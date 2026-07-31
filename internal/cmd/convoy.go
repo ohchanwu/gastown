@@ -3031,12 +3031,15 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 }
 
 func getIssueDetailsBatchContext(ctx context.Context, issueIDs []string) map[string]*issueDetails {
+	return getIssueDetailsBatchWithClientContext(ctx, convoyIssueClient(), issueIDs)
+}
+
+func getIssueDetailsBatchWithClientContext(ctx context.Context, client *beads.Beads, issueIDs []string) map[string]*issueDetails {
 	result := make(map[string]*issueDetails, len(issueIDs))
 	if len(issueIDs) == 0 {
 		return result
 	}
 
-	client := convoyIssueClient()
 	if client == nil {
 		return result
 	}

@@ -801,6 +801,7 @@ func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args 
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetProcessGroup(cmd)
+	cmd.WaitDelay = 100 * time.Millisecond
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -828,6 +829,7 @@ func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args 
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		util.SetProcessGroup(cmd)
+		cmd.WaitDelay = 100 * time.Millisecond
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	beadsapi "github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestCheckCompletedConvoysCancelsListingAtCommandDeadline(t *testing.T) {
@@ -252,12 +254,19 @@ func TestGetTrackedIssuesCancellationStopsRelationshipQuery(t *testing.T) {
 	townRoot := t.TempDir()
 	started := filepath.Join(binDir, "relationship.started")
 	completed := filepath.Join(binDir, "relationship.completed")
+	heartbeat := filepath.Join(binDir, "relationship.heartbeat")
 	script := `#!/bin/sh
 while [ "${1#--}" != "$1" ]; do shift; done
 case "$1" in
   sql)
+	printf '0\n' > "` + heartbeat + `"
     touch "` + started + `"
-    sleep 5
+	i=1
+	while [ "$i" -lt 100 ]; do
+	  printf '%s\n' "$i" > "` + heartbeat + `"
+	  i=$((i + 1))
+	  sleep 0.05
+	done
     touch "` + completed + `"
     printf '[{"depends_on_id":"gt-tracked"}]\n'
     ;;
@@ -272,25 +281,30 @@ esac
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cancelWhenFileExists(cancel, started)
-	start := time.Now()
 	_, err := getTrackedIssuesCached(
 		ctx,
 		townRoot,
 		"hq-cv-relationship-cancel",
 		newConvoyIssueDetailsCache(func([]string) map[string]*issueDetails { return nil }),
 	)
-	elapsed := time.Since(start)
-
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context canceled", err)
-	}
-	if elapsed >= time.Second {
-		t.Fatalf("canceled relationship query returned after %s, want under 1s", elapsed.Round(time.Millisecond))
 	}
 	if _, statErr := os.Stat(started); statErr != nil {
 		t.Fatalf("relationship query did not start: %v", statErr)
 	}
+	heartbeatBefore, readErr := os.ReadFile(heartbeat)
+	if readErr != nil {
+		t.Fatalf("read relationship heartbeat: %v", readErr)
+	}
 	time.Sleep(100 * time.Millisecond)
+	heartbeatAfter, readErr := os.ReadFile(heartbeat)
+	if readErr != nil {
+		t.Fatalf("reread relationship heartbeat: %v", readErr)
+	}
+	if !bytes.Equal(heartbeatBefore, heartbeatAfter) {
+		t.Fatalf("relationship subprocess survived cancellation: heartbeat changed from %q to %q", heartbeatBefore, heartbeatAfter)
+	}
 	if _, statErr := os.Stat(completed); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("relationship query survived cancellation: %v", statErr)
 	}
@@ -303,16 +317,42 @@ func TestGetTrackedIssuesCancellationStopsIssueDetailLookup(t *testing.T) {
 
 	binDir := t.TempDir()
 	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test-town"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigRoot := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(rigRoot, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	routes := `{"prefix":"hq-","path":"."}
+{"prefix":"gt-","path":"gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	started := filepath.Join(binDir, "detail.started")
 	completed := filepath.Join(binDir, "detail.completed")
+	heartbeat := filepath.Join(binDir, "detail.heartbeat")
 	script := `#!/bin/sh
 while [ "${1#--}" != "$1" ]; do shift; done
 case "$1" in
   version) echo 'bd 1.0.0' ;;
   sql) printf '[{"depends_on_id":"gt-cancel-detail"}]\n' ;;
   show)
+	printf '0\n' > "` + heartbeat + `"
     touch "` + started + `"
-    sleep 5
+	 i=1
+	 while [ "$i" -lt 100 ]; do
+	   printf '%s\n' "$i" > "` + heartbeat + `"
+	   i=$((i + 1))
+	   sleep 0.05
+	 done
     touch "` + completed + `"
     printf '[{"id":"gt-cancel-detail","title":"Tracked","status":"closed","issue_type":"task"}]\n'
     ;;
@@ -323,29 +363,40 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "65534")
+	t.Setenv("BEADS_DOLT_PORT", "65534")
+	t.Setenv("GT_DOLT_PORT", "65534")
+	client := beadsapi.NewIsolated(townRoot)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cancelWhenFileExists(cancel, started)
-	start := time.Now()
 	_, err := getTrackedIssuesCached(
 		ctx,
 		townRoot,
 		"hq-cv-detail-cancel",
-		newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext),
+		newConvoyIssueDetailsCacheContext(func(ctx context.Context, ids []string) map[string]*issueDetails {
+			return getIssueDetailsBatchWithClientContext(ctx, client, ids)
+		}),
 	)
-	elapsed := time.Since(start)
-
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context canceled", err)
-	}
-	if elapsed >= time.Second {
-		t.Fatalf("canceled issue-detail lookup returned after %s, want under 1s", elapsed.Round(time.Millisecond))
 	}
 	if _, statErr := os.Stat(started); statErr != nil {
 		t.Fatalf("issue-detail lookup did not start: %v", statErr)
 	}
+	heartbeatBefore, readErr := os.ReadFile(heartbeat)
+	if readErr != nil {
+		t.Fatalf("read issue-detail heartbeat: %v", readErr)
+	}
 	time.Sleep(100 * time.Millisecond)
+	heartbeatAfter, readErr := os.ReadFile(heartbeat)
+	if readErr != nil {
+		t.Fatalf("reread issue-detail heartbeat: %v", readErr)
+	}
+	if !bytes.Equal(heartbeatBefore, heartbeatAfter) {
+		t.Fatalf("issue-detail subprocess survived cancellation: heartbeat changed from %q to %q", heartbeatBefore, heartbeatAfter)
+	}
 	if _, statErr := os.Stat(completed); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("issue-detail lookup survived cancellation: %v", statErr)
 	}
