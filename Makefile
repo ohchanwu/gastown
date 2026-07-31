@@ -180,9 +180,10 @@ clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
 
 test: test-makefile
-	go test ./...
+	bash scripts/test-isolated.sh
 
 test-makefile:
+	bash scripts/test-isolated_test.sh
 	bash scripts/check-install-path_test.sh
 	bash -n plugins/stuck-agent-dog/run.sh
 	bash -n plugins/stuck-agent-dog/run_test.sh
