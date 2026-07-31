@@ -756,7 +756,11 @@ func resolveBdSubprocessTimeout() time.Duration {
 
 // run executes a bd command and returns stdout.
 func (b *Beads) run(args ...string) ([]byte, error) {
-	return b.runWithStdin(nil, args...)
+	return b.runContext(context.Background(), args...)
+}
+
+func (b *Beads) runContext(ctx context.Context, args ...string) ([]byte, error) {
+	return b.runWithStdinContext(ctx, nil, args...)
 }
 
 // runWithStdin executes a bd command, optionally piping stdinData to bd's stdin.
@@ -764,6 +768,10 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 // --body-file=- that read multi-line content from stdin (avoids embedding
 // newlines in --description, which bd 1.0.3+ rejects).
 func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr error) {
+	return b.runWithStdinContext(context.Background(), stdinData, args...)
+}
+
+func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args ...string) (_ []byte, retErr error) {
 	start := time.Now()
 	// Declare buffers before defer so the closure captures them after cmd.Run.
 	var stdout, stderr bytes.Buffer
@@ -785,14 +793,14 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
 	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	ctx, cancel := context.WithTimeout(ctx, resolveBdSubprocessTimeout())
 	defer cancel()
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -819,7 +827,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 		stdout.Reset()
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-		util.SetDetachedProcessGroup(cmd)
+		util.SetProcessGroup(cmd)
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -1554,17 +1562,25 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 
 // Show returns detailed information about an issue.
 func (b *Beads) Show(id string) (*Issue, error) {
+	return b.ShowContext(context.Background(), id)
+}
+
+// ShowContext returns detailed information about an issue and honors caller cancellation.
+func (b *Beads) ShowContext(ctx context.Context, id string) (*Issue, error) {
 	if !b.noRoute {
 		if target := b.forIssueID(id); target != b {
-			return target.Show(id)
+			return target.ShowContext(ctx, id)
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.store != nil {
 		return b.storeShow(id)
 	}
 
-	out, err := b.run("show", id, "--json")
+	out, err := b.runContext(ctx, "show", id, "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -1616,8 +1632,16 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
 // If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	return b.ShowMultipleContext(context.Background(), ids)
+}
+
+// ShowMultipleContext fetches multiple issues by routed database and honors caller cancellation.
+func (b *Beads) ShowMultipleContext(ctx context.Context, ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	if !b.noRoute {
@@ -1636,7 +1660,7 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 				if targetDir != fallbackDir {
 					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
 				}
-				issues, err := target.showMultipleLocal(groupIDs)
+				issues, err := target.showMultipleLocalContext(ctx, groupIDs)
 				if err != nil {
 					if firstErr == nil {
 						firstErr = err
@@ -1651,21 +1675,28 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 		}
 	}
 
-	return b.showMultipleLocal(ids)
+	return b.showMultipleLocalContext(ctx, ids)
 }
 
 func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
+	return b.showMultipleLocalContext(context.Background(), ids)
+}
+
+func (b *Beads) showMultipleLocalContext(ctx context.Context, ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.store != nil {
 		return b.storeShowMultiple(ids)
 	}
 
 	// bd show supports multiple IDs
 	args := append([]string{"show", "--json"}, ids...)
-	out, err := b.run(args...)
+	out, err := b.runContext(ctx, args...)
 	if err != nil {
 		return nil, fmt.Errorf("bd show: %w", err)
 	}

@@ -242,3 +242,132 @@ func TestWriteConvoyListJSONReturnsCallerCancellationWithoutPartialOutput(t *tes
 		t.Fatalf("canceled list encoded partial JSON: %s", output.String())
 	}
 }
+
+func TestGetTrackedIssuesCancellationStopsRelationshipQuery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	binDir := t.TempDir()
+	townRoot := t.TempDir()
+	started := filepath.Join(binDir, "relationship.started")
+	completed := filepath.Join(binDir, "relationship.completed")
+	script := `#!/bin/sh
+while [ "${1#--}" != "$1" ]; do shift; done
+case "$1" in
+  sql)
+    touch "` + started + `"
+    sleep 5
+    touch "` + completed + `"
+    printf '[{"depends_on_id":"gt-tracked"}]\n'
+    ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelWhenFileExists(cancel, started)
+	start := time.Now()
+	_, err := getTrackedIssuesCached(
+		ctx,
+		townRoot,
+		"hq-cv-relationship-cancel",
+		newConvoyIssueDetailsCache(func([]string) map[string]*issueDetails { return nil }),
+	)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("canceled relationship query returned after %s, want under 1s", elapsed.Round(time.Millisecond))
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("relationship query did not start: %v", statErr)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, statErr := os.Stat(completed); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("relationship query survived cancellation: %v", statErr)
+	}
+}
+
+func TestGetTrackedIssuesCancellationStopsIssueDetailLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	binDir := t.TempDir()
+	townRoot := t.TempDir()
+	started := filepath.Join(binDir, "detail.started")
+	completed := filepath.Join(binDir, "detail.completed")
+	script := `#!/bin/sh
+while [ "${1#--}" != "$1" ]; do shift; done
+case "$1" in
+  version) echo 'bd 1.0.0' ;;
+  sql) printf '[{"depends_on_id":"gt-cancel-detail"}]\n' ;;
+  show)
+    touch "` + started + `"
+    sleep 5
+    touch "` + completed + `"
+    printf '[{"id":"gt-cancel-detail","title":"Tracked","status":"closed","issue_type":"task"}]\n'
+    ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelWhenFileExists(cancel, started)
+	start := time.Now()
+	_, err := getTrackedIssuesCached(
+		ctx,
+		townRoot,
+		"hq-cv-detail-cancel",
+		newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext),
+	)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("canceled issue-detail lookup returned after %s, want under 1s", elapsed.Round(time.Millisecond))
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("issue-detail lookup did not start: %v", statErr)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, statErr := os.Stat(completed); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("issue-detail lookup survived cancellation: %v", statErr)
+	}
+}
+
+func cancelWhenFileExists(cancel context.CancelFunc, path string) {
+	go func() {
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if _, err := os.Stat(path); err == nil {
+				cancel()
+				return
+			}
+			select {
+			case <-deadline.C:
+				cancel()
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}

@@ -2016,7 +2016,7 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 	if err != nil {
 		return convoyCheckSummary{}, fmt.Errorf("listing convoys: %w", err)
 	}
-	cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
+	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
 	summary := checkConvoys(
 		ctx,
 		convoys,
@@ -2479,7 +2479,7 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 	}
 
 	if convoyListJSON {
-		cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
+		cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
 		return writeConvoyListJSON(ctx, os.Stdout, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
 			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
 		})
@@ -2736,10 +2736,16 @@ type convoyIssueDetailsCacheEntry struct {
 type convoyIssueDetailsCache struct {
 	mu      sync.Mutex
 	entries map[string]*convoyIssueDetailsCacheEntry
-	load    func([]string) map[string]*issueDetails
+	load    func(context.Context, []string) map[string]*issueDetails
 }
 
 func newConvoyIssueDetailsCache(load func([]string) map[string]*issueDetails) *convoyIssueDetailsCache {
+	return newConvoyIssueDetailsCacheContext(func(_ context.Context, ids []string) map[string]*issueDetails {
+		return load(ids)
+	})
+}
+
+func newConvoyIssueDetailsCacheContext(load func(context.Context, []string) map[string]*issueDetails) *convoyIssueDetailsCache {
 	return &convoyIssueDetailsCache{
 		entries: make(map[string]*convoyIssueDetailsCacheEntry),
 		load:    load,
@@ -2762,7 +2768,7 @@ func (c *convoyIssueDetailsCache) get(ctx context.Context, ids []string) map[str
 	c.mu.Unlock()
 
 	if len(toLoad) > 0 {
-		loaded := c.load(toLoad)
+		loaded := c.load(ctx, toLoad)
 		c.mu.Lock()
 		for _, id := range toLoad {
 			entry := c.entries[id]
@@ -2828,10 +2834,13 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 	// Prefer raw SQL — works for cross-database deps where tracked beads
 	// live in different Dolt databases. Falls back to bd dep list if bd sql
 	// is not available (older bd versions).
-	trackedIDs, err := bdDepListRawIDs(townBeads, convoyID, "down", "tracks")
+	trackedIDs, err := bdDepListRawIDsContext(ctx, townBeads, convoyID, "down", "tracks")
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// bd sql not supported (older bd) — fall back to bd dep list.
-		trackedIDs, err = bdDepListTracked(townBeads, convoyID)
+		trackedIDs, err = bdDepListTrackedContext(ctx, townBeads, convoyID)
 		if err != nil {
 			return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
 		}
@@ -2840,7 +2849,7 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 	// Fallback: when dep queries return empty (common for cross-database deps
 	// on older bd where the JOIN fails), try parsing from bd show output.
 	if len(trackedIDs) == 0 {
-		trackedIDs, err = bdShowTrackedDeps(townBeads, convoyID)
+		trackedIDs, err = bdShowTrackedDepsContext(ctx, townBeads, convoyID)
 		if err != nil {
 			return nil, fmt.Errorf("fallback show for tracked deps of %s: %w", convoyID, err)
 		}
@@ -2852,6 +2861,9 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 
 	// Fetch fresh issue details via bd show (uses prefix routing for cross-rig).
 	freshDetails := cache.get(ctx, trackedIDs)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 
 	// Build tracked dependency structs from fresh details. When fresh details
 	// are missing (cross-rig DB unreachable, missing, parked, or unroutable
@@ -2912,7 +2924,11 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 // bdShowBead) — without it, a jsonl write that straddles a second boundary causes
 // "database out of sync" errors in CI and fast-turnaround production workflows.
 func bdDepListTracked(dir, convoyID string) ([]string, error) {
-	out, err := runBdJSONAllowStale(dir, "dep", "list", convoyID, "--direction=down", "--type=tracks", "--json")
+	return bdDepListTrackedContext(context.Background(), dir, convoyID)
+}
+
+func bdDepListTrackedContext(ctx context.Context, dir, convoyID string) ([]string, error) {
+	out, err := runBdJSONWithOptionsContext(ctx, dir, true, false, "dep", "list", convoyID, "--direction=down", "--type=tracks", "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -2940,7 +2956,11 @@ func bdDepListTracked(dir, convoyID string) ([]string, error) {
 // tracked dependency IDs from the convoy's dependencies array.
 // This handles cross-database dependencies where bd dep list returns empty.
 func bdShowTrackedDeps(dir, convoyID string) ([]string, error) {
-	out, err := runBdJSON(dir, "show", convoyID, "--json")
+	return bdShowTrackedDepsContext(context.Background(), dir, convoyID)
+}
+
+func bdShowTrackedDepsContext(ctx context.Context, dir, convoyID string) ([]string, error) {
+	out, err := runBdJSONWithOptionsContext(ctx, dir, false, false, "show", convoyID, "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -3007,6 +3027,10 @@ func (d issueDetails) IsBlocked() bool {
 // getIssueDetailsBatch fetches details through the central routed beads lookup.
 // Returns a map from issue ID to details. Missing/invalid issues are omitted from the map.
 func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
+	return getIssueDetailsBatchContext(context.Background(), issueIDs)
+}
+
+func getIssueDetailsBatchContext(ctx context.Context, issueIDs []string) map[string]*issueDetails {
 	result := make(map[string]*issueDetails, len(issueIDs))
 	if len(issueIDs) == 0 {
 		return result
@@ -3017,7 +3041,7 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 		return result
 	}
 
-	issues, err := client.ShowMultiple(issueIDs)
+	issues, err := client.ShowMultipleContext(ctx, issueIDs)
 	for id, issue := range issues {
 		if details := issueToDetails(issue); details != nil {
 			result[id] = details
@@ -3030,10 +3054,13 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	// If a grouped batch fails because one ID is missing or stale, keep the
 	// previous best-effort behavior and recover any IDs that still resolve.
 	for _, id := range issueIDs {
+		if ctx.Err() != nil {
+			break
+		}
 		if result[id] != nil {
 			continue
 		}
-		if details := getIssueDetailsWithClient(client, id); details != nil {
+		if details := getIssueDetailsWithClientContext(ctx, client, id); details != nil {
 			result[id] = details
 		}
 	}
@@ -3059,7 +3086,11 @@ func convoyIssueClient() *beads.Beads {
 }
 
 func getIssueDetailsWithClient(client *beads.Beads, issueID string) *issueDetails {
-	issue, err := client.Show(issueID)
+	return getIssueDetailsWithClientContext(context.Background(), client, issueID)
+}
+
+func getIssueDetailsWithClientContext(ctx context.Context, client *beads.Beads, issueID string) *issueDetails {
+	issue, err := client.ShowContext(ctx, issueID)
 	if err != nil {
 		return nil
 	}
