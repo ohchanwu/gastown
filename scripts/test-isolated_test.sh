@@ -27,6 +27,11 @@ printf '%s\n' \
   "GT_DOLT_PORT=$GT_DOLT_PORT" \
   "BEADS_DOLT_PORT=$BEADS_DOLT_PORT" \
   "BEADS_DOLT_SERVER_PORT=$BEADS_DOLT_SERVER_PORT" \
+  "GT_TEST_DOLT_PORT=${GT_TEST_DOLT_PORT-}" \
+	"GT_TEST_ISOLATED=${GT_TEST_ISOLATED-}" \
+	"GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL-}" \
+	"GIT_CONFIG_SYSTEM=${GIT_CONFIG_SYSTEM-}" \
+  "umask=$(umask)" \
   "args=$*" > "$CAPTURE"
 exit "${FAKE_GO_EXIT:-0}"
 FAKE_GO
@@ -66,10 +71,13 @@ fail() {
 
 echo "=== isolated test launcher tests ==="
 
-if PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
-  GT_DOLT_PORT=45123 BEADS_DOLT_PORT=45123 BEADS_DOLT_SERVER_PORT=45123 \
-  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER"; then
-  expected=$'GT_DOLT_PORT=44001\nBEADS_DOLT_PORT=44001\nBEADS_DOLT_SERVER_PORT=44001\nargs=test ./...'
+if (
+  umask 077
+  PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+    GT_DOLT_PORT=45123 BEADS_DOLT_PORT=45123 BEADS_DOLT_SERVER_PORT=45123 \
+    GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER"
+); then
+  expected=$'GT_DOLT_PORT=44001\nBEADS_DOLT_PORT=44001\nBEADS_DOLT_SERVER_PORT=44001\nGT_TEST_DOLT_PORT=\nGT_TEST_ISOLATED=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_CONFIG_SYSTEM=/dev/null\numask=0022\nargs=test -p 1 ./...'
   [[ "$(cat "$CAPTURE")" == "$expected" ]] && \
     pass "quarantines inherited Dolt selectors" || \
     fail "quarantines inherited Dolt selectors"
@@ -79,7 +87,7 @@ fi
 
 rm -f "$CAPTURE"
 status=0
-output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+output="$(env -u GT_TEST_DOLT_PORT PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
   GT_DOLT_PORT=45123 BEADS_DOLT_PORT=45123 \
   bash "$LAUNCHER" 2>&1)" || status=$?
 if [[ "$status" -eq 78 && ! -e "$CAPTURE" && \

@@ -299,6 +299,10 @@ func TestIsDoneCommand(t *testing.T) {
 }
 
 func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
+	previousBuiltProperly := BuiltProperly
+	BuiltProperly = "1"
+	t.Cleanup(func() { BuiltProperly = previousBuiltProperly })
+
 	townRoot, _ := setupDoneGuardWorktree(t, "nested", "shiny")
 	initDoneGuardGitRepo(t, townRoot)
 	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), []byte(`{"rigs":{"gastown":{"beads":{"prefix":"gt"}}}}`), 0644); err != nil {

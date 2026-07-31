@@ -2144,6 +2144,7 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 // correct port from DefaultConfig. This is the root cause of "connection
 // refused" errors reported by community users after gt dolt fix-metadata.
 func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 
 	beadsDir := filepath.Join(townRoot, ".beads")
@@ -2660,6 +2661,7 @@ func TestIsDoltRetryableError_CatalogRace(t *testing.T) {
 }
 
 func TestWaitForCatalog_NoServer(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	// When no Dolt server is reachable, waitForCatalog should fail.
 	// Use port 13399 (unlikely to be in use) to ensure no server responds.
 	townRoot := t.TempDir()
@@ -2740,6 +2742,7 @@ func TestListDatabases_MixedContent(t *testing.T) {
 // =============================================================================
 
 func TestGetConnectionString(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 	s := GetConnectionString(townRoot)
 	if s != "root@tcp(127.0.0.1:3307)/" {
@@ -2748,6 +2751,7 @@ func TestGetConnectionString(t *testing.T) {
 }
 
 func TestGetConnectionStringForRig(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 	s := GetConnectionStringForRig(townRoot, "hq")
 	if s != "root@tcp(127.0.0.1:3307)/hq" {
@@ -3064,6 +3068,7 @@ func TestDatabaseExists_NoDataDir(t *testing.T) {
 // =============================================================================
 
 func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 
 	// Point the test at a port nothing listens on so IsRunning returns false
@@ -3216,6 +3221,7 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 }
 
 func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 
 	// Isolate from real Dolt server on default port

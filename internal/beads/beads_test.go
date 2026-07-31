@@ -2008,6 +2008,9 @@ func TestIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
+	if os.Getenv("GT_TEST_ISOLATED") != "" {
+		t.Skip("requires an explicitly provisioned beads repository")
+	}
 
 	// Find a beads repo (use current directory if it has .beads)
 	cwd, err := os.Getwd()
@@ -5330,6 +5333,9 @@ func TestRunEnv_StripsPollutedDoltEnvAndUsesRigMetadata(t *testing.T) {
 	})
 
 	workDir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(workDir); err == nil {
+		workDir = resolved
+	}
 	beadsDir := filepath.Join(workDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
@@ -5373,6 +5379,7 @@ printf 'unknown\n'
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MOCK_BD_LOG", logPath)
 	t.Setenv("GT_DOLT_DATA", "/home/coder/gt/.dolt-data")
+	t.Setenv("GT_DOLT_HOST", "")
 	t.Setenv("BEADS_DOLT_DATA_DIR", "/home/coder/gt/.dolt-data")
 	t.Setenv("BEADS_DOLT_HOST", "127.0.0.1")
 	t.Setenv("GT_DOLT_PORT", "")

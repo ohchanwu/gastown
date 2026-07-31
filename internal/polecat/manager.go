@@ -123,6 +123,8 @@ var (
 	ErrDiskSpaceLow       = errors.New("insufficient disk space")
 )
 
+var checkDiskSpace = util.CheckDiskSpace
+
 // UncommittedWorkError provides details about uncommitted work.
 type UncommittedWorkError struct {
 	PolecatName string
@@ -726,7 +728,7 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 	defer func() { telemetry.RecordPolecatSpawn(context.Background(), name, retErr) }()
 
 	// Pre-check: Verify sufficient disk space before expensive worktree creation.
-	if level, msg, err := util.CheckDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
+	if level, msg, err := checkDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
 		return nil, fmt.Errorf("%w: %s", ErrDiskSpaceLow, msg)
 	}
 
@@ -893,7 +895,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	// beads state — all requiring disk I/O. If the disk is nearly full, fail early
 	// with a clear message rather than leaving a half-created polecat.
 	// See: disk-space-resilience — 5 polecats died silently on disk exhaustion.
-	if level, msg, err := util.CheckDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
+	if level, msg, err := checkDiskSpace(m.rig.Path); err == nil && level == util.DiskSpaceCritical {
 		return nil, fmt.Errorf("%w: %s", ErrDiskSpaceLow, msg)
 	}
 

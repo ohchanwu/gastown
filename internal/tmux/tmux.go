@@ -4097,7 +4097,7 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 //  2. Unguarded form (set by EnsureBindingsOnSocket): direct run-shell
 //     invoking "gt agents menu" or "gt feed --window".
 func (t *Tmux) isGTBinding(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4115,7 +4115,7 @@ func (t *Tmux) isGTBinding(table, key string) bool {
 // --client for multi-client support. Older GT bindings without --client cause
 // switch-client to target the wrong client when multiple clients are attached.
 func (t *Tmux) isGTBindingWithClient(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4127,7 +4127,7 @@ func (t *Tmux) isGTBindingWithClient(table, key string) bool {
 // current prefix pattern. Returns false if the binding is stale (e.g., after
 // gt rig add introduces a new prefix not yet in the grep pattern).
 func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4146,15 +4146,15 @@ func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
 // the presence of both "if-shell" and "gt " in the output), it is treated as
 // no prior binding to avoid recursive wrapping on repeated calls.
 func (t *Tmux) getKeyBinding(table, key string) string {
-	// tmux list-keys -T <table> <key> outputs a line like:
+	// tmux list-keys -T <table> outputs lines like:
 	//   bind-key -T prefix g if-shell "..." "run-shell 'gt agents menu'" ":"
 	// We need to extract just the command portion.
 	//
-	// Assumed format (tested with tmux 3.3+):
+	// Assumed format:
 	//   bind-key [-r] -T <table> <key> <command...>
 	// If tmux changes this format, parsing fails safely (returns ""),
 	// which causes the caller to use its default fallback.
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return ""
 	}
@@ -4200,6 +4200,25 @@ func (t *Tmux) getKeyBinding(table, key string) string {
 	}
 
 	return cmd
+}
+
+// keyBindingLine returns the binding for one key. Filtering the full table is
+// compatible with tmux 3.7, where the positional key argument may return an
+// empty successful result.
+func (t *Tmux) keyBindingLine(table, key string) (string, error) {
+	output, err := t.run("list-keys", "-T", table)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field == "-T" && i+2 < len(fields) && fields[i+1] == table && fields[i+2] == key {
+				return line, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // safePrefixRe matches the character set guaranteed by beadsPrefixRegexp in

@@ -2,6 +2,10 @@
 
 set -uo pipefail
 
+# Tests assert repository-default permissions; do not inherit a restrictive
+# interactive-shell umask into the hermetic suite.
+umask 022
+
 server_pid=""
 data_dir=""
 
@@ -76,7 +80,10 @@ if [[ "$owns_listener" != true ]]; then
   exit 78
 fi
 
-if env \
+if env -u GT_TEST_DOLT_PORT \
+	GT_TEST_ISOLATED=1 \
+	GIT_CONFIG_GLOBAL=/dev/null \
+	GIT_CONFIG_SYSTEM=/dev/null \
   GT_DOLT_HOST=127.0.0.1 \
   GT_DOLT_PORT="$test_port" \
   DOLT_PORT="$test_port" \
@@ -84,7 +91,7 @@ if env \
   BEADS_DOLT_PORT="$test_port" \
   BEADS_DOLT_SERVER_HOST=127.0.0.1 \
   BEADS_DOLT_SERVER_PORT="$test_port" \
-  go test ./...; then
+  go test -p 1 ./...; then
   exit 0
 else
   status=$?
