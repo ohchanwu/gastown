@@ -208,7 +208,7 @@ func lookupConvoysBounded(
 						remaining--
 					}
 				default:
-					return results, remaining > 0
+					return results, true
 				}
 			}
 		}
@@ -2428,7 +2428,10 @@ func writeConvoyListJSON(
 	lookup func(context.Context, convoyListIssue) ([]trackedIssueInfo, error),
 ) error {
 	enriched := make([]convoyListEntry, 0, len(convoys))
-	results, _ := lookupConvoysBounded(ctx, convoys, lookup)
+	results, canceled := lookupConvoysBounded(ctx, convoys, lookup)
+	if canceled {
+		return ctx.Err()
+	}
 	for _, result := range results {
 		c := result.convoy
 		if !result.done || result.err != nil {

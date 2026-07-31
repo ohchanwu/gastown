@@ -207,3 +207,38 @@ func TestWriteConvoyListJSONWaitsForSlowSuccessfulLookup(t *testing.T) {
 		t.Fatalf("slow successful lookup was not encoded: %s", output.String())
 	}
 }
+
+func TestWriteConvoyListJSONReturnsCallerCancellationWithoutPartialOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slowStarted := make(chan struct{})
+	go func() {
+		<-slowStarted
+		cancel()
+	}()
+
+	var output bytes.Buffer
+	err := writeConvoyListJSON(
+		ctx,
+		&output,
+		[]convoyListIssue{
+			{ID: "hq-cv-fast-list", Title: "Fast list", Status: "open"},
+			{ID: "hq-cv-pending-list", Title: "Pending list", Status: "open"},
+		},
+		func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+			if convoy.ID == "hq-cv-pending-list" {
+				close(slowStarted)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return []trackedIssueInfo{{ID: "gt-done", Status: "closed"}}, nil
+		},
+	)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("canceled list encoded partial JSON: %s", output.String())
+	}
+}
