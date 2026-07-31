@@ -2,6 +2,7 @@ package lock
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,80 @@ import (
 
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestLock_AcquireOwner(t *testing.T) {
+	t.Run("matching live owner is idempotent", func(t *testing.T) {
+		l := New(t.TempDir())
+		owner := Owner{PID: os.Getpid(), SessionID: "gt-worker"}
+
+		if err := l.AcquireOwner(owner); err != nil {
+			t.Fatalf("first AcquireOwner() error = %v", err)
+		}
+		if err := l.AcquireOwner(owner); err != nil {
+			t.Fatalf("second AcquireOwner() error = %v", err)
+		}
+
+		info, err := l.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.PID != owner.PID || info.SessionID != owner.SessionID {
+			t.Fatalf("owner = (%d, %q), want (%d, %q)", info.PID, info.SessionID, owner.PID, owner.SessionID)
+		}
+	})
+
+	t.Run("different live owner is rejected", func(t *testing.T) {
+		l := New(t.TempDir())
+		livePID := os.Getppid()
+		if !processExists(livePID) {
+			t.Fatalf("parent PID %d is not live", livePID)
+		}
+		if err := l.AcquireOwner(Owner{PID: livePID, SessionID: "gt-worker"}); err != nil {
+			t.Fatal(err)
+		}
+
+		err := l.AcquireOwner(Owner{PID: os.Getpid(), SessionID: "gt-worker"})
+		if !errors.Is(err, ErrLocked) {
+			t.Fatalf("AcquireOwner() error = %v, want ErrLocked", err)
+		}
+	})
+
+	t.Run("different tmux session is rejected", func(t *testing.T) {
+		l := New(t.TempDir())
+		if err := l.AcquireOwner(Owner{PID: os.Getpid(), SessionID: "other-session"}); err != nil {
+			t.Fatal(err)
+		}
+
+		err := l.AcquireOwner(Owner{PID: os.Getpid(), SessionID: "gt-worker"})
+		if !errors.Is(err, ErrLocked) {
+			t.Fatalf("AcquireOwner() error = %v, want ErrLocked", err)
+		}
+	})
+
+	t.Run("stale owner is replaced", func(t *testing.T) {
+		workerDir := t.TempDir()
+		l := New(workerDir)
+		if err := os.MkdirAll(filepath.Dir(l.lockPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(LockInfo{PID: 999999999, SessionID: "dead-pane", AcquiredAt: time.Now()})
+		if err := os.WriteFile(l.lockPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		owner := Owner{PID: os.Getpid(), SessionID: "gt-worker"}
+		if err := l.AcquireOwner(owner); err != nil {
+			t.Fatalf("AcquireOwner() error = %v", err)
+		}
+		info, err := l.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.PID != owner.PID || info.SessionID != owner.SessionID {
+			t.Fatalf("owner = (%d, %q), want (%d, %q)", info.PID, info.SessionID, owner.PID, owner.SessionID)
+		}
+	})
+}
 
 func TestNew(t *testing.T) {
 	workerDir := "/tmp/test-worker"
@@ -26,8 +101,8 @@ func TestNew(t *testing.T) {
 
 func TestLockInfo_IsStale(t *testing.T) {
 	tests := []struct {
-		name     string
-		pid      int
+		name      string
+		pid       int
 		wantStale bool
 	}{
 		{"current process", os.Getpid(), false},

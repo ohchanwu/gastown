@@ -1197,6 +1197,14 @@ func getAgentIdentity(ctx RoleContext) string {
 // acquireIdentityLock checks and acquires the identity lock for worker roles.
 // This prevents multiple agents from claiming the same worker identity.
 // Returns an error if another agent already owns this identity.
+var resolveIdentityLockOwner = func() (lock.Owner, error) {
+	pid, session, err := tmux.NewTmux().ResolveCurrentPaneOwner()
+	if err != nil {
+		return lock.Owner{}, err
+	}
+	return lock.Owner{PID: pid, SessionID: session}, nil
+}
+
 func acquireIdentityLock(ctx RoleContext) error {
 	// Only lock worker roles (polecat, crew)
 	// Infrastructure roles (mayor, witness, refinery, deacon) are singletons
@@ -1208,15 +1216,13 @@ func acquireIdentityLock(ctx RoleContext) error {
 	// Create lock for this worker directory
 	l := lock.New(ctx.WorkDir)
 
-	// Determine session ID from environment or context
-	sessionID := os.Getenv("TMUX_PANE")
-	if sessionID == "" {
-		// Fall back to a descriptive identifier
-		sessionID = fmt.Sprintf("%s/%s", ctx.Rig, ctx.Polecat)
+	owner, err := resolveIdentityLockOwner()
+	if err != nil {
+		return fmt.Errorf("resolving current tmux owner: %w", err)
 	}
 
 	// Try to acquire the lock
-	if err := l.Acquire(sessionID); err != nil {
+	if err := l.AcquireOwner(owner); err != nil {
 		if errors.Is(err, lock.ErrLocked) {
 			// Another agent owns this identity
 			fmt.Printf("\n%s\n\n", style.Bold.Render("⚠️  IDENTITY COLLISION DETECTED"))

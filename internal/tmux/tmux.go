@@ -2653,9 +2653,16 @@ func (t *Tmux) SelectWindow(session string, index int) error {
 // Walks up the process parent chain and matches against tmux pane PIDs on
 // the configured socket.
 func (t *Tmux) ResolveCurrentSession() (string, error) {
+	_, session, err := t.ResolveCurrentPaneOwner()
+	return session, err
+}
+
+// ResolveCurrentPaneOwner returns the durable pane PID and session containing
+// the calling process.
+func (t *Tmux) ResolveCurrentPaneOwner() (int, string, error) {
 	out, err := t.run("list-panes", "-a", "-F", "#{pane_pid} #{session_name}")
 	if err != nil {
-		return "", fmt.Errorf("listing panes: %w", err)
+		return 0, "", fmt.Errorf("listing panes: %w", err)
 	}
 
 	paneSessions := make(map[int]string)
@@ -2671,20 +2678,25 @@ func (t *Tmux) ResolveCurrentSession() (string, error) {
 		paneSessions[pid] = parts[1]
 	}
 
-	// Walk up from our PID to PID 1, checking each against pane PIDs
-	pid := os.Getpid()
+	if pid, session, ok := resolvePaneOwner(os.Getpid(), paneSessions, parentPID); ok {
+		return pid, session, nil
+	}
+
+	return 0, "", fmt.Errorf("no tmux pane ancestor found for pid %d", os.Getpid())
+}
+
+func resolvePaneOwner(pid int, paneSessions map[int]string, parent func(int) (int, error)) (int, string, bool) {
 	for pid > 1 {
-		if name, ok := paneSessions[pid]; ok {
-			return name, nil
+		if session, ok := paneSessions[pid]; ok {
+			return pid, session, true
 		}
-		ppid, err := parentPID(pid)
+		ppid, err := parent(pid)
 		if err != nil || ppid == pid {
 			break
 		}
 		pid = ppid
 	}
-
-	return "", fmt.Errorf("no tmux pane ancestor found for pid %d", os.Getpid())
+	return 0, "", false
 }
 
 // parentPID returns the parent PID of the given process.

@@ -1266,6 +1266,22 @@ func TestGetParentPID(t *testing.T) {
 	}
 }
 
+func TestResolvePaneOwnerFromProcessAncestry(t *testing.T) {
+	panes := map[int]string{100: "gt-worker", 500: "gt-other"}
+	parents := map[int]int{300: 200, 200: 100, 100: 1, 600: 500, 500: 1}
+	parent := func(pid int) (int, error) { return parents[pid], nil }
+
+	ownerPID, session, ok := resolvePaneOwner(300, panes, parent)
+	if !ok || ownerPID != 100 || session != "gt-worker" {
+		t.Fatalf("resolvePaneOwner() = (%d, %q, %v), want (100, %q, true)", ownerPID, session, ok, "gt-worker")
+	}
+
+	ownerPID, session, ok = resolvePaneOwner(400, panes, parent)
+	if ok || ownerPID != 0 || session != "" {
+		t.Fatalf("unrelated resolvePaneOwner() = (%d, %q, %v), want no owner", ownerPID, session, ok)
+	}
+}
+
 func TestKillSessionWithProcesses_DoesNotKillUnrelatedProcesses(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-nounrelated-" + t.Name()

@@ -30,10 +30,16 @@ var (
 
 // LockInfo contains information about who holds a lock.
 type LockInfo struct {
-	PID       int       `json:"pid"`
+	PID        int       `json:"pid"`
 	AcquiredAt time.Time `json:"acquired_at"`
-	SessionID string    `json:"session_id,omitempty"`
-	Hostname  string    `json:"hostname,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	Hostname   string    `json:"hostname,omitempty"`
+}
+
+// Owner identifies the durable process and tmux session that own a worker.
+type Owner struct {
+	PID       int
+	SessionID string
 }
 
 // IsStale checks if the lock is stale (owning process is dead).
@@ -62,6 +68,19 @@ func New(workerDir string) *Lock {
 // Uses OS-level advisory locking (flock) to prevent TOCTOU races
 // where two processes could both see no lock and both write one.
 func (l *Lock) Acquire(sessionID string) error {
+	owner := Owner{PID: os.Getpid(), SessionID: sessionID}
+	return l.acquire(owner, func(info *LockInfo) bool { return info.PID == owner.PID })
+}
+
+// AcquireOwner acquires the lock for a durable worker owner. Repeated callers
+// are accepted only when both the owner process and tmux session still match.
+func (l *Lock) AcquireOwner(owner Owner) error {
+	return l.acquire(owner, func(info *LockInfo) bool {
+		return info.PID == owner.PID && info.SessionID == owner.SessionID
+	})
+}
+
+func (l *Lock) acquire(owner Owner, isOwner func(*LockInfo) bool) error {
 	// Ensure .runtime directory exists before flock
 	dir := filepath.Dir(l.lockPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -87,9 +106,9 @@ func (l *Lock) Acquire(sessionID string) error {
 			}
 		} else {
 			// Active lock - check if it's us
-			if info.PID == os.Getpid() {
+			if isOwner(info) {
 				// We already hold it - refresh
-				return l.write(sessionID)
+				return l.write(owner)
 			}
 			// Another process holds it
 			return fmt.Errorf("%w: PID %d (session: %s, acquired: %s)",
@@ -98,7 +117,7 @@ func (l *Lock) Acquire(sessionID string) error {
 	}
 
 	// No lock or stale lock removed - acquire it
-	return l.write(sessionID)
+	return l.write(owner)
 }
 
 // Release releases the lock if we hold it.
@@ -184,7 +203,7 @@ func (l *Lock) ForceRelease() error {
 }
 
 // write creates or updates the lock file.
-func (l *Lock) write(sessionID string) error {
+func (l *Lock) write(owner Owner) error {
 	// Ensure .runtime directory exists
 	dir := filepath.Dir(l.lockPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -193,9 +212,9 @@ func (l *Lock) write(sessionID string) error {
 
 	hostname, _ := os.Hostname()
 	info := LockInfo{
-		PID:        os.Getpid(),
+		PID:        owner.PID,
 		AcquiredAt: time.Now(),
-		SessionID:  sessionID,
+		SessionID:  owner.SessionID,
 		Hostname:   hostname,
 	}
 
