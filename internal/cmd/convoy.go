@@ -638,6 +638,10 @@ func runBdJSONWithAutoCommit(dir string, args ...string) ([]byte, error) {
 }
 
 func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...string) ([]byte, error) {
+	return runBdJSONWithOptionsContext(context.Background(), dir, allowStale, autoCommit, args...)
+}
+
+func runBdJSONWithOptionsContext(ctx context.Context, dir string, allowStale, autoCommit bool, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	bdc := BdCmd(args...).Dir(dir).StripBeadsDir().Stderr(&stderr)
 	if allowStale {
@@ -646,11 +650,14 @@ func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...strin
 	if autoCommit {
 		bdc.WithAutoCommit()
 	}
-	cmd := bdc.Build()
+	cmd := bdc.buildContextCommand(ctx)
 	cmd.Dir = dir
 	cmd.Stdout = &stdout
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
 			return nil, fmt.Errorf("bd %s: %s", args[0], errMsg)
 		}
@@ -1214,6 +1221,10 @@ func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedI
 }
 
 func closeConvoyIfCompleteWithOutput(townBeads, convoyID, title string, tracked []trackedIssueInfo, dryRun, showOutput bool) (bool, error) {
+	return closeConvoyIfCompleteWithOutputContext(context.Background(), townBeads, convoyID, title, tracked, dryRun, showOutput)
+}
+
+func closeConvoyIfCompleteWithOutputContext(ctx context.Context, townBeads, convoyID, title string, tracked []trackedIssueInfo, dryRun, showOutput bool) (bool, error) {
 	// If no tracked issues were resolved, skip auto-close. A 0/0 result means
 	// cross-rig tracking resolution failed — not that all issues are done.
 	// Treating 0/0 as "complete" caused false 🚚 Convoy landed notifications. (GH#3xxx)
@@ -1264,7 +1275,7 @@ func closeConvoyIfCompleteWithOutput(townBeads, convoyID, title string, tracked 
 
 	reason := "All tracked issues completed"
 	closeArgs := []string{"close", convoyID, "-r", reason}
-	if err := runTownMutationAndExport(townBeads, closeArgs...); err != nil {
+	if err := runTownMutationAndExportContext(ctx, townBeads, closeArgs...); err != nil {
 		return false, fmt.Errorf("closing convoy: %w", err)
 	}
 
@@ -1989,7 +2000,7 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 }
 
 func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet bool) (convoyCheckSummary, error) {
-	convoys, err := listConvoyIssues(townBeads, "open", false)
+	convoys, err := listConvoyIssuesContext(ctx, townBeads, "open", false)
 	if err != nil {
 		return convoyCheckSummary{}, fmt.Errorf("listing convoys: %w", err)
 	}
@@ -2002,7 +2013,7 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
 		},
 		func(convoy convoyListIssue, tracked []trackedIssueInfo, dryRun bool) error {
-			_, err := closeConvoyIfCompleteWithOutput(townBeads, convoy.ID, convoy.Title, tracked, dryRun, !quiet)
+			_, err := closeConvoyIfCompleteWithOutputContext(ctx, townBeads, convoy.ID, convoy.Title, tracked, dryRun, !quiet)
 			return err
 		},
 	)
@@ -2014,19 +2025,35 @@ func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet 
 // auto-export for normal command hygiene, but close state must survive a later
 // Dolt rebuild from .beads/issues.jsonl.
 func persistTownBeadsJSONL(townBeads string) error {
+	return persistTownBeadsJSONLContext(context.Background(), townBeads)
+}
+
+func persistTownBeadsJSONLContext(ctx context.Context, townBeads string) error {
 	beadsDir := beads.ResolveBeadsDir(townBeads)
 	if beadsDir == "" {
 		return fmt.Errorf("could not resolve town .beads directory")
 	}
 	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
-	return BdCmd("export", "-o", issuesPath).Dir(townBeads).Run()
+	return runBdCommandContext(ctx, BdCmd("export", "-o", issuesPath).Dir(townBeads))
 }
 
 func runTownMutationAndExport(townBeads string, args ...string) error {
-	if err := BdCmd(args...).Dir(townBeads).WithAutoCommit().Run(); err != nil {
+	return runTownMutationAndExportContext(context.Background(), townBeads, args...)
+}
+
+func runTownMutationAndExportContext(ctx context.Context, townBeads string, args ...string) error {
+	if err := runBdCommandContext(ctx, BdCmd(args...).Dir(townBeads).WithAutoCommit()); err != nil {
 		return err
 	}
-	return persistTownBeadsJSONL(townBeads)
+	return persistTownBeadsJSONLContext(ctx, townBeads)
+}
+
+func runBdCommandContext(ctx context.Context, command *bdCmd) error {
+	err := command.buildContextCommand(ctx).Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func persistAndNotifyConvoyCompletion(townBeads, convoyID, title string) error {
@@ -2521,6 +2548,10 @@ func convoyLabels(owned bool) string {
 }
 
 func listConvoyIssues(townBeads, status string, all bool, extraLabels ...string) ([]convoyListIssue, error) {
+	return listConvoyIssuesContext(context.Background(), townBeads, status, all, extraLabels...)
+}
+
+func listConvoyIssuesContext(ctx context.Context, townBeads, status string, all bool, extraLabels ...string) ([]convoyListIssue, error) {
 	args := []string{"list", "--label=gt:convoy", "--json", "--limit=0"}
 	for _, label := range extraLabels {
 		args = append(args, "--label="+label)
@@ -2532,7 +2563,7 @@ func listConvoyIssues(townBeads, status string, all bool, extraLabels ...string)
 	}
 
 	args = beads.InjectFlatForListJSON(args)
-	convoys, err := readConvoyIssues(townBeads, args...)
+	convoys, err := readConvoyIssuesContext(ctx, townBeads, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2548,7 +2579,7 @@ func listConvoyIssues(townBeads, status string, all bool, extraLabels ...string)
 		legacyArgs = append(legacyArgs, "--all")
 	}
 	legacyArgs = beads.InjectFlatForListJSON(legacyArgs)
-	legacy, err := readConvoyIssues(townBeads, legacyArgs...)
+	legacy, err := readConvoyIssuesContext(ctx, townBeads, legacyArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -2563,7 +2594,11 @@ func listConvoyIssues(townBeads, status string, all bool, extraLabels ...string)
 }
 
 func readConvoyIssues(townBeads string, args ...string) ([]convoyListIssue, error) {
-	out, err := runBdJSON(townBeads, args...)
+	return readConvoyIssuesContext(context.Background(), townBeads, args...)
+}
+
+func readConvoyIssuesContext(ctx context.Context, townBeads string, args ...string) ([]convoyListIssue, error) {
+	out, err := runBdJSONWithOptionsContext(ctx, townBeads, false, false, args...)
 	if err != nil {
 		return nil, err
 	}
