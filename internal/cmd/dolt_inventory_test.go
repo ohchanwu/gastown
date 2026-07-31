@@ -1,0 +1,102 @@
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
+)
+
+func TestSummarizeDoltInventoryUsesActionableClassification(t *testing.T) {
+	inventory := []doltserver.LocalDoltServer{
+		{Class: doltserver.DoltServerCanonical},
+		{Class: doltserver.DoltServerConfiguredPortImposter},
+		{Class: doltserver.DoltServerOwnedTownLeak},
+		{Class: doltserver.DoltServerOwnedTestLeak},
+		{Class: doltserver.DoltServerUnknown},
+	}
+
+	actionable, unknown := summarizeDoltInventory(inventory)
+	if actionable != 3 || unknown != 1 {
+		t.Fatalf("summarizeDoltInventory() = (%d, %d), want (3, 1)", actionable, unknown)
+	}
+}
+
+func TestWriteTestLeakPreviewUsesMode0600(t *testing.T) {
+	runtimeDir := filepath.Join(t.TempDir(), ".runtime")
+	if err := os.Mkdir(runtimeDir, 0755); err != nil {
+		t.Fatalf("mkdir permissive runtime dir: %v", err)
+	}
+	path := filepath.Join(runtimeDir, "preview.json")
+	selections := []doltserver.TestLeakSelection{{
+		PID: 701, Port: 4701, Class: doltserver.DoltServerOwnedTestLeak,
+		OwnershipToken: strings.Repeat("ab", 32),
+	}}
+	if err := writeTestLeakPreview(path, selections); err != nil {
+		t.Fatalf("writeTestLeakPreview: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat preview: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("preview mode = %04o, want 0600", got)
+	}
+	dirInfo, err := os.Stat(runtimeDir)
+	if err != nil {
+		t.Fatalf("stat preview directory: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0700 {
+		t.Fatalf("preview directory mode = %04o, want 0700", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read preview directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("atomic preview left temporary files: %v", entries)
+	}
+	got, err := readTestLeakPreview(path)
+	if err != nil {
+		t.Fatalf("readTestLeakPreview: %v", err)
+	}
+	if len(got) != 1 || got[0] != selections[0] {
+		t.Fatalf("preview selections = %#v, want %#v", got, selections)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("chmod preview: %v", err)
+	}
+	if _, err := readTestLeakPreview(path); err == nil {
+		t.Fatal("readTestLeakPreview accepted a non-private receipt")
+	}
+}
+
+func TestCleanupTestLeaksCommandIsPreviewDefaultApplyExplicit(t *testing.T) {
+	if doltCleanupTestLeaksCmd.Use != "cleanup-test-leaks" {
+		t.Fatalf("Use = %q", doltCleanupTestLeaksCmd.Use)
+	}
+	flag := doltCleanupTestLeaksCmd.Flags().Lookup("apply")
+	if flag == nil || flag.DefValue != "false" {
+		t.Fatalf("apply flag = %#v, want explicit false default", flag)
+	}
+}
+
+func TestFormatDoltInventoryLineDoesNotExposeOwnerPath(t *testing.T) {
+	server := doltserver.LocalDoltServer{
+		DoltListener: doltserver.DoltListener{PID: 77, Port: 3307},
+		Class:        doltserver.DoltServerConfiguredPortImposter,
+		OwnerPath:    "/private/production/secret/data",
+	}
+
+	got := formatDoltInventoryLine(server)
+	if strings.Contains(got, server.OwnerPath) || strings.Contains(got, "production") {
+		t.Fatalf("inventory output exposed owner path: %q", got)
+	}
+	for _, want := range []string{"PID 77", "port 3307", "configured-port-imposter"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("inventory output %q missing %q", got, want)
+		}
+	}
+}

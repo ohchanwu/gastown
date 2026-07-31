@@ -206,6 +206,7 @@ func newDoctorForCommand(rig string) *doctor.Doctor {
 	d.Register(doctor.NewClaudeBinaryCheck())
 	d.Register(doctor.NewGroqCompoundCheck())
 	d.Register(doctor.NewDoltServerReachableCheck())
+	d.Register(doctor.NewDoltInventoryCheck())
 
 	d.Register(doctor.NewTownGitCheck())
 	d.Register(doctor.NewTownRootBranchCheck())

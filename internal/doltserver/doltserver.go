@@ -29,6 +29,7 @@ package doltserver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -954,6 +955,150 @@ type DoltListener struct {
 	Port int
 }
 
+// DoltServerClass describes why a local Dolt listener is or is not safe to act on.
+type DoltServerClass string
+
+const (
+	DoltServerCanonical              DoltServerClass = "canonical"
+	DoltServerConfiguredPortImposter DoltServerClass = "configured-port-imposter"
+	DoltServerOwnedTownLeak          DoltServerClass = "owned-town-leak"
+	DoltServerOwnedTestLeak          DoltServerClass = "owned-test-leak"
+	DoltServerUnknown                DoltServerClass = "unknown"
+)
+
+// LocalDoltServer is one entry in the shared local listener inventory.
+type LocalDoltServer struct {
+	DoltListener
+	Class     DoltServerClass
+	OwnerPath string
+}
+
+// TestLeakSelection is the private, path-free identity recorded by a preview.
+type TestLeakSelection struct {
+	PID            int             `json:"pid"`
+	Port           int             `json:"port"`
+	Class          DoltServerClass `json:"class"`
+	OwnershipToken string          `json:"ownership_token"`
+}
+
+func newTestLeakSelection(server LocalDoltServer) TestLeakSelection {
+	if server.Class != DoltServerOwnedTestLeak || server.OwnerPath == "" {
+		return TestLeakSelection{}
+	}
+	token := sha256.Sum256([]byte(filepath.Clean(server.OwnerPath)))
+	return TestLeakSelection{
+		PID:            server.PID,
+		Port:           server.Port,
+		Class:          server.Class,
+		OwnershipToken: fmt.Sprintf("%x", token),
+	}
+}
+
+// TestLeakSelections returns path-free identities for positively test-owned listeners.
+func TestLeakSelections(inventory []LocalDoltServer) []TestLeakSelection {
+	var selections []TestLeakSelection
+	for _, server := range inventory {
+		if selection := newTestLeakSelection(server); selection.OwnershipToken != "" {
+			selections = append(selections, selection)
+		}
+	}
+	return selections
+}
+
+// Actionable reports whether Gas Town has enough evidence to remediate this listener.
+func (s LocalDoltServer) Actionable() bool {
+	return s.Class == DoltServerConfiguredPortImposter || s.Class == DoltServerOwnedTownLeak || s.Class == DoltServerOwnedTestLeak
+}
+
+type doltProcessEvidence struct {
+	DataDir    string
+	ConfigPath string
+	CWD        string
+	StateDir   string
+}
+
+func processEvidence(townRoot string, pid int) doltProcessEvidence {
+	return doltProcessEvidence{
+		DataDir:    GetDoltDataDirFromProcess(pid),
+		ConfigPath: getDoltConfigPathFromProcess(pid),
+		CWD:        getProcessCWD(pid),
+		StateDir:   getServerDataDir(townRoot, pid),
+	}
+}
+
+func (e doltProcessEvidence) ownerPath() string {
+	return doltProcessOwnerPathFromEvidence(e.DataDir, e.ConfigPath, e.CWD, e.StateDir)
+}
+
+func isOwnedTestDataDir(path string) bool {
+	if path == "" || !strings.HasPrefix(filepath.Base(filepath.Clean(path)), "gastown-test-dolt.") {
+		return false
+	}
+	rel, err := filepath.Rel(os.TempDir(), filepath.Clean(path))
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func pathWithin(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func isOwnedTownLeak(expectedDataDir string, evidence doltProcessEvidence) bool {
+	if expectedDataDir == "" {
+		return false
+	}
+	townRoot := filepath.Dir(filepath.Clean(expectedDataDir))
+	return pathWithin(townRoot, evidence.DataDir) || pathWithin(townRoot, evidence.ConfigPath) || pathWithin(townRoot, evidence.StateDir)
+}
+
+func classifyLocalDoltServers(expectedPort int, expectedDataDir string, listeners []DoltListener, evidenceFor func(int) doltProcessEvidence) []LocalDoltServer {
+	evidenceByPID := make(map[int]doltProcessEvidence, len(listeners))
+	canonicalPIDs := make(map[int]bool)
+	for _, listener := range listeners {
+		evidence, ok := evidenceByPID[listener.PID]
+		if !ok {
+			evidence = evidenceFor(listener.PID)
+			evidenceByPID[listener.PID] = evidence
+		}
+		if listener.Port == expectedPort && doltProcessMatchesTownPaths(expectedDataDir, evidence.DataDir, evidence.ConfigPath, evidence.CWD, evidence.StateDir) {
+			canonicalPIDs[listener.PID] = true
+		}
+	}
+	servers := make([]LocalDoltServer, 0, len(listeners))
+	for _, listener := range listeners {
+		evidence := evidenceByPID[listener.PID]
+		server := LocalDoltServer{DoltListener: listener, Class: DoltServerUnknown, OwnerPath: evidence.ownerPath()}
+		switch {
+		case canonicalPIDs[listener.PID]:
+			server.Class = DoltServerCanonical
+		case listener.Port == expectedPort:
+			server.Class = DoltServerConfiguredPortImposter
+		case isOwnedTestDataDir(evidence.DataDir):
+			server.Class = DoltServerOwnedTestLeak
+		case isOwnedTownLeak(expectedDataDir, evidence):
+			server.Class = DoltServerOwnedTownLeak
+		}
+		servers = append(servers, server)
+	}
+	return servers
+}
+
+// InventoryLocalDoltServers discovers and classifies all local Dolt listeners once.
+func InventoryLocalDoltServers(townRoot string) []LocalDoltServer {
+	config := DefaultConfig(townRoot)
+	if config.IsRemote() {
+		return classifyLocalDoltServers(0, "", FindAllDoltListeners(), func(pid int) doltProcessEvidence {
+			return processEvidence(townRoot, pid)
+		})
+	}
+	return classifyLocalDoltServers(config.Port, config.DataDir, FindAllDoltListeners(), func(pid int) doltProcessEvidence {
+		return processEvidence(townRoot, pid)
+	})
+}
+
 // FindAllDoltListeners discovers all Dolt processes with TCP listeners using lsof.
 // Uses process binary name matching (-c dolt) instead of command-line string matching
 // (pgrep -f), avoiding fragile ps/pgrep pattern coupling (ZFC fix: gt-fj87).
@@ -1225,52 +1370,164 @@ func VerifyServerDataDir(townRoot string) (bool, error) {
 	return true, nil
 }
 
-// KillImposters finds and kills any dolt sql-server process on the configured
-// port that is NOT serving from the expected data directory. This handles the
-// case where another tool (e.g., bd) launched its own embedded Dolt server
-// from a different directory, hijacking the port.
-func KillImposters(townRoot string) error {
-	config := DefaultConfig(townRoot)
-	pid := findDoltServerOnPort(config.Port)
-	if pid == 0 {
-		return nil // No server on port
-	}
-
-	if doltProcessMatchesTown(townRoot, pid, config) {
-		return nil
-	}
-
-	owner := doltProcessOwnerPath(townRoot, pid)
-	expectedDir, _ := filepath.Abs(config.DataDir)
-	fmt.Fprintf(os.Stderr, "Killing imposter dolt sql-server (PID %d, data-dir: %q, expected: %s)\n",
-		pid, owner, expectedDir)
-
+func terminateLocalDoltServer(pid int) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return fmt.Errorf("finding imposter process %d: %w", pid, err)
+		return fmt.Errorf("finding Dolt process %d: %w", pid, err)
 	}
-
-	// Graceful termination first (SIGTERM on Unix, Kill on Windows)
 	if err := gracefulTerminate(process); err != nil {
-		return fmt.Errorf("sending termination signal to imposter PID %d: %w", pid, err)
+		return fmt.Errorf("sending termination signal to Dolt PID %d: %w", pid, err)
 	}
-
-	// Wait for graceful shutdown
 	for i := 0; i < 10; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if !processIsAlive(pid) {
-			// Clean up PID file if it pointed to the imposter
-			_ = os.Remove(config.PidFile)
 			return nil
 		}
 	}
-
-	// Force kill
-	_ = process.Kill()
+	if err := process.Kill(); err != nil {
+		return fmt.Errorf("killing Dolt PID %d: %w", pid, err)
+	}
 	time.Sleep(100 * time.Millisecond)
-	_ = os.Remove(config.PidFile)
-
+	if processIsAlive(pid) {
+		return fmt.Errorf("Dolt PID %d remained alive after kill", pid)
+	}
 	return nil
+}
+
+func remediateInventory(initial []LocalDoltServer, apply bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+	if !apply {
+		return nil
+	}
+	seen := make(map[int]bool)
+	for _, server := range initial {
+		if server.Actionable() && !seen[server.PID] {
+			seen[server.PID] = true
+			if err := terminate(server.PID); err != nil {
+				return err
+			}
+		}
+	}
+	remaining := 0
+	for _, server := range rescan() {
+		if server.Actionable() {
+			remaining++
+		}
+	}
+	if remaining > 0 {
+		return fmt.Errorf("%d actionable Dolt listener(s) remain", remaining)
+	}
+	return nil
+}
+
+func configuredPortImposters(inventory []LocalDoltServer) []LocalDoltServer {
+	var imposters []LocalDoltServer
+	for _, server := range inventory {
+		if server.Class == DoltServerConfiguredPortImposter {
+			imposters = append(imposters, server)
+		}
+	}
+	return imposters
+}
+
+func remediateConfiguredInventory(initial []LocalDoltServer, apply bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+	return remediateInventory(configuredPortImposters(initial), apply, terminate, func() []LocalDoltServer {
+		return configuredPortImposters(rescan())
+	})
+}
+
+func ownedLeaksSince(inventory []LocalDoltServer, baseline map[int]bool) []LocalDoltServer {
+	var leaks []LocalDoltServer
+	for _, server := range inventory {
+		owned := server.Class == DoltServerOwnedTownLeak || server.Class == DoltServerOwnedTestLeak
+		if owned && !baseline[server.PID] {
+			leaks = append(leaks, server)
+		}
+	}
+	return leaks
+}
+
+func remediateOwnedLeaksSince(initial []LocalDoltServer, baseline map[int]bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+	return remediateInventory(ownedLeaksSince(initial, baseline), true, terminate, func() []LocalDoltServer {
+		return ownedLeaksSince(rescan(), baseline)
+	})
+}
+
+func previewedTestLeaks(inventory []LocalDoltServer, preview []TestLeakSelection) []LocalDoltServer {
+	selected := make(map[TestLeakSelection]bool, len(preview))
+	for _, selection := range preview {
+		selected[selection] = true
+	}
+	var leaks []LocalDoltServer
+	for _, server := range inventory {
+		if selection := newTestLeakSelection(server); selected[selection] {
+			leaks = append(leaks, server)
+		}
+	}
+	return leaks
+}
+
+func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSelection, apply bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+	for _, wanted := range preview {
+		if wanted.Class != DoltServerOwnedTestLeak || wanted.OwnershipToken == "" {
+			return fmt.Errorf("invalid test-leak preview selection")
+		}
+		for _, server := range initial {
+			if server.PID == wanted.PID && server.Port == wanted.Port && newTestLeakSelection(server) != wanted {
+				return fmt.Errorf("previewed test-leak ownership changed for PID %d port %d", wanted.PID, wanted.Port)
+			}
+		}
+	}
+	return remediateInventory(previewedTestLeaks(initial, preview), apply, terminate, func() []LocalDoltServer {
+		return previewedTestLeaks(rescan(), preview)
+	})
+}
+
+// RemediateLocalDoltServers previews by default and only signals listeners
+// with an actionable inventory classification when apply is true.
+func RemediateLocalDoltServers(townRoot string, apply bool) ([]LocalDoltServer, error) {
+	initial := InventoryLocalDoltServers(townRoot)
+	err := remediateInventory(initial, apply, terminateLocalDoltServer, func() []LocalDoltServer {
+		return InventoryLocalDoltServers(townRoot)
+	})
+	return initial, err
+}
+
+// RemediateConfiguredPortImposters previews the full inventory but applies only
+// to imposters occupying this town's configured port.
+func RemediateConfiguredPortImposters(townRoot string, apply bool) ([]LocalDoltServer, error) {
+	initial := InventoryLocalDoltServers(townRoot)
+	err := remediateConfiguredInventory(initial, apply, terminateLocalDoltServer, func() []LocalDoltServer {
+		return InventoryLocalDoltServers(townRoot)
+	})
+	return initial, err
+}
+
+// CleanupOwnedLocalDoltLeaks removes only new listeners with positive town/test
+// ownership evidence. Pre-existing and unknown listeners are never signaled.
+func CleanupOwnedLocalDoltLeaks(townRoot string, baseline []DoltListener) error {
+	baselinePIDs := make(map[int]bool, len(baseline))
+	for _, listener := range baseline {
+		baselinePIDs[listener.PID] = true
+	}
+	return remediateOwnedLeaksSince(InventoryLocalDoltServers(townRoot), baselinePIDs, terminateLocalDoltServer, func() []LocalDoltServer {
+		return InventoryLocalDoltServers(townRoot)
+	})
+}
+
+// RemediatePreviewedTestLeaks applies only to still-positive test-owned
+// listeners that were captured by a prior preview.
+func RemediatePreviewedTestLeaks(townRoot string, preview []TestLeakSelection, apply bool) ([]LocalDoltServer, error) {
+	initial := InventoryLocalDoltServers(townRoot)
+	err := remediatePreviewedTestLeaks(initial, preview, apply, terminateLocalDoltServer, func() []LocalDoltServer {
+		return InventoryLocalDoltServers(townRoot)
+	})
+	return initial, err
+}
+
+// KillImposters remediates configured-port imposters only.
+func KillImposters(townRoot string) error {
+	_, err := RemediateConfiguredPortImposters(townRoot, true)
+	return err
 }
 
 // containsPathBoundary checks whether line contains path as a complete path

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	gtconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/daemon"
@@ -101,12 +102,109 @@ This is safe to run at any time. It only kills servers that are:
 It never kills the workspace's own legitimate Dolt server.
 
 Examples:
-  gt dolt kill-imposters          # Kill imposters on configured port
-  gt dolt kill-imposters --dry-run # Preview without killing`,
+  gt dolt kill-imposters          # Preview actionable and unknown listeners
+  gt dolt kill-imposters --apply  # Remediate actionable listeners after review`,
 	RunE: runDoltKillImposters,
 }
 
+var doltCleanupTestLeaksCmd = &cobra.Command{
+	Use:   "cleanup-test-leaks",
+	Short: "Preview or remove positively test-owned Dolt listener leaks",
+	Long: `Preview positively test-owned Dolt listeners without signaling them.
+
+The preview atomically writes a mode-0600 private receipt under .runtime. A
+later --apply revalidates PID, port, class, and opaque ownership token before
+signaling an entry. Paths and ownership tokens are never rendered.
+Town-owned, configured-port, unknown, and newly discovered listeners remain
+report-only.
+
+Examples:
+  gt dolt cleanup-test-leaks          # Preview and record exact selection
+  gt dolt cleanup-test-leaks --apply  # Apply the recorded selection`,
+	RunE: runDoltCleanupTestLeaks,
+}
+
 var doltKillImpostersDry bool
+var doltKillImpostersApply bool
+var doltCleanupTestLeaksApply bool
+
+const testLeakPreviewVersion = 1
+
+type testLeakPreviewReceipt struct {
+	Version    int                            `json:"version"`
+	Selections []doltserver.TestLeakSelection `json:"selections"`
+}
+
+func summarizeDoltInventory(inventory []doltserver.LocalDoltServer) (actionable, unknown int) {
+	for _, server := range inventory {
+		if server.Actionable() {
+			actionable++
+		} else if server.Class == doltserver.DoltServerUnknown {
+			unknown++
+		}
+	}
+	return actionable, unknown
+}
+
+func formatDoltInventoryLine(server doltserver.LocalDoltServer) string {
+	return fmt.Sprintf("PID %d port %d (%s)", server.PID, server.Port, server.Class)
+}
+
+func writeTestLeakPreview(path string, selections []doltserver.TestLeakSelection) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return err
+	}
+	return atomicfile.WriteJSONWithPerm(path, testLeakPreviewReceipt{
+		Version: testLeakPreviewVersion, Selections: selections,
+	}, 0600)
+}
+
+func readTestLeakPreview(path string) ([]doltserver.TestLeakSelection, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+		return nil, fmt.Errorf("test-leak preview is not a private regular file")
+	}
+	var receipt testLeakPreviewReceipt
+	if err := json.NewDecoder(f).Decode(&receipt); err != nil {
+		return nil, err
+	}
+	if receipt.Version != testLeakPreviewVersion {
+		return nil, fmt.Errorf("unsupported preview version %d", receipt.Version)
+	}
+	if len(receipt.Selections) == 0 {
+		return nil, fmt.Errorf("empty test-leak preview")
+	}
+	seen := make(map[doltserver.TestLeakSelection]bool, len(receipt.Selections))
+	for _, selection := range receipt.Selections {
+		if selection.PID <= 0 || selection.Port < 1 || selection.Port > 65535 ||
+			selection.Class != doltserver.DoltServerOwnedTestLeak || !validOwnershipToken(selection.OwnershipToken) || seen[selection] {
+			return nil, fmt.Errorf("invalid test-leak preview entry")
+		}
+		seen[selection] = true
+	}
+	return receipt.Selections, nil
+}
+
+func validOwnershipToken(token string) bool {
+	if len(token) != 64 {
+		return false
+	}
+	for _, ch := range token {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
 
 var doltStatusCmd = &cobra.Command{
 	Use:   "status",
@@ -348,6 +446,7 @@ func init() {
 	doltCmd.AddCommand(doltStopCmd)
 	doltCmd.AddCommand(doltRestartCmd)
 	doltCmd.AddCommand(doltKillImpostersCmd)
+	doltCmd.AddCommand(doltCleanupTestLeaksCmd)
 	doltCmd.AddCommand(doltStatusCmd)
 	doltCmd.AddCommand(doltLogsCmd)
 	doltCmd.AddCommand(doltDumpCmd)
@@ -364,6 +463,8 @@ func init() {
 	doltCmd.AddCommand(doltMigrateWispsCmd)
 
 	doltKillImpostersCmd.Flags().BoolVar(&doltKillImpostersDry, "dry-run", false, "Preview without killing")
+	doltKillImpostersCmd.Flags().BoolVar(&doltKillImpostersApply, "apply", false, "Remediate actionable listeners after preview")
+	doltCleanupTestLeaksCmd.Flags().BoolVar(&doltCleanupTestLeaksApply, "apply", false, "Apply the exact prior preview after revalidating ownership")
 
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupDry, "dry-run", false, "Preview what would be removed without making changes")
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupForce, "force", false, "Remove databases even if they have user tables")
@@ -452,27 +553,118 @@ func runDoltKillImposters(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Dolt server is remote — imposter detection requires local server")
 	}
 
-	conflictPID, conflictDataDir := doltserver.CheckPortConflict(townRoot)
-	if conflictPID == 0 {
-		fmt.Printf("%s No imposters found on port %d\n", style.Bold.Render("✓"), config.Port)
-		return nil
+	if doltKillImpostersDry && doltKillImpostersApply {
+		return fmt.Errorf("--dry-run and --apply are mutually exclusive")
 	}
 
-	fmt.Printf("Found imposter dolt server:\n")
-	fmt.Printf("  PID:      %d\n", conflictPID)
-	fmt.Printf("  Data-dir: %s\n", conflictDataDir)
-	fmt.Printf("  Expected: %s\n", config.DataDir)
-
-	if doltKillImpostersDry {
-		fmt.Printf("\n%s Dry-run — not killing\n", style.Warning.Render("~"))
-		return nil
+	inventory, remediateErr := doltserver.RemediateConfiguredPortImposters(townRoot, doltKillImpostersApply)
+	actionable, unknown := summarizeDoltInventory(inventory)
+	configured := 0
+	for _, server := range inventory {
+		switch {
+		case server.Class == doltserver.DoltServerConfiguredPortImposter:
+			configured++
+			fmt.Printf("  actionable: %s\n", formatDoltInventoryLine(server))
+		case server.Actionable():
+			fmt.Printf("  report only (out of scope): %s\n", formatDoltInventoryLine(server))
+		case server.Class == doltserver.DoltServerUnknown:
+			fmt.Printf("  report only: %s\n", formatDoltInventoryLine(server))
+		}
 	}
-
-	if err := doltserver.KillImposters(townRoot); err != nil {
-		return fmt.Errorf("killing imposter: %w", err)
+	if actionable == 0 && unknown == 0 {
+		fmt.Printf("%s No noncanonical local Dolt listeners found on port %d or elsewhere\n", style.Bold.Render("✓"), config.Port)
+	} else if !doltKillImpostersApply {
+		fmt.Printf("\n%s Preview only — rerun with --apply after reviewing ownership\n", style.Warning.Render("~"))
 	}
-	fmt.Printf("%s Imposter killed (PID %d)\n", style.Bold.Render("✓"), conflictPID)
+	if remediateErr != nil {
+		return fmt.Errorf("remediating local Dolt listeners: %w", remediateErr)
+	}
+	if doltKillImpostersApply && configured > 0 {
+		fmt.Printf("%s Remediated %d configured-port imposter(s)\n", style.Bold.Render("✓"), configured)
+	}
 	return nil
+}
+
+func runDoltCleanupTestLeaks(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	if doltserver.DefaultConfig(townRoot).IsRemote() {
+		return fmt.Errorf("Dolt server is remote — test-leak cleanup requires local process evidence")
+	}
+
+	receiptPath := filepath.Join(townRoot, ".runtime", "dolt-test-leaks-preview.json")
+	if !doltCleanupTestLeaksApply {
+		inventory := doltserver.InventoryLocalDoltServers(townRoot)
+		selected := doltserver.TestLeakSelections(inventory)
+		for _, server := range inventory {
+			if server.Class == doltserver.DoltServerOwnedTestLeak {
+				fmt.Printf("  selected: %s\n", formatDoltInventoryLine(server))
+			} else if server.Class != doltserver.DoltServerCanonical {
+				fmt.Printf("  report only: %s\n", formatDoltInventoryLine(server))
+			}
+		}
+		if len(selected) == 0 {
+			_ = os.Remove(receiptPath)
+			fmt.Printf("%s No positively test-owned Dolt listener leaks found\n", style.Bold.Render("✓"))
+			return nil
+		}
+		if err := writeTestLeakPreview(receiptPath, selected); err != nil {
+			return fmt.Errorf("could not write test-leak preview")
+		}
+		fmt.Printf("\n%s Previewed %d test-owned leak(s); rerun with --apply\n", style.Warning.Render("~"), len(selected))
+		return nil
+	}
+
+	preview, err := readTestLeakPreview(receiptPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no test-leak preview found; run without --apply first")
+		}
+		return fmt.Errorf("test-leak preview is invalid or unreadable; create a new preview")
+	}
+	inventory, remediateErr := doltserver.RemediatePreviewedTestLeaks(townRoot, preview, true)
+	selectedNow := previewedLocalTestLeaks(inventory, preview)
+	for _, server := range inventory {
+		if isPreviewedTestLeak(server, preview) {
+			fmt.Printf("  applied selection: %s\n", formatDoltInventoryLine(server))
+		} else if server.Class != doltserver.DoltServerCanonical {
+			fmt.Printf("  report only: %s\n", formatDoltInventoryLine(server))
+		}
+	}
+	if remediateErr != nil {
+		return fmt.Errorf("test-owned leak cleanup incomplete: %w", remediateErr)
+	}
+	if err := os.Remove(receiptPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("test-owned leaks removed but preview receipt could not be cleared")
+	}
+	fmt.Printf("%s Remediated %d previewed test-owned leak(s)\n", style.Bold.Render("✓"), len(selectedNow))
+	return nil
+}
+
+func containsTestLeakSelection(selections []doltserver.TestLeakSelection, want doltserver.TestLeakSelection) bool {
+	for _, selection := range selections {
+		if selection == want {
+			return true
+		}
+	}
+	return false
+}
+
+func isPreviewedTestLeak(server doltserver.LocalDoltServer, preview []doltserver.TestLeakSelection) bool {
+	selection := doltserver.TestLeakSelections([]doltserver.LocalDoltServer{server})
+	return len(selection) == 1 && containsTestLeakSelection(preview, selection[0])
+}
+
+func previewedLocalTestLeaks(inventory []doltserver.LocalDoltServer, preview []doltserver.TestLeakSelection) []doltserver.LocalDoltServer {
+	var selected []doltserver.LocalDoltServer
+	for _, server := range inventory {
+		if isPreviewedTestLeak(server, preview) {
+			selected = append(selected, server)
+		}
+	}
+	return selected
 }
 
 func runDoltStop(cmd *cobra.Command, args []string) error {

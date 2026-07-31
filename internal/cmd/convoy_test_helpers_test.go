@@ -7,11 +7,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,39 @@ func newTestDAG(t *testing.T) *testDAG {
 		t:     t,
 		beads: make(map[string]*testBead),
 	}
+}
+
+func newListenerPIDs(baseline, after []doltserver.DoltListener) []int {
+	seen := make(map[int]bool, len(baseline))
+	for _, listener := range baseline {
+		seen[listener.PID] = true
+	}
+	added := make(map[int]bool)
+	for _, listener := range after {
+		if !seen[listener.PID] {
+			added[listener.PID] = true
+		}
+	}
+	pids := make([]int, 0, len(added))
+	for pid := range added {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+func cleanupStagedConvoyDoltCustody(townRoot string, baseline []doltserver.DoltListener, cleanup func(string, []doltserver.DoltListener) error) error {
+	return cleanup(townRoot, baseline)
+}
+
+func registerStagedConvoyDoltCustody(t *testing.T, townRoot string) {
+	t.Helper()
+	baseline := doltserver.FindAllDoltListeners()
+	t.Cleanup(func() {
+		if err := cleanupStagedConvoyDoltCustody(townRoot, baseline, doltserver.CleanupOwnedLocalDoltLeaks); err != nil {
+			t.Errorf("staged-convoy Dolt cleanup failed: %v", err)
+		}
+	})
 }
 
 // Epic adds an epic bead to the DAG.

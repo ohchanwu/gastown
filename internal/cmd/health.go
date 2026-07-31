@@ -25,26 +25,26 @@ var (
 
 // HealthReport is the machine-readable output of gt health --json.
 type HealthReport struct {
-	Timestamp string              `json:"timestamp"`
-	Server    *ServerHealth       `json:"server"`
-	Databases []DatabaseHealth    `json:"databases"`
-	Pollution []PollutionRecord   `json:"pollution,omitempty"`
-	Backups   *BackupHealth       `json:"backups"`
-	Processes *ProcessHealth      `json:"processes"`
-	Orphans   []OrphanDB          `json:"orphans,omitempty"`
+	Timestamp string            `json:"timestamp"`
+	Server    *ServerHealth     `json:"server"`
+	Databases []DatabaseHealth  `json:"databases"`
+	Pollution []PollutionRecord `json:"pollution,omitempty"`
+	Backups   *BackupHealth     `json:"backups"`
+	Processes *ProcessHealth    `json:"processes"`
+	Orphans   []OrphanDB        `json:"orphans,omitempty"`
 }
 
 type ServerHealth struct {
-	Running            bool    `json:"running"`
-	PID                int     `json:"pid,omitempty"`
-	Port               int     `json:"port,omitempty"`
-	LatencyMs          int64   `json:"latency_ms,omitempty"`
-	Connections        int     `json:"connections,omitempty"`
-	MaxConnections     int     `json:"max_connections,omitempty"`
-	DiskUsageBytes     int64   `json:"disk_usage_bytes,omitempty"`
-	DiskUsageHuman     string  `json:"disk_usage_human,omitempty"`
-	LastCommitAgeSec   float64 `json:"last_commit_age_seconds,omitempty"`
-	LastCommitDB       string  `json:"last_commit_db,omitempty"`
+	Running          bool    `json:"running"`
+	PID              int     `json:"pid,omitempty"`
+	Port             int     `json:"port,omitempty"`
+	LatencyMs        int64   `json:"latency_ms,omitempty"`
+	Connections      int     `json:"connections,omitempty"`
+	MaxConnections   int     `json:"max_connections,omitempty"`
+	DiskUsageBytes   int64   `json:"disk_usage_bytes,omitempty"`
+	DiskUsageHuman   string  `json:"disk_usage_human,omitempty"`
+	LastCommitAgeSec float64 `json:"last_commit_age_seconds,omitempty"`
+	LastCommitDB     string  `json:"last_commit_db,omitempty"`
 }
 
 type DatabaseHealth struct {
@@ -64,17 +64,19 @@ type PollutionRecord struct {
 }
 
 type BackupHealth struct {
-	DoltFreshness  string `json:"dolt_freshness,omitempty"`
-	DoltAgeSeconds int    `json:"dolt_age_seconds,omitempty"`
-	DoltStale      bool   `json:"dolt_stale"`
-	JSONLFreshness string `json:"jsonl_freshness,omitempty"`
-	JSONLAgeSeconds int   `json:"jsonl_age_seconds,omitempty"`
-	JSONLStale     bool   `json:"jsonl_stale"`
+	DoltFreshness   string `json:"dolt_freshness,omitempty"`
+	DoltAgeSeconds  int    `json:"dolt_age_seconds,omitempty"`
+	DoltStale       bool   `json:"dolt_stale"`
+	JSONLFreshness  string `json:"jsonl_freshness,omitempty"`
+	JSONLAgeSeconds int    `json:"jsonl_age_seconds,omitempty"`
+	JSONLStale      bool   `json:"jsonl_stale"`
 }
 
 type ProcessHealth struct {
-	ZombieCount int   `json:"zombie_count"`
-	ZombiePIDs  []int `json:"zombie_pids,omitempty"`
+	ActionableCount int   `json:"actionable_count"`
+	ActionablePIDs  []int `json:"actionable_pids,omitempty"`
+	UnknownCount    int   `json:"unknown_count"`
+	UnknownPIDs     []int `json:"unknown_pids,omitempty"`
 }
 
 type OrphanDB struct {
@@ -131,7 +133,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	report.Backups = checkBackupHealth(townRoot)
 
 	// 5. Processes
-	report.Processes = checkProcessHealth(report.Server.Port)
+	report.Processes = checkProcessHealth(townRoot)
 
 	// 6. Orphans
 	report.Orphans = checkOrphanDBs(townRoot)
@@ -317,13 +319,14 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 	return bh
 }
 
-// checkProcessHealth finds zombie Dolt servers (not on the expected port).
-// Uses lsof-based port discovery instead of pgrep/ps string matching (ZFC fix: gt-fj87).
-func checkProcessHealth(expectedPort int) *ProcessHealth {
-	result := health.FindZombieServers([]int{expectedPort})
+// checkProcessHealth reports the shared classified local Dolt inventory.
+func checkProcessHealth(townRoot string) *ProcessHealth {
+	result := health.FindLocalDoltServers(townRoot)
 	return &ProcessHealth{
-		ZombieCount: result.Count,
-		ZombiePIDs:  result.PIDs,
+		ActionableCount: result.ActionableCount,
+		ActionablePIDs:  result.ActionablePIDs,
+		UnknownCount:    result.UnknownCount,
+		UnknownPIDs:     result.UnknownPIDs,
 	}
 }
 
@@ -404,11 +407,15 @@ func printHealthReport(r *HealthReport) {
 
 	// 5. Processes
 	fmt.Printf("\n%s Processes\n", style.Bold.Render("●"))
-	if r.Processes.ZombieCount == 0 {
-		fmt.Printf("  %s No zombie processes\n", style.Bold.Render("✓"))
+	if r.Processes.ActionableCount == 0 {
+		fmt.Printf("  %s No actionable Dolt listeners\n", style.Bold.Render("✓"))
 	} else {
-		fmt.Printf("  %s %d zombie(s): %v\n", style.Bold.Render("!"),
-			r.Processes.ZombieCount, r.Processes.ZombiePIDs)
+		fmt.Printf("  %s %d actionable Dolt listener(s): %v\n", style.Bold.Render("!"),
+			r.Processes.ActionableCount, r.Processes.ActionablePIDs)
+	}
+	if r.Processes.UnknownCount > 0 {
+		fmt.Printf("  %s %d unknown Dolt listener(s), report only: %v\n", style.Dim.Render("~"),
+			r.Processes.UnknownCount, r.Processes.UnknownPIDs)
 	}
 
 	// 6. Orphans

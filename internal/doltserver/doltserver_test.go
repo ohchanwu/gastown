@@ -243,6 +243,190 @@ func TestDoltProcessMatchesTownPaths(t *testing.T) {
 	}
 }
 
+func TestClassifyLocalDoltServers(t *testing.T) {
+	expectedDir := t.TempDir()
+	testDir := filepath.Join(os.TempDir(), "gastown-test-dolt.fixture")
+	listeners := []DoltListener{
+		{PID: 101, Port: 3307},
+		{PID: 101, Port: 3308},
+		{PID: 102, Port: 3307},
+		{PID: 103, Port: 4400},
+		{PID: 104, Port: 4401},
+		{PID: 105, Port: 4402},
+	}
+	evidence := map[int]doltProcessEvidence{
+		101: {DataDir: expectedDir},
+		102: {DataDir: t.TempDir()},
+		103: {DataDir: testDir},
+		105: {DataDir: filepath.Join(filepath.Dir(expectedDir), ".beads", "dolt")},
+	}
+
+	got := classifyLocalDoltServers(3307, expectedDir, listeners, func(pid int) doltProcessEvidence {
+		return evidence[pid]
+	})
+
+	want := []DoltServerClass{
+		DoltServerCanonical,
+		DoltServerCanonical,
+		DoltServerConfiguredPortImposter,
+		DoltServerOwnedTestLeak,
+		DoltServerUnknown,
+		DoltServerOwnedTownLeak,
+	}
+	for i := range want {
+		if got[i].Class != want[i] {
+			t.Errorf("listener %d class = %q, want %q", i, got[i].Class, want[i])
+		}
+	}
+	if !got[2].Actionable() || !got[3].Actionable() || !got[5].Actionable() {
+		t.Fatal("configured-port imposters and positively owned leaks must be actionable")
+	}
+	if got[4].Actionable() {
+		t.Fatal("unknown listeners must remain report-only")
+	}
+}
+
+func TestTestLeakRequiresPositiveDataDirEvidence(t *testing.T) {
+	testDir := filepath.Join(os.TempDir(), "gastown-test-dolt.fixture")
+	listeners := []DoltListener{{PID: 201, Port: 4400}}
+
+	got := classifyLocalDoltServers(3307, t.TempDir(), listeners, func(int) doltProcessEvidence {
+		return doltProcessEvidence{CWD: testDir}
+	})
+
+	if got[0].Class != DoltServerUnknown {
+		t.Fatalf("CWD-only test-like path classified as %q, want unknown", got[0].Class)
+	}
+}
+
+func TestRemediateInventoryIsDryRunFirstAndFailsIfActionableRemain(t *testing.T) {
+	actionable := LocalDoltServer{DoltListener: DoltListener{PID: 301, Port: 3307}, Class: DoltServerConfiguredPortImposter}
+	unknown := LocalDoltServer{DoltListener: DoltListener{PID: 302, Port: 4400}, Class: DoltServerUnknown}
+	terminated := []int{}
+	terminate := func(pid int) error {
+		terminated = append(terminated, pid)
+		return nil
+	}
+
+	if err := remediateInventory([]LocalDoltServer{actionable, unknown}, false, terminate, nil); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(terminated) != 0 {
+		t.Fatalf("dry run terminated PIDs: %v", terminated)
+	}
+
+	err := remediateInventory([]LocalDoltServer{actionable, actionable, unknown}, true, terminate, func() []LocalDoltServer {
+		return []LocalDoltServer{actionable, unknown}
+	})
+	if err == nil {
+		t.Fatal("apply returned nil while an actionable entry remained")
+	}
+	if len(terminated) != 1 || terminated[0] != actionable.PID {
+		t.Fatalf("terminated PIDs = %v, want only %d", terminated, actionable.PID)
+	}
+}
+
+func TestRemediateConfiguredInventoryScopesSignalsAndRemainingCheck(t *testing.T) {
+	configured := LocalDoltServer{DoltListener: DoltListener{PID: 401}, Class: DoltServerConfiguredPortImposter}
+	townLeak := LocalDoltServer{DoltListener: DoltListener{PID: 402}, Class: DoltServerOwnedTownLeak}
+	testLeak := LocalDoltServer{DoltListener: DoltListener{PID: 403}, Class: DoltServerOwnedTestLeak}
+	terminated := []int{}
+
+	err := remediateConfiguredInventory(
+		[]LocalDoltServer{configured, townLeak, testLeak},
+		true,
+		func(pid int) error { terminated = append(terminated, pid); return nil },
+		func() []LocalDoltServer { return []LocalDoltServer{configured, townLeak, testLeak} },
+	)
+	if err == nil {
+		t.Fatal("apply returned nil while configured-port imposter remained")
+	}
+	if len(terminated) != 1 || terminated[0] != configured.PID {
+		t.Fatalf("terminated PIDs = %v, want configured-only PID %d", terminated, configured.PID)
+	}
+}
+
+func TestRemediateOwnedLeaksSinceRequiresOwnershipAndExcludesBaseline(t *testing.T) {
+	baselineLeak := LocalDoltServer{DoltListener: DoltListener{PID: 501}, Class: DoltServerOwnedTownLeak}
+	newLeak := LocalDoltServer{DoltListener: DoltListener{PID: 502}, Class: DoltServerOwnedTestLeak}
+	unknown := LocalDoltServer{DoltListener: DoltListener{PID: 503}, Class: DoltServerUnknown}
+	terminated := []int{}
+
+	err := remediateOwnedLeaksSince(
+		[]LocalDoltServer{baselineLeak, newLeak, unknown},
+		map[int]bool{baselineLeak.PID: true},
+		func(pid int) error { terminated = append(terminated, pid); return nil },
+		func() []LocalDoltServer { return []LocalDoltServer{baselineLeak, unknown} },
+	)
+	if err != nil {
+		t.Fatalf("remediateOwnedLeaksSince: %v", err)
+	}
+	if len(terminated) != 1 || terminated[0] != newLeak.PID {
+		t.Fatalf("terminated PIDs = %v, want only new positively owned leak %d", terminated, newLeak.PID)
+	}
+}
+
+func TestRemediatePreviewedTestLeaksSignalsOnlyRevalidatedPreview(t *testing.T) {
+	previewed := LocalDoltServer{DoltListener: DoltListener{PID: 601, Port: 4601}, Class: DoltServerOwnedTestLeak}
+	previewed.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.previewed")
+	preexistingUnpreviewed := LocalDoltServer{DoltListener: DoltListener{PID: 602, Port: 4602}, Class: DoltServerOwnedTestLeak}
+	preexistingUnpreviewed.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.preexisting")
+	town := LocalDoltServer{DoltListener: DoltListener{PID: 603, Port: 4603}, Class: DoltServerOwnedTownLeak}
+	unknown := LocalDoltServer{DoltListener: DoltListener{PID: 604, Port: 4604}, Class: DoltServerUnknown}
+	configured := LocalDoltServer{DoltListener: DoltListener{PID: 605, Port: 4605}, Class: DoltServerConfiguredPortImposter}
+	preview := []TestLeakSelection{newTestLeakSelection(previewed)}
+	terminated := []int{}
+
+	err := remediatePreviewedTestLeaks(
+		[]LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured},
+		preview,
+		true,
+		func(pid int) error { terminated = append(terminated, pid); return nil },
+		func() []LocalDoltServer {
+			return []LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured}
+		},
+	)
+	if err == nil {
+		t.Fatal("apply returned nil while a previewed test leak remained")
+	}
+	if len(terminated) != 1 || terminated[0] != previewed.PID {
+		t.Fatalf("terminated PIDs = %v, want only previewed test leak %d", terminated, previewed.PID)
+	}
+}
+
+func TestRemediatePreviewedTestLeaksDefaultsToNoSignals(t *testing.T) {
+	leak := LocalDoltServer{DoltListener: DoltListener{PID: 611, Port: 4611}, Class: DoltServerOwnedTestLeak}
+	leak.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.preview")
+	terminated := false
+	if err := remediatePreviewedTestLeaks([]LocalDoltServer{leak}, []TestLeakSelection{newTestLeakSelection(leak)}, false,
+		func(int) error { terminated = true; return nil }, nil); err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if terminated {
+		t.Fatal("preview signaled a test leak")
+	}
+}
+
+func TestRemediatePreviewedTestLeaksRejectsPIDReuseChangedOwner(t *testing.T) {
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 621, Port: 4621},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.original"),
+	}
+	reused := original
+	reused.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.reused")
+	terminated := false
+
+	err := remediatePreviewedTestLeaks([]LocalDoltServer{reused}, []TestLeakSelection{newTestLeakSelection(original)}, true,
+		func(int) error { terminated = true; return nil }, func() []LocalDoltServer { return []LocalDoltServer{reused} })
+	if err == nil {
+		t.Fatal("apply accepted reused PID/port with changed owner")
+	}
+	if terminated {
+		t.Fatal("apply signaled reused PID/port with changed owner")
+	}
+}
+
 func TestContainsPathBoundary(t *testing.T) {
 	tests := []struct {
 		name string

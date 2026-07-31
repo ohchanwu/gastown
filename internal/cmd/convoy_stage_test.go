@@ -1817,7 +1817,8 @@ func TestCreateStagedConvoy_CleanReady(t *testing.T) {
 		Task("gt-b", "Task B", withRig("gastown")).BlockedBy("gt-a").
 		Task("gt-c", "Task C", withRig("gastown")).BlockedBy("gt-b")
 
-	_, logPath := testDAG.Setup(t)
+	townRoot, logPath := testDAG.Setup(t)
+	registerStagedConvoyDoltCustody(t, townRoot)
 
 	// Build the ConvoyDAG directly with rigs populated (avoids rigFromBeadID stub).
 	convoyDAG := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
@@ -1894,7 +1895,8 @@ func TestCreateStagedConvoy_TracksOnlySlingable(t *testing.T) {
 		Bug("gt-b1", "Bug 1", withRig("gastown")).ParentOf("gt-epic").
 		Task("gt-t2", "Task 2", withRig("gastown")).ParentOf("gt-epic").BlockedBy("gt-t1")
 
-	_, logPath := dag.Setup(t)
+	townRoot, logPath := dag.Setup(t)
+	registerStagedConvoyDoltCustody(t, townRoot)
 
 	input := &StageInput{Kind: StageInputEpic, IDs: []string{"gt-epic"}}
 	beads, deps, err := collectBeads(input)
@@ -1948,7 +1950,8 @@ func TestCreateStagedConvoy_DescriptionFormat(t *testing.T) {
 		Task("gt-a", "Task A", withRig("gastown")).
 		Task("gt-b", "Task B", withRig("gastown")).BlockedBy("gt-a")
 
-	_, logPath := dag.Setup(t)
+	townRoot, logPath := dag.Setup(t)
+	registerStagedConvoyDoltCustody(t, townRoot)
 
 	input := &StageInput{Kind: StageInputTasks, IDs: []string{"gt-a", "gt-b"}}
 	beads, deps, err := collectBeads(input)
@@ -2010,7 +2013,8 @@ func TestCreateStagedConvoy_IDFormat(t *testing.T) {
 	dag := newTestDAG(t).
 		Task("gt-a", "Task A", withRig("gastown"))
 
-	dag.Setup(t)
+	townRoot, _ := dag.Setup(t)
+	registerStagedConvoyDoltCustody(t, townRoot)
 
 	input := &StageInput{Kind: StageInputTasks, IDs: []string{"gt-a"}}
 	beads, deps, err := collectBeads(input)

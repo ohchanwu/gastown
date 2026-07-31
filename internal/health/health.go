@@ -85,36 +85,33 @@ func DatabaseCount(host string, port int) (int, []string, error) {
 	return len(databases), databases, nil
 }
 
-// ZombieResult holds the result of a zombie server scan.
-type ZombieResult struct {
-	Count int
-	PIDs  []int
+// LocalDoltServerResult summarizes actionable and report-only listeners.
+type LocalDoltServerResult struct {
+	ActionableCount int
+	ActionablePIDs  []int
+	UnknownCount    int
+	UnknownPIDs     []int
 }
 
-// FindZombieServers scans for dolt sql-server processes not on any expected port.
-// Uses lsof-based port discovery instead of pgrep/ps string matching (ZFC fix: gt-fj87).
-func FindZombieServers(expectedPorts []int) ZombieResult {
-	result := ZombieResult{}
-
-	listeners := doltserver.FindAllDoltListeners()
-	if len(listeners) == 0 {
-		return result
-	}
-
-	expectedSet := make(map[int]bool, len(expectedPorts))
-	for _, p := range expectedPorts {
-		expectedSet[p] = true
-	}
-
-	for _, l := range listeners {
-		if expectedSet[l.Port] {
-			continue
+// SummarizeLocalDoltServers keeps unknown listeners visible without making them actionable.
+func SummarizeLocalDoltServers(inventory []doltserver.LocalDoltServer) LocalDoltServerResult {
+	result := LocalDoltServerResult{}
+	for _, server := range inventory {
+		switch {
+		case server.Actionable():
+			result.ActionablePIDs = append(result.ActionablePIDs, server.PID)
+		case server.Class == doltserver.DoltServerUnknown:
+			result.UnknownPIDs = append(result.UnknownPIDs, server.PID)
 		}
-		result.Count++
-		result.PIDs = append(result.PIDs, l.PID)
 	}
-
+	result.ActionableCount = len(result.ActionablePIDs)
+	result.UnknownCount = len(result.UnknownPIDs)
 	return result
+}
+
+// FindLocalDoltServers uses the shared classified listener inventory.
+func FindLocalDoltServers(townRoot string) LocalDoltServerResult {
+	return SummarizeLocalDoltServers(doltserver.InventoryLocalDoltServers(townRoot))
 }
 
 // BackupFreshness checks the age of the newest file in a directory.

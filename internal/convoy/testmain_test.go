@@ -16,12 +16,21 @@ func TestMain(m *testing.M) {
 	// container is terminated at cleanup — preventing orphan
 	// accumulation in the shared production Dolt data dir.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "convoy TestMain: skipping — %v\n", err)
-		os.Exit(0)
+		fmt.Fprintf(os.Stderr, "convoy TestMain: setup failed: %v\n", err)
+		os.Exit(convoyTestMainExitCode(0, err, nil))
 	}
 
 	code := m.Run()
+	cleanupErr := testutil.TerminateDoltContainer()
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "convoy TestMain: cleanup failed: %v\n", cleanupErr)
+	}
+	os.Exit(convoyTestMainExitCode(code, nil, cleanupErr))
+}
 
-	testutil.TerminateDoltContainer()
-	os.Exit(code)
+func convoyTestMainExitCode(testCode int, setupErr, cleanupErr error) int {
+	if setupErr != nil || cleanupErr != nil {
+		return 1
+	}
+	return testCode
 }

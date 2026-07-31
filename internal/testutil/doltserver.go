@@ -192,9 +192,12 @@ func DoltContainerPort() string {
 
 // TerminateDoltContainer stops and removes the shared Dolt container.
 // Called from TestMain after m.Run().
-func TerminateDoltContainer() {
+func TerminateDoltContainer() error {
 	if doltCtr != nil {
-		_ = testcontainers.TerminateContainer(doltCtr)
+		if err := testcontainers.TerminateContainer(doltCtr); err != nil {
+			return err
+		}
 		doltCtr = nil
 	}
+	return nil
 }

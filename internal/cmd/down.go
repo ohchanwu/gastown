@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -301,32 +300,21 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 4b-iii: Stop imposter Dolt servers.
-	// After stopping the canonical server, rogue Dolt servers spawned by bd
-	// from .beads/dolt/ directories may still be running. KillImposters only
-	// catches servers on our port, so also scan for any dolt sql-server
-	// processes rooted in this town's directory tree.
-	if !downDryRun {
-		if err := doltserver.KillImposters(townRoot); err != nil {
-			printDownStatus("Dolt imposters", false, err.Error())
-			allOK = false
+	// Phase 4b-iii: Preview or remediate only positively actionable listeners.
+	inventory, inventoryErr := doltserver.RemediateLocalDoltServers(townRoot, !downDryRun)
+	actionable, unknown := summarizeDoltInventory(inventory)
+	if inventoryErr != nil {
+		printDownStatus("Dolt listeners", false, inventoryErr.Error())
+		allOK = false
+	} else if actionable > 0 {
+		verb := "remediated"
+		if downDryRun {
+			verb = "would remediate"
 		}
-		orphanDolts := findOrphanDoltServers(townRoot)
-		if len(orphanDolts) > 0 {
-			stopped := stopOrphanDoltServers(orphanDolts)
-			if stopped > 0 {
-				printDownStatus("Dolt orphans", true, fmt.Sprintf("stopped %d rogue server(s)", stopped))
-			}
-		}
-	} else {
-		conflictPID, _ := doltserver.CheckPortConflict(townRoot)
-		if conflictPID > 0 {
-			printDownStatus("Dolt imposters", true, fmt.Sprintf("would stop imposter (PID %d)", conflictPID))
-		}
-		orphanDolts := findOrphanDoltServers(townRoot)
-		if len(orphanDolts) > 0 {
-			printDownStatus("Dolt orphans", true, fmt.Sprintf("%d rogue server(s) would stop", len(orphanDolts)))
-		}
+		printDownStatus("Dolt listeners", true, fmt.Sprintf("%s %d actionable server(s)", verb, actionable))
+	}
+	if unknown > 0 {
+		printDownStatus("Dolt listeners", true, fmt.Sprintf("reported %d unknown server(s) without action", unknown))
 	}
 
 	// Phase 4b-iv: Remove .beads/dolt directories.
@@ -734,9 +722,11 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 		respawned = append(respawned, fmt.Sprintf("bd dolt idle-monitor processes (PIDs: %v)", pids))
 	}
 
-	// Check for orphan Dolt servers from .beads/dolt directories
-	if pids := findOrphanDoltServers(townRoot); len(pids) > 0 {
-		respawned = append(respawned, fmt.Sprintf("orphan Dolt servers (PIDs: %v)", pids))
+	// Check for actionable Dolt listeners using the same ownership inventory.
+	for _, server := range doltserver.InventoryLocalDoltServers(townRoot) {
+		if server.Actionable() {
+			respawned = append(respawned, fmt.Sprintf("actionable Dolt server (PID: %d, class: %s)", server.PID, server.Class))
+		}
 	}
 
 	return respawned
@@ -841,88 +831,6 @@ func stopIdleMonitors(pids []int) int {
 			continue
 		}
 		_ = proc.Kill()
-		stopped++
-	}
-	return stopped
-}
-
-// findOrphanDoltServers finds dolt sql-server processes whose working
-// directory is within the town root but NOT the canonical .dolt-data/ dir.
-// These are rogues spawned by bd from .beads/dolt/ directories.
-func findOrphanDoltServers(townRoot string) []int {
-	out, err := exec.Command("ps", "-eo", "pid,args").Output()
-	if err != nil {
-		return nil
-	}
-
-	canonicalDir, _ := filepath.Abs(filepath.Join(townRoot, ".dolt-data"))
-	townAbs, _ := filepath.Abs(townRoot)
-
-	var pids []int
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "dolt") || !strings.Contains(line, "sql-server") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil {
-			continue
-		}
-
-		// Check the process's working directory via lsof
-		cwdOut, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-Fn", "-d", "cwd").Output()
-		if err != nil {
-			continue
-		}
-		cwd := ""
-		for _, cwdLine := range strings.Split(string(cwdOut), "\n") {
-			if strings.HasPrefix(cwdLine, "n") {
-				cwd = cwdLine[1:]
-				break
-			}
-		}
-		if cwd == "" {
-			continue
-		}
-
-		cwdAbs, _ := filepath.Abs(cwd)
-		// Only target processes rooted in our town but NOT in canonical data dir.
-		// Use path-boundary check to avoid false matches on sibling paths.
-		inTown := cwdAbs == townAbs || strings.HasPrefix(cwdAbs, townAbs+string(filepath.Separator))
-		notCanonical := !strings.HasPrefix(cwdAbs, canonicalDir)
-		if inTown && notCanonical {
-			pids = append(pids, pid)
-		}
-	}
-	return pids
-}
-
-// stopOrphanDoltServers terminates orphan Dolt servers.
-// Returns the number of processes stopped.
-func stopOrphanDoltServers(pids []int) int {
-	var stopped int
-	for _, pid := range pids {
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
-		if err := proc.Signal(os.Interrupt); err != nil {
-			continue
-		}
-		// Wait up to 3s for Dolt to flush and exit
-		for i := 0; i < 6; i++ {
-			time.Sleep(500 * time.Millisecond)
-			if !isProcessRunning(pid) {
-				break
-			}
-		}
-		if isProcessRunning(pid) {
-			_ = proc.Kill()
-		}
 		stopped++
 	}
 	return stopped

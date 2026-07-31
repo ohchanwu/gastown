@@ -166,6 +166,23 @@ error pointing to `gt dolt start`.
 Each rig database is a subdirectory under `.dolt-data/`. The daemon monitors
 the server on every heartbeat and auto-restarts on crash.
 
+Local Dolt listeners are discovered once and classified by port plus process
+ownership evidence. Health, Doctor, `gt dolt kill-imposters`, and `gt down`
+share that inventory: configured-port imposters and positively owned town/test
+leaks are actionable, while unknown listeners are reported without signals.
+`gt dolt kill-imposters` applies only to configured-port imposters and reports
+other classes without action. Broader leak remediation previews first and only
+signals new listeners with positive ownership evidence. Staged-convoy tests
+register per-test cleanup before subprocesses and enforce a package-exit
+listener baseline.
+
+`gt dolt cleanup-test-leaks` is the user-facing test-leak path. Preview is the
+default and atomically writes a mode-0600 receipt under a mode-0700 `.runtime`
+directory. Each private
+selector binds PID, port, class, and an opaque ownership token; `--apply`
+revalidates all four before signaling. Paths and tokens are never rendered.
+Unpreviewed and non-test listeners remain report-only.
+
 For write concurrency, all agents write directly to `main` using transaction
 discipline (`BEGIN` / `DOLT_COMMIT` / `COMMIT` atomically). This eliminates
 branch proliferation and ensures immediate cross-agent visibility.
