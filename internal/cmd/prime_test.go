@@ -152,11 +152,14 @@ func TestGetAgentBeadID_UsesRigPrefix(t *testing.T) {
 }
 
 func TestRigBeadsRootPrefersRouteResolvedRigDir(t *testing.T) {
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 	writeTestRoutes(t, townRoot, []beads.Route{
 		{Prefix: "gt-", Path: "gastown/mayor/rig"},
 		{Prefix: "hq-", Path: "."},
 	})
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("create routed rig dir: %v", err)
+	}
 
 	ctx := RoleContext{
 		Role:     RolePolecat,
