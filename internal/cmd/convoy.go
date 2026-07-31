@@ -677,6 +677,10 @@ func runBdJSONWithOptionsContext(ctx context.Context, dir string, allowStale, au
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
 func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
+	return bdDepListRawIDsContext(context.Background(), dir, issueID, direction, depType)
+}
+
+func bdDepListRawIDsContext(ctx context.Context, dir, issueID, direction, depType string) ([]string, error) {
 	// Bead IDs are system-generated alphanumeric strings with hyphens, dots,
 	// and underscores — validate to prevent injection before interpolating below.
 	if !isValidBeadID(issueID) {
@@ -693,14 +697,17 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid dep type: %q", depType)
 	}
 
-	if ids, err := bdDepListRawIDsViaDolt(dir, issueID, direction, depType); err == nil {
+	if ids, err := bdDepListRawIDsViaDoltContext(ctx, dir, issueID, direction, depType); err == nil {
 		return ids, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	var lastErr error
 	for _, legacy := range []bool{false, true} {
 		query := rawDepSQLLiteral(issueID, direction, depType, legacy)
-		out, err := runBdJSONWithAutoCommit(dir, "sql", query, "--json")
+		out, err := runBdJSONWithOptionsContext(ctx, dir, false, true, "sql", query, "--json")
 		if err != nil {
 			lastErr = err
 			continue
@@ -715,6 +722,12 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 }
 
 func bdDepListRawIDsViaDolt(dir, issueID, direction, depType string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return bdDepListRawIDsViaDoltContext(ctx, dir, issueID, direction, depType)
+}
+
+func bdDepListRawIDsViaDoltContext(ctx context.Context, dir, issueID, direction, depType string) ([]string, error) {
 	beadsDir := beads.ResolveBeadsDir(dir)
 	cfg, ok := readBeadsRuntimeConfig(beadsDir)
 	if !ok || cfg.Database == "" || cfg.Port == 0 {
@@ -730,9 +743,6 @@ func bdDepListRawIDsViaDolt(dir, issueID, direction, depType string) ([]string, 
 		return nil, err
 	}
 	defer db.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 
 	typedQuery, typedArgs := rawDepSQLArgs(issueID, direction, depType, false)
 	ids, err := queryRawDepIDs(ctx, db, typedQuery, typedArgs)
@@ -1282,7 +1292,9 @@ func closeConvoyIfCompleteWithOutputContext(ctx context.Context, townBeads, conv
 	if showOutput {
 		fmt.Printf("%s Auto-closed convoy 🚚 %s: %s\n", style.Bold.Render("✓"), convoyID, title)
 	}
-	notifyConvoyCompletion(townBeads, convoyID, title)
+	if err := notifyConvoyCompletionContext(ctx, townBeads, convoyID, title); err != nil {
+		return true, fmt.Errorf("notifying convoy completion: %w", err)
+	}
 	return true, nil
 }
 
@@ -2066,9 +2078,13 @@ func persistAndNotifyConvoyCompletion(townBeads, convoyID, title string) error {
 
 // notifyConvoyCompletion sends notifications to owner, any notify addresses, and mayor/.
 func notifyConvoyCompletion(townBeads, convoyID, title string) {
-	stdout, err := runBdJSON(townBeads, "show", convoyID, "--json")
+	_ = notifyConvoyCompletionContext(context.Background(), townBeads, convoyID, title)
+}
+
+func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, title string) error {
+	stdout, err := runBdJSONWithOptionsContext(ctx, townBeads, false, false, "show", convoyID, "--json")
 	if err != nil {
-		return
+		return ctx.Err()
 	}
 
 	var convoys []struct {
@@ -2076,7 +2092,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		CreatedAt   string `json:"created_at"`
 	}
 	if err := json.Unmarshal(stdout, &convoys); err != nil || len(convoys) == 0 {
-		return
+		return nil
 	}
 
 	// ZFC: Use typed accessor instead of parsing description text
@@ -2085,7 +2101,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		fields = &beads.ConvoyFields{}
 	}
 	if fields.CompletionNotifiedAt != "" {
-		return
+		return nil
 	}
 
 	// Compute duration since convoy was created.
@@ -2096,7 +2112,10 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	}
 
 	// Count tracked issues (best-effort; 0 on error is fine for display).
-	trackedIDs, _ := bdDepListRawIDs(townBeads, convoyID, "down", "tracks")
+	trackedIDs, _ := bdDepListRawIDsContext(ctx, townBeads, convoyID, "down", "tracks")
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	issueCount := len(trackedIDs)
 
 	// Build enriched body for mayor notification.
@@ -2120,8 +2139,11 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 			fmt.Sprintf("🚚 Convoy landed: %s", title),
 			fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID),
 			convoyID)
-		mailCmd := exec.Command("gt", mailArgs...)
+		mailCmd := exec.CommandContext(ctx, "gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			style.PrintWarning("could not notify %s: %v", addr, err)
 		}
 	}
@@ -2129,9 +2151,12 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	// Send nudge notifications to nudge watchers.
 	for _, addr := range fields.NudgeNotificationAddresses() {
 		nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
-		nudgeCmd := exec.Command("gt", "nudge", addr, "-m", nudgeMsg)
+		nudgeCmd := exec.CommandContext(ctx, "gt", "nudge", addr, "-m", nudgeMsg)
 		nudgeCmd.Env = convoyNudgeEnv(convoyID)
 		if err := nudgeCmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
 	}
@@ -2139,41 +2164,61 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	// Always notify mayor/ for strategic visibility, unless already notified above.
 	if !notifiedAddrs["mayor/"] {
 		mailArgs := convoyMailArgs("mayor/", fmt.Sprintf("Convoy complete: %s", title), mayorBody, convoyID)
-		mailCmd := exec.Command("gt", mailArgs...)
+		mailCmd := exec.CommandContext(ctx, "gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
 		}
 	}
 
 	// Push notification to active Mayor session if configured.
-	notifyMayorSession(townBeads, convoyID, title)
+	if err := notifyMayorSessionContext(ctx, townBeads, convoyID, title); err != nil {
+		return err
+	}
 
 	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
 	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, fields)
-	if err := runTownMutationAndExport(townBeads, "update", convoyID, "--description="+newDesc); err != nil {
+	if err := runTownMutationAndExportContext(ctx, townBeads, "update", convoyID, "--description="+newDesc); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		style.PrintWarning("could not record convoy completion notification state for %s: %v", convoyID, err)
-		return
+		return nil
 	}
+	return nil
 }
 
 // notifyMayorSession pushes a convoy completion notification into the active
 // Mayor session via nudge, if convoy.notify_on_complete is enabled.
 func notifyMayorSession(townBeads, convoyID, title string) {
+	_ = notifyMayorSessionContext(context.Background(), townBeads, convoyID, title)
+}
+
+func notifyMayorSessionContext(ctx context.Context, townBeads, convoyID, title string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	settingsPath := config.TownSettingsPath(townBeads)
 	settings, err := config.LoadOrCreateTownSettings(settingsPath)
 	if err != nil {
-		return
+		return nil
 	}
 	if settings.Convoy == nil || !settings.Convoy.NotifyOnComplete {
-		return
+		return nil
 	}
 
 	nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
-	nudgeCmd := exec.Command("gt", "nudge", "mayor", "-m", nudgeMsg)
+	nudgeCmd := exec.CommandContext(ctx, "gt", "nudge", "mayor", "-m", nudgeMsg)
 	nudgeCmd.Env = convoyNudgeEnv(convoyID)
 	if err := nudgeCmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		style.PrintWarning("could not nudge Mayor session: %v", err)
 	}
+	return nil
 }
 
 func runConvoyStatus(cmd *cobra.Command, args []string) error {
@@ -2366,71 +2411,75 @@ func showAllConvoyStatus(townBeads string) error {
 	return nil
 }
 
+type convoyListEntry struct {
+	ID        string             `json:"id"`
+	Title     string             `json:"title"`
+	Status    string             `json:"status"`
+	CreatedAt string             `json:"created_at"`
+	Tracked   []trackedIssueInfo `json:"tracked"`
+	Completed int                `json:"completed"`
+	Total     int                `json:"total"`
+}
+
+func writeConvoyListJSON(
+	ctx context.Context,
+	w io.Writer,
+	convoys []convoyListIssue,
+	lookup func(context.Context, convoyListIssue) ([]trackedIssueInfo, error),
+) error {
+	enriched := make([]convoyListEntry, 0, len(convoys))
+	results, _ := lookupConvoysBounded(ctx, convoys, lookup)
+	for _, result := range results {
+		c := result.convoy
+		if !result.done || result.err != nil {
+			style.PrintWarning("skipping convoy %s: lookup_failed", c.ID)
+			continue
+		}
+		tracked := result.tracked
+		if tracked == nil {
+			tracked = []trackedIssueInfo{} // Ensure JSON [] not null
+		}
+		completed := 0
+		for _, trackedIssue := range tracked {
+			if trackedIssue.Status == "closed" {
+				completed++
+			}
+		}
+		enriched = append(enriched, convoyListEntry{
+			ID:        c.ID,
+			Title:     c.Title,
+			Status:    c.Status,
+			CreatedAt: c.CreatedAt,
+			Tracked:   tracked,
+			Completed: completed,
+			Total:     len(tracked),
+		})
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(enriched)
+}
+
 func runConvoyList(cmd *cobra.Command, args []string) error {
 	townBeads, err := getTownBeadsDir()
 	if err != nil {
 		return err
 	}
+	ctx := context.Background()
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
 
-	convoys, err := listConvoyIssues(townBeads, convoyListStatus, convoyListAll)
+	convoys, err := listConvoyIssuesContext(ctx, townBeads, convoyListStatus, convoyListAll)
 	if err != nil {
 		return fmt.Errorf("listing convoys: %w", err)
 	}
 
 	if convoyListJSON {
-		// Enrich each convoy with tracked issues and completion counts
-		type convoyListEntry struct {
-			ID        string             `json:"id"`
-			Title     string             `json:"title"`
-			Status    string             `json:"status"`
-			CreatedAt string             `json:"created_at"`
-			Tracked   []trackedIssueInfo `json:"tracked"`
-			Completed int                `json:"completed"`
-			Total     int                `json:"total"`
-		}
-		enriched := make([]convoyListEntry, 0, len(convoys))
-		ctx := context.Background()
-		if cmd != nil {
-			ctx = cmd.Context()
-		}
-		ctx, cancel := context.WithTimeout(ctx, convoyCheckDeadline)
-		defer cancel()
 		cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
-		results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+		return writeConvoyListJSON(ctx, os.Stdout, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
 			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
 		})
-		for _, result := range results {
-			c := result.convoy
-			if !result.done || result.err != nil {
-				style.PrintWarning("skipping convoy %s: lookup_failed", c.ID)
-				continue
-			}
-			tracked := result.tracked
-			if tracked == nil {
-				tracked = []trackedIssueInfo{} // Ensure JSON [] not null
-			}
-			completed := 0
-			for _, t := range tracked {
-				if t.Status == "closed" {
-					completed++
-				}
-			}
-			enriched = append(enriched, convoyListEntry{
-				ID:        c.ID,
-				Title:     c.Title,
-				Status:    c.Status,
-				CreatedAt: c.CreatedAt,
-				Tracked:   tracked,
-				Completed: completed,
-				Total:     len(tracked),
-			})
-		}
-		if timedOut {
-			return fmt.Errorf("convoy list timed out after %s", convoyCheckDeadline)
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(enriched)
 	}
 
 	if len(convoys) == 0 {
