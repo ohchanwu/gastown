@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -92,6 +93,7 @@ var (
 	convoyCloseNotify  string
 	convoyCloseForce   bool
 	convoyCheckDryRun  bool
+	convoyCheckJSON    bool
 	convoyLandForce    bool
 	convoyLandKeep     bool
 	convoyLandDryRun   bool
@@ -99,6 +101,9 @@ var (
 )
 
 const (
+	convoyLookupConcurrency = 4
+	convoyCheckDeadline     = 30 * time.Second
+
 	convoyStatusOpen           = "open"
 	convoyStatusClosed         = "closed"
 	convoyStatusStagedReady    = "staged_ready"
@@ -111,6 +116,173 @@ const (
 	// `gt convoy status` can label it clearly. (gt-bs6 / GH#2786)
 	trackedStatusUnknown = "unknown"
 )
+
+type convoyLookupResult struct {
+	index   int
+	convoy  convoyListIssue
+	tracked []trackedIssueInfo
+	err     error
+	done    bool
+}
+
+const (
+	convoyCheckErrorInvalidState = "invalid_state"
+	convoyCheckErrorLookup       = "lookup_failed"
+	convoyCheckErrorUncertain    = "uncertain_lookup"
+	convoyCheckErrorClose        = "close_failed"
+	convoyCheckErrorTimeout      = "timeout"
+)
+
+type convoyCheckError struct {
+	ConvoyID string `json:"convoy_id"`
+	Code     string `json:"code"`
+}
+
+type convoyCheckSummary struct {
+	Checked          int                `json:"checked"`
+	EligibleClosed   int                `json:"eligible_closed"`
+	SkippedUncertain int                `json:"skipped_uncertain"`
+	TimedOut         bool               `json:"timed_out"`
+	Errors           []convoyCheckError `json:"errors"`
+	closed           []struct{ ID, Title string }
+}
+
+// lookupConvoysBounded resolves convoy relationships with a fixed worker pool
+// and returns completed results in input order. Callers can safely ignore
+// unfinished results after cancellation because workers only perform lookups.
+func lookupConvoysBounded(
+	ctx context.Context,
+	convoys []convoyListIssue,
+	lookup func(context.Context, convoyListIssue) ([]trackedIssueInfo, error),
+) ([]convoyLookupResult, bool) {
+	results := make([]convoyLookupResult, len(convoys))
+	for i := range convoys {
+		results[i] = convoyLookupResult{index: i, convoy: convoys[i]}
+	}
+	if len(convoys) == 0 {
+		return results, false
+	}
+
+	jobs := make(chan int, len(convoys))
+	completed := make(chan convoyLookupResult, len(convoys))
+	for i := range convoys {
+		jobs <- i
+	}
+	close(jobs)
+
+	workers := convoyLookupConcurrency
+	if len(convoys) < workers {
+		workers = len(convoys)
+	}
+	for range workers {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case i, ok := <-jobs:
+					if !ok {
+						return
+					}
+					tracked, err := lookup(ctx, convoys[i])
+					completed <- convoyLookupResult{
+						index: i, convoy: convoys[i], tracked: tracked, err: err, done: true,
+					}
+				}
+			}
+		}()
+	}
+
+	remaining := len(convoys)
+	for remaining > 0 {
+		select {
+		case result := <-completed:
+			results[result.index] = result
+			remaining--
+		case <-ctx.Done():
+			for {
+				select {
+				case result := <-completed:
+					if !results[result.index].done {
+						results[result.index] = result
+						remaining--
+					}
+				default:
+					return results, remaining > 0
+				}
+			}
+		}
+	}
+	return results, ctx.Err() != nil
+}
+
+func checkConvoys(
+	ctx context.Context,
+	convoys []convoyListIssue,
+	dryRun bool,
+	lookup func(context.Context, convoyListIssue) ([]trackedIssueInfo, error),
+	closeConvoy func(convoyListIssue, []trackedIssueInfo, bool) error,
+) convoyCheckSummary {
+	summary := convoyCheckSummary{Errors: []convoyCheckError{}}
+	results, timedOut := lookupConvoysBounded(ctx, convoys, lookup)
+	summary.TimedOut = timedOut
+
+	for _, result := range results {
+		if !result.done || errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
+			summary.TimedOut = true
+			summary.SkippedUncertain++
+			summary.Errors = append(summary.Errors, convoyCheckError{ConvoyID: result.convoy.ID, Code: convoyCheckErrorTimeout})
+			continue
+		}
+
+		summary.Checked++
+		if result.err != nil {
+			summary.SkippedUncertain++
+			summary.Errors = append(summary.Errors, convoyCheckError{ConvoyID: result.convoy.ID, Code: convoyCheckErrorLookup})
+			continue
+		}
+		if ensureKnownConvoyStatus(result.convoy.Status) != nil {
+			summary.SkippedUncertain++
+			summary.Errors = append(summary.Errors, convoyCheckError{ConvoyID: result.convoy.ID, Code: convoyCheckErrorInvalidState})
+			continue
+		}
+
+		eligible, uncertain := trackedIssuesCompletion(result.tracked)
+		if uncertain {
+			summary.SkippedUncertain++
+			summary.Errors = append(summary.Errors, convoyCheckError{ConvoyID: result.convoy.ID, Code: convoyCheckErrorUncertain})
+			continue
+		}
+		if !eligible {
+			continue
+		}
+		if err := closeConvoy(result.convoy, result.tracked, dryRun); err != nil {
+			summary.SkippedUncertain++
+			summary.Errors = append(summary.Errors, convoyCheckError{ConvoyID: result.convoy.ID, Code: convoyCheckErrorClose})
+			continue
+		}
+		summary.EligibleClosed++
+		summary.closed = append(summary.closed, struct{ ID, Title string }{result.convoy.ID, result.convoy.Title})
+	}
+	return summary
+}
+
+func trackedIssuesCompletion(tracked []trackedIssueInfo) (eligible, uncertain bool) {
+	if len(tracked) == 0 {
+		return false, false
+	}
+	hasOpen := false
+	for _, issue := range tracked {
+		switch strings.TrimSpace(issue.Status) {
+		case "closed", "tombstone":
+		case "", trackedStatusUnknown:
+			uncertain = true
+		default:
+			hasOpen = true
+		}
+	}
+	return !hasOpen && !uncertain, uncertain
+}
 
 func normalizeConvoyStatus(status string) string {
 	return strings.ToLower(strings.TrimSpace(status))
@@ -408,6 +580,7 @@ func init() {
 
 	// Check flags
 	convoyCheckCmd.Flags().BoolVar(&convoyCheckDryRun, "dry-run", false, "Preview what would close without acting")
+	convoyCheckCmd.Flags().BoolVar(&convoyCheckJSON, "json", false, "Output machine-readable check summary as JSON")
 
 	// Stranded flags
 	convoyStrandedCmd.Flags().BoolVar(&convoyStrandedJSON, "json", false, "Output as JSON")
@@ -988,25 +1161,48 @@ func runConvoyCheck(cmd *cobra.Command, args []string) error {
 		return checkSingleConvoy(townBeads, convoyID, convoyCheckDryRun)
 	}
 
-	// Check all open convoys
-	closed, err := checkAndCloseCompletedConvoys(townBeads, convoyCheckDryRun)
+	ctx := context.Background()
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
+	ctx, cancel := context.WithTimeout(ctx, convoyCheckDeadline)
+	defer cancel()
+
+	// Check all open convoys.
+	summary, err := checkCompletedConvoys(ctx, townBeads, convoyCheckDryRun, convoyCheckJSON)
 	if err != nil {
 		return err
 	}
+	if convoyCheckJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(summary); err != nil {
+			return err
+		}
+		if summary.TimedOut || summary.SkippedUncertain > 0 {
+			return fmt.Errorf("convoy check incomplete")
+		}
+		return nil
+	}
 
-	if len(closed) == 0 {
+	for _, checkErr := range summary.Errors {
+		style.PrintWarning("skipping convoy %s: %s", checkErr.ConvoyID, checkErr.Code)
+	}
+	if len(summary.closed) == 0 {
 		fmt.Println("No convoys ready to close.")
 	} else {
 		if convoyCheckDryRun {
-			fmt.Printf("%s Would auto-close %d convoy(s):\n", style.Warning.Render("⚠"), len(closed))
+			fmt.Printf("%s Would auto-close %d convoy(s):\n", style.Warning.Render("⚠"), len(summary.closed))
 		} else {
-			fmt.Printf("%s Auto-closed %d convoy(s):\n", style.Bold.Render("✓"), len(closed))
+			fmt.Printf("%s Auto-closed %d convoy(s):\n", style.Bold.Render("✓"), len(summary.closed))
 		}
-		for _, c := range closed {
+		for _, c := range summary.closed {
 			fmt.Printf("  🚚 %s: %s\n", c.ID, c.Title)
 		}
 	}
-
+	if summary.TimedOut || summary.SkippedUncertain > 0 {
+		return fmt.Errorf("convoy check incomplete")
+	}
 	return nil
 }
 
@@ -1014,6 +1210,10 @@ func runConvoyCheck(cmd *cobra.Command, args []string) error {
 // and closes the convoy if so. Returns (true, nil) if the convoy was closed or
 // would be closed (dry-run), (false, nil) if not ready, or (false, err) on failure.
 func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedIssueInfo, dryRun bool) (bool, error) {
+	return closeConvoyIfCompleteWithOutput(townBeads, convoyID, title, tracked, dryRun, true)
+}
+
+func closeConvoyIfCompleteWithOutput(townBeads, convoyID, title string, tracked []trackedIssueInfo, dryRun, showOutput bool) (bool, error) {
 	// If no tracked issues were resolved, skip auto-close. A 0/0 result means
 	// cross-rig tracking resolution failed — not that all issues are done.
 	// Treating 0/0 as "complete" caused false 🚚 Convoy landed notifications. (GH#3xxx)
@@ -1040,21 +1240,25 @@ func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedI
 	}
 
 	if !allClosed {
-		switch {
-		case unknownCount > 0 && openCount > 0:
-			fmt.Printf("%s Convoy %s has %d open, %d unknown (cross-rig unreachable) issue(s) remaining\n",
-				style.Dim.Render("○"), convoyID, openCount, unknownCount)
-		case unknownCount > 0:
-			fmt.Printf("%s Convoy %s has %d tracked issue(s) with unknown status (cross-rig unreachable)\n",
-				style.Dim.Render("○"), convoyID, unknownCount)
-		default:
-			fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
+		if showOutput {
+			switch {
+			case unknownCount > 0 && openCount > 0:
+				fmt.Printf("%s Convoy %s has %d open, %d unknown (cross-rig unreachable) issue(s) remaining\n",
+					style.Dim.Render("○"), convoyID, openCount, unknownCount)
+			case unknownCount > 0:
+				fmt.Printf("%s Convoy %s has %d tracked issue(s) with unknown status (cross-rig unreachable)\n",
+					style.Dim.Render("○"), convoyID, unknownCount)
+			default:
+				fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
+			}
 		}
 		return false, nil
 	}
 
 	if dryRun {
-		fmt.Printf("%s Would auto-close convoy 🚚 %s: %s\n", style.Warning.Render("⚠"), convoyID, title)
+		if showOutput {
+			fmt.Printf("%s Would auto-close convoy 🚚 %s: %s\n", style.Warning.Render("⚠"), convoyID, title)
+		}
 		return true, nil
 	}
 
@@ -1064,7 +1268,9 @@ func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedI
 		return false, fmt.Errorf("closing convoy: %w", err)
 	}
 
-	fmt.Printf("%s Auto-closed convoy 🚚 %s: %s\n", style.Bold.Render("✓"), convoyID, title)
+	if showOutput {
+		fmt.Printf("%s Auto-closed convoy 🚚 %s: %s\n", style.Bold.Render("✓"), convoyID, title)
+	}
 	notifyConvoyCompletion(townBeads, convoyID, title)
 	return true, nil
 }
@@ -1767,35 +1973,40 @@ func isSlingableBead(townRoot, beadID string) bool {
 // and auto-closes them. Returns the list of convoys that were closed (or would be closed in dry-run mode).
 // If dryRun is true, no changes are made and the function returns what would have been closed.
 func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID, Title string }, error) {
-	var closed []struct{ ID, Title string }
+	ctx, cancel := context.WithTimeout(context.Background(), convoyCheckDeadline)
+	defer cancel()
+	summary, err := checkCompletedConvoys(ctx, townBeads, dryRun, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, checkErr := range summary.Errors {
+		style.PrintWarning("skipping convoy %s: %s", checkErr.ConvoyID, checkErr.Code)
+	}
+	if summary.TimedOut || summary.SkippedUncertain > 0 {
+		return summary.closed, fmt.Errorf("convoy check incomplete")
+	}
+	return summary.closed, nil
+}
 
+func checkCompletedConvoys(ctx context.Context, townBeads string, dryRun, quiet bool) (convoyCheckSummary, error) {
 	convoys, err := listConvoyIssues(townBeads, "open", false)
 	if err != nil {
-		return nil, fmt.Errorf("listing convoys: %w", err)
+		return convoyCheckSummary{}, fmt.Errorf("listing convoys: %w", err)
 	}
-
-	// Check each convoy
-	for _, convoy := range convoys {
-		if err := ensureKnownConvoyStatus(convoy.Status); err != nil {
-			style.PrintWarning("skipping convoy %s: invalid lifecycle state: %v", convoy.ID, err)
-			continue
-		}
-		tracked, err := getTrackedIssues(townBeads, convoy.ID)
-		if err != nil {
-			style.PrintWarning("skipping convoy %s: %v", convoy.ID, err)
-			continue
-		}
-		ready, err := closeConvoyIfComplete(townBeads, convoy.ID, convoy.Title, tracked, dryRun)
-		if err != nil {
-			style.PrintWarning("couldn't close convoy %s: %v", convoy.ID, err)
-			continue
-		}
-		if ready {
-			closed = append(closed, struct{ ID, Title string }{convoy.ID, convoy.Title})
-		}
-	}
-
-	return closed, nil
+	cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
+	summary := checkConvoys(
+		ctx,
+		convoys,
+		dryRun,
+		func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
+		},
+		func(convoy convoyListIssue, tracked []trackedIssueInfo, dryRun bool) error {
+			_, err := closeConvoyIfCompleteWithOutput(townBeads, convoy.ID, convoy.Title, tracked, dryRun, !quiet)
+			return err
+		},
+	)
+	return summary, nil
 }
 
 // persistTownBeadsJSONL writes the current town Beads state to the JSONL file
@@ -2151,12 +2362,23 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 			Total     int                `json:"total"`
 		}
 		enriched := make([]convoyListEntry, 0, len(convoys))
-		for _, c := range convoys {
-			tracked, err := getTrackedIssues(townBeads, c.ID)
-			if err != nil {
-				style.PrintWarning("skipping convoy %s: %v", c.ID, err)
+		ctx := context.Background()
+		if cmd != nil {
+			ctx = cmd.Context()
+		}
+		ctx, cancel := context.WithTimeout(ctx, convoyCheckDeadline)
+		defer cancel()
+		cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
+		results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+			return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
+		})
+		for _, result := range results {
+			c := result.convoy
+			if !result.done || result.err != nil {
+				style.PrintWarning("skipping convoy %s: lookup_failed", c.ID)
 				continue
 			}
+			tracked := result.tracked
 			if tracked == nil {
 				tracked = []trackedIssueInfo{} // Ensure JSON [] not null
 			}
@@ -2175,6 +2397,9 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 				Completed: completed,
 				Total:     len(tracked),
 			})
+		}
+		if timedOut {
+			return fmt.Errorf("convoy list timed out after %s", convoyCheckDeadline)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -2416,6 +2641,65 @@ type trackedDependency struct {
 	Blocked        bool     `json:"-"`
 }
 
+type convoyIssueDetailsCacheEntry struct {
+	ready   chan struct{}
+	details *issueDetails
+}
+
+type convoyIssueDetailsCache struct {
+	mu      sync.Mutex
+	entries map[string]*convoyIssueDetailsCacheEntry
+	load    func([]string) map[string]*issueDetails
+}
+
+func newConvoyIssueDetailsCache(load func([]string) map[string]*issueDetails) *convoyIssueDetailsCache {
+	return &convoyIssueDetailsCache{
+		entries: make(map[string]*convoyIssueDetailsCacheEntry),
+		load:    load,
+	}
+}
+
+func (c *convoyIssueDetailsCache) get(ctx context.Context, ids []string) map[string]*issueDetails {
+	entries := make(map[string]*convoyIssueDetailsCacheEntry, len(ids))
+	var toLoad []string
+	c.mu.Lock()
+	for _, id := range ids {
+		entry := c.entries[id]
+		if entry == nil {
+			entry = &convoyIssueDetailsCacheEntry{ready: make(chan struct{})}
+			c.entries[id] = entry
+			toLoad = append(toLoad, id)
+		}
+		entries[id] = entry
+	}
+	c.mu.Unlock()
+
+	if len(toLoad) > 0 {
+		loaded := c.load(toLoad)
+		c.mu.Lock()
+		for _, id := range toLoad {
+			entry := c.entries[id]
+			entry.details = loaded[id]
+			close(entry.ready)
+		}
+		c.mu.Unlock()
+	}
+
+	result := make(map[string]*issueDetails, len(ids))
+	for _, id := range ids {
+		entry := entries[id]
+		select {
+		case <-ctx.Done():
+			return result
+		case <-entry.ready:
+			if entry.details != nil {
+				result[id] = entry.details
+			}
+		}
+	}
+	return result
+}
+
 func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 	dep.Status = strings.TrimSpace(details.Status)
 	if dep.Status == "" {
@@ -2449,6 +2733,11 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 // for older bd versions that don't support bd sql.
 // Then fetches fresh issue details via bd show with prefix routing.
 func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
+	cache := newConvoyIssueDetailsCache(getIssueDetailsBatch)
+	return getTrackedIssuesCached(context.Background(), townBeads, convoyID, cache)
+}
+
+func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cache *convoyIssueDetailsCache) ([]trackedIssueInfo, error) {
 	// Prefer raw SQL — works for cross-database deps where tracked beads
 	// live in different Dolt databases. Falls back to bd dep list if bd sql
 	// is not available (older bd versions).
@@ -2475,7 +2764,7 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	}
 
 	// Fetch fresh issue details via bd show (uses prefix routing for cross-rig).
-	freshDetails := getIssueDetailsBatch(trackedIDs)
+	freshDetails := cache.get(ctx, trackedIDs)
 
 	// Build tracked dependency structs from fresh details. When fresh details
 	// are missing (cross-rig DB unreachable, missing, parked, or unroutable
