@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -147,9 +148,18 @@ type AutoCloseResult struct {
 
 // Anomaly represents an unexpected condition found during reaper operations.
 type Anomaly struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-	Count   int    `json:"count,omitempty"`
+	Type        string   `json:"type"`
+	Scope       string   `json:"scope"`
+	AffectedIDs []string `json:"affected_ids,omitempty"`
+	Remediation string   `json:"remediation"`
+	Message     string   `json:"message"`
+	Count       int      `json:"count,omitempty"`
+}
+
+func commitFailureAnomaly(kind, scope string, affectedIDs []string, remediation, message string) Anomaly {
+	return Anomaly{
+		Type: kind, Scope: scope, AffectedIDs: affectedIDs, Remediation: remediation, Message: message,
+	}
 }
 
 const (
@@ -391,15 +401,38 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	// Anomaly detection: dangling parent references.
 	danglingQuery := `
-		SELECT COUNT(*) FROM wisp_dependencies wd
+		SELECT DISTINCT wd.issue_id FROM wisp_dependencies wd
 		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child' AND wd.depends_on_external IS NULL AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL) AND pw.id IS NULL AND pi.id IS NULL`
-	var danglingCount int
-	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
+	rows, err := db.QueryContext(ctx, danglingQuery)
+	if err != nil {
+		return nil, fmt.Errorf("list dangling parent references: %w", err)
+	}
+	defer rows.Close()
+	seenDangling := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan dangling parent reference: %w", err)
+		}
+		seenDangling[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read dangling parent references: %w", err)
+	}
+	danglingIDs := make([]string, 0, len(seenDangling))
+	for id := range seenDangling {
+		danglingIDs = append(danglingIDs, id)
+	}
+	sort.Strings(danglingIDs)
+	if len(danglingIDs) > 0 {
 		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "dangling_parent_ref",
-			Message: fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", danglingCount),
-			Count:   danglingCount,
+			Type:        "dangling_parent_ref",
+			Scope:       dbName,
+			AffectedIDs: danglingIDs,
+			Remediation: "repair_parent_links",
+			Message:     fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", len(danglingIDs)),
+			Count:       len(danglingIDs),
 		})
 	}
 
@@ -641,19 +674,15 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	if totalDeleted > 0 {
 		// Flush SQL transaction to working set before DOLT_COMMIT.
 		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			anomalies = append(anomalies, Anomaly{
-				Type:    "sql_commit_failed",
-				Message: fmt.Sprintf("sql commit after purge failed: %v", err),
-			})
+			anomalies = append(anomalies, commitFailureAnomaly(
+				"sql_commit_failed", dbName, nil, "retry_purge_commit", fmt.Sprintf("sql commit after purge failed: %v", err)))
 			return totalDeleted, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal — log but continue.
-			anomalies = append(anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
-			})
+			anomalies = append(anomalies, commitFailureAnomaly(
+				"dolt_commit_failed", dbName, nil, "retry_purge_commit", fmt.Sprintf("dolt commit after purge failed: %v", err)))
 		}
 	}
 
@@ -825,20 +854,16 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	if len(ids) > 0 {
 		// Flush SQL transaction to working set before DOLT_COMMIT.
 		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "sql_commit_failed",
-				Message: fmt.Sprintf("sql commit after auto-close failed: %v", err),
-			})
+			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+				"sql_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("sql commit after auto-close failed: %v", err)))
 			return result, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// "nothing to commit" is expected when the updated tables are dolt_ignored.
 			if !isNothingToCommit(err) {
-				result.Anomalies = append(result.Anomalies, Anomaly{
-					Type:    "dolt_commit_failed",
-					Message: fmt.Sprintf("dolt commit after auto-close failed: %v", err),
-				})
+				result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+					"dolt_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("dolt commit after auto-close failed: %v", err)))
 			}
 		}
 	}
@@ -990,19 +1015,15 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 
 	// Flush and commit.
 	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin receipt close failed: %v", err),
-		})
+		result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+			"sql_commit_failed", dbName, ids, "retry_plugin_receipt_commit", fmt.Sprintf("sql commit after plugin receipt close failed: %v", err)))
 		return result, nil
 	}
 	commitMsg := fmt.Sprintf("reaper: close %d plugin receipts in %s", len(ids), dbName)
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 		if !isNothingToCommit(err) {
-			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after plugin receipt close failed: %v", err),
-			})
+			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+				"dolt_commit_failed", dbName, ids, "retry_plugin_receipt_commit", fmt.Sprintf("dolt commit after plugin receipt close failed: %v", err)))
 		}
 	}
 
@@ -1078,19 +1099,15 @@ func ClosePluginDispatches(db *sql.DB, dbName string, maxAge time.Duration, dryR
 
 	// Flush and commit.
 	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin dispatch close failed: %v", err),
-		})
+		result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+			"sql_commit_failed", dbName, ids, "retry_plugin_dispatch_commit", fmt.Sprintf("sql commit after plugin dispatch close failed: %v", err)))
 		return result, nil
 	}
 	commitMsg := fmt.Sprintf("reaper: close %d plugin dispatches in %s", len(ids), dbName)
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 		if !isNothingToCommit(err) {
-			result.Anomalies = append(result.Anomalies, Anomaly{
-				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after plugin dispatch close failed: %v", err),
-			})
+			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
+				"dolt_commit_failed", dbName, ids, "retry_plugin_dispatch_commit", fmt.Sprintf("dolt commit after plugin dispatch close failed: %v", err)))
 		}
 	}
 

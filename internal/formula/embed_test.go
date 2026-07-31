@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -980,5 +981,35 @@ func TestGetEmbeddedFormulaContent(t *testing.T) {
 	_, err = GetEmbeddedFormulaContent("nonexistent-formula")
 	if err == nil {
 		t.Error("expected error for non-existent formula")
+	}
+}
+
+func TestDogReaperFormulaDelegatesAnomalyLifecycleToCommand(t *testing.T) {
+	content, err := GetEmbeddedFormulaContent("mol-dog-reaper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	formula, err := Parse(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcile := formula.GetStep("reconcile-anomalies")
+	if reconcile == nil {
+		t.Fatal("missing reconcile-anomalies step")
+	}
+	if len(reconcile.Needs) != 1 || reconcile.Needs[0] != "scan" {
+		t.Fatalf("reconcile needs = %#v, want [scan]", reconcile.Needs)
+	}
+	if !strings.Contains(reconcile.Description, "gt reaper reconcile-anomalies") {
+		t.Fatalf("reconcile step does not invoke deterministic command: %s", reconcile.Description)
+	}
+	reap := formula.GetStep("reap")
+	if reap == nil || len(reap.Needs) != 1 || reap.Needs[0] != "reconcile-anomalies" {
+		t.Fatalf("reap needs = %#v, want [reconcile-anomalies]", reap.Needs)
+	}
+	for _, step := range formula.Steps {
+		if strings.Contains(step.Description, "gt escalate") {
+			t.Fatalf("step %q retains free-form anomaly lifecycle", step.ID)
+		}
 	}
 }

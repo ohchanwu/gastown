@@ -2,18 +2,19 @@ description = """
 Reap stale wisps and close stale issues across all Dolt databases.
 
 The Reaper Dog executes this formula to clean up wisp and issue tables.
-SQL operations are exposed via `gt reaper` CLI helpers — the Dog calls
-these commands, inspects results, and uses judgment for anomalies.
+SQL operations are exposed via `gt reaper` CLI helpers. Deterministic Go
+reconciliation owns anomaly escalation lifecycle decisions.
 
 ## Dog Contract
 
 This is infrastructure cleanup work:
 1. Scan all production databases for candidates
-2. Reap (close) wisps past max_age whose parent is closed/missing, plus step-wisps whose parent molecule is already closed
-3. Purge (delete) closed wisps past purge_age + old closed mail
-4. Auto-close stale issues (>stale_issue_age, not P0/P1, not epics/convoys, no active deps)
-5. Close completed convoys via `gt convoy check` (tracked-bead status, never staleness)
-6. Report findings and flag anomalies
+2. Reconcile anomaly escalation lifecycle deterministically
+3. Reap (close) wisps past max_age whose parent is closed/missing, plus step-wisps whose parent molecule is already closed
+4. Purge (delete) closed wisps past purge_age + old closed mail
+5. Auto-close stale issues (>stale_issue_age, not P0/P1, not epics/convoys, no active deps)
+6. Close completed convoys via `gt convoy check` (tracked-bead status, never staleness)
+7. Report findings and deterministic anomaly results
 
 ## Variables
 
@@ -80,18 +81,41 @@ gt reaper scan --db=<name> \\
 - Treat an absent `molecule_step_candidates` field as zero
 - Flag any `dangling_parent_ref` anomalies — these indicate wisps with
   parent dependency records pointing to purged/missing parents
-- If `open_wisps` exceeds {{alert_threshold}}, escalate
+- If `open_wisps` exceeds {{alert_threshold}}, record it for deterministic reconciliation
 
 **4. Decide whether to proceed:**
-- If no candidates found across all databases, including `molecule_step_candidates`, skip remaining steps
-- If anomalies are severe, consider escalating before proceeding
+- Always continue to anomaly reconciliation, including when no anomaly remains;
+  successful empty scopes resolve prior occurrences
+- Cleanup steps may be skipped when their candidate counts are zero
 
 **Exit criteria:** Scan complete, candidates identified, anomalies flagged."""
 
 [[steps]]
+id = "reconcile-anomalies"
+title = "Reconcile anomaly escalation lifecycle"
+needs = ["scan"]
+description = """
+Run the deterministic Reaper reconciliation command after the complete scan.
+This command owns fingerprinting, duplicate suppression, resolution, recurrence
+linkage, and durable escalation mail. Do not make free-form lifecycle decisions.
+
+```bash
+gt reaper reconcile-anomalies \
+  --max-age={{max_age}} --purge-age={{purge_age}} \
+  --mail-age={{mail_delete_age}} --stale-age={{stale_issue_age}} \
+  --db-delay={{db_delay}}
+```
+
+When {{databases}} explicitly configures database names, invoke the same command
+once per name with `--db=<name>`. A failed or incomplete scope must remain
+unresolved and must be reported as an error.
+
+**Exit criteria:** Successfully observed scopes reconciled; incomplete scopes preserved."""
+
+[[steps]]
 id = "reap"
 title = "Reap stale wisps"
-needs = ["scan"]
+needs = ["reconcile-anomalies"]
 description = """
 Close wisps past max_age whose parent molecule is closed or missing, and close
 step-wisps immediately when their parent molecule is already closed.
@@ -106,12 +130,12 @@ gt reaper reap --db=<name> \\
 - Compare reaped and molecule-step counts to scan candidates. A mismatch (scan > reap) is NORMAL
   and expected — the witness may close wisps for dead polecat sessions between
   scan and reap. Do NOT escalate scan/reap count mismatches.
-- Only escalate if reap returns an actual error (not a zero count).
+- Record actual reap errors in the patrol report; do not mutate anomaly lifecycle here.
 - Check for any anomalies in the response
 
 **3. Alert check:**
 If total open wisps across all databases exceed {{alert_threshold}},
-log a warning and consider escalating.
+record the deterministic threshold warning in the patrol report.
 
 **Exit criteria:** All stale wisps closed (or dry-run counts reported)."""
 
@@ -213,12 +237,12 @@ Generate summary and signal completion.
 **Anomalies**: (list any anomalies found)
 ```
 
-**2. If anomalies were found, escalate:**
-```bash
-gt escalate "Reaper anomalies detected" -s MEDIUM -m "<anomaly details>"
-```
+**2. Report anomaly reconciliation results:**
+- Record the deterministic reconciliation command's created/resolved counts
+- Record incomplete scopes as preserved errors
+- Do not create, close, or relink anomaly escalations manually
 
-**Exit criteria:** Report generated, anomalies escalated if any."""
+**Exit criteria:** Report generated; deterministic anomaly results included."""
 
 [vars]
 [vars.max_age]

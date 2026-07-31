@@ -492,6 +492,60 @@ func TestAutoCloseExcludesConvoyLabel(t *testing.T) {
 	}
 }
 
+func TestScanReturnsStableDanglingParentAnomaly(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"child-b": {id: "child-b", status: "open", issueType: "task", createdAt: now},
+			"child-a": {id: "child-a", status: "open", issueType: "task", createdAt: now},
+		},
+		issues: map[string]*fakeIssue{},
+		deps: []fakeDep{
+			{issueID: "child-b", dependsOnID: "missing-parent", depType: "parent-child"},
+			{issueID: "child-a", dependsOnID: "missing-parent", depType: "parent-child"},
+			{issueID: "child-a", dependsOnID: "missing-parent", depType: "parent-child"},
+			{issueID: "child-b", dependsOnID: "external-parent", dependsOnExternal: "other", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := Scan(db, "testdb", time.Hour, 24*time.Hour, 24*time.Hour, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Anomalies) != 1 {
+		t.Fatalf("anomalies = %#v, want one dangling-parent anomaly", result.Anomalies)
+	}
+	got := result.Anomalies[0]
+	if got.Type != "dangling_parent_ref" || got.Scope != "testdb" || got.Remediation != "repair_parent_links" {
+		t.Fatalf("stable anomaly fields = %#v", got)
+	}
+	wantIDs := []string{"child-a", "child-b"}
+	if !reflect.DeepEqual(got.AffectedIDs, wantIDs) {
+		t.Fatalf("affected IDs = %#v, want %#v", got.AffectedIDs, wantIDs)
+	}
+	if got.Count != len(wantIDs) {
+		t.Fatalf("count = %d, want %d", got.Count, len(wantIDs))
+	}
+}
+
+func TestCommitFailureAnomalyCarriesStableLifecycleFields(t *testing.T) {
+	anomaly := commitFailureAnomaly(
+		"sql_commit_failed", "hq", []string{"hq-b", "hq-a"}, "retry_auto_close_commit", "volatile database detail",
+	)
+	if anomaly.Type != "sql_commit_failed" || anomaly.Scope != "hq" || anomaly.Remediation != "retry_auto_close_commit" {
+		t.Fatalf("stable fields = %#v", anomaly)
+	}
+	if !reflect.DeepEqual(anomaly.AffectedIDs, []string{"hq-b", "hq-a"}) {
+		t.Fatalf("affected IDs = %v", anomaly.AffectedIDs)
+	}
+	if _, err := FingerprintAnomaly(anomaly); err != nil {
+		t.Fatalf("fingerprint structured commit anomaly: %v", err)
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
@@ -679,6 +733,25 @@ func (s *fakeReaperState) openCountLocked() int {
 	return count
 }
 
+func (s *fakeReaperState) danglingChildIDsLocked() []string {
+	seen := make(map[string]bool)
+	for _, dep := range s.deps {
+		if dep.depType != "parent-child" || dep.dependsOnExternal != "" {
+			continue
+		}
+		if s.wisps[dep.dependsOnID] != nil || s.issues[dep.dependsOnID] != nil {
+			continue
+		}
+		seen[dep.issueID] = true
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 type fakeReaperDriver struct {
 	state *fakeReaperState
 }
@@ -734,6 +807,8 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
 		return fakeCountRows(0), nil
+	case strings.Contains(normalized, "SELECT DISTINCT wd.issue_id FROM wisp_dependencies wd"):
+		return fakeIDRows(c.state.danglingChildIDsLocked()), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err

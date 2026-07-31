@@ -264,6 +264,24 @@ fingerprint: escalation-fp:abc123def456`,
 	}
 }
 
+func TestEscalationFieldsRoundTripAnomalyLifecycle(t *testing.T) {
+	fields := &EscalationFields{
+		Severity:           "medium",
+		Reason:             "dangling parents",
+		EscalatedBy:        "reaper",
+		EscalatedAt:        "2026-08-01T00:00:00Z",
+		Fingerprint:        "reaper-anomaly:v1:abc",
+		AnomalyFamily:      "reaper-anomaly-family:v1:def",
+		AnomalyScope:       "hq",
+		PreviousOccurrence: "hq-esc-previous",
+	}
+
+	got := ParseEscalationFields(FormatEscalationDescription("Reaper anomaly", fields))
+	if got.AnomalyFamily != fields.AnomalyFamily || got.AnomalyScope != fields.AnomalyScope || got.PreviousOccurrence != fields.PreviousOccurrence {
+		t.Fatalf("lifecycle fields = %#v, want %#v", got, fields)
+	}
+}
+
 func TestEscalationFieldsRoundTrip(t *testing.T) {
 	original := &EscalationFields{
 		Severity:          "high",

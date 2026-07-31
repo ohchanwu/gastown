@@ -13,21 +13,24 @@ import (
 // EscalationFields holds structured fields for escalation beads.
 // These are stored as "key: value" lines in the description.
 type EscalationFields struct {
-	Severity          string // critical, high, medium, low
-	Reason            string // Why this was escalated
-	Source            string // Source identifier (e.g., plugin:rebuild-gt, patrol:deacon)
-	EscalatedBy       string // Agent address that escalated (e.g., "gastown/Toast")
-	EscalatedAt       string // ISO 8601 timestamp
-	AckedBy           string // Agent that acknowledged (empty if not acked)
-	AckedAt           string // When acknowledged (empty if not acked)
-	ClosedBy          string // Agent that closed (empty if not closed)
-	ClosedReason      string // Resolution reason (empty if not closed)
-	RelatedBead       string // Optional: related bead ID (task, bug, etc.)
-	OriginalSeverity  string // Original severity before any re-escalation
-	ReescalationCount int    // Number of times this has been re-escalated
-	LastReescalatedAt string // When last re-escalated (empty if never)
-	LastReescalatedBy string // Who last re-escalated (empty if never)
-	Fingerprint       string // Stable duplicate-suppression label
+	Severity           string // critical, high, medium, low
+	Reason             string // Why this was escalated
+	Source             string // Source identifier (e.g., plugin:rebuild-gt, patrol:deacon)
+	EscalatedBy        string // Agent address that escalated (e.g., "gastown/Toast")
+	EscalatedAt        string // ISO 8601 timestamp
+	AckedBy            string // Agent that acknowledged (empty if not acked)
+	AckedAt            string // When acknowledged (empty if not acked)
+	ClosedBy           string // Agent that closed (empty if not closed)
+	ClosedReason       string // Resolution reason (empty if not closed)
+	RelatedBead        string // Optional: related bead ID (task, bug, etc.)
+	OriginalSeverity   string // Original severity before any re-escalation
+	ReescalationCount  int    // Number of times this has been re-escalated
+	LastReescalatedAt  string // When last re-escalated (empty if never)
+	LastReescalatedBy  string // Who last re-escalated (empty if never)
+	Fingerprint        string // Stable duplicate-suppression label
+	AnomalyFamily      string // Stable anomaly family excluding affected IDs
+	AnomalyScope       string // Successfully observed database scope
+	PreviousOccurrence string // Most recent resolved occurrence in this lifecycle
 }
 
 // FormatEscalationDescription creates a description string from escalation fields.
@@ -101,6 +104,21 @@ func FormatEscalationDescription(title string, fields *EscalationFields) string 
 	} else {
 		lines = append(lines, "fingerprint: null")
 	}
+	if fields.AnomalyFamily != "" {
+		lines = append(lines, fmt.Sprintf("anomaly_family: %s", fields.AnomalyFamily))
+	} else {
+		lines = append(lines, "anomaly_family: null")
+	}
+	if fields.AnomalyScope != "" {
+		lines = append(lines, fmt.Sprintf("anomaly_scope: %s", fields.AnomalyScope))
+	} else {
+		lines = append(lines, "anomaly_scope: null")
+	}
+	if fields.PreviousOccurrence != "" {
+		lines = append(lines, fmt.Sprintf("previous_occurrence: %s", fields.PreviousOccurrence))
+	} else {
+		lines = append(lines, "previous_occurrence: null")
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -159,6 +177,12 @@ func ParseEscalationFields(description string) *EscalationFields {
 			fields.LastReescalatedBy = value
 		case "fingerprint":
 			fields.Fingerprint = value
+		case "anomaly_family":
+			fields.AnomalyFamily = value
+		case "anomaly_scope":
+			fields.AnomalyScope = value
+		case "previous_occurrence":
+			fields.PreviousOccurrence = value
 		}
 	}
 
@@ -311,6 +335,20 @@ func (b *Beads) ListEscalations() ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
+	return filterEscalationRecords(issues), nil
+}
+
+// ListEscalationOccurrences returns open and closed escalation beads.
+func (b *Beads) ListEscalationOccurrences() ([]*Issue, error) {
+	out, err := b.run("list", "--label=gt:escalation", "--status=all", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
 	return filterEscalationRecords(issues), nil
 }
 
