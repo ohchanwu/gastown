@@ -95,6 +95,21 @@ func TestReconcileAnomaliesFiveIdenticalSnapshotsCreateOneOccurrence(t *testing.
 	}
 }
 
+func TestReconcileAnomaliesDeduplicatesIdenticalAnomaliesWithinScan(t *testing.T) {
+	anomaly := Anomaly{
+		Type: "dangling_parent_ref", Scope: "hq", AffectedIDs: []string{"hq-a"}, Remediation: "repair_parent_links",
+	}
+	actions, err := ReconcileAnomalies([]AnomalyScan{{
+		Scope: "hq", Complete: true, Anomalies: []Anomaly{anomaly, anomaly},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != ReconcileCreate {
+		t.Fatalf("actions = %#v, want one create", actions)
+	}
+}
+
 func TestReconcileAnomaliesChangedAffectedSetReplacesOccurrence(t *testing.T) {
 	oldAnomaly := Anomaly{
 		Type:        "dangling_parent_ref",

@@ -46,6 +46,19 @@ func TestReconcileAnomalyScansFiveIdenticalPatrolsPersistOneEscalationAndMail(t 
 	}
 }
 
+func TestReconcileAnomalyScansDuplicateInputPersistsOneEscalationAndMail(t *testing.T) {
+	lifecycle := newIsolatedAnomalyLifecycle()
+	anomaly := testReaperAnomaly("hq-child")
+	scan := completeAnomalyScan(anomaly)
+	scan.Anomalies = append(scan.Anomalies, anomaly)
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.issues) != 1 || len(lifecycle.durableMail) != 1 {
+		t.Fatalf("duplicate input state issues=%d mail=%v, want one occurrence and one mail", len(lifecycle.issues), lifecycle.durableMail)
+	}
+}
+
 func TestReconcileAnomalyScansPersistsChangedResolvedRecurrenceAndIncompleteTransitions(t *testing.T) {
 	lifecycle := newIsolatedAnomalyLifecycle()
 	anomaly := reaper.Anomaly{

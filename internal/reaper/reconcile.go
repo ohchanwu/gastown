@@ -156,6 +156,9 @@ func ReconcileAnomalies(scans []AnomalyScan, occurrences []AnomalyOccurrence) ([
 		})
 		for _, normalized := range normalizedAnomalies {
 			fingerprint, _ := FingerprintAnomaly(normalized)
+			if currentFingerprints[fingerprint] {
+				continue
+			}
 			currentFingerprints[fingerprint] = true
 			if active[fingerprint] {
 				matching := activeByFingerprint[fingerprint]
