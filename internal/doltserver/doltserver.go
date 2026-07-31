@@ -1038,6 +1038,86 @@ func isOwnedTestDataDir(path string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+func isOwnedTestCWD(path string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	for _, component := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if component == "." || component == ".." {
+			return false
+		}
+	}
+
+	tempRoot := filepath.Clean(os.TempDir())
+	cleanPath := filepath.Clean(path)
+	resolvedTempRoot, err := filepath.EvalSymlinks(tempRoot)
+	if err != nil {
+		return false
+	}
+	containedRel := func(root, candidate string) (string, bool) {
+		rel, err := filepath.Rel(root, candidate)
+		return rel, err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	lexicalRel, ok := containedRel(tempRoot, cleanPath)
+	if !ok {
+		lexicalRel, ok = containedRel(resolvedTempRoot, cleanPath)
+	}
+	if !ok {
+		return false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		return false
+	}
+	resolvedRel, ok := containedRel(resolvedTempRoot, resolvedPath)
+	if !ok || resolvedRel != lexicalRel {
+		return false
+	}
+
+	components := strings.Split(lexicalRel, string(filepath.Separator))
+	if len(components) < 5 || !strings.HasPrefix(components[0], ".ctx-mode-") || len(components[0]) == len(".ctx-mode-") ||
+		!isGoTestTempComponent(components[1]) || !allDecimalDigits(components[2]) ||
+		components[len(components)-2] != ".beads" || components[len(components)-1] != "dolt" {
+		return false
+	}
+	return true
+}
+
+func isGoTestTempComponent(component string) bool {
+	if !strings.HasPrefix(component, "Test") {
+		return false
+	}
+	nameAndDigits := component[len("Test"):]
+	digitStart := len(nameAndDigits)
+	for digitStart > 0 && nameAndDigits[digitStart-1] >= '0' && nameAndDigits[digitStart-1] <= '9' {
+		digitStart--
+	}
+	if digitStart == 0 || digitStart == len(nameAndDigits) {
+		return false
+	}
+	if first := nameAndDigits[0]; !((first >= 'A' && first <= 'Z') || first == '_') {
+		return false
+	}
+	for i, ch := range nameAndDigits[:digitStart] {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (i > 0 && ch >= '0' && ch <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func allDecimalDigits(component string) bool {
+	if component == "" {
+		return false
+	}
+	for _, ch := range component {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func pathWithin(root, path string) bool {
 	if root == "" || path == "" {
 		return false
@@ -1078,6 +1158,10 @@ func classifyLocalDoltServers(expectedPort int, expectedDataDir string, listener
 			server.Class = DoltServerConfiguredPortImposter
 		case isOwnedTestDataDir(evidence.DataDir):
 			server.Class = DoltServerOwnedTestLeak
+			server.OwnerPath = evidence.DataDir
+		case isOwnedTestCWD(evidence.CWD):
+			server.Class = DoltServerOwnedTestLeak
+			server.OwnerPath = evidence.CWD
 		case isOwnedTownLeak(expectedDataDir, evidence):
 			server.Class = DoltServerOwnedTownLeak
 		}

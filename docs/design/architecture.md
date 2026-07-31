@@ -172,14 +172,18 @@ share that inventory: configured-port imposters and positively owned town/test
 leaks are actionable, while unknown listeners are reported without signals.
 `gt dolt kill-imposters` applies only to configured-port imposters and reports
 other classes without action. Broader leak remediation previews first and only
-signals new listeners with positive ownership evidence. Staged-convoy tests
+signals new listeners with positive ownership evidence. A CWD is positive test
+ownership only when its resolved path remains under the OS temp root and has the
+exact `.ctx-mode-*` / Go `Test...<digits>` / numeric-temp / terminal `.beads/dolt`
+shape; traversal, symlink escapes, town paths, and lookalike names remain unknown.
+Staged-convoy tests
 register per-test cleanup before subprocesses and enforce a package-exit
 listener baseline.
 
 `gt dolt cleanup-test-leaks` is the user-facing test-leak path. Preview is the
 default and atomically writes a mode-0600 receipt under a mode-0700 `.runtime`
-directory. Each private
-selector binds PID, port, class, and an opaque ownership token; `--apply`
+directory. Each private selector binds PID, port, class, and an opaque ownership
+token derived from that positive owner evidence; `--apply`
 revalidates all four before signaling. Paths and tokens are never rendered.
 Unpreviewed and non-test listeners remain report-only.
 

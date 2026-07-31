@@ -286,16 +286,94 @@ func TestClassifyLocalDoltServers(t *testing.T) {
 	}
 }
 
-func TestTestLeakRequiresPositiveDataDirEvidence(t *testing.T) {
-	testDir := filepath.Join(os.TempDir(), "gastown-test-dolt.fixture")
-	listeners := []DoltListener{{PID: 201, Port: 4400}}
+func TestTestLeakRequiresStrictPositiveCWD(t *testing.T) {
+	sandbox, err := os.MkdirTemp(os.TempDir(), ".ctx-mode-owned-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sandbox) })
 
-	got := classifyLocalDoltServers(3307, t.TempDir(), listeners, func(int) doltProcessEvidence {
-		return doltProcessEvidence{CWD: testDir}
-	})
+	testComponent := "TestCreateStagedConvoy_CleanReady123456789"
+	validDirect := filepath.Join(sandbox, testComponent, "001", ".beads", "dolt")
+	validTestrip := filepath.Join(sandbox, testComponent, "002", "testrip", ".beads", "dolt")
+	validRig := filepath.Join(sandbox, testComponent, "003", "rig", "gastown", ".beads", "dolt")
+	arbitraryTemp := filepath.Join(t.TempDir(), ".beads", "dolt")
+	missingGoTest := filepath.Join(sandbox, "CreateStagedConvoy123", "001", ".beads", "dolt")
+	similarGoTest := filepath.Join(sandbox, "TestsCreateStagedConvoy123", "001", ".beads", "dolt")
+	lowercaseGoTest := filepath.Join(sandbox, "TestcreateStagedConvoy123", "001", ".beads", "dolt")
+	missingGoTestDigits := filepath.Join(sandbox, "TestCreateStagedConvoy", "001", ".beads", "dolt")
+	missingGoTestName := filepath.Join(sandbox, "Test123", "001", ".beads", "dolt")
+	missingNumericTemp := filepath.Join(sandbox, testComponent, "temp", ".beads", "dolt")
+	similarTerminal := filepath.Join(sandbox, testComponent, "005", ".beads", "doltx")
+	for _, path := range []string{
+		validDirect, validTestrip, validRig, arbitraryTemp, missingGoTest, similarGoTest,
+		lowercaseGoTest, missingGoTestDigits, missingGoTestName, missingNumericTemp, similarTerminal,
+	} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	if got[0].Class != DoltServerUnknown {
-		t.Fatalf("CWD-only test-like path classified as %q, want unknown", got[0].Class)
+	symlinkTarget := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(symlinkTarget, ".beads", "dolt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkParent := filepath.Join(sandbox, testComponent, "004")
+	if err := os.Symlink(symlinkTarget, symlinkParent); err != nil {
+		t.Fatal(err)
+	}
+	resolvedTempRoot, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxRel, err := filepath.Rel(os.TempDir(), sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalDirect := filepath.Join(resolvedTempRoot, sandboxRel, testComponent, "001", ".beads", "dolt")
+
+	sep := string(filepath.Separator)
+	tests := []struct {
+		name string
+		cwd  string
+		want DoltServerClass
+	}{
+		{name: "direct", cwd: validDirect, want: DoltServerOwnedTestLeak},
+		{name: "resolved OS temp alias", cwd: canonicalDirect, want: DoltServerOwnedTestLeak},
+		{name: "testrip", cwd: validTestrip, want: DoltServerOwnedTestLeak},
+		{name: "rig", cwd: validRig, want: DoltServerOwnedTestLeak},
+		{name: "arbitrary temp dolt", cwd: arbitraryTemp, want: DoltServerUnknown},
+		{name: "missing sandbox", cwd: filepath.Join(os.TempDir(), testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
+		{name: "empty sandbox name", cwd: filepath.Join(os.TempDir(), ".ctx-mode-", testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
+		{name: "similar sandbox name", cwd: filepath.Join(os.TempDir(), ".ctx-modes-owned", testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
+		{name: "missing go test", cwd: missingGoTest, want: DoltServerUnknown},
+		{name: "similar go test", cwd: similarGoTest, want: DoltServerUnknown},
+		{name: "lowercase go test", cwd: lowercaseGoTest, want: DoltServerUnknown},
+		{name: "go test missing digits", cwd: missingGoTestDigits, want: DoltServerUnknown},
+		{name: "go test missing name", cwd: missingGoTestName, want: DoltServerUnknown},
+		{name: "missing numeric temp", cwd: missingNumericTemp, want: DoltServerUnknown},
+		{name: "nonterminal dolt", cwd: filepath.Join(validDirect, "child"), want: DoltServerUnknown},
+		{name: "similar terminal", cwd: similarTerminal, want: DoltServerUnknown},
+		{name: "traversal", cwd: filepath.Join(sandbox, testComponent, "006") + sep + ".." + sep + "006" + sep + ".beads" + sep + "dolt", want: DoltServerUnknown},
+		{name: "symlink escape", cwd: filepath.Join(symlinkParent, ".beads", "dolt"), want: DoltServerUnknown},
+		{name: "town path", cwd: filepath.Join(string(filepath.Separator), "town", "rig", ".beads", "dolt"), want: DoltServerUnknown},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyLocalDoltServers(3307, t.TempDir(), []DoltListener{{PID: 201 + i, Port: 4400}}, func(int) doltProcessEvidence {
+				return doltProcessEvidence{CWD: tt.cwd}
+			})
+			if got[0].Class != tt.want {
+				t.Fatalf("CWD classified as %q, want %q", got[0].Class, tt.want)
+			}
+			if tt.want == DoltServerOwnedTestLeak && got[0].OwnerPath != tt.cwd {
+				t.Fatal("classified test CWD was not retained as private owner evidence")
+			}
+			if tt.want == DoltServerOwnedTestLeak && newTestLeakSelection(got[0]).OwnershipToken == "" {
+				t.Fatal("classified test CWD did not produce an opaque ownership token")
+			}
+		})
 	}
 }
 
