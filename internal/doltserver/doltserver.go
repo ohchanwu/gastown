@@ -1011,18 +1011,21 @@ func (s LocalDoltServer) Actionable() bool {
 }
 
 type doltProcessEvidence struct {
-	DataDir    string
-	ConfigPath string
-	CWD        string
-	StateDir   string
+	DataDir     string
+	ConfigPath  string
+	CWD         string
+	CWDFromLsof bool
+	StateDir    string
 }
 
 func processEvidence(townRoot string, pid int) doltProcessEvidence {
+	cwd := getProcessCWD(pid)
 	return doltProcessEvidence{
-		DataDir:    GetDoltDataDirFromProcess(pid),
-		ConfigPath: getDoltConfigPathFromProcess(pid),
-		CWD:        getProcessCWD(pid),
-		StateDir:   getServerDataDir(townRoot, pid),
+		DataDir:     GetDoltDataDirFromProcess(pid),
+		ConfigPath:  getDoltConfigPathFromProcess(pid),
+		CWD:         cwd,
+		CWDFromLsof: runtime.GOOS == "darwin" && cwd != "",
+		StateDir:    getServerDataDir(townRoot, pid),
 	}
 }
 
@@ -1038,7 +1041,7 @@ func isOwnedTestDataDir(path string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func isOwnedTestCWD(path string) bool {
+func isOwnedTestCWD(path string, fromLsof bool) bool {
 	if path == "" || !filepath.IsAbs(path) {
 		return false
 	}
@@ -1065,19 +1068,21 @@ func isOwnedTestCWD(path string) bool {
 	if !ok {
 		return false
 	}
-	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
-	if err != nil {
-		return false
-	}
-	resolvedRel, ok := containedRel(resolvedTempRoot, resolvedPath)
-	if !ok || resolvedRel != lexicalRel {
-		return false
-	}
-
 	components := strings.Split(lexicalRel, string(filepath.Separator))
 	if len(components) < 5 || !strings.HasPrefix(components[0], ".ctx-mode-") || len(components[0]) == len(".ctx-mode-") ||
 		!isGoTestTempComponent(components[1]) || !allDecimalDigits(components[2]) ||
 		components[len(components)-2] != ".beads" || components[len(components)-1] != "dolt" {
+		return false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		// On macOS this path comes only from lsof's live, kernel-resolved cwd
+		// record. A deleted test temp directory cannot be resolved again, but its
+		// strict reported shape remains positive ownership evidence.
+		return fromLsof && os.IsNotExist(err)
+	}
+	resolvedRel, ok := containedRel(resolvedTempRoot, resolvedPath)
+	if !ok || resolvedRel != lexicalRel {
 		return false
 	}
 	return true
@@ -1159,7 +1164,7 @@ func classifyLocalDoltServers(expectedPort int, expectedDataDir string, listener
 		case isOwnedTestDataDir(evidence.DataDir):
 			server.Class = DoltServerOwnedTestLeak
 			server.OwnerPath = evidence.DataDir
-		case isOwnedTestCWD(evidence.CWD):
+		case isOwnedTestCWD(evidence.CWD, evidence.CWDFromLsof):
 			server.Class = DoltServerOwnedTestLeak
 			server.OwnerPath = evidence.CWD
 		case isOwnedTownLeak(expectedDataDir, evidence):

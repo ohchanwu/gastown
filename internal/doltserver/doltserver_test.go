@@ -331,18 +331,60 @@ func TestTestLeakRequiresStrictPositiveCWD(t *testing.T) {
 		t.Fatal(err)
 	}
 	canonicalDirect := filepath.Join(resolvedTempRoot, sandboxRel, testComponent, "001", ".beads", "dolt")
+	deletedSandbox, err := os.MkdirTemp(os.TempDir(), ".ctx-mode-deleted-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedDirect := filepath.Join(deletedSandbox, testComponent, "001", ".beads", "dolt")
+	deletedTestrip := filepath.Join(deletedSandbox, testComponent, "002", "testrip", ".beads", "dolt")
+	deletedRig := filepath.Join(deletedSandbox, testComponent, "003", "rig", "gastown", ".beads", "dolt")
+	for _, path := range []string{deletedDirect, deletedTestrip, deletedRig} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.RemoveAll(deletedSandbox); err != nil {
+		t.Fatal(err)
+	}
+
+	arbitraryDeletedRoot := t.TempDir()
+	arbitraryDeleted := filepath.Join(arbitraryDeletedRoot, ".beads", "dolt")
+	if err := os.MkdirAll(arbitraryDeleted, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(arbitraryDeletedRoot); err != nil {
+		t.Fatal(err)
+	}
+	lookalikeDeletedSandbox, err := os.MkdirTemp(os.TempDir(), ".ctx-modes-deleted-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookalikeDeleted := filepath.Join(lookalikeDeletedSandbox, testComponent, "001", ".beads", "dolt")
+	if err := os.MkdirAll(lookalikeDeleted, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(lookalikeDeletedSandbox); err != nil {
+		t.Fatal(err)
+	}
 
 	sep := string(filepath.Separator)
 	tests := []struct {
-		name string
-		cwd  string
-		want DoltServerClass
+		name        string
+		cwd         string
+		cwdFromLsof bool
+		want        DoltServerClass
 	}{
 		{name: "direct", cwd: validDirect, want: DoltServerOwnedTestLeak},
 		{name: "resolved OS temp alias", cwd: canonicalDirect, want: DoltServerOwnedTestLeak},
 		{name: "testrip", cwd: validTestrip, want: DoltServerOwnedTestLeak},
 		{name: "rig", cwd: validRig, want: DoltServerOwnedTestLeak},
+		{name: "deleted direct lsof cwd", cwd: deletedDirect, cwdFromLsof: true, want: DoltServerOwnedTestLeak},
+		{name: "deleted testrip lsof cwd", cwd: deletedTestrip, cwdFromLsof: true, want: DoltServerOwnedTestLeak},
+		{name: "deleted rig lsof cwd", cwd: deletedRig, cwdFromLsof: true, want: DoltServerOwnedTestLeak},
+		{name: "deleted exact untrusted cwd", cwd: deletedDirect, want: DoltServerUnknown},
 		{name: "arbitrary temp dolt", cwd: arbitraryTemp, want: DoltServerUnknown},
+		{name: "arbitrary deleted temp dolt", cwd: arbitraryDeleted, cwdFromLsof: true, want: DoltServerUnknown},
+		{name: "deleted sandbox lookalike", cwd: lookalikeDeleted, cwdFromLsof: true, want: DoltServerUnknown},
 		{name: "missing sandbox", cwd: filepath.Join(os.TempDir(), testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
 		{name: "empty sandbox name", cwd: filepath.Join(os.TempDir(), ".ctx-mode-", testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
 		{name: "similar sandbox name", cwd: filepath.Join(os.TempDir(), ".ctx-modes-owned", testComponent, "001", ".beads", "dolt"), want: DoltServerUnknown},
@@ -362,7 +404,7 @@ func TestTestLeakRequiresStrictPositiveCWD(t *testing.T) {
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := classifyLocalDoltServers(3307, t.TempDir(), []DoltListener{{PID: 201 + i, Port: 4400}}, func(int) doltProcessEvidence {
-				return doltProcessEvidence{CWD: tt.cwd}
+				return doltProcessEvidence{CWD: tt.cwd, CWDFromLsof: tt.cwdFromLsof}
 			})
 			if got[0].Class != tt.want {
 				t.Fatalf("CWD classified as %q, want %q", got[0].Class, tt.want)
