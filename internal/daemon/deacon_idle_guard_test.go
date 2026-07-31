@@ -58,7 +58,7 @@ fi
 
 # WaitForCommand treats shell commands as not ready and retries for minutes.
 if [[ "$cmd" == "display-message" && "$*" == *"pane_current_command"* ]]; then
-  echo "codex"
+  echo "claude"
   exit 0
 fi
 

@@ -621,7 +621,7 @@ func TestRoutedBeadReadUsesCanonicalShowWithoutUnsupportedAllowStale(t *testing.
 	beads.ResetBdAllowStaleCacheForTest()
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 	beadID := "gt-new123"
 	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
 	rigBeadsDir := filepath.Join(rigDir, ".beads")
@@ -1005,7 +1005,7 @@ exit /b 0
 }
 
 func TestSlingRejectsBeadMissingFromTargetRigBeforeSpawn(t *testing.T) {
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
@@ -1141,7 +1141,7 @@ func TestTargetRigDatabaseAllowsRouteResolvedGtBead(t *testing.T) {
 	beads.ResetBdAllowStaleCacheForTest()
 	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
 
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
 	for _, dir := range []string{filepath.Join(townRoot, ".beads"), filepath.Join(townRoot, "mayor", "rig"), filepath.Join(rigDir, ".beads")} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1232,7 +1232,7 @@ esac
 func setupCrossDatabaseSlingGuardTest(t *testing.T) (townRoot, logPath string) {
 	t.Helper()
 
-	townRoot = t.TempDir()
+	townRoot = canonicalTestTempDir(t)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}
