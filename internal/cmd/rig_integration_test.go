@@ -756,6 +756,31 @@ func TestRigAddTrackedBeadsUsesOnlyCentralDatabase(t *testing.T) {
 		}
 	}
 
+	// The prefix repair and central-Dolt repair overlap at this ordering edge:
+	// after clone reveals the tracked prefix, collision rejection must still
+	// happen before InitRig can mutate the central catalog.
+	const collisionRig = "trackedcollision"
+	if _, err := mgr.AddRig(rig.AddRigOptions{Name: collisionRig, GitURL: gitURL}); err == nil || !strings.Contains(err.Error(), "prefix collision") {
+		t.Fatalf("AddRig collision error = %v, want tracked-prefix collision", err)
+	}
+	collisionRows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		t.Fatalf("query catalog after tracked-prefix collision: %v", err)
+	}
+	defer collisionRows.Close()
+	for collisionRows.Next() {
+		var database string
+		if err := collisionRows.Scan(&database); err != nil {
+			t.Fatalf("scan catalog after tracked-prefix collision: %v", err)
+		}
+		if database == collisionRig {
+			t.Fatalf("tracked-prefix collision created central database %q", collisionRig)
+		}
+	}
+	if err := collisionRows.Err(); err != nil {
+		t.Fatalf("read catalog after tracked-prefix collision: %v", err)
+	}
+
 	const failedRig = "trackedinitfail"
 	if _, err := db.Exec("DROP DATABASE IF EXISTS `" + failedRig + "`"); err != nil {
 		t.Fatalf("clear failed-init database: %v", err)
