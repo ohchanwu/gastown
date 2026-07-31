@@ -158,18 +158,20 @@ For larger changes, please open an issue first to discuss the approach.
 Run the full test suite before submitting:
 
 ```bash
-GT_TEST_DOLT_PORT=<test-owned-port> make test
+GT_TEST_DOLT_PORT=<unused-loopback-port> make test
 ```
 
 The launcher replaces inherited `GT_DOLT_PORT`, `BEADS_DOLT_PORT`, and
-`BEADS_DOLT_SERVER_PORT` before any package starts. The test-owned port must
-not match an inherited listener. Start an isolated Dolt server first; never
-point `GT_TEST_DOLT_PORT` at a live Gas Town listener.
+`BEADS_DOLT_SERVER_PORT` before any package starts. It starts Dolt against a
+temporary data directory on the requested loopback port and verifies that its
+child process owns the listener. An inherited or otherwise preexisting
+listener therefore fails closed before the suite starts.
 
 Launcher failures have two classifications:
 
 - `test-isolation: configuration` (exit 78): the isolated port is missing,
-  invalid, or aliases an inherited listener. No Go package was started.
+  invalid, aliases an inherited listener, or cannot be owned by the launcher's
+  temporary Dolt process. No Go package was started.
 - `test-isolation: suite`: the quarantined suite ran and failed. A package
   that cannot reach Dolt here has a test-custody gap; do not retry it against
   a live listener.

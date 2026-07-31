@@ -2,6 +2,20 @@
 
 set -uo pipefail
 
+server_pid=""
+data_dir=""
+
+cleanup() {
+  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid"
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  [[ -n "$data_dir" ]] && rm -rf -- "$data_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 test_port="${GT_TEST_DOLT_PORT:-}"
 case "$test_port" in
   ''|*[!0-9]*)
@@ -22,6 +36,45 @@ for selector in GT_DOLT_PORT BEADS_DOLT_PORT BEADS_DOLT_SERVER_PORT; do
     exit 78
   fi
 done
+
+for dependency in dolt lsof; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    echo "test-isolation: configuration: required command '$dependency' is unavailable" >&2
+    exit 78
+  fi
+done
+
+data_dir="$(mktemp -d "${TMPDIR:-/tmp}/gastown-test-dolt.XXXXXX")" || {
+  echo "test-isolation: configuration: could not create isolated Dolt data directory" >&2
+  exit 78
+}
+dolt sql-server \
+  --host 127.0.0.1 \
+  --port "$test_port" \
+  --data-dir "$data_dir" \
+  --socket "$data_dir/mysql.sock" \
+  --loglevel error >"$data_dir/server.log" 2>&1 &
+server_pid=$!
+
+owns_listener=false
+for _ in {1..200}; do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+    break
+  fi
+  if lsof -nP -a -p "$server_pid" -iTCP:"$test_port" -sTCP:LISTEN \
+      >/dev/null 2>&1; then
+    owns_listener=true
+    break
+  fi
+  sleep 0.05
+done
+
+if [[ "$owns_listener" != true ]]; then
+  echo "test-isolation: configuration: launcher could not own the isolated Dolt listener" >&2
+  exit 78
+fi
 
 if env \
   GT_DOLT_HOST=127.0.0.1 \

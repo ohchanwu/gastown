@@ -9,8 +9,13 @@ TMPDIR="$(mktemp -d)"
 CAPTURE="$TMPDIR/go.env"
 PASS=0
 FAIL=0
+LISTENER_PID=""
 
 cleanup() {
+  if [[ -n "$LISTENER_PID" ]] && kill -0 "$LISTENER_PID" 2>/dev/null; then
+    kill "$LISTENER_PID"
+    wait "$LISTENER_PID" 2>/dev/null || true
+  fi
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -26,6 +31,28 @@ printf '%s\n' \
 exit "${FAKE_GO_EXIT:-0}"
 FAKE_GO
 chmod +x "$TMPDIR/bin/go"
+
+cat > "$TMPDIR/bin/dolt" <<'FAKE_DOLT'
+#!/usr/bin/env bash
+port=""
+while (( $# )); do
+  case "$1" in
+    --port) port="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+exec python3 - "$port" <<'PY'
+import signal
+import socket
+import sys
+
+listener = socket.socket()
+listener.bind(("127.0.0.1", int(sys.argv[1])))
+listener.listen()
+signal.pause()
+PY
+FAKE_DOLT
+chmod +x "$TMPDIR/bin/dolt"
 
 pass() {
   echo "  PASS: $1"
@@ -97,6 +124,40 @@ if [[ "$status" -eq 78 && ! -e "$CAPTURE" && \
   pass "rejects a numerically equivalent inherited listener port"
 else
   fail "rejects a numerically equivalent inherited listener port"
+fi
+
+rm -f "$CAPTURE"
+listener_ready="$TMPDIR/listener.port"
+python3 - "$listener_ready" <<'PY' &
+import signal
+import socket
+import sys
+
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen()
+with open(sys.argv[1], "w", encoding="utf-8") as ready:
+    ready.write(str(listener.getsockname()[1]))
+signal.pause()
+PY
+LISTENER_PID=$!
+for _ in {1..100}; do
+  [[ -s "$listener_ready" ]] && break
+  kill -0 "$LISTENER_PID" 2>/dev/null || break
+  sleep 0.02
+done
+occupied_port="$(cat "$listener_ready")"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+  GT_TEST_DOLT_PORT="$occupied_port" bash "$LAUNCHER" 2>&1)" || status=$?
+kill "$LISTENER_PID"
+wait "$LISTENER_PID" 2>/dev/null || true
+LISTENER_PID=""
+if [[ "$status" -eq 78 && ! -e "$CAPTURE" && \
+      "$output" == *"test-isolation: configuration"* ]]; then
+  pass "rejects a preexisting listener without inherited selectors"
+else
+  fail "rejects a preexisting listener without inherited selectors"
 fi
 
 status=0
