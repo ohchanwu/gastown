@@ -1828,12 +1828,6 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s Nuked %d polecat(s).\n", style.SuccessPrefix, nuked)
 	}
 
-	// Final cleanup: Kill any orphaned Claude processes that escaped the session termination.
-	// This catches processes that called setsid() or were reparented during session shutdown.
-	if !polecatNukeDryRun {
-		cleanupOrphanedProcesses()
-	}
-
 	if len(nukeErrors) > 0 {
 		return fmt.Errorf("%d nuke(s) failed", len(nukeErrors))
 	}
