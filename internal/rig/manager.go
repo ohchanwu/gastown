@@ -582,7 +582,9 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// If so, we need to initialize the database (it doesn't exist after clone since DB files are gitignored).
 	sourceBeadsDir := filepath.Join(mayorRigPath, ".beads")
 	sourceBeadsConfig := filepath.Join(sourceBeadsDir, "config.yaml")
+	trackedBeads := false
 	if _, err := os.Stat(sourceBeadsDir); err == nil {
+		trackedBeads = true
 		// Remove any redirect file that might have been accidentally tracked.
 		// Redirect files are runtime/local config and should not be in git.
 		// If not removed, they can cause circular redirect warnings during rig setup.
@@ -617,7 +619,26 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		}
 	}
 
-	if _, err := os.Stat(sourceBeadsDir); err == nil {
+	// Create the server-side database after tracked prefix detection but before
+	// either tracked or untracked beads initialization. bd init falls back to an
+	// embedded store when the requested central database does not exist yet.
+	if !opts.SkipDoltCheck {
+		if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
+			if trackedBeads {
+				return nil, fmt.Errorf("creating central rig database: %w", err)
+			}
+			fmt.Printf("  Warning: Could not create rig database: %v\n", err)
+		}
+	}
+
+	if trackedBeads {
+		portFile := filepath.Join(sourceBeadsDir, "dolt-server.port")
+		if err := os.WriteFile(portFile, []byte(strconv.Itoa(bdInitServerPort(m.townRoot))+"\n"), 0600); err != nil {
+			return nil, fmt.Errorf("writing tracked beads server port: %w", err)
+		}
+		if err := os.Chmod(portFile, 0600); err != nil {
+			return nil, fmt.Errorf("securing tracked beads server port: %w", err)
+		}
 		// Initialize bd database if runtime files are missing.
 		// DB files are gitignored so they won't exist after clone — bd init creates them.
 		// bd init --prefix will create the database on the Dolt server.
@@ -671,17 +692,6 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created for any agent.
 	// Only ~/gt/CLAUDE.md (town-root identity anchor) exists on disk.
 	// Full context is injected ephemerally by `gt prime` at session start.
-
-	// Create server-side database for this rig BEFORE initializing beads.
-	// InitBeads runs bd init --server which writes metadata.json, but the actual
-	// database in .dolt-data/ must exist first for bd config commands to work.
-	if !opts.SkipDoltCheck {
-		if _, err := exec.LookPath("dolt"); err == nil {
-			if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
-				fmt.Printf("  Warning: Could not create rig database: %v\n", err)
-			}
-		}
-	}
 
 	// Initialize beads at rig level BEFORE creating worktrees.
 	// This ensures rig/.beads exists so worktree redirects can point to it.

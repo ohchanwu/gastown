@@ -7,12 +7,14 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -619,6 +621,169 @@ func TestRigAddInitializesBeads(t *testing.T) {
 	rigIssuesPath := filepath.Join(beadsDir, "issues.jsonl")
 	if _, err := os.Stat(rigIssuesPath); err == nil {
 		t.Errorf("issues.jsonl should NOT exist in rig .beads directory (Dolt-only mode)")
+	}
+}
+
+func TestRigAddTrackedBeadsUsesOnlyCentralDatabase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+	requireDoltServer(t)
+
+	const (
+		rigName = "trackedrig"
+		prefix  = "tb"
+	)
+	realBDPath, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatalf("find real bd: %v", err)
+	}
+
+	gitURL := createTestGitRepo(t, "tracked-beads")
+	trackedBeadsDir := filepath.Join(gitURL, ".beads")
+	if err := os.MkdirAll(trackedBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir tracked .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(trackedBeadsDir, "config.yaml"), []byte("prefix: "+prefix+"\nissue-prefix: "+prefix+"\n"), 0644); err != nil {
+		t.Fatalf("write tracked config: %v", err)
+	}
+	metadata := []byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"` + rigName + `"}`)
+	if err := os.WriteFile(filepath.Join(trackedBeadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatalf("write tracked metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(trackedBeadsDir, "dolt-server.port"), []byte("3307\n"), 0644); err != nil {
+		t.Fatalf("write tracked port selector: %v", err)
+	}
+	for _, args := range [][]string{{"add", "-f", ".beads"}, {"commit", "-m", "Track beads configuration"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = gitURL
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	townRoot := setupTestTown(t)
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}\n"), 0644); err != nil {
+		t.Fatalf("write town marker: %v", err)
+	}
+	bridgeDoltPidToTown(t, townRoot)
+	rigsConfig, err := config.LoadRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"))
+	if err != nil {
+		t.Fatalf("load rigs.json: %v", err)
+	}
+	mgr := rig.NewManager(townRoot, rigsConfig, git.NewGit(townRoot))
+	if _, err := mgr.AddRig(rig.AddRigOptions{Name: rigName, GitURL: gitURL, BeadsPrefix: prefix}); err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+
+	mayorBeadsDir := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	portInfo, err := os.Stat(filepath.Join(mayorBeadsDir, "dolt-server.port"))
+	if err != nil {
+		t.Fatalf("stat tracked port selector: %v", err)
+	}
+	if got := portInfo.Mode().Perm(); got != 0600 {
+		t.Fatalf("tracked port selector mode = %04o, want 0600", got)
+	}
+	for _, dir := range []string{"dolt", "embeddeddolt"} {
+		if _, err := os.Stat(filepath.Join(mayorBeadsDir, dir)); !os.IsNotExist(err) {
+			t.Fatalf("tracked rig created embedded Dolt store %q: %v", dir, err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(mayorBeadsDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	var gotMetadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &gotMetadata); err != nil {
+		t.Fatalf("parse metadata: %v", err)
+	}
+	if gotMetadata.DoltMode != "server" || gotMetadata.DoltDatabase != rigName {
+		t.Fatalf("metadata runtime = mode %q database %q, want server/%s", gotMetadata.DoltMode, gotMetadata.DoltDatabase, rigName)
+	}
+	runtimeCmd := exec.Command(realBDPath, "dolt", "show", "--json")
+	runtimeCmd.Dir = filepath.Dir(mayorBeadsDir)
+	runtimeOut, err := runtimeCmd.Output()
+	if err != nil {
+		t.Fatalf("real bd info: %v\n%s", err, runtimeOut)
+	}
+	var gotRuntime struct {
+		Database string `json:"database"`
+		Embedded bool   `json:"embedded"`
+		Port     int    `json:"port"`
+	}
+	if err := json.Unmarshal(runtimeOut, &gotRuntime); err != nil {
+		t.Fatalf("parse real bd runtime: %v\n%s", err, runtimeOut)
+	}
+	wantPort, err := strconv.Atoi(os.Getenv("GT_DOLT_PORT"))
+	if err != nil {
+		t.Fatalf("parse GT_DOLT_PORT: %v", err)
+	}
+	if gotRuntime.Embedded || gotRuntime.Database != rigName || gotRuntime.Port != wantPort {
+		t.Fatalf("real bd runtime = embedded %t database %q port %d, want false/%s/%d", gotRuntime.Embedded, gotRuntime.Database, gotRuntime.Port, rigName, wantPort)
+	}
+
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:"+os.Getenv("GT_DOLT_PORT")+")/")
+	if err != nil {
+		t.Fatalf("open central catalog: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		t.Fatalf("query central catalog: %v", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var database string
+		if err := rows.Scan(&database); err != nil {
+			t.Fatalf("scan central catalog: %v", err)
+		}
+		seen[database] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read central catalog: %v", err)
+	}
+	if !seen[rigName] {
+		t.Fatalf("central inventory missing %q: %v", rigName, seen)
+	}
+	for _, orphan := range []string{prefix, "beads_" + prefix} {
+		if seen[orphan] {
+			t.Errorf("central inventory contains orphan database %q: %v", orphan, seen)
+		}
+	}
+
+	const failedRig = "trackedinitfail"
+	if _, err := db.Exec("DROP DATABASE IF EXISTS `" + failedRig + "`"); err != nil {
+		t.Fatalf("clear failed-init database: %v", err)
+	}
+	if _, err := db.Exec("CREATE DATABASE `" + failedRig + "`"); err != nil {
+		t.Fatalf("seed failed-init database: %v", err)
+	}
+	defer func() { _, _ = db.Exec("DROP DATABASE IF EXISTS `" + failedRig + "`") }()
+	initMarker := filepath.Join(t.TempDir(), "bd-init-called")
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	bdScript := "#!/bin/sh\n[ -n \"$BD_INIT_MARKER\" ] && : > \"$BD_INIT_MARKER\"\nexit 0\n"
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd shim: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_INIT_MARKER", initMarker)
+	if _, err := mgr.AddRig(rig.AddRigOptions{Name: failedRig, GitURL: gitURL, BeadsPrefix: prefix}); err == nil {
+		t.Fatal("AddRig succeeded after central database initialization failed")
+	}
+	if _, err := os.Stat(initMarker); !os.IsNotExist(err) {
+		t.Fatalf("tracked bd init ran after central initialization failure: %v", err)
+	}
+	failedBeadsDir := filepath.Join(townRoot, failedRig, "mayor", "rig", ".beads")
+	for _, dir := range []string{"dolt", "embeddeddolt"} {
+		if _, err := os.Stat(filepath.Join(failedBeadsDir, dir)); !os.IsNotExist(err) {
+			t.Fatalf("failed tracked rig created embedded Dolt store %q: %v", dir, err)
+		}
 	}
 }
 
