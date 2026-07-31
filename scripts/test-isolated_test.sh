@@ -77,7 +77,7 @@ if (
     GT_DOLT_PORT=45123 BEADS_DOLT_PORT=45123 BEADS_DOLT_SERVER_PORT=45123 \
     GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER"
 ); then
-  expected=$'GT_DOLT_PORT=44001\nBEADS_DOLT_PORT=44001\nBEADS_DOLT_SERVER_PORT=44001\nGT_TEST_DOLT_PORT=\nGT_TEST_ISOLATED=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_CONFIG_SYSTEM=/dev/null\numask=0022\nargs=test -p 1 ./...'
+  expected=$'GT_DOLT_PORT=44001\nBEADS_DOLT_PORT=44001\nBEADS_DOLT_SERVER_PORT=44001\nGT_TEST_DOLT_PORT=\nGT_TEST_ISOLATED=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_CONFIG_SYSTEM=/dev/null\numask=0022\nargs=test -timeout=15m -p 1 ./...'
   [[ "$(cat "$CAPTURE")" == "$expected" ]] && \
     pass "quarantines inherited Dolt selectors" || \
     fail "quarantines inherited Dolt selectors"

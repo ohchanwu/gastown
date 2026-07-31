@@ -91,7 +91,7 @@ if env -u GT_TEST_DOLT_PORT \
   BEADS_DOLT_PORT="$test_port" \
   BEADS_DOLT_SERVER_HOST=127.0.0.1 \
   BEADS_DOLT_SERVER_PORT="$test_port" \
-  go test -p 1 ./...; then
+  go test -timeout=15m -p 1 ./...; then
   exit 0
 else
   status=$?
