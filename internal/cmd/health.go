@@ -20,18 +20,22 @@ import (
 )
 
 var (
-	healthJSON bool
+	healthJSON                   bool
+	checkServerHealthForCommand  = checkServerHealth
+	checkProcessHealthForCommand = checkProcessHealth
+	collectControlPlaneHealth    = health.CollectControlPlaneWithDoltEvidence
 )
 
 // HealthReport is the machine-readable output of gt health --json.
 type HealthReport struct {
-	Timestamp string            `json:"timestamp"`
-	Server    *ServerHealth     `json:"server"`
-	Databases []DatabaseHealth  `json:"databases"`
-	Pollution []PollutionRecord `json:"pollution,omitempty"`
-	Backups   *BackupHealth     `json:"backups"`
-	Processes *ProcessHealth    `json:"processes"`
-	Orphans   []OrphanDB        `json:"orphans,omitempty"`
+	Timestamp    string                      `json:"timestamp"`
+	Server       *ServerHealth               `json:"server"`
+	Databases    []DatabaseHealth            `json:"databases"`
+	Pollution    []PollutionRecord           `json:"pollution,omitempty"`
+	Backups      *BackupHealth               `json:"backups"`
+	Processes    *ProcessHealth              `json:"processes"`
+	Orphans      []OrphanDB                  `json:"orphans,omitempty"`
+	ControlPlane *health.ControlPlaneVerdict `json:"control_plane"`
 }
 
 type ServerHealth struct {
@@ -117,7 +121,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// 1. Dolt Server
-	report.Server = checkServerHealth(townRoot)
+	report.Server = checkServerHealthForCommand(townRoot)
 
 	// 2. Databases (only if server is running)
 	if report.Server.Running {
@@ -133,18 +137,34 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	report.Backups = checkBackupHealth(townRoot)
 
 	// 5. Processes
-	report.Processes = checkProcessHealth(townRoot)
+	report.Processes = checkProcessHealthForCommand(townRoot)
 
 	// 6. Orphans
 	report.Orphans = checkOrphanDBs(townRoot)
 
+	verdict, err := collectControlPlaneHealth(townRoot, resolveCommitHash(), report.Processes.ActionableCount, report.Server.Running)
+	if err != nil {
+		return fmt.Errorf("control-plane health evidence unavailable")
+	}
+	report.ControlPlane = &verdict
+
 	if healthJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(report)
+		if err := enc.Encode(report); err != nil {
+			return err
+		}
+	} else {
+		printHealthReport(report)
 	}
 
-	printHealthReport(report)
+	if !verdict.Healthy {
+		subsystems := make([]string, 0, len(verdict.Failures))
+		for _, failure := range verdict.Failures {
+			subsystems = append(subsystems, failure.Subsystem)
+		}
+		return fmt.Errorf("control plane unhealthy: %s", strings.Join(subsystems, ", "))
+	}
 	return nil
 }
 
@@ -425,6 +445,16 @@ func printHealthReport(r *HealthReport) {
 	} else {
 		for _, o := range r.Orphans {
 			fmt.Printf("  %s %s (%s)\n", style.Bold.Render("!"), o.Name, o.Size)
+		}
+	}
+
+	// 7. Control plane
+	fmt.Printf("\n%s Control Plane\n", style.Bold.Render("●"))
+	if r.ControlPlane != nil && r.ControlPlane.Healthy {
+		fmt.Printf("  %s Evidence-backed checks healthy\n", style.Bold.Render("✓"))
+	} else if r.ControlPlane != nil {
+		for _, failure := range r.ControlPlane.Failures {
+			fmt.Printf("  %s %s; next: %s\n", style.Bold.Render("!"), failure.Subsystem, failure.Diagnostic)
 		}
 	}
 

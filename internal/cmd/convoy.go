@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	convoyops "github.com/steveyegge/gastown/internal/convoy"
+	"github.com/steveyegge/gastown/internal/health"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -98,6 +99,11 @@ var (
 	convoyLandKeep     bool
 	convoyLandDryRun   bool
 	convoyFromEpic     string
+)
+
+var (
+	checkCompletedConvoysForCommand = checkCompletedConvoys
+	writeConvoyCheckHealthEvidence  = health.WriteConvoyCheckEvidence
 )
 
 const (
@@ -1186,9 +1192,16 @@ func runConvoyCheck(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	// Check all open convoys.
-	summary, err := checkCompletedConvoys(ctx, townBeads, convoyCheckDryRun, convoyCheckJSON)
+	startedAt := time.Now()
+	summary, err := checkCompletedConvoysForCommand(ctx, townBeads, convoyCheckDryRun, convoyCheckJSON)
 	if err != nil {
 		return err
+	}
+	if _, err := writeConvoyCheckHealthEvidence(townBeads, health.ConvoyCheckState{
+		SchemaVersion: 1, CheckedAt: time.Now(), DurationMS: time.Since(startedAt).Milliseconds(),
+		TimedOut: summary.TimedOut, SkippedUncertain: summary.SkippedUncertain,
+	}); err != nil {
+		return fmt.Errorf("recording convoy health evidence failed")
 	}
 	if convoyCheckJSON {
 		enc := json.NewEncoder(os.Stdout)

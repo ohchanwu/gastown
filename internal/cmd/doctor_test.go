@@ -10,3 +10,13 @@ func TestDoctorDoesNotRegisterDoltConfigCheck(t *testing.T) {
 		}
 	}
 }
+
+func TestDoctorRegistersControlPlaneHealthCheck(t *testing.T) {
+	d := newDoctorForCommand("")
+	for _, check := range d.Checks() {
+		if check.Name() == "control-plane-health" {
+			return
+		}
+	}
+	t.Fatal("control-plane-health check is not registered")
+}
