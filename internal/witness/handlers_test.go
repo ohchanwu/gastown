@@ -14,6 +14,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -166,7 +167,7 @@ func readMayorEvents(t *testing.T, townRoot string) []testMayorEvent {
 func TestNotifyMayorSlotOpen_BlocksNonCompletedExit(t *testing.T) {
 	townRoot, workDir := setupSlotOpenTestTown(t)
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeDeferred))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeDeferred), nil)
 
 	events := readMayorEvents(t, townRoot)
 	if len(events) != 1 {
@@ -209,7 +210,7 @@ func TestNotifyMayorSlotOpen_SchedulerDispatchSuppressesMayor(t *testing.T) {
 		return slotOpenSchedulerResult{Dispatched: 1}, nil
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	if !called {
 		t.Fatal("scheduler trigger was not called")
@@ -248,7 +249,7 @@ func TestNotifyMayorSlotOpen_DispatchThenEmptyEmitsSchedulerOpen(t *testing.T) {
 		return result, nil
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	events := readMayorEvents(t, townRoot)
 	if len(events) != 1 {
@@ -282,7 +283,7 @@ func TestNotifyMayorSlotOpen_DispatchWithStatusErrorSuppressesMayor(t *testing.T
 		return slotOpenSchedulerResult{Dispatched: 1}, errors.New("status read failed")
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	if events := readMayorEvents(t, townRoot); len(events) != 0 {
 		t.Fatalf("events = %+v, want none after confirmed dispatch", events)
@@ -316,7 +317,7 @@ func TestNotifyMayorSlotOpen_EmitsSchedulerOpenWhenQueueEmpty(t *testing.T) {
 		return result, nil
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	events := readMayorEvents(t, townRoot)
 	if len(events) != 1 {
@@ -359,7 +360,7 @@ func TestNotifyMayorSlotOpen_QueuedReadyWithoutDispatchFallsBack(t *testing.T) {
 		return result, nil
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	events := readMayorEvents(t, townRoot)
 	if len(events) != 1 {
@@ -367,6 +368,68 @@ func TestNotifyMayorSlotOpen_QueuedReadyWithoutDispatchFallsBack(t *testing.T) {
 	}
 	if events[0].Type != "SLOT_OPEN" {
 		t.Fatalf("event type = %q, want SLOT_OPEN", events[0].Type)
+	}
+}
+
+func TestNotifyMayorSlotOpen_UnverifiedNotificationKeepsDurableHighPriorityMail(t *testing.T) {
+	townRoot, workDir := setupSlotOpenTestTown(t)
+
+	prevRecovery := slotOpenRecoveryCheck
+	prevDecision := slotOpenDecisionForNotify
+	prevScheduler := runSchedulerForSlotOpen
+	prevSend := mayorRouterSend
+	prevWait := mayorRouterWait
+	t.Cleanup(func() {
+		slotOpenRecoveryCheck = prevRecovery
+		slotOpenDecisionForNotify = prevDecision
+		runSchedulerForSlotOpen = prevScheduler
+		mayorRouterSend = prevSend
+		mayorRouterWait = prevWait
+	})
+
+	slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+		return `{"verdict":"SAFE_TO_NUKE"}`, nil
+	}
+	slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+		return polecat.SlotReuseDecision{Reusable: true}
+	}
+	runSchedulerForSlotOpen = func(string) (slotOpenSchedulerResult, error) {
+		var result slotOpenSchedulerResult
+		result.Before.Capacity.Max = 10
+		result.Before.Capacity.Free = 1
+		result.Before.QueuedReady = 1
+		return result, nil
+	}
+
+	var sent []*mail.Message
+	mayorRouterSend = func(_ *mail.Router, msg *mail.Message) error {
+		copy := *msg
+		sent = append(sent, &copy)
+		return nil
+	}
+	mayorRouterWait = func(*mail.Router) error { return mail.ErrNotificationQueued }
+
+	outcome, err := notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
+	if err != nil {
+		t.Fatalf("notifyMayorSlotOpen() error = %v", err)
+	}
+	if outcome != MayorNotificationQueued {
+		t.Fatalf("outcome = %q, want %q", outcome, MayorNotificationQueued)
+	}
+	if len(sent) != 1 {
+		t.Fatalf("durable mail count = %d, want 1", len(sent))
+	}
+	if sent[0].To != "mayor/" || sent[0].Priority != mail.PriorityHigh || sent[0].Type != mail.TypeNotification || sent[0].Wisp {
+		t.Fatalf("durable Mayor mail = %+v, want high-priority non-wisp", sent[0])
+	}
+	if events := readMayorEvents(t, townRoot); len(events) != 1 || events[0].Type != "SLOT_OPEN" {
+		t.Fatalf("events = %+v, want one SLOT_OPEN", events)
+	}
+
+	mayorRouterSend = func(*mail.Router, *mail.Message) error { return errors.New("private-branch-marker") }
+	_, err = DeliverMayorNotification(mail.NewRouterWithTownRoot(workDir, townRoot), "private-subject-marker", "private-body-marker")
+	if err == nil || strings.Contains(err.Error(), "private-") {
+		t.Fatalf("storage error = %q, want sanitized error", err)
 	}
 }
 
@@ -401,7 +464,7 @@ func TestNotifyMayorSlotOpen_NoDispatchAfterCapacityFillsSuppressesMayor(t *test
 		return result, nil
 	}
 
-	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted), nil)
 
 	if events := readMayorEvents(t, townRoot); len(events) != 0 {
 		t.Fatalf("events = %+v, want none when scheduler no longer has capacity", events)
@@ -2369,9 +2432,119 @@ func TestProcessDiscoveredCompletion_PhaseComplete(t *testing.T) {
 		Exit:        "PHASE_COMPLETE",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, nil)
 	if discovery.Action != "phase-complete" {
 		t.Errorf("Action = %q, want %q", discovery.Action, "phase-complete")
+	}
+}
+
+func TestProcessDiscoveredCompletion_PushFailedRecordsQueuedMayorMail(t *testing.T) {
+	_, workDir := setupSlotOpenTestTown(t)
+	prevSend := mayorRouterSend
+	prevWait := mayorRouterWait
+	t.Cleanup(func() {
+		mayorRouterSend = prevSend
+		mayorRouterWait = prevWait
+	})
+
+	var sent []*mail.Message
+	mayorRouterSend = func(_ *mail.Router, msg *mail.Message) error {
+		copy := *msg
+		sent = append(sent, &copy)
+		return nil
+	}
+	mayorRouterWait = func(*mail.Router) error { return mail.ErrNotificationQueued }
+
+	payload := &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        "COMPLETED",
+		IssueID:     "issue-1",
+		Branch:      "work-branch",
+		PushFailed:  true,
+	}
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion(DefaultBdCli(), workDir, "gastown", payload, discovery, nil)
+
+	if discovery.Error != nil {
+		t.Fatalf("processDiscoveredCompletion() error = %v", discovery.Error)
+	}
+	if !strings.Contains(discovery.Action, "mayor-notification=queued") {
+		t.Fatalf("Action = %q, want queued Mayor outcome", discovery.Action)
+	}
+	if len(sent) != 1 || sent[0].Priority != mail.PriorityHigh || sent[0].Wisp {
+		t.Fatalf("durable Mayor mail = %+v, want one high-priority non-wisp", sent)
+	}
+}
+
+func TestDiscoverCompletions_WakeFailureStoresMayorMailOnceAcrossReplay(t *testing.T) {
+	townRoot, workDir := setupSlotOpenTestTown(t)
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "polecats", "nux"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	currentDescription := beads.FormatAgentDescription("Agent: gastown/polecats/nux", &beads.AgentFields{
+		RoleType: "polecat", Rig: "gastown", AgentState: "idle", LastSourceIssue: "issue-1",
+		ExitType: "COMPLETED", Branch: "private-branch", PushFailed: true, CompletionTime: "2026-08-01T00:00:00Z",
+	})
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			if len(args) == 0 || args[0] != "show" {
+				return "[]", nil
+			}
+			data, err := json.Marshal([]map[string]string{{"title": "Agent: gastown/polecats/nux", "description": currentDescription}})
+			return string(data), err
+		},
+		func(args []string) error {
+			for i := range args {
+				if args[i] == "--description" && i+1 < len(args) {
+					currentDescription = args[i+1]
+					return nil
+				}
+			}
+			return errors.New("missing sanitized description")
+		},
+	)
+
+	prevSend := mayorRouterSend
+	prevWait := mayorRouterWait
+	t.Cleanup(func() {
+		mayorRouterSend = prevSend
+		mayorRouterWait = prevWait
+	})
+	durableRecords := 0
+	mayorRouterSend = func(*mail.Router, *mail.Message) error {
+		durableRecords++
+		return nil
+	}
+	mayorRouterWait = func(*mail.Router) error { return errors.New("private-session private-path") }
+
+	first := DiscoverCompletions(bd, workDir, "gastown", nil)
+	second := DiscoverCompletions(bd, workDir, "gastown", nil)
+	if len(first.Discovered) != 1 || first.Discovered[0].Error != nil || !strings.Contains(first.Discovered[0].Action, "mayor-notification=wake-failed") {
+		t.Fatalf("first discovery = %+v, want durable wake-failed outcome", first.Discovered)
+	}
+	if len(second.Discovered) != 0 {
+		t.Fatalf("replayed discoveries = %+v, want none after metadata clear", second.Discovered)
+	}
+	if durableRecords != 1 {
+		t.Fatalf("durable Mayor records = %d, want exactly 1 across replay", durableRecords)
+	}
+}
+
+func TestDeliverMayorNotification_PartialFailureIsWakeFailed(t *testing.T) {
+	prevSend := mayorRouterSend
+	prevWait := mayorRouterWait
+	t.Cleanup(func() {
+		mayorRouterSend = prevSend
+		mayorRouterWait = prevWait
+	})
+	mayorRouterSend = func(*mail.Router, *mail.Message) error { return nil }
+	mayorRouterWait = func(*mail.Router) error {
+		return errors.Join(mail.ErrNotificationQueued, mail.ErrNotificationFailed)
+	}
+
+	outcome, err := DeliverMayorNotification(mail.NewRouterWithTownRoot(t.TempDir(), t.TempDir()), "subject", "body")
+	if err != nil || outcome != MayorNotificationWakeFailed {
+		t.Fatalf("DeliverMayorNotification(partial failure) = %q, %v; want wake-failed, nil", outcome, err)
 	}
 }
 
@@ -2383,7 +2556,7 @@ func TestProcessDiscoveredCompletion_NoMR(t *testing.T) {
 		MRFailed:    true, // Prevents fallback MR lookup
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, nil)
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q", discovery.Action, "acknowledged-idle")
 	}
@@ -2396,7 +2569,7 @@ func TestProcessDiscoveredCompletion_EscalatedNoMR(t *testing.T) {
 		Exit:        "ESCALATED",
 	}
 	discovery := &CompletionDiscovery{}
-	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery)
+	processDiscoveredCompletion(DefaultBdCli(), "/tmp", "testrig", payload, discovery, nil)
 	if !strings.Contains(discovery.Action, "acknowledged-idle") {
 		t.Errorf("Action = %q, want to contain %q for ESCALATED exit", discovery.Action, "acknowledged-idle")
 	}

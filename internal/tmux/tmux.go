@@ -19,6 +19,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/telemetry"
 )
 
@@ -182,6 +183,14 @@ func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 // Tmux wraps tmux operations.
 type Tmux struct {
 	socketName string // tmux socket name (-L flag), empty = default socket
+	commandEnv []string
+	leaseMu    sync.Mutex
+	nudgeLease *nudgeLease
+}
+
+type nudgeLease struct {
+	townRoot string
+	session  string
 }
 
 // noTownSocket is a sentinel socket name used when no town socket is configured.
@@ -217,6 +226,68 @@ func NewTmuxWithSocket(socket string) *Tmux {
 	return &Tmux{socketName: socket}
 }
 
+// NewTmuxWithSocketAndEnv creates an isolated tmux client whose server and
+// panes cannot inherit ambient process routing such as live Dolt endpoints.
+func NewTmuxWithSocketAndEnv(socket string, env []string) *Tmux {
+	return &Tmux{socketName: socket, commandEnv: append([]string(nil), env...)}
+}
+
+// IsIsolated reports whether this client targets a dedicated tmux socket.
+func (t *Tmux) IsIsolated() bool { return t != nil && t.socketName != "" }
+
+// NudgeLockAvailable proves no other process or goroutine currently owns the
+// target's nudge lock without retaining the lock after the check.
+func NudgeLockAvailable(townRoot, session string) bool {
+	unlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), 0)
+	if err != nil {
+		return false
+	}
+	unlock()
+	if !acquireNudgeLock(session, 0) {
+		return false
+	}
+	releaseNudgeLock(session)
+	return true
+}
+
+// AcquireNudgeLease retains exclusive ownership while a multi-step delivery
+// proof runs. Calls made through this Tmux instance reuse the held lease.
+func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
+	t.leaseMu.Lock()
+	defer t.leaseMu.Unlock()
+	if t.nudgeLease != nil {
+		return nil, fmt.Errorf("nudge lease already held for session %q", t.nudgeLease.session)
+	}
+	unlockFlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), nudgeLockTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if !acquireNudgeLock(session, nudgeLockTimeout) {
+		unlockFlock()
+		return nil, fmt.Errorf("nudge lock timeout for session %q", session)
+	}
+	lease := &nudgeLease{townRoot: townRoot, session: session}
+	t.nudgeLease = lease
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.leaseMu.Lock()
+			if t.nudgeLease == lease {
+				t.nudgeLease = nil
+			}
+			t.leaseMu.Unlock()
+			releaseNudgeLock(session)
+			unlockFlock()
+		})
+	}, nil
+}
+
+func (t *Tmux) ownsNudgeLease(townRoot, session string) bool {
+	t.leaseMu.Lock()
+	defer t.leaseMu.Unlock()
+	return t.nudgeLease != nil && t.nudgeLease.townRoot == townRoot && t.nudgeLease.session == session
+}
+
 // run executes a tmux command and returns stdout.
 // All commands include -u flag for UTF-8 support regardless of locale settings.
 // See: https://github.com/steveyegge/gastown/issues/1219
@@ -231,6 +302,9 @@ func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
 	}
 	allArgs = append(allArgs, args...)
 	cmd := exec.CommandContext(ctx, "tmux", allArgs...)
+	if t.commandEnv != nil {
+		cmd.Env = t.commandEnv
+	}
 	hideConsoleWindow(cmd)
 	return cmd
 }
@@ -1346,6 +1420,14 @@ func getSessionNudgeSem(session string) chan struct{} {
 // Returns true if the lock was acquired, false if the timeout expired.
 func acquireNudgeLock(session string, timeout time.Duration) bool {
 	sem := getSessionNudgeSem(session)
+	if timeout <= 0 {
+		select {
+		case sem <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
 	select {
 	case sem <- struct{}{}:
 		return true
@@ -1371,10 +1453,52 @@ func nudgeFlockPath(townRoot, session string) string {
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
+const clientAttachmentLatch = "@gt-canary-client-attached"
+
+func (t *Tmux) sessionAttached(target string) (bool, error) {
+	attached, err := t.run("display-message", "-t", target, "-p", "#{session_attached}")
+	if err != nil {
+		return false, err
+	}
+	return attached == "1", nil
+}
+
 // IsSessionAttached returns true if the session has any clients attached.
 func (t *Tmux) IsSessionAttached(target string) bool {
-	attached, err := t.run("display-message", "-t", target, "-p", "#{session_attached}")
-	return err == nil && attached == "1"
+	attached, err := t.sessionAttached(target)
+	return err == nil && attached
+}
+
+// ArmClientAttachmentLatch records every subsequent client attachment on this
+// dedicated server, including clients that detach before the next inspection.
+func (t *Tmux) ArmClientAttachmentLatch(target string) error {
+	if _, err := t.run("set-option", "-g", clientAttachmentLatch, "0"); err != nil {
+		return err
+	}
+	if _, err := t.run("set-hook", "-g", "client-attached", "set-option -g "+clientAttachmentLatch+" 1"); err != nil {
+		return err
+	}
+	attached, err := t.sessionAttached(target)
+	if err != nil {
+		return err
+	}
+	if attached {
+		return fmt.Errorf("tmux session %q already has an attached client", target)
+	}
+	return nil
+}
+
+// ClientAttachmentObserved fails closed if attachment state cannot be read.
+func (t *Tmux) ClientAttachmentObserved(target string) (bool, error) {
+	attached, err := t.sessionAttached(target)
+	if err != nil {
+		return false, err
+	}
+	latched, err := t.run("show-options", "-gv", clientAttachmentLatch)
+	if err != nil {
+		return false, err
+	}
+	return attached || strings.TrimSpace(latched) == "1", nil
 }
 
 // WakePane triggers a SIGWINCH in a pane by resizing it slightly then restoring.
@@ -1715,7 +1839,19 @@ type NudgeOpts struct {
 	// <townRoot>/.runtime/nudge_queue/<session>/.lock before delivery.
 	// When empty, only in-process locking is used (backward-compatible).
 	TownRoot string
+
+	// DeliveryID binds runtime proof to one durable queue record.
+	DeliveryID string
+
+	receipt *SubmissionReceipt
 }
+
+type SubmissionReceipt = delivery.SubmissionReceipt
+
+var (
+	submissionReceiptTimeout      = 3 * time.Second
+	submissionReceiptPollInterval = 25 * time.Millisecond
+)
 
 // canonicalPaneTarget converts a pane identifier like "%23" into an explicit
 // tmux session:window.pane target. If the pane is stale or resolves outside the
@@ -1780,7 +1916,8 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// channel semaphore below provides no cross-process protection. Without
 	// this, concurrent nudges interleave send-keys/Enter and produce garbled
 	// or empty input. (GH#gt-ukl8)
-	if opts.TownRoot != "" {
+	ownsLease := t.ownsNudgeLease(opts.TownRoot, session)
+	if opts.TownRoot != "" && !ownsLease {
 		lockPath := nudgeFlockPath(opts.TownRoot, session)
 		unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
 		if err != nil {
@@ -1790,10 +1927,12 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	}
 
 	// In-process lock: serialize nudges within a single process (goroutine fast path).
-	if !acquireNudgeLock(session, nudgeLockTimeout) {
-		return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+	if !ownsLease {
+		if !acquireNudgeLock(session, nudgeLockTimeout) {
+			return fmt.Errorf("nudge lock timeout for session %q: previous nudge may be hung", session)
+		}
+		defer releaseNudgeLock(session)
 	}
-	defer releaseNudgeLock(session)
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
@@ -1838,6 +1977,10 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
 		return err
 	}
+	if opts.receipt != nil {
+		opts.receipt.Typed = true
+		opts.receipt.TypedAt = time.Now()
+	}
 
 	// 4. Adaptive post-text delay: scales with message length to give tmux
 	// enough time to process all chunks under load. (GH#gt-0b5)
@@ -1871,7 +2014,8 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	if err := t.submitComposer(target, sanitized, readyPromptPrefixForSession(t, session)); err != nil {
+	promptPrefix, requireProof := submissionPromptForSession(t, session)
+	if err := t.submitComposer(target, sanitized, promptPrefix, requireProof); err != nil {
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
@@ -1884,6 +2028,44 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// delivered nudge. Targeting the resolved pane wakes the correct window.
 	t.WakePaneIfDetached(target)
 	return nil
+}
+
+// NudgeSessionWithReceipt delivers a nudge and reports how far it reached.
+func (t *Tmux) NudgeSessionWithReceipt(session, message string, opts NudgeOpts) (SubmissionReceipt, error) {
+	receipt := SubmissionReceipt{Session: session, DeliveryID: opts.DeliveryID}
+	if opts.DeliveryID == "" {
+		return receipt, fmt.Errorf("%w (delivery ID is required)", ErrSubmitNotVerified)
+	}
+	runtimeName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || runtimeName != string(config.AgentCodex) {
+		return receipt, fmt.Errorf("%w: %q", ErrSubmitVerifierUnsupported, runtimeName)
+	}
+	if opts.TownRoot == "" {
+		return receipt, fmt.Errorf("%w (town root is required for runtime receipt)", ErrSubmitNotVerified)
+	}
+
+	baseline := time.Now()
+	opts.receipt = &receipt
+	if err := t.NudgeSessionWithOpts(session, delivery.ControlMessage(opts.DeliveryID, message), opts); err != nil {
+		return receipt, err
+	}
+
+	deadline := time.Now().Add(submissionReceiptTimeout)
+	for {
+		matched, ok, findErr := delivery.FindSubmittedAfter(opts.TownRoot, session, opts.DeliveryID, baseline)
+		if findErr != nil {
+			return receipt, fmt.Errorf("%w (reading runtime receipt: %v)", ErrSubmitNotVerified, findErr)
+		}
+		if ok {
+			matched.Typed = receipt.Typed
+			matched.TypedAt = receipt.TypedAt
+			return matched, nil
+		}
+		if !time.Now().Before(deadline) {
+			return receipt, fmt.Errorf("%w (no matching post-baseline runtime receipt)", ErrSubmitNotVerified)
+		}
+		time.Sleep(submissionReceiptPollInterval)
+	}
 }
 
 // NudgePane sends a message to a specific pane reliably.
@@ -1944,7 +2126,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 7. Submit with verification — confirms Enter was processed and the
 	// message actually left the composer instead of being stranded by a
 	// swallowed carriage return. (GH#gt-0b5, PR #4461 replacement)
-	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix); err != nil {
+	if err := t.submitComposer(pane, sanitized, DefaultReadyPromptPrefix, false); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
@@ -3359,17 +3541,21 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 	return shouldSendEscapeForLines(lines)
 }
 
-func readyPromptPrefixForSession(t *Tmux, session string) string {
-	promptPrefix := DefaultReadyPromptPrefix
+func submissionPromptForSession(t *Tmux, session string) (string, bool) {
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
 	if err != nil || agentName == "" {
-		return promptPrefix
+		return DefaultReadyPromptPrefix, false
 	}
 	preset := config.GetAgentPresetByName(agentName)
 	if preset == nil || preset.ReadyPromptPrefix == "" {
-		return promptPrefix
+		return DefaultReadyPromptPrefix, false
 	}
-	return preset.ReadyPromptPrefix
+	return preset.ReadyPromptPrefix, true
+}
+
+func readyPromptPrefixForSession(t *Tmux, session string) string {
+	promptPrefix, _ := submissionPromptForSession(t, session)
+	return promptPrefix
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {

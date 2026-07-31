@@ -1536,7 +1536,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// Mail dispatcher with READY_FOR_REVIEW
 				if dispatcher := attachmentFields.DispatchedBy; dispatcher != "" {
 					townRouter := mail.NewRouter(townRoot)
-					defer townRouter.WaitPendingNotifications()
+					defer waitForMailNotifications(townRouter)
 					reviewBody := fmt.Sprintf("Branch: %s\nIssue: %s\nReady for review.", branch, issueID)
 					if prURL != "" {
 						reviewBody = fmt.Sprintf("Branch: %s\nIssue: %s\nPR: %s\nReady for review.", branch, issueID, prURL)
@@ -2037,7 +2037,7 @@ func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
 	}
 
 	router := mail.NewRouter(townRoot)
-	defer router.WaitPendingNotifications()
+	defer waitForMailNotifications(router)
 	msg := &mail.Message{
 		To:      fmt.Sprintf("%s/witness", rigName),
 		From:    sender,

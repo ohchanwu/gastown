@@ -12,6 +12,10 @@ import (
 // transport could not prove it left the target composer.
 var ErrSubmitNotVerified = errors.New("submit not verified: message stranded in composer")
 
+// ErrSubmitVerifierUnsupported reports that the target runtime has no trusted
+// hook receipt capable of proving a new model turn accepted the message.
+var ErrSubmitVerifierUnsupported = errors.New("submit verifier unsupported for runtime")
+
 type submitProbe int
 
 const (
@@ -282,7 +286,7 @@ func (t *Tmux) pollSubmission(target, needle, promptPrefix string, attempts int)
 	return last
 }
 
-func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
+func (t *Tmux) submitComposer(target, message, promptPrefix string, requireProof bool) error {
 	enterErr := t.sendEnterVerified(target)
 	needle := submitNeedle(message)
 	if needle == "" {
@@ -293,7 +297,13 @@ func (t *Tmux) submitComposer(target, message, promptPrefix string) error {
 	case probeTurnStarted, probeComposerCleared:
 		return nil
 	case probeUnknown:
-		return enterErr
+		if enterErr != nil {
+			return enterErr
+		}
+		if requireProof {
+			return fmt.Errorf("%w (runtime state could not be observed after Enter)", ErrSubmitNotVerified)
+		}
+		return nil
 	case probeComposerDirty:
 		return fmt.Errorf("%w (composer contains other text after Enter)", ErrSubmitNotVerified)
 	case probeStranded:

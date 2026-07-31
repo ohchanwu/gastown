@@ -81,6 +81,9 @@ type SessionConfig struct {
 	// These are set in the tmux session environment after the standard vars.
 	ExtraEnv map[string]string
 
+	// StripEnvPrefixes removes inherited routing variables after AgentEnv is built.
+	StripEnvPrefixes []string
+
 	// Theme is the tmux theme to apply. Nil means no theme is applied.
 	Theme *tmux.Theme
 
@@ -214,6 +217,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	for k, v := range cfg.ExtraEnv {
 		envVars[k] = v
 	}
+	stripSessionEnvPrefixes(envVars, cfg.StripEnvPrefixes)
 
 	// 5. Create tmux session with command and env vars via -e flags so the
 	// initial shell — and the agent's subprocesses — inherit them from the start.
@@ -458,6 +462,17 @@ func KillExistingSession(t *tmux.Tmux, sessionID string, checkAlive bool) (bool,
 }
 
 // buildPrompt creates the startup prompt from beacon + instructions.
+func stripSessionEnvPrefixes(env map[string]string, prefixes []string) {
+	for key := range env {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(key, prefix) {
+				delete(env, key)
+				break
+			}
+		}
+	}
+}
+
 func buildPrompt(cfg SessionConfig) string {
 	if cfg.Instructions != "" {
 		return BuildStartupPrompt(cfg.Beacon, cfg.Instructions)

@@ -30,6 +30,28 @@ var ErrUnknownQueue = errors.New("unknown queue")
 // ErrUnknownAnnounce indicates an announce channel name was not found in configuration.
 var ErrUnknownAnnounce = errors.New("unknown announce channel")
 
+// ErrNotificationQueued means durable mail succeeded but the wake notification
+// is awaiting a runtime-proven retry.
+var ErrNotificationQueued = errors.New("mail notification queued")
+
+// ErrNotificationFailed means durable mail succeeded but one or more wake
+// notifications could neither be submitted nor queued.
+var ErrNotificationFailed = errors.New("mail notification failed")
+
+type notificationResultError struct {
+	submitted int
+	queued    int
+	failed    int
+}
+
+func (e *notificationResultError) Error() string {
+	return fmt.Sprintf("mail notification result: submitted=%d queued=%d failed=%d", e.submitted, e.queued, e.failed)
+}
+
+func (e *notificationResultError) Is(target error) bool {
+	return (target == ErrNotificationQueued && e.queued > 0) || (target == ErrNotificationFailed && e.failed > 0)
+}
+
 // DefaultIdleNotifyTimeout is how long the router waits for a recipient's
 // session to become idle before falling back to a queued nudge.
 const DefaultIdleNotifyTimeout = 3 * time.Second
@@ -47,7 +69,9 @@ type Router struct {
 	// idle before falling back to a queued nudge. Zero uses the default.
 	IdleNotifyTimeout time.Duration
 
-	notifyWg sync.WaitGroup // tracks in-flight async notifications
+	notifyWg   sync.WaitGroup // tracks in-flight async notifications
+	notifyMu   sync.Mutex
+	notifyErrs []error
 }
 
 // NewRouter creates a new mail router.
@@ -73,11 +97,46 @@ func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 	}
 }
 
+// NewRouterWithTownRootAndTmux creates a router on a dedicated tmux transport.
+// It is used by isolated canaries so they cannot address a live town session.
+func NewRouterWithTownRootAndTmux(workDir, townRoot string, transport *tmux.Tmux) *Router {
+	return &Router{workDir: workDir, townRoot: townRoot, tmux: transport}
+}
+
 // WaitPendingNotifications blocks until all in-flight async notifications
 // have completed. CLI commands should call this before exiting to avoid
 // losing notifications that are still being delivered.
-func (r *Router) WaitPendingNotifications() {
+func (r *Router) WaitPendingNotifications() error {
 	r.notifyWg.Wait()
+	r.notifyMu.Lock()
+	defer r.notifyMu.Unlock()
+	result := &notificationResultError{}
+	for _, err := range r.notifyErrs {
+		var notificationErr *notificationResultError
+		if errors.As(err, &notificationErr) {
+			result.submitted += notificationErr.submitted
+			result.queued += notificationErr.queued
+			result.failed += notificationErr.failed
+		} else if errors.Is(err, ErrNotificationQueued) {
+			result.queued++
+		} else {
+			result.failed++
+		}
+	}
+	r.notifyErrs = nil
+	if result.queued == 0 && result.failed == 0 {
+		return nil
+	}
+	return result
+}
+
+func (r *Router) recordNotificationResult(err error) {
+	if err == nil {
+		return
+	}
+	r.notifyMu.Lock()
+	r.notifyErrs = append(r.notifyErrs, err)
+	r.notifyMu.Unlock()
 }
 
 // isListAddress returns true if the address uses list:name syntax.
@@ -1202,7 +1261,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 		r.notifyWg.Add(1)
 		go func() {
 			defer r.notifyWg.Done()
-			r.notifyRecipient(&msgCopy) //nolint:errcheck
+			r.recordNotificationResult(r.notifyRecipient(&msgCopy))
 		}()
 	}
 
@@ -1617,6 +1676,7 @@ func (r *Router) notifyRecipient(msg *Message) error {
 	notification := formatNotificationMessage(msg)
 	priority := nudgePriorityForMailPriority(msg.Priority)
 	notified := 0
+	queuedCount := 0
 	var errs []string
 	noTmuxServer := false
 
@@ -1659,18 +1719,38 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		// inter-tool-call gaps. See: https://github.com/steveyegge/gastown/issues/2032
 		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
 		if waitErr == nil {
-			// Agent is idle — deliver directly for immediate wakeup.
-			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
+			queued := nudge.QueuedNudge{
+				DeliveryID:      nudge.NewDeliveryID(),
+				Sender:          msg.From,
+				Message:         notification,
+				Priority:        priority,
+				Kind:            nudgeKindForMessage(msg),
+				ThreadID:        msg.ThreadID,
+				Severity:        prioritySeverityLabel(msg.Priority),
+				DurableUntilAck: priority == nudge.PriorityUrgent,
+			}
+			// Agent is idle — count success only after runtime-specific proof.
+			receipt, deliveryErr := r.tmux.NudgeSessionWithReceipt(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, DeliveryID: queued.DeliveryID})
+			if deliveryErr == nil && receipt.Typed && receipt.Submitted && receipt.Session == sessionID && receipt.DeliveryID == queued.DeliveryID && receipt.SubmittedAt.After(receipt.TypedAt) {
 				r.enqueueReplyReminder(msg, sessionID)
 				notified++
 				continue
-			} else if errors.Is(err, tmux.ErrSessionNotFound) {
+			} else if errors.Is(deliveryErr, tmux.ErrSessionNotFound) {
 				continue
-			} else if errors.Is(err, tmux.ErrNoServer) {
+			} else if errors.Is(deliveryErr, tmux.ErrNoServer) {
 				noTmuxServer = true
 				break
+			} else if r.townRoot != "" {
+				if queueErr := nudge.Enqueue(r.townRoot, sessionID, queued); queueErr != nil {
+					errs = append(errs, fmt.Sprintf("%s: direct=%v queue=%v", sessionID, deliveryErr, queueErr))
+					continue
+				}
+				r.enqueueReplyReminder(msg, sessionID)
+				notified++
+				queuedCount++
+				continue
 			} else {
-				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, deliveryErr))
 				continue
 			}
 		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
@@ -1682,18 +1762,20 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:          msg.From,
+				Message:         notification,
+				Priority:        priority,
+				Kind:            nudgeKindForMessage(msg),
+				ThreadID:        msg.ThreadID,
+				Severity:        prioritySeverityLabel(msg.Priority),
+				DurableUntilAck: priority == nudge.PriorityUrgent,
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
 			}
 			r.enqueueReplyReminder(msg, sessionID)
 			notified++
+			queuedCount++
 			continue
 		}
 		// No town root available — last resort direct delivery.
@@ -1719,26 +1801,27 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				continue
 			}
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
-				Sender:   msg.From,
-				Message:  notification,
-				Priority: priority,
-				Kind:     nudgeKindForMessage(msg),
-				ThreadID: msg.ThreadID,
-				Severity: prioritySeverityLabel(msg.Priority),
+				Sender:          msg.From,
+				Message:         notification,
+				Priority:        priority,
+				Kind:            nudgeKindForMessage(msg),
+				ThreadID:        msg.ThreadID,
+				Severity:        prioritySeverityLabel(msg.Priority),
+				DurableUntilAck: priority == nudge.PriorityUrgent,
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
 			}
 			notified++
+			queuedCount++
 		}
 	}
 
 	if len(errs) > 0 {
-		if notified > 0 {
-			fmt.Fprintf(os.Stderr, "Warning: mail notification partially failed: %s\n", strings.Join(errs, "; "))
-			return nil
-		}
-		return fmt.Errorf("mail notification failed: %s", strings.Join(errs, "; "))
+		return &notificationResultError{submitted: notified - queuedCount, queued: queuedCount, failed: len(errs)}
+	}
+	if queuedCount > 0 {
+		return &notificationResultError{queued: queuedCount}
 	}
 
 	return nil // No active session found

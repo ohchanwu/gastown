@@ -142,7 +142,7 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 	}
 
 	// Send the reply (defer drains async notification goroutines before CLI exits)
-	defer router.WaitPendingNotifications()
+	defer waitForMailNotifications(router)
 	if err := router.Send(reply); err != nil {
 		return fmt.Errorf("sending reply: %w", err)
 	}

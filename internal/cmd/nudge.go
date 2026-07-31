@@ -59,6 +59,35 @@ const (
 	NudgeModeWaitIdle = "wait-idle"
 )
 
+type nudgeDeliveryResult string
+
+const (
+	nudgeDeliveryQueued    nudgeDeliveryResult = "queued"
+	nudgeDeliverySubmitted nudgeDeliveryResult = "submitted"
+)
+
+func submissionReceiptMatches(receipt tmux.SubmissionReceipt, sessionName, deliveryID string, baseline time.Time) bool {
+	return deliveryID != "" && receipt.Typed && receipt.Submitted && receipt.Session == sessionName && receipt.DeliveryID == deliveryID && !receipt.SubmittedAt.Before(baseline)
+}
+
+func fallbackUrgentDelivery(townRoot, sessionName string, queued nudge.QueuedNudge, baseline time.Time, receipt tmux.SubmissionReceipt, deliveryErr error) (nudgeDeliveryResult, error) {
+	matched := submissionReceiptMatches(receipt, sessionName, queued.DeliveryID, baseline)
+	if deliveryErr == nil && matched {
+		return nudgeDeliverySubmitted, nil
+	}
+	if deliveryErr == nil {
+		deliveryErr = tmux.ErrSubmitNotVerified
+	}
+	if queued.Priority != nudge.PriorityUrgent || townRoot == "" || matched {
+		return "", deliveryErr
+	}
+	queued.DurableUntilAck = true
+	if err := nudge.Enqueue(townRoot, sessionName, queued); err != nil {
+		return "", fmt.Errorf("urgent queue fallback failed: %v (original: %w)", err, deliveryErr)
+	}
+	return nudgeDeliveryQueued, nil
+}
+
 func init() {
 	rootCmd.AddCommand(nudgeCmd)
 	nudgeCmd.Flags().StringVarP(&nudgeMessageFlag, "message", "m", "", "Message to send")
@@ -155,7 +184,7 @@ var idleWatcherPollInterval = 1 * time.Second
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
 // For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
-func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
+func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) (nudgeDeliveryResult, error) {
 	// Test hook: when GT_TEST_NUDGE_LOG is set, log the nudge instead of
 	// delivering through real tmux/queue transport. Prevents test-suite
 	// runs from delivering "test" messages to live agents (mayor reported
@@ -167,7 +196,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			_, _ = f.WriteString(entry)
 			_ = f.Close()
 		}
-		return nil
+		return nudgeDeliverySubmitted, nil
 	}
 
 	townRoot, _ := workspace.FindFromCwd()
@@ -187,19 +216,20 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	switch mode {
 	case NudgeModeQueue:
 		if townRoot == "" {
-			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
+			return "", fmt.Errorf("--mode=queue requires a Gas Town workspace")
 		}
-		return nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
 			Priority: nudgePriorityFlag,
 		})
+		return nudgeDeliveryQueued, err
 
 	case NudgeModeWaitIdle:
 		if townRoot == "" {
 			// wait-idle needs workspace for queue fallback — fail explicitly
 			// rather than silently degrading to immediate (destructive) delivery.
-			return fmt.Errorf("--mode=wait-idle requires a Gas Town workspace")
+			return "", fmt.Errorf("--mode=wait-idle requires a Gas Town workspace")
 		}
 		// Check if the target agent supports prompt-based idle detection.
 		// WaitForIdle uses Claude Code's prompt pattern (❯) and status bar (⏵⏵).
@@ -212,16 +242,21 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			if preset != nil && preset.ReadyPromptPrefix == "" {
 				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
 				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
-					Sender:   sender,
-					Message:  message,
-					Priority: nudgePriorityFlag,
+					Sender: sender, Message: message, Priority: nudgePriorityFlag,
+					DurableUntilAck: nudgePriorityFlag == nudge.PriorityUrgent,
 				}); qErr != nil {
 					formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
 						Sender:   sender,
 						Message:  message,
 						Priority: nudgePriorityFlag,
 					}})
-					return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+					deliveryID := nudge.NewDeliveryID()
+					baseline := time.Now()
+					receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
+					if err == nil && submissionReceiptMatches(receipt, sessionName, deliveryID, baseline) {
+						return nudgeDeliverySubmitted, nil
+					}
+					return "", err
 				}
 				// Ensure a nudge-poller is running so the queue actually drains.
 				// The poller is normally started by gt crew start, but if the
@@ -231,7 +266,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
 					fmt.Fprintf(os.Stderr, "wait-idle: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
 				}
-				return nil
+				return nudgeDeliveryQueued, nil
 			}
 		}
 		// Try to wait for idle
@@ -240,35 +275,43 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// Agent is idle — deliver directly. Format as system-reminder
 			// so the agent processes it as a background notification rather
 			// than a user interruption/correction.
-			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{{
-				Sender:   sender,
-				Message:  message,
-				Priority: nudgePriorityFlag,
-			}})
-			deliverErr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			queued := nudge.QueuedNudge{
+				DeliveryID: nudge.NewDeliveryID(),
+				Sender:     sender,
+				Message:    message,
+				Priority:   nudgePriorityFlag,
+			}
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{queued})
+			baseline := time.Now()
+			receipt, deliverErr := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: queued.DeliveryID})
+			if deliverErr == nil && submissionReceiptMatches(receipt, sessionName, queued.DeliveryID, baseline) {
+				return nudgeDeliverySubmitted, nil
+			}
+			if queued.Priority == nudge.PriorityUrgent {
+				return fallbackUrgentDelivery(townRoot, sessionName, queued, baseline, receipt, deliverErr)
+			}
 			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
-				return deliverErr
+				return "", deliverErr
 			}
 			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
-			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
-				Sender:   sender,
-				Message:  message,
-				Priority: nudgePriorityFlag,
-			}); qErr != nil {
-				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
+			if qErr := nudge.Enqueue(townRoot, sessionName, queued); qErr != nil {
+				return "", fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
 			}
-			return nil
+			return nudgeDeliveryQueued, nil
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
 		if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
-			return fmt.Errorf("wait-idle: %w", err)
+			if nudgePriorityFlag == nudge.PriorityUrgent {
+				queued := nudge.QueuedNudge{DeliveryID: nudge.NewDeliveryID(), Sender: sender, Message: message, Priority: nudge.PriorityUrgent}
+				return fallbackUrgentDelivery(townRoot, sessionName, queued, time.Now(), tmux.SubmissionReceipt{}, err)
+			}
+			return "", fmt.Errorf("wait-idle: %w", err)
 		}
 		// Timeout (agent busy) — queue instead
 		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
-			Sender:   sender,
-			Message:  message,
-			Priority: nudgePriorityFlag,
+			Sender: sender, Message: message, Priority: nudgePriorityFlag,
+			DurableUntilAck: nudgePriorityFlag == nudge.PriorityUrgent,
 		}); qErr != nil {
 			// Queue failed — fall back to immediate as last resort.
 			// Better to interrupt than lose the message entirely.
@@ -280,7 +323,13 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Message:  message,
 				Priority: nudgePriorityFlag,
 			}})
-			return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			deliveryID := nudge.NewDeliveryID()
+			baseline := time.Now()
+			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
+			if err == nil && submissionReceiptMatches(receipt, sessionName, deliveryID, baseline) {
+				return nudgeDeliverySubmitted, nil
+			}
+			return "", err
 		}
 		// Run watcher synchronously: polls for idle over a longer window.
 		// The UserPromptSubmit hook drains the queue on agent input, but an
@@ -288,8 +337,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// this watcher. It exits on: delivery, session death, or timeout.
 		// Must be synchronous (not a goroutine) because gt nudge is a CLI
 		// command — the process exits after return, killing any goroutines.
-		watchAndDeliver(t, townRoot, sessionName)
-		return nil
+		return watchAndDeliver(t, townRoot, sessionName), nil
 
 	default: // NudgeModeImmediate
 		opts := tmux.NudgeOpts{TownRoot: townRoot}
@@ -301,7 +349,20 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				opts.SkipEscape = true
 			}
 		}
-		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
+		queued := nudge.QueuedNudge{
+			DeliveryID: nudge.NewDeliveryID(),
+			Sender:     sender,
+			Message:    message,
+			Priority:   nudgePriorityFlag,
+		}
+		opts.DeliveryID = queued.DeliveryID
+		baseline := time.Now()
+		receipt, deliveryErr := t.NudgeSessionWithReceipt(sessionName, prefixedMessage, opts)
+		result, err := fallbackUrgentDelivery(townRoot, sessionName, queued, baseline, receipt, deliveryErr)
+		if result == nudgeDeliveryQueued {
+			fmt.Fprintf(os.Stderr, "urgent nudge submission unverified; queued durably for %s\n", sessionName)
+		}
+		return result, err
 	}
 }
 
@@ -320,7 +381,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 //   - Queue is empty (someone else drained it): exit.
 //   - Session disappears: exit (nothing to deliver to).
 //   - Timeout: exit (queue stays for next input or watcher cycle).
-func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) nudgeDeliveryResult {
 	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
 	deadline := time.Now().Add(idleWatcherTimeout)
 	for time.Now().Before(deadline) {
@@ -328,12 +389,12 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 
 		// If queue is already empty, someone else drained it.
 		if nudge.QueueLen(townRoot, sessionName) == 0 {
-			return
+			return nudgeDeliveryQueued
 		}
 
 		// Check if session still exists — no point watching a dead session.
 		if exists, _ := t.HasSession(sessionName); !exists {
-			return
+			return nudgeDeliveryQueued
 		}
 
 		// Use WaitForIdle with a short timeout instead of single-snapshot
@@ -341,24 +402,38 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
 		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
-			// Drain atomically claims queued entries (rename-based).
+			// Claim atomically reserves queued entries until delivery is proven.
 			// If another process raced and drained first, we get an
 			// empty slice and skip delivery to avoid duplicates.
-			drained, _ := nudge.Drain(townRoot, sessionName)
-			if len(drained) == 0 {
-				return
+			claim, err := nudge.ClaimDue(townRoot, sessionName)
+			if err != nil || claim == nil {
+				return nudgeDeliveryQueued
 			}
-			formatted := nudge.FormatForInjection(drained)
-			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
+			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
+			if err != nil || !receipt.Submitted {
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
+				if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+					fmt.Fprintf(os.Stderr, "idle-watcher: nack for %s failed: %v\n", sessionName, nackErr)
+				}
+			} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: ack for %s failed: %v\n", sessionName, ackErr)
+				if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+					fmt.Fprintf(os.Stderr, "idle-watcher: nack for %s failed: %v\n", sessionName, nackErr)
+				}
+				return nudgeDeliveryQueued
+			} else {
+				return nudgeDeliverySubmitted
 			}
-			return
+			return nudgeDeliveryQueued
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+	return nudgeDeliveryQueued
 }
 
+// requeueDrainedNudges remains for compatibility with callers that explicitly
+// use the consume-on-read Drain API. Runtime delivery uses ClaimDue/Nack.
 func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
 	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
@@ -526,11 +601,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			return nil
 		}
 
-		if err := deliverNudge(t, deaconSession, message, sender); err != nil {
+		result, err := deliverNudge(t, deaconSession, message, sender)
+		if err != nil {
 			return fmt.Errorf("nudging deacon: %w", err)
 		}
 
-		fmt.Printf("%s Nudged deacon (%s)\n", style.Bold.Render("✓"), nudgeModeFlag)
+		fmt.Printf("%s Nudge deacon: %s\n", style.Bold.Render("✓"), result)
 
 		// Log nudge event
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
@@ -551,11 +627,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
-		if err := deliverNudge(t, sessionName, message, sender); err != nil {
+		result, err := deliverNudge(t, sessionName, message, sender)
+		if err != nil {
 			return fmt.Errorf("nudging dog: %w", err)
 		}
 
-		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
+		fmt.Printf("%s Nudge %s: %s\n", style.Bold.Render("✓"), target, result)
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
 			_ = LogNudge(townRoot, target, message)
 		}
@@ -621,11 +698,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Send nudge using the configured delivery mode
-		if err := deliverNudge(t, sessionName, message, sender); err != nil {
+		result, err := deliverNudge(t, sessionName, message, sender)
+		if err != nil {
 			return fmt.Errorf("nudging session: %w", err)
 		}
 
-		fmt.Printf("%s Nudged %s/%s (%s)\n", style.Bold.Render("✓"), rigName, polecatName, nudgeModeFlag)
+		fmt.Printf("%s Nudge %s/%s: %s\n", style.Bold.Render("✓"), rigName, polecatName, result)
 
 		// Log nudge event
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
@@ -647,11 +725,12 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
-		if err := deliverNudge(t, target, message, sender); err != nil {
+		result, err := deliverNudge(t, target, message, sender)
+		if err != nil {
 			return fmt.Errorf("nudging session: %w", err)
 		}
 
-		fmt.Printf("✓ Nudged %s (%s)\n", target, nudgeModeFlag)
+		fmt.Printf("✓ Nudge %s: %s\n", target, result)
 
 		// Log nudge event
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
@@ -733,13 +812,14 @@ func runNudgeChannel(channelName, message, sender string) error {
 			}
 		}
 
-		if err := deliverNudge(t, sessionName, message, sender); err != nil {
+		result, err := deliverNudge(t, sessionName, message, sender)
+		if err != nil {
 			failed++
 			failures = append(failures, fmt.Sprintf("%s: %v", sessionName, err))
 			fmt.Printf("  %s %s\n", style.ErrorPrefix, sessionName)
 		} else {
 			succeeded++
-			fmt.Printf("  %s %s\n", style.SuccessPrefix, sessionName)
+			fmt.Printf("  %s %s (%s)\n", style.SuccessPrefix, sessionName, result)
 		}
 
 		// Small delay between nudges

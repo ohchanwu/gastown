@@ -95,16 +95,6 @@ func TestPropeller_DeliverNudges_RequeuesWhenSessionUnavailable(t *testing.T) {
 		t.Fatalf("expected requeued nudge to remain pending, got %d", pending)
 	}
 
-	drained, err := nudge.Drain(townRoot, "hq-mayor")
-	if err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	if len(drained) != 1 {
-		t.Fatalf("expected 1 requeued nudge, got %d", len(drained))
-	}
-	if drained[0].Priority != nudge.PriorityUrgent {
-		t.Fatalf("priority = %q, want %q", drained[0].Priority, nudge.PriorityUrgent)
-	}
 }
 
 func TestPropeller_NotifyReturnsErrorWithoutSessionID(t *testing.T) {

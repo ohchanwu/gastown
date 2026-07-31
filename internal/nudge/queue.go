@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/delivery"
 )
 
 // Priority levels for nudge delivery.
@@ -57,17 +59,85 @@ func nudgeConfig(townRoot string) *config.NudgeThresholds {
 
 // QueuedNudge represents a nudge message stored in the queue.
 type QueuedNudge struct {
-	Sender    string    `json:"sender"`
-	Message   string    `json:"message"`
-	Priority  string    `json:"priority"`
-	Kind      string    `json:"kind,omitempty"`
-	ThreadID  string    `json:"thread_id,omitempty"`
-	Severity  string    `json:"severity,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	DeliveryID      string    `json:"delivery_id"`
+	Session         string    `json:"session"`
+	Sender          string    `json:"sender"`
+	Message         string    `json:"message"`
+	Priority        string    `json:"priority"`
+	Kind            string    `json:"kind,omitempty"`
+	ThreadID        string    `json:"thread_id,omitempty"`
+	Severity        string    `json:"severity,omitempty"`
+	Timestamp       time.Time `json:"timestamp"`
+	ExpiresAt       time.Time `json:"expires_at,omitempty"`
+	Attempts        int       `json:"attempts"`
+	ClaimedAt       time.Time `json:"claimed_at,omitempty"`
+	NextAttempt     time.Time `json:"next_attempt_at,omitempty"`
+	LastErrorCode   string    `json:"last_error_code,omitempty"`
+	DurableUntilAck bool      `json:"durable_until_ack,omitempty"`
 	// DeliverAfter, if non-zero, defers delivery until this time has passed.
 	// Drain skips (but does not discard) the nudge until the deadline is met.
 	DeliverAfter time.Time `json:"deliver_after,omitempty"`
+}
+
+type SubmissionReceipt = delivery.SubmissionReceipt
+
+// ClaimedNudge owns one FIFO queue record until AckSubmitted or Nack.
+type ClaimedNudge struct {
+	Nudge     QueuedNudge
+	queuePath string
+	claimPath string
+}
+
+// AckSubmitted removes a claim only when the receipt matches its owner and was
+// produced after the claim baseline.
+func (c *ClaimedNudge) AckSubmitted(receipt SubmissionReceipt) error {
+	if !receipt.Submitted {
+		return fmt.Errorf("submission receipt is not submitted")
+	}
+	if receipt.Runtime == "" {
+		return fmt.Errorf("submission receipt has no runtime identity")
+	}
+	if receipt.Session != c.Nudge.Session || receipt.DeliveryID != c.Nudge.DeliveryID {
+		return fmt.Errorf("submission receipt does not own delivery")
+	}
+	if !receipt.SubmittedAt.After(c.Nudge.ClaimedAt) {
+		return fmt.Errorf("submission receipt is not newer than claim")
+	}
+	return os.Remove(c.claimPath)
+}
+
+// Nack records a sanitized failure and returns the delivery to its FIFO slot.
+func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
+	c.Nudge.ClaimedAt = time.Time{}
+	c.Nudge.NextAttempt = nextAttempt
+	c.Nudge.LastErrorCode = sanitizeErrorCode(errorCode)
+	if err := writeQueueRecord(c.claimPath, c.Nudge); err != nil {
+		return err
+	}
+	return os.Rename(c.claimPath, c.queuePath)
+}
+
+func sanitizeErrorCode(value string) string {
+	value = strings.ToLower(value)
+	var b strings.Builder
+	dash := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' {
+			b.WriteRune(r)
+			dash = false
+		} else if b.Len() > 0 && !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+		if b.Len() >= 64 {
+			break
+		}
+	}
+	result := strings.Trim(b.String(), "-")
+	if result == "" {
+		return "unknown"
+	}
+	return result
 }
 
 // queueDir returns the nudge queue directory for a given session.
@@ -86,13 +156,62 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
+// NewDeliveryID returns an opaque identifier suitable for queue ownership.
+func NewDeliveryID() string { return "ndg-" + randomSuffix() }
+
+// NextRetry returns a bounded linear retry time for a failed attempt.
+func NextRetry(attempt int) time.Time {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 60 {
+		attempt = 60
+	}
+	return time.Now().Add(time.Duration(attempt) * time.Second)
+}
+
+func writeQueueRecord(path string, n QueuedNudge) error {
+	data, err := json.MarshalIndent(n, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling nudge: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".nudge-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating nudge queue record: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("securing nudge queue record: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing nudge queue record: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing nudge queue record: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing nudge queue record: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("publishing nudge queue record: %w", err)
+	}
+	return nil
+}
+
 // Enqueue writes a nudge to the queue for the given session.
 // The nudge will be picked up by the agent's hook at the next turn boundary.
 // Returns an error if the queue is full (MaxQueueDepth reached).
 func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	dir := queueDir(townRoot, session)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating nudge queue dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("securing nudge queue dir: %w", err)
 	}
 
 	// Check queue depth before writing to prevent runaway senders.
@@ -105,12 +224,16 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	if nudge.Timestamp.IsZero() {
 		nudge.Timestamp = time.Now()
 	}
+	if nudge.DeliveryID == "" {
+		nudge.DeliveryID = NewDeliveryID()
+	}
+	nudge.Session = session
 	if nudge.Priority == "" {
 		nudge.Priority = PriorityNormal
 	}
 
 	// Set expiry if not already specified by the caller.
-	if nudge.ExpiresAt.IsZero() {
+	if nudge.ExpiresAt.IsZero() && !nudge.DurableUntilAck {
 		switch nudge.Priority {
 		case PriorityUrgent:
 			nudge.ExpiresAt = nudge.Timestamp.Add(DefaultUrgentTTL)
@@ -119,22 +242,13 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(nudge, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshaling nudge: %w", err)
-	}
-
 	// Use nanosecond timestamp + random suffix for unique, ordered filenames.
 	// The random suffix prevents collisions when multiple agents enqueue
 	// nudges for the same session within the same nanosecond.
 	filename := fmt.Sprintf("%d-%s.json", nudge.Timestamp.UnixNano(), randomSuffix())
 	path := filepath.Join(dir, filename)
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("writing nudge to queue: %w", err)
-	}
-
-	return nil
+	return writeQueueRecord(path, nudge)
 }
 
 // Requeue writes previously drained nudges back to the queue for later delivery.
@@ -152,8 +266,8 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 	return nil
 }
 
-// Drain reads and removes all queued nudges for a session, returning them
-// in FIFO order. This is called by the hook to pick up pending nudges.
+// ClaimDue atomically reserves the oldest due nudge for a session.
+// Callers must AckSubmitted only after runtime proof, or Nack on failure.
 //
 // Uses rename-then-process to prevent concurrent Drain calls from delivering
 // the same nudge twice: each file is atomically renamed to a .claimed suffix
@@ -161,7 +275,7 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 //
 // Expired nudges (past ExpiresAt) are silently discarded during drain.
 // Orphaned .claimed files from crashed drainers are swept if older than 5 minutes.
-func Drain(townRoot, session string) ([]QueuedNudge, error) {
+func ClaimDue(townRoot, session string) (*ClaimedNudge, error) {
 	dir := queueDir(townRoot, session)
 
 	entries, err := os.ReadDir(dir)
@@ -170,6 +284,9 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("reading nudge queue: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("securing nudge queue: %w", err)
 	}
 
 	// Requeue orphaned .claimed files from crashed drainers.
@@ -194,9 +311,9 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 			claimedIdx := strings.Index(name, ".claimed")
 			restoredPath := filepath.Join(dir, name[:claimedIdx])
 			if err := os.Rename(orphanPath, restoredPath); err != nil {
-				// Rename failed — remove as last resort to prevent infinite accumulation
+				// Leave the claim in place on failure. A later recovery pass can
+				// retry; deleting here would turn a filesystem error into data loss.
 				fmt.Fprintf(os.Stderr, "Warning: failed to requeue orphaned claim %s: %v\n", entry.Name(), err)
-				_ = os.Remove(orphanPath)
 			}
 		}
 	}
@@ -206,7 +323,6 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 		return entries[i].Name() < entries[j].Name()
 	})
 
-	var nudges []QueuedNudge
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -244,11 +360,10 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 
 		var n QueuedNudge
 		if err := json.Unmarshal(data, &n); err != nil {
-			// Malformed — clean up
-			if rmErr := os.Remove(claimPath); rmErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to remove malformed claim %s: %v\n", entry.Name(), rmErr)
-			}
-			continue
+			_ = os.Chmod(claimPath, 0600)
+			quarantinePath := path + ".malformed." + randomSuffix()
+			_ = os.Rename(claimPath, quarantinePath)
+			return nil, errors.New("malformed nudge queue record preserved")
 		}
 
 		// Skip expired nudges — stale messages create noise, not value.
@@ -258,23 +373,63 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 			}
 			continue
 		}
+		if n.Session == "" {
+			n.Session = session
+		}
+		if n.Session != session {
+			_ = os.Rename(claimPath, path)
+			return nil, fmt.Errorf("delivery %q belongs to session %q, not %q", n.DeliveryID, n.Session, session)
+		}
+		if n.DeliveryID == "" {
+			n.DeliveryID = NewDeliveryID()
+		}
 
 		// Deferred nudge: not ready yet — unclaim and leave in queue.
-		if !n.DeliverAfter.IsZero() && now.Before(n.DeliverAfter) {
+		dueAt := n.DeliverAfter
+		if n.NextAttempt.After(dueAt) {
+			dueAt = n.NextAttempt
+		}
+		if !dueAt.IsZero() && now.Before(dueAt) {
 			if renameErr := os.Rename(claimPath, path); renameErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to unclaim deferred nudge %s: %v\n", entry.Name(), renameErr)
 			}
 			continue
 		}
 
-		nudges = append(nudges, n)
-
-		// Remove the claimed file after successful processing
-		if rmErr := os.Remove(claimPath); rmErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to remove processed claim %s: %v\n", entry.Name(), rmErr)
+		n.Attempts++
+		n.ClaimedAt = now
+		if err := writeQueueRecord(claimPath, n); err != nil {
+			_ = os.Rename(claimPath, path)
+			return nil, err
 		}
+		return &ClaimedNudge{Nudge: n, queuePath: path, claimPath: claimPath}, nil
 	}
 
+	return nil, nil
+}
+
+// Drain preserves the original consume-on-read API for hook and inspection
+// callers. Runtime delivery paths should use Claim and acknowledge explicitly.
+func Drain(townRoot, session string) ([]QueuedNudge, error) {
+	limit, err := Pending(townRoot, session)
+	if err != nil {
+		return nil, err
+	}
+	var nudges []QueuedNudge
+	for range limit {
+		claim, err := ClaimDue(townRoot, session)
+		if err != nil {
+			return nil, err
+		}
+		if claim == nil {
+			return nudges, nil
+		}
+		receipt := SubmissionReceipt{Session: session, DeliveryID: claim.Nudge.DeliveryID, Runtime: "legacy", Submitted: true, SubmittedAt: time.Now()}
+		if err := claim.AckSubmitted(receipt); err != nil {
+			return nil, err
+		}
+		nudges = append(nudges, claim.Nudge)
+	}
 	return nudges, nil
 }
 

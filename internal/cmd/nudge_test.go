@@ -1,15 +1,84 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestNudgeQueueTypedOnlySurvivesUntilMatchingRuntimeReceipt(t *testing.T) {
+	tm := tmux.NewTmuxWithSocket("gt-test-queue-receipt-" + fmt.Sprintf("%d", time.Now().UnixNano()))
+	townRoot := t.TempDir()
+	captured := filepath.Join(townRoot, "submitted.txt")
+	sessionName := "gt-test-queue-receipt"
+	command := fmt.Sprintf(`sh -c 'while true; do printf "› "; IFS= read -r line || exit; printf "%%s\n" "$line" >> %s; printf "\033[2K\r› \n"; done'`, captured)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), command, map[string]string{"GT_AGENT": "codex"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillServer() }()
+	time.Sleep(200 * time.Millisecond)
+
+	queued := nudge.QueuedNudge{DeliveryID: "ndg-integration", Sender: "witness", Message: "wake", Priority: nudge.PriorityUrgent, DurableUntilAck: true}
+	if err := nudge.Enqueue(townRoot, sessionName, queued); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := nudge.ClaimDue(townRoot, sessionName)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, claim.Nudge.Message, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
+	if !errors.Is(err, tmux.ErrSubmitNotVerified) || !receipt.Typed || receipt.Submitted {
+		t.Fatalf("typed-only receipt = %#v, %v", receipt, err)
+	}
+	if err := claim.Nack("submit-unverified", time.Now()); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 1 {
+		t.Fatalf("pending after typed-only attempt = %d, want 1", pending)
+	}
+	if err := os.WriteFile(captured, nil, 0600); err != nil {
+		t.Fatalf("reset captured input: %v", err)
+	}
+
+	claim, err = nudge.ClaimDue(townRoot, sessionName)
+	if err != nil || claim == nil {
+		t.Fatalf("second ClaimDue = %#v, %v", claim, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		want := delivery.ControlMessage(claim.Nudge.DeliveryID, claim.Nudge.Message)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, _ := os.ReadFile(captured)
+			if strings.Contains(string(data), want) {
+				_, _ = delivery.RecordPromptSubmitted(townRoot, sessionName, "codex", want, time.Now())
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	receipt, err = tm.NudgeSessionWithReceipt(sessionName, claim.Nudge.Message, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
+	<-done
+	if err != nil || !receipt.Submitted {
+		t.Fatalf("submitted receipt = %#v, %v", receipt, err)
+	}
+	if err := claim.AckSubmitted(receipt); err != nil {
+		t.Fatalf("AckSubmitted: %v", err)
+	}
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 0 {
+		t.Fatalf("pending after matching receipt = %d, want 0", pending)
+	}
+}
 
 func setupNudgeTestRegistry(t *testing.T) {
 	t.Helper()
@@ -455,6 +524,51 @@ func TestRequeueDrainedNudgesPreservesFailedDelivery(t *testing.T) {
 		if got[i].Message != drained[i].Message || got[i].Sender != drained[i].Sender {
 			t.Fatalf("requeued[%d] = %#v, want %#v", i, got[i], drained[i])
 		}
+	}
+}
+
+func TestFallbackUrgentDeliveryQueuesTypedButUnsubmittedNudge(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-urgent-fallback"
+	want := nudge.QueuedNudge{
+		DeliveryID: nudge.NewDeliveryID(),
+		Sender:     "witness",
+		Message:    "wake canary",
+		Priority:   nudge.PriorityUrgent,
+	}
+
+	result, err := fallbackUrgentDelivery(
+		townRoot,
+		session,
+		want,
+		time.Now(),
+		tmux.SubmissionReceipt{Typed: true, Submitted: false},
+		tmux.ErrSubmitNotVerified,
+	)
+	if err != nil {
+		t.Fatalf("fallbackUrgentDelivery: %v", err)
+	}
+	if result != nudgeDeliveryQueued {
+		t.Fatalf("result = %q, want %q", result, nudgeDeliveryQueued)
+	}
+
+	got, err := nudge.Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(got) != 1 || got[0].Sender != want.Sender || got[0].Message != want.Message || got[0].Priority != want.Priority || !got[0].DurableUntilAck || !got[0].ExpiresAt.IsZero() {
+		t.Fatalf("queued fallback = %#v, want %#v", got, want)
+	}
+}
+
+func TestFallbackUrgentDeliveryQueuesTransportFailure(t *testing.T) {
+	townRoot := t.TempDir()
+	want := nudge.QueuedNudge{
+		DeliveryID: nudge.NewDeliveryID(), Sender: "witness", Message: "wake", Priority: nudge.PriorityUrgent,
+	}
+	result, err := fallbackUrgentDelivery(townRoot, "gt-test-urgent-failure", want, time.Now(), tmux.SubmissionReceipt{}, errors.New("transport failed"))
+	if err != nil || result != nudgeDeliveryQueued {
+		t.Fatalf("fallbackUrgentDelivery = %q, %v; want queued", result, err)
 	}
 }
 

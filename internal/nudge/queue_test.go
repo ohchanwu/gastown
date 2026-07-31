@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,158 @@ func TestEnqueueAndDrain(t *testing.T) {
 	}
 }
 
+func TestEnqueueTightensLegacyQueuePermissions(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-private-queue"
+	dir := queueDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "private"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Fatalf("queue dir mode = %o, want 0700", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("queue entries = %v, %v", entries, err)
+	}
+	info, err = entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("queue record mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestClaimDueRequiresMatchingPostClaimReceipt(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-claim"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "wake"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	if claim == nil || claim.Nudge.Message != "wake" {
+		t.Fatalf("ClaimDue = %#v, want wake nudge", claim)
+	}
+	if claim.Nudge.Session != session || claim.Nudge.DeliveryID == "" || claim.Nudge.Attempts != 1 || claim.Nudge.ClaimedAt.IsZero() {
+		t.Fatalf("claim metadata = %#v", claim.Nudge)
+	}
+	info, err := os.Stat(claim.claimPath)
+	if err != nil {
+		t.Fatalf("Stat claim: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("claim mode = %o, want 0600", info.Mode().Perm())
+	}
+	if err := claim.AckSubmitted(SubmissionReceipt{
+		Session: session, DeliveryID: claim.Nudge.DeliveryID, SubmittedAt: time.Now(),
+	}); err == nil {
+		t.Fatal("AckSubmitted accepted submitted=false receipt")
+	}
+
+	bad := SubmissionReceipt{
+		Session:     "other-session",
+		DeliveryID:  claim.Nudge.DeliveryID,
+		Submitted:   true,
+		SubmittedAt: time.Now(),
+	}
+	if err := claim.AckSubmitted(bad); err == nil {
+		t.Fatal("AckSubmitted accepted a receipt for another session")
+	}
+	withoutRuntime := SubmissionReceipt{
+		Session: session, DeliveryID: claim.Nudge.DeliveryID,
+		Submitted: true, SubmittedAt: time.Now(),
+	}
+	if err := claim.AckSubmitted(withoutRuntime); err == nil {
+		t.Fatal("AckSubmitted accepted a receipt without runtime identity")
+	}
+
+	receipt := SubmissionReceipt{
+		Session:     session,
+		DeliveryID:  claim.Nudge.DeliveryID,
+		Runtime:     "codex",
+		Typed:       true,
+		Submitted:   true,
+		SubmittedAt: time.Now(),
+	}
+	if err := claim.AckSubmitted(receipt); err != nil {
+		t.Fatalf("AckSubmitted: %v", err)
+	}
+	if entries, err := os.ReadDir(queueDir(townRoot, session)); err != nil || len(entries) != 0 {
+		t.Fatalf("queue after AckSubmitted = %v, %v; want empty", entries, err)
+	}
+}
+
+func TestAckSubmittedRejectsEqualClaimTimestamp(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-equal-claim"
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "wake"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue() = %#v, %v", claim, err)
+	}
+	receipt := SubmissionReceipt{
+		Session: claim.Nudge.Session, DeliveryID: claim.Nudge.DeliveryID, Runtime: "codex",
+		Typed: true, Submitted: true, SubmittedAt: claim.Nudge.ClaimedAt,
+	}
+	if err := claim.AckSubmitted(receipt); err == nil {
+		t.Fatal("AckSubmitted accepted a receipt at the exact claim timestamp")
+	}
+	if _, err := os.Stat(claim.claimPath); err != nil {
+		t.Fatalf("equal-timestamp rejection removed claim: %v", err)
+	}
+}
+
+func TestNackSanitizesErrorAndDefersRetry(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-nack"
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "wake"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	next := time.Now().Add(time.Minute)
+	if err := claim.Nack("Transport Failed: private/path", next); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	if got, err := ClaimDue(townRoot, session); err != nil || got != nil {
+		t.Fatalf("ClaimDue before retry = %#v, %v; want nil", got, err)
+	}
+
+	entries, err := os.ReadDir(queueDir(townRoot, session))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("queue entries = %v, %v", entries, err)
+	}
+	data, err := os.ReadFile(filepath.Join(queueDir(townRoot, session), entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var queued QueuedNudge
+	if err := json.Unmarshal(data, &queued); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if queued.LastErrorCode != "transport-failed-private-path" || !queued.NextAttempt.Equal(next) || !queued.ClaimedAt.IsZero() {
+		t.Fatalf("nacked metadata = %#v", queued)
+	}
+}
+
 func TestDrainEmptyQueue(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -82,48 +235,55 @@ func TestDrainEmptyQueue(t *testing.T) {
 	}
 }
 
-func TestDrainSkipsMalformed(t *testing.T) {
+func TestClaimDuePreservesMalformedUrgentRecord(t *testing.T) {
 	townRoot := t.TempDir()
-	session := "gt-test"
+	const session = "gt-test-malformed-urgent"
 
-	// Create queue dir and a malformed file
-	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	dir := queueDir(townRoot, session)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "100.json"), []byte("not json"), 0644); err != nil {
+	path := filepath.Join(dir, "100.json")
+	const malformed = `{"priority":"urgent","message":"private-marker"`
+	if err := os.WriteFile(path, []byte(malformed), 0644); err != nil {
 		t.Fatal(err)
 	}
-
-	// Enqueue a valid nudge (with later timestamp)
-	n := QueuedNudge{
-		Sender:    "test",
-		Message:   "valid",
-		Timestamp: time.Now().Add(time.Second),
-	}
-	if err := Enqueue(townRoot, session, n); err != nil {
-		t.Fatal(err)
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "mayor", Message: "valid-after-malformed", Priority: PriorityUrgent}); err != nil {
+		t.Fatalf("Enqueue valid record: %v", err)
 	}
 
-	nudges, err := Drain(townRoot, session)
-	if err != nil {
-		t.Fatalf("Drain: %v", err)
+	claim, err := ClaimDue(townRoot, session)
+	if claim != nil || err == nil {
+		t.Fatalf("ClaimDue() = %#v, %v; want nil sanitized error", claim, err)
 	}
-	if len(nudges) != 1 {
-		t.Fatalf("got %d nudges, want 1 (malformed should be skipped)", len(nudges))
+	if strings.Contains(err.Error(), "private-marker") || strings.Contains(err.Error(), session) || strings.Contains(err.Error(), path) {
+		t.Fatalf("ClaimDue() leaked private queue data: %v", err)
 	}
-	if nudges[0].Message != "valid" {
-		t.Errorf("got message %q, want %q", nudges[0].Message, "valid")
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("malformed FIFO path still blocks queue: %v", statErr)
 	}
-
-	// Malformed file should have been cleaned up (renamed to .claimed then removed)
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 0 {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
+	entries, readDirErr := os.ReadDir(dir)
+	if readDirErr != nil {
+		t.Fatal(readDirErr)
+	}
+	var quarantinePath string
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".malformed.") && !strings.HasSuffix(entry.Name(), ".json") {
+			quarantinePath = filepath.Join(dir, entry.Name())
+			break
 		}
-		t.Errorf("queue dir should be empty after drain, got %d entries: %v", len(entries), names)
+	}
+	if quarantinePath == "" {
+		t.Fatalf("queue entries = %v, want unique non-json quarantine", entries)
+	}
+	data, readErr := os.ReadFile(quarantinePath)
+	info, statErr := os.Stat(quarantinePath)
+	if readErr != nil || string(data) != malformed || statErr != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("quarantine = %q, mode=%v, read=%v, stat=%v; want exact mode-0600 bytes", data, info, readErr, statErr)
+	}
+	next, nextErr := ClaimDue(townRoot, session)
+	if nextErr != nil || next == nil || next.Nudge.Message != "valid-after-malformed" {
+		t.Fatalf("ClaimDue after quarantine = %#v, %v; want following valid record", next, nextErr)
 	}
 }
 

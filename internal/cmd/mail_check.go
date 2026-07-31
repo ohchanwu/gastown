@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/estop"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/nudge"
@@ -15,7 +17,24 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+func recordCodexSubmissionReceipt(townRoot, session string, input *hookInput) error {
+	if input == nil || input.HookEventName != "UserPromptSubmit" {
+		return nil
+	}
+	_, err := delivery.RecordPromptSubmitted(townRoot, session, "codex", input.Prompt, time.Now())
+	return err
+}
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
+	if mailCheckInject {
+		input := readStdinJSON()
+		if townRoot, err := workspace.FindFromCwd(); err == nil {
+			if err := recordCodexSubmissionReceipt(townRoot, tmux.CurrentSessionName(), input); err != nil {
+				fmt.Fprintf(os.Stderr, "gt mail check: delivery receipt error: %v\n", err)
+			}
+		}
+	}
+
 	// Determine which inbox (priority: --identity flag, auto-detect)
 	address := ""
 	if mailCheckIdentity != "" {
@@ -73,6 +92,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	// at the next task boundary, normal/low is informational but still
 	// checked before going idle (prevents mail from sitting unread).
 	if mailCheckInject {
+		sessionName := tmux.CurrentSessionName()
 		// Agent-side E-stop check (defense-in-depth).
 		// If an E-stop is active (town-wide or per-rig), inject a system reminder
 		// telling the agent to checkpoint and wait. This catches agents that
@@ -96,18 +116,33 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 			// Ack after output so message is delivered before being marked acked.
 			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
 				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+			} else if sessionName != "" {
+				for _, msg := range messages {
+					_, _ = nudge.RemoveKindByThread(workDir, sessionName, "mail", msg.ThreadID)
+					_, _ = nudge.RemoveKindByThread(workDir, sessionName, "escalation", msg.ThreadID)
+				}
 			}
 		}
 
 		// Also drain queued nudges (from --mode=queue or --mode=wait-idle fallback).
 		// The nudge queue is per-session; detect our session name.
-		sessionName := tmux.CurrentSessionName()
 		if sessionName != "" {
-			queuedNudges, drainErr := nudge.Drain(workDir, sessionName)
-			if drainErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
-			} else if len(queuedNudges) > 0 {
-				fmt.Print(nudge.FormatForInjection(queuedNudges))
+			for {
+				claim, claimErr := nudge.ClaimDue(workDir, sessionName)
+				if claimErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: nudge queue claim error: %v\n", claimErr)
+					break
+				}
+				if claim == nil {
+					break
+				}
+				fmt.Print(nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge}))
+				// Hook stdout is context, not runtime acceptance. Preserve the
+				// queue item until a later transport obtains a real receipt.
+				if nackErr := claim.Nack("hook-output-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: nudge queue nack error: %v\n", nackErr)
+				}
+				break
 			}
 		}
 

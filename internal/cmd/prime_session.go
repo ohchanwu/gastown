@@ -25,6 +25,7 @@ type hookInput struct {
 	TranscriptPath string `json:"transcript_path"`
 	Source         string `json:"source"` // startup, resume, clear, compact
 	HookEventName  string `json:"hook_event_name"`
+	Prompt         string `json:"prompt"`
 }
 
 // readHookSessionID reads session ID from available sources in hook mode.

@@ -3,9 +3,29 @@ package cmd
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/mail"
 )
+
+func TestRecordCodexSubmissionReceiptFromHookInput(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-codex-hook"
+	deliveryID := "ndg-hook-receipt"
+	baseline := time.Now()
+	input := &hookInput{
+		HookEventName: "UserPromptSubmit",
+		Prompt:        delivery.ControlMessage(deliveryID, "private hook prompt"),
+	}
+	if err := recordCodexSubmissionReceipt(townRoot, session, input); err != nil {
+		t.Fatalf("recordCodexSubmissionReceipt: %v", err)
+	}
+	receipt, ok, err := delivery.FindSubmittedAfter(townRoot, session, deliveryID, baseline)
+	if err != nil || !ok || !receipt.Submitted || receipt.Runtime != "codex" {
+		t.Fatalf("FindSubmittedAfter = %#v, %v, %v", receipt, ok, err)
+	}
+}
 
 func TestFormatInjectOutput(t *testing.T) {
 	// Helper to build test messages with a given priority.

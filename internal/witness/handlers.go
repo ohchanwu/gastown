@@ -132,7 +132,7 @@ type HandlerResult struct {
 	Action        string
 	CleanupStatus string // Observed cleanup_status (ZFC: report data, agent decides policy)
 	WispCreated   string // ID of created wisp (if any)
-	MailSent      string // Deprecated: was ID of sent mail. Notifications now use nudge.
+	MailSent      string // Durable Mayor notification outcome: submitted, queued, or wake-failed.
 	Error         error
 }
 
@@ -196,7 +196,9 @@ func HandlePolecatDone(bd *BdCli, workDir, rigName string, msg *mail.Message, ro
 	// Notify Mayor that a slot is open regardless of MR status.
 	// The polecat is idle either way — Mayor should consider slinging next bead. (GH#2727)
 	if result.Handled {
-		notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+		outcome, err := notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit, router)
+		result.MailSent = string(outcome)
+		result.Error = errors.Join(result.Error, err)
 	}
 
 	return result
@@ -250,16 +252,9 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 		result.Handled = true
 		result.Action = fmt.Sprintf("push-failed-recovery-needed for %s (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
 			polecatName, payload.Branch, payload.IssueID)
-		townRoot, _ := workspace.Find(workDir)
-		if townRoot != "" {
-			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
-				polecatName, payload.Branch, payload.IssueID)
-			mayorSession := session.MayorSessionName()
-			t := tmux.NewTmux()
-			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, mayorMsg)
-			}
-		}
+		outcome, err := notifyMayorPushFailed(workDir, polecatName, payload.Branch, payload.IssueID, router)
+		result.MailSent = string(outcome)
+		result.Error = errors.Join(result.Error, err)
 		return result
 	}
 
@@ -282,7 +277,9 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 	// Notify Mayor that a slot is open regardless of MR status.
 	// Mirror HandlePolecatDone behavior — polecat is idle, Mayor should sling next bead. (GH#2727)
 	if result.Handled {
-		notifyMayorSlotOpen(workDir, rigName, polecatName, payload.Exit)
+		outcome, err := notifyMayorSlotOpen(workDir, rigName, polecatName, payload.Exit, router)
+		result.MailSent = string(outcome)
+		result.Error = errors.Join(result.Error, err)
 	}
 
 	return result
@@ -877,15 +874,69 @@ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, stri
 	return true, ""
 }
 
-// notifyMayorSlotOpen nudges the Mayor that a polecat slot is now open.
-// This is critical for pipeline throughput: without it, the Mayor sits idle
-// even when open beads exist, because it never learns about the completion.
-// Prefers nudge per communication hygiene, falls back to mail if nudge
-// can't reach the Mayor (e.g., ACP session, no tmux). (GH#2727)
-func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
+// MayorNotificationOutcome reports whether the durable notification was submitted
+// to the live session or queued for later delivery.
+type MayorNotificationOutcome string
+
+const (
+	MayorNotificationSubmitted  MayorNotificationOutcome = "submitted"
+	MayorNotificationQueued     MayorNotificationOutcome = "queued"
+	MayorNotificationWakeFailed MayorNotificationOutcome = "wake-failed"
+)
+
+var (
+	mayorRouterSend = func(router *mail.Router, msg *mail.Message) error { return router.Send(msg) }
+	mayorRouterWait = func(router *mail.Router) error { return router.WaitPendingNotifications() }
+)
+
+// DeliverMayorNotification is the production Witness-to-Mayor seam. It stores
+// one durable high-priority record before observing the receipt-aware wake result.
+func DeliverMayorNotification(router *mail.Router, subject, body string) (MayorNotificationOutcome, error) {
+	if router == nil {
+		return "", errors.New("Mayor notification router unavailable")
+	}
+	msg := mail.NewMessage("witness/", "mayor/", subject, body)
+	msg.Priority = mail.PriorityHigh
+	msg.Type = mail.TypeNotification
+	if err := mayorRouterSend(router, msg); err != nil {
+		return "", errors.New("durable Mayor notification could not be stored")
+	}
+	if err := mayorRouterWait(router); err != nil {
+		if errors.Is(err, mail.ErrNotificationFailed) {
+			return MayorNotificationWakeFailed, nil
+		}
+		if errors.Is(err, mail.ErrNotificationQueued) {
+			return MayorNotificationQueued, nil
+		}
+		return MayorNotificationWakeFailed, nil
+	}
+	return MayorNotificationSubmitted, nil
+}
+
+func routeMayorNotification(workDir, townRoot string, router *mail.Router, subject, body string) (MayorNotificationOutcome, error) {
+	if router == nil {
+		router = mail.NewRouterWithTownRoot(workDir, townRoot)
+	}
+	return DeliverMayorNotification(router, subject, body)
+}
+
+func notifyMayorPushFailed(workDir, polecatName, branch, issueID string, router *mail.Router) (MayorNotificationOutcome, error) {
 	townRoot, _ := workspace.Find(workDir)
 	if townRoot == "" {
-		return
+		return "", errors.New("Mayor notification workspace unavailable")
+	}
+	subject := fmt.Sprintf("PUSH_FAILED: %s requires recovery", polecatName)
+	body := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss", polecatName, branch, issueID)
+	return routeMayorNotification(workDir, townRoot, router, subject, body)
+}
+
+// notifyMayorSlotOpen notifies the Mayor that a polecat slot is now open.
+// This is critical for pipeline throughput: without it, the Mayor sits idle
+// even when open beads exist, because it never learns about the completion.
+func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string, router *mail.Router) (MayorNotificationOutcome, error) {
+	townRoot, _ := workspace.Find(workDir)
+	if townRoot == "" {
+		return "", nil
 	}
 	if exitType != string(ExitTypeCompleted) {
 		decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
@@ -898,11 +949,11 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 				"reason=" + decision.Reason,
 			})
 		}
-		return
+		return "", nil
 	}
 	if ok, reason := shouldNotifyMayorSlotOpen(workDir, rigName, polecatName); !ok {
 		fmt.Fprintf(os.Stderr, "witness: suppressing SLOT_OPEN for %s/%s: %s\n", rigName, polecatName, reason)
-		return
+		return "", nil
 	}
 	decision := slotOpenDecisionForNotify(workDir, townRoot, rigName, polecatName, exitType)
 	if !decision.Reusable {
@@ -913,23 +964,22 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 			"exit=" + exitType,
 			"reason=" + decision.Reason,
 		})
-		return
+		return "", nil
 	}
 	if result, err := runSchedulerForSlotOpen(townRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN scheduler trigger failed for %s/%s: %v\n", rigName, polecatName, err)
 		if result.Dispatched > 0 {
-			return
+			return "", nil
 		}
 	} else if result.Dispatched > 0 {
 		if status, ok := schedulerOpenAfterSlot(result); ok {
-			notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
+			return notifyMayorSchedulerOpen(workDir, townRoot, rigName, polecatName, exitType, status, router)
 		}
-		return
+		return "", nil
 	} else if status, ok := schedulerOpenAfterSlot(result); ok {
-		notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
-		return
+		return notifyMayorSchedulerOpen(workDir, townRoot, rigName, polecatName, exitType, status, router)
 	} else if status := schedulerStatusAfterSlot(result); status.Capacity.Max > 0 && (status.Paused || status.Capacity.Free <= 0) {
-		return
+		return "", nil
 	}
 
 	// Emit SLOT_OPEN channel event so Mayor's await-event unblocks instantly.
@@ -940,23 +990,9 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		"exit=" + exitType,
 	})
 
-	// Try nudge first — lightweight, no Dolt commit.
-	mayorSession := session.MayorSessionName()
-	t := tmux.NewTmux()
-	if running, err := t.HasSession(mayorSession); err == nil && running {
-		msg := fmt.Sprintf("SLOT_OPEN: %s/%s completed (exit=%s) — slot available. Run `gt polecat list` to verify and sling next bead.", rigName, polecatName, exitType)
-		if err := t.NudgeSession(mayorSession, msg); err == nil {
-			return // Nudge delivered — no mail needed.
-		}
-	}
-
-	// Nudge failed or Mayor not in tmux (e.g., ACP/Claude Code session).
-	// Fall back to mail so the completion is not silently lost.
 	subject := fmt.Sprintf("SLOT_OPEN: %s/%s completed (exit=%s)", rigName, polecatName, exitType)
 	body := fmt.Sprintf("Polecat %s/%s finished (exit=%s). Slot available for next bead.", rigName, polecatName, exitType)
-	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", body)
-	cmd.Dir = townRoot
-	_ = cmd.Run()
+	return routeMayorNotification(workDir, townRoot, router, subject, body)
 }
 
 func schedulerOpenAfterSlot(result slotOpenSchedulerResult) (slotOpenSchedulerStatus, bool) {
@@ -972,7 +1008,7 @@ func schedulerStatusAfterSlot(result slotOpenSchedulerResult) slotOpenSchedulerS
 	return status
 }
 
-func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, status slotOpenSchedulerStatus) {
+func notifyMayorSchedulerOpen(workDir, townRoot, rigName, polecatName, exitType string, status slotOpenSchedulerStatus, router *mail.Router) (MayorNotificationOutcome, error) {
 	_, _ = channelevents.EmitToTown(townRoot, "mayor", "SCHEDULER_OPEN", []string{
 		"source=witness",
 		"rig=" + rigName,
@@ -982,19 +1018,9 @@ func notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType string, s
 		"queued_ready=" + strconv.Itoa(status.QueuedReady),
 	})
 
-	mayorSession := session.MayorSessionName()
-	t := tmux.NewTmux()
 	msg := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s); scheduler has capacity but no eligible queued beads remain.", rigName, polecatName, exitType)
-	if running, err := t.HasSession(mayorSession); err == nil && running {
-		if err := t.NudgeSession(mayorSession, msg); err == nil {
-			return
-		}
-	}
-
 	subject := fmt.Sprintf("SCHEDULER_OPEN: %s/%s completed (exit=%s)", rigName, polecatName, exitType)
-	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", msg)
-	cmd.Dir = townRoot
-	_ = cmd.Run()
+	return routeMayorNotification(workDir, townRoot, router, subject, msg)
 }
 
 func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
@@ -2450,7 +2476,7 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 		}
 
 		// Route based on exit type and MR presence
-		processDiscoveredCompletion(bd, workDir, rigName, payload, &discovery)
+		processDiscoveredCompletion(bd, workDir, rigName, payload, &discovery, router)
 
 		// Clear completion metadata only after successful processing. If cleanup
 		// wisp creation/update failed, leave metadata for the next patrol retry.
@@ -2470,7 +2496,7 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 // processDiscoveredCompletion routes a discovered completion through the same
 // logic as HandlePolecatDone, creating cleanup wisps and sending MERGE_READY
 // as appropriate. This is the bead-based equivalent of POLECAT_DONE mail handling.
-func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *PolecatDonePayload, discovery *CompletionDiscovery) {
+func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *PolecatDonePayload, discovery *CompletionDiscovery, router *mail.Router) {
 	if payload.Exit == string(ExitTypePhaseComplete) {
 		discovery.Action = "phase-complete"
 		return
@@ -2482,16 +2508,11 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	if payload.PushFailed {
 		discovery.Action = fmt.Sprintf("push-failed-recovery-needed (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
 			payload.Branch, payload.IssueID)
-		// Notify mayor so a new polecat can be dispatched if work is lost.
-		townRoot, _ := workspace.Find(workDir)
-		if townRoot != "" {
-			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
-				payload.PolecatName, payload.Branch, payload.IssueID)
-			mayorSession := session.MayorSessionName()
-			t := tmux.NewTmux()
-			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, mayorMsg)
-			}
+		outcome, err := notifyMayorPushFailed(workDir, payload.PolecatName, payload.Branch, payload.IssueID, router)
+		if err != nil {
+			discovery.Error = err
+		} else {
+			discovery.Action += " mayor-notification=" + string(outcome)
 		}
 		return
 	}
@@ -2539,7 +2560,12 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 		discovery.Action = fmt.Sprintf("merge-ready-nudged (MR=%s, wisp=%s)", payload.MRID, wispID)
 
 		// Notify Mayor that a slot is open even with pending MR — polecat is idle. (GH#2727)
-		notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+		outcome, err := notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit, router)
+		if err != nil {
+			discovery.Error = err
+		} else if outcome != "" {
+			discovery.Action += " mayor-notification=" + string(outcome)
+		}
 		return
 	}
 
@@ -2547,7 +2573,12 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	discovery.Action = fmt.Sprintf("acknowledged-idle (exit=%s)", payload.Exit)
 
 	// Notify Mayor that a slot is open (bead-based discovery path). (GH#2727)
-	notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit)
+	outcome, err := notifyMayorSlotOpen(workDir, rigName, payload.PolecatName, payload.Exit, router)
+	if err != nil {
+		discovery.Error = err
+	} else if outcome != "" {
+		discovery.Action += " mayor-notification=" + string(outcome)
+	}
 }
 
 // agentBeadSnapshot holds all fields from a single bd show --json call for an agent bead.

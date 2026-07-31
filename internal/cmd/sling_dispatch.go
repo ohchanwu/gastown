@@ -199,7 +199,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 				} else {
 					fmt.Printf("  %s Sent LIFECYCLE:Shutdown to %s/witness for %s\n", style.Bold.Render("→"), oldRigName, oldPolecatName)
 				}
-				router.WaitPendingNotifications()
+				waitForMailNotifications(router)
 			}
 		}
 	}

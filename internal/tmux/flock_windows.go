@@ -19,8 +19,11 @@ var windowsFlockMu sync.Mutex
 // a global mutex rather than per-path locking for simplicity.
 func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
 	dir := filepath.Dir(lockPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("securing lock dir: %w", err)
 	}
 
 	deadline := time.Now().Add(timeout)

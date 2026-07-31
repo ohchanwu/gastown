@@ -15,13 +15,20 @@ import (
 // Uses non-blocking flock in a polling loop to respect the timeout.
 func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
 	dir := filepath.Dir(lockPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("securing lock dir: %w", err)
+	}
 
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("opening lock file: %w", err)
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("securing lock file: %w", err)
 	}
 
 	deadline := time.Now().Add(timeout)

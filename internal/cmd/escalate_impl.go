@@ -132,7 +132,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 
 	// Send mail to each target (actions with "mail:" prefix)
 	router := mail.NewRouter(townRoot)
-	defer router.WaitPendingNotifications()
+	defer waitForMailNotifications(router)
 	statuses := []deliveryStatus{{Channel: "bead", Created: true, Severity: severity}}
 	for _, target := range targets {
 		status := deliveryStatus{Target: target, Channel: "mail", Severity: severity, NotificationRoute: "mail+nudge"}
@@ -481,7 +481,7 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 	// Perform re-escalation
 	var results []*beads.ReescalationResult
 	router := mail.NewRouter(townRoot)
-	defer router.WaitPendingNotifications()
+	defer waitForMailNotifications(router)
 
 	for _, issue := range stale {
 		result, err := bd.ReescalateEscalation(issue.ID, reescalatedBy, maxReescalations)

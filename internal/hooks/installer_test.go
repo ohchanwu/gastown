@@ -673,6 +673,9 @@ func TestInstallForRole_CodexRoleAware(t *testing.T) {
 	if !strings.Contains(string(got), "costs record >/dev/null 2>&1 &") {
 		t.Error("codex interactive: stop hook should silence gt costs record output")
 	}
+	if !strings.Contains(string(got), `"UserPromptSubmit"`) || !strings.Contains(string(got), "mail check --inject") {
+		t.Error("codex interactive: UserPromptSubmit should record delivery receipts before injection")
+	}
 
 	dir2 := t.TempDir()
 	err = InstallForRole("codex", dir2, dir2, "polecat", ".codex", "hooks.json", false)
@@ -690,6 +693,9 @@ func TestInstallForRole_CodexRoleAware(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "costs record >/dev/null 2>&1 &") {
 		t.Error("codex autonomous: stop hook should silence gt costs record output")
+	}
+	if !strings.Contains(string(got), `"UserPromptSubmit"`) || !strings.Contains(string(got), "mail check --inject") {
+		t.Error("codex autonomous: UserPromptSubmit should record delivery receipts before injection")
 	}
 }
 

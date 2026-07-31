@@ -11,6 +11,17 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} mail check --inject"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "",

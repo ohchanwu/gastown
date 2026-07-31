@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +22,43 @@ import (
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestWaitPendingNotificationsSanitizesAsyncFailure(t *testing.T) {
+	r := NewRouterWithTownRoot(t.TempDir(), t.TempDir())
+	r.notifyWg.Add(1)
+	go func() {
+		defer r.notifyWg.Done()
+		r.recordNotificationResult(errors.New("session=private-session path=/private/path wake unconfirmed"))
+	}()
+
+	err := r.WaitPendingNotifications()
+	if !errors.Is(err, ErrNotificationFailed) {
+		t.Fatalf("WaitPendingNotifications() = %v, want ErrNotificationFailed", err)
+	}
+	if got := err.Error(); got != "mail notification result: submitted=0 queued=0 failed=1" {
+		t.Fatalf("sanitized notification result = %q", got)
+	}
+	if err := r.WaitPendingNotifications(); err != nil {
+		t.Fatalf("second WaitPendingNotifications() = %v, want cleared results", err)
+	}
+}
+
+func TestWaitPendingNotificationsDistinguishesQueued(t *testing.T) {
+	r := NewRouterWithTownRoot(t.TempDir(), t.TempDir())
+	r.notifyWg.Add(1)
+	go func() {
+		defer r.notifyWg.Done()
+		r.recordNotificationResult(fmt.Errorf("%w: session=private-session delivery=/private/path", ErrNotificationQueued))
+	}()
+
+	err := r.WaitPendingNotifications()
+	if !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("WaitPendingNotifications() = %v, want ErrNotificationQueued", err)
+	}
+	if got := err.Error(); got != "mail notification result: submitted=0 queued=1 failed=0" {
+		t.Fatalf("sanitized queued result = %q", got)
+	}
+}
 
 func TestDetectTownRoot(t *testing.T) {
 	// Unset GT_TOWN_ROOT/GT_ROOT so tests exercise workspace.Find fallback.
@@ -1694,9 +1732,9 @@ func createNotifyTestSession(t *testing.T, socket, sessionName, command string) 
 	t.Fatalf("session %q never appeared on socket %q", sessionName, socket)
 }
 
-// TestNotifyRecipient_IdleAgent verifies that an idle agent (prompt visible)
-// receives a direct nudge instead of a queued one.
-func TestNotifyRecipient_IdleAgent(t *testing.T) {
+// TestNotifyRecipient_IdleUnsupportedRuntimeQueues verifies that an idle
+// runtime without a submit verifier retains a durable queued wake.
+func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 	socket := requireNotifyTestSocket(t)
 	sessionName := "gt-crew-idletest"
 
@@ -1722,16 +1760,14 @@ func TestNotifyRecipient_IdleAgent(t *testing.T) {
 	}
 
 	err := r.notifyRecipient(msg)
-	if err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
-	// The main notification was delivered directly (no immediate queue).
-	// But the reply-reminder is deferred — it should be in the queue with a
-	// future DeliverAfter, waiting for the configured delay to elapse.
+	// The unconfirmed notification and deferred reply reminder both persist.
 	pending, _ := nudge.Pending(townRoot, sessionName)
-	if pending != 1 {
-		t.Errorf("expected 1 queued nudge (deferred reply-reminder) for idle agent, got %d", pending)
+	if pending != 2 {
+		t.Errorf("expected notification + reminder for idle unsupported runtime, got %d", pending)
 	}
 
 	// Confirm the queued nudge is deferred, not a missed immediate notification.
@@ -1739,8 +1775,8 @@ func TestNotifyRecipient_IdleAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
-	if len(nudges) != 0 {
-		t.Errorf("expected 0 immediately-deliverable nudges (reminder should be deferred), got %d", len(nudges))
+	if len(nudges) != 1 {
+		t.Errorf("expected 1 immediately-deliverable queued notification, got %d", len(nudges))
 	}
 }
 
@@ -1768,8 +1804,8 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	}
 
 	err := r.notifyRecipient(msg)
-	if err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
 	// Two nudges should be queued:
@@ -1790,6 +1826,9 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	}
 	if nudges[0].Priority != nudge.PriorityNormal {
 		t.Errorf("queued mail notification priority = %q, want %q", nudges[0].Priority, nudge.PriorityNormal)
+	}
+	if nudges[0].ExpiresAt.IsZero() {
+		t.Error("normal queued notification should retain its configured TTL")
 	}
 
 	// The reply-reminder should still be in queue (deferred).
@@ -1821,8 +1860,8 @@ func TestNotifyRecipient_CanonicalAliasFansOutToBusyCandidates(t *testing.T) {
 		ThreadID: "thread-fanout",
 	}
 
-	if err := r.notifyRecipient(msg); err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if err := r.notifyRecipient(msg); !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
 	for _, sessionID := range []string{crewSession, polecatSession} {
@@ -1862,8 +1901,8 @@ func TestNotifyRecipient_CanonicalAliasQueuesAllHeadlessCandidates(t *testing.T)
 		ThreadID: "thread-headless",
 	}
 
-	if err := r.notifyRecipient(msg); err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if err := r.notifyRecipient(msg); !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
 	for _, sessionID := range []string{"gt-crew-headless", "gt-headless"} {
@@ -1895,8 +1934,8 @@ func TestNotifyRecipient_DogQueuesDogSessionNotDeacon(t *testing.T) {
 		ThreadID: "thread-dog-delivery",
 	}
 
-	if err := r.notifyRecipient(msg); err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if err := r.notifyRecipient(msg); !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
 	dogNudges, err := nudge.Drain(townRoot, "hq-dog-fido")
@@ -1941,8 +1980,8 @@ func TestNotifyRecipient_BusyAgentEscalationUsesUrgentQueuedNudge(t *testing.T) 
 		ThreadID: "hq-esc123",
 	}
 
-	if err := r.notifyRecipient(msg); err != nil {
-		t.Fatalf("notifyRecipient returned error: %v", err)
+	if err := r.notifyRecipient(msg); !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
 	}
 
 	nudges, err := nudge.Drain(townRoot, sessionName)
@@ -1954,6 +1993,9 @@ func TestNotifyRecipient_BusyAgentEscalationUsesUrgentQueuedNudge(t *testing.T) 
 	}
 	if nudges[0].Priority != nudge.PriorityUrgent {
 		t.Fatalf("queued escalation priority = %q, want %q", nudges[0].Priority, nudge.PriorityUrgent)
+	}
+	if !nudges[0].DurableUntilAck || !nudges[0].ExpiresAt.IsZero() {
+		t.Fatalf("urgent mail retry must remain durable until ack: %#v", nudges[0])
 	}
 	for _, want := range []string{"Escalation mail from gastown/witness", "ID: hq-esc123", "Severity: critical", "gt mail read hq-esc123", "gt escalate ack hq-esc123"} {
 		if !strings.Contains(nudges[0].Message, want) {

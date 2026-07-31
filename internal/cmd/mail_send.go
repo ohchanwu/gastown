@@ -165,7 +165,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		}
 		// Fall back to legacy routing for infrastructure errors (beads down, etc.)
 		router := mail.NewRouter(workDir)
-		defer router.WaitPendingNotifications()
+		defer waitForMailNotifications(router)
 		if err := router.Send(msg); err != nil {
 			return fmt.Errorf("sending message: %w", err)
 		}
@@ -177,7 +177,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 
 	// Route based on recipient type, collecting errors instead of failing early
 	router := mail.NewRouter(workDir)
-	defer router.WaitPendingNotifications()
+	defer waitForMailNotifications(router)
 	var recipientAddrs []string
 	var sendErrs []string
 
@@ -245,6 +245,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func waitForMailNotifications(router *mail.Router) {
+	if err := router.WaitPendingNotifications(); err != nil {
+		style.PrintWarning("message stored, but recipient notification was not confirmed: %v", err)
+	}
 }
 
 // generateThreadID creates a random thread ID for new message threads.

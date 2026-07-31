@@ -193,16 +193,17 @@ func (p *Propeller) eventLoop() {
 	}
 }
 
-// deliverNudges drains queued nudges and injects them into the ACP session.
+// deliverNudges claims queued nudges and acknowledges them after ACP accepts the update.
 func (p *Propeller) deliverNudges() {
-	nudges, err := nudge.Drain(p.townRoot, p.session)
+	claim, err := nudge.ClaimDue(p.townRoot, p.session)
 	if err != nil {
-		debugLog(p.townRoot, "[Propeller] deliverNudges: Drain error: %v", err)
+		debugLog(p.townRoot, "[Propeller] deliverNudges: Claim error: %v", err)
 		return
 	}
-	if len(nudges) == 0 {
+	if claim == nil {
 		return
 	}
+	nudges := []nudge.QueuedNudge{claim.Nudge}
 
 	debugLog(p.townRoot, "[Propeller] deliverNudges: drained %d nudge(s)", len(nudges))
 
@@ -218,23 +219,28 @@ func (p *Propeller) deliverNudges() {
 	}
 
 	meta := buildSessionUpdateMeta(nudges, p.session)
-	requeue := func(reason string) {
-		if err := nudge.Requeue(p.townRoot, p.session, nudges); err != nil {
-			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to requeue nudges after %s: %v", reason, err))
-			style.PrintWarning("ACP Propeller failed to requeue nudges after %s: %v", reason, err)
+	nack := func(reason string) {
+		if err := claim.Nack(reason, nudge.NextRetry(claim.Nudge.Attempts)); err != nil {
+			logEvent(p.townRoot, "acp_error", fmt.Sprintf("failed to nack nudge after %s: %v", reason, err))
+			style.PrintWarning("ACP Propeller failed to nack nudge after %s: %v", reason, err)
 			return
 		}
-		logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("requeued %d nudges: %s", len(nudges), reason))
+		logEvent(p.townRoot, "acp_degraded", fmt.Sprintf("nacked delivery: %s", reason))
 	}
 
 	if p.proxy == nil || p.proxy.SessionID() == "" {
-		requeue("session not ready")
+		nack("session-not-ready")
 		return
 	}
 
 	if err := p.notify(text, meta, urgent); err != nil {
-		requeue(fmt.Sprintf("delivery failure: %v", err))
+		nack("acp-delivery-failed")
 		style.PrintWarning("ACP Propeller failed to deliver nudge: %v", err)
+		return
+	}
+	receipt := nudge.SubmissionReceipt{Session: p.session, DeliveryID: claim.Nudge.DeliveryID, Runtime: "acp", Submitted: true, SubmittedAt: time.Now()}
+	if err := claim.AckSubmitted(receipt); err != nil {
+		style.PrintWarning("ACP Propeller delivered nudge but failed to acknowledge claim: %v", err)
 	}
 }
 

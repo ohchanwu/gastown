@@ -117,20 +117,30 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Drain and inject.
-			drained, err := nudge.Drain(townRoot, sessionName)
+			// Claim and inject; acknowledge only after runtime-proven submission.
+			claim, err := nudge.ClaimDue(townRoot, sessionName)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "nudge-poller: drain error for %s: %v\n", sessionName, err)
+				fmt.Fprintf(os.Stderr, "nudge-poller: claim error for %s: %v\n", sessionName, err)
 				continue
 			}
-			if len(drained) == 0 {
+			if claim == nil {
 				continue // someone else drained it
 			}
 
-			formatted := nudge.FormatForInjection(drained)
-			if err := t.NudgeSessionWithOpts(sessionName, formatted, nudgeOpts); err != nil {
+			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
+			nudgeOpts.TownRoot = townRoot
+			nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
+			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
+			if err != nil || !receipt.Submitted {
 				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-				requeueDrainedNudges(townRoot, sessionName, "nudge-poller", drained)
+				if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
+				}
+			} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
+				fmt.Fprintf(os.Stderr, "nudge-poller: ack error for %s: %v\n", sessionName, ackErr)
+				if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
+				}
 			}
 		}
 	}

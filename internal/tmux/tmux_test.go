@@ -1,15 +1,20 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/delivery"
 )
 
 func hasTmux() bool {
@@ -1660,6 +1665,72 @@ func TestNudgeLockDifferentSessions(t *testing.T) {
 	}
 }
 
+func TestCrossProcessNudgeLockIsPrivate(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "queue", "session", ".lock")
+	unlock, err := acquireFlockLock(lockPath, time.Second)
+	if err != nil {
+		t.Fatalf("acquireFlockLock: %v", err)
+	}
+	defer unlock()
+	for _, path := range []string{filepath.Dir(lockPath), lockPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 && info.Mode().Perm() != 0700 {
+			t.Fatalf("mode(%s) = %o, want private", path, info.Mode().Perm())
+		}
+	}
+}
+
+func TestNewTmuxWithSocketAndEnvUsesIsolatedEnvironment(t *testing.T) {
+	tm := NewTmuxWithSocketAndEnv("isolated", []string{"PATH=/usr/bin"})
+	cmd := tm.commandContext(context.Background(), "list-sessions")
+	if got := strings.Join(cmd.Env, "\n"); got != "PATH=/usr/bin" {
+		t.Fatalf("tmux command environment = %q", got)
+	}
+}
+
+func TestNudgeLeaseProvidesExclusiveOwnership(t *testing.T) {
+	townRoot := t.TempDir()
+	tm := NewTmuxWithSocket("isolated")
+	release, err := tm.AcquireNudgeLease(townRoot, "gt-mayor")
+	if err != nil {
+		t.Fatalf("AcquireNudgeLease: %v", err)
+	}
+	if !tm.ownsNudgeLease(townRoot, "gt-mayor") || NudgeLockAvailable(townRoot, "gt-mayor") {
+		t.Fatal("lease did not retain exclusive nudge ownership")
+	}
+	release()
+	if tm.ownsNudgeLease(townRoot, "gt-mayor") || !NudgeLockAvailable(townRoot, "gt-mayor") {
+		t.Fatal("lease release did not restore nudge availability")
+	}
+}
+
+func TestClientAttachmentLatchRecordsTransientAttachment(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-client-latch"
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.ArmClientAttachmentLatch(sessionName); err != nil {
+		t.Fatalf("ArmClientAttachmentLatch: %v", err)
+	}
+	hook, err := tm.run("show-hooks", "-g", "client-attached")
+	if err != nil || !strings.Contains(hook, clientAttachmentLatch) {
+		t.Fatalf("client-attached hook = %q, %v", hook, err)
+	}
+	if _, err := tm.run("set-option", "-g", clientAttachmentLatch, "1"); err != nil {
+		t.Fatalf("simulate client-attached hook: %v", err)
+	}
+	observed, err := tm.ClientAttachmentObserved(sessionName)
+	if err != nil || !observed {
+		t.Fatalf("ClientAttachmentObserved = %v, %v; want true", observed, err)
+	}
+}
+
 func TestFindAgentPane_NonexistentSession(t *testing.T) {
 	tm := newTestTmux(t)
 	_, err := tm.FindAgentPane("nonexistent-session-findagent-xyz")
@@ -1908,6 +1979,114 @@ func TestNudgeSession_WithRetry(t *testing.T) {
 	err := tm.NudgeSession(sessionName, "test message")
 	if err != nil {
 		t.Errorf("NudgeSession() = %v, want nil", err)
+	}
+}
+
+func TestNudgeSessionReceipt_DistinguishesTypedFromSubmitted(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-receipt-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	deliveryID := "ndg-typed-only"
+	baseline := time.Now()
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "echo receipt-transport-marker", NudgeOpts{TownRoot: t.TempDir(), DeliveryID: deliveryID})
+	if !errors.Is(err, ErrSubmitNotVerified) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitNotVerified", err)
+	}
+	if !receipt.Typed || receipt.Submitted {
+		t.Fatalf("receipt = %#v, want typed=true submitted=false", receipt)
+	}
+	if receipt.Session != sessionName || receipt.DeliveryID != deliveryID || receipt.TypedAt.Before(baseline) || !receipt.SubmittedAt.IsZero() {
+		t.Fatalf("receipt identity/timestamps = %#v", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_RejectsUnsupportedRuntime(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-unsupported-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentClaude)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{TownRoot: t.TempDir(), DeliveryID: "ndg-unsupported"})
+	if !errors.Is(err, ErrSubmitVerifierUnsupported) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitVerifierUnsupported", err)
+	}
+	if receipt.Typed || receipt.Submitted {
+		t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_RequiresDeliveryID(t *testing.T) {
+	receipt, err := newTestTmux(t).NudgeSessionWithReceipt("unused", "message", NudgeOpts{})
+	if !errors.Is(err, ErrSubmitNotVerified) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitNotVerified", err)
+	}
+	if receipt.Typed || receipt.Submitted || receipt.DeliveryID != "" {
+		t.Fatalf("receipt = %#v, want untouched receipt", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_MatchingRuntimeReceipt(t *testing.T) {
+	tm := newTestTmux(t)
+	townRoot := t.TempDir()
+	captured := townRoot + "/submitted.txt"
+	sessionName := "gt-test-nudge-submitted-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	command := fmt.Sprintf(`sh -c 'while true; do printf "› "; IFS= read -r line || exit; printf "%%s\n" "$line" >> %s; printf "\033[2K\r› \n"; done'`, captured)
+	if _, err := tm.run("respawn-pane", "-k", "-t", sessionName+":0.0", command); err != nil {
+		t.Fatalf("respawn runtime fixture: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	deliveryID := "ndg-submitted"
+	baseline := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, _ := os.ReadFile(captured)
+			if strings.Contains(string(data), delivery.ControlMessage(deliveryID, "echo receipt-submitted-marker")) {
+				_, _ = delivery.RecordPromptSubmitted(townRoot, sessionName, "codex", string(data), time.Now())
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "echo receipt-submitted-marker", NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
+	<-done
+	if err != nil {
+		pane, _ := tm.run("capture-pane", "-p", "-e", "-t", sessionName+":0.0", "-S", "-15")
+		t.Fatalf("NudgeSessionWithReceipt: %v\npane:\n%s", err, pane)
+	}
+	if !receipt.Typed || !receipt.Submitted || receipt.Session != sessionName || receipt.DeliveryID != deliveryID || !receipt.SubmittedAt.After(baseline) {
+		t.Fatalf("receipt = %#v, want matching post-baseline submission", receipt)
+	}
+	data, err := os.ReadFile(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), delivery.ControlMessage(deliveryID, "echo receipt-submitted-marker")) {
+		t.Fatalf("submitted control message missing delivery ID: %q", data)
 	}
 }
 

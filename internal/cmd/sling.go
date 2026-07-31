@@ -813,7 +813,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				// otherwise create cleanup wisp for manual intervention
 				if townRoot != "" {
 					router := mail.NewRouter(townRoot)
-					defer router.WaitPendingNotifications()
+					defer waitForMailNotifications(router)
 					shutdownMsg := &mail.Message{
 						From:     "gt-sling",
 						To:       fmt.Sprintf("%s/witness", oldRigName),

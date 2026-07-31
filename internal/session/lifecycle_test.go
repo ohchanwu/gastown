@@ -1,10 +1,20 @@
 package session
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+func TestStripSessionEnvPrefixes(t *testing.T) {
+	env := map[string]string{"GT_TOWN_ROOT": "/isolated", "GT_DOLT_PORT": "3306", "BEADS_DOLT_PORT": "3306", "BD_DB": "live"}
+	stripSessionEnvPrefixes(env, []string{"GT_DOLT_", "BEADS_", "BD_"})
+	want := map[string]string{"GT_TOWN_ROOT": "/isolated"}
+	if !reflect.DeepEqual(env, want) {
+		t.Fatalf("stripped session env = %#v, want %#v", env, want)
+	}
+}
 
 func TestStartSession_RequiresSessionID(t *testing.T) {
 	_, err := StartSession(nil, SessionConfig{
