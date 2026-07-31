@@ -194,6 +194,9 @@ func TestReconcileAnomalyScansAsyncNotificationFailureDoesNotDuplicateStoredMail
 	if len(lifecycle.durableMail) != 1 {
 		t.Fatalf("durable mail = %v, want stored mail", lifecycle.durableMail)
 	}
+	if !beads.ParseEscalationFields(lifecycle.issues[0].Description).AnomalyMailStored {
+		t.Fatal("mail-stored marker = false after durable write")
+	}
 
 	lifecycle.notifyErr = nil
 	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err != nil {
@@ -201,6 +204,47 @@ func TestReconcileAnomalyScansAsyncNotificationFailureDoesNotDuplicateStoredMail
 	}
 	if len(lifecycle.durableMail) != 1 {
 		t.Fatalf("retry duplicated stored mail: %v", lifecycle.durableMail)
+	}
+}
+
+func TestReconcileAnomalyScansMailMarkerSurvivesThreadRetention(t *testing.T) {
+	lifecycle := newIsolatedAnomalyLifecycle()
+	scan := completeAnomalyScan(testReaperAnomaly("hq-child-a"))
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle.durableMail = nil // Simulate normal retention after the marker is durable.
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.durableMail) != 0 {
+		t.Fatalf("unchanged replay recreated retained mail: %v", lifecycle.durableMail)
+	}
+}
+
+func TestReconcileAnomalyScansMailMarkerFailureHealsWithoutDuplicateMail(t *testing.T) {
+	lifecycle := newIsolatedAnomalyLifecycle()
+	lifecycle.markerErr = errors.New("marker unavailable")
+	scan := completeAnomalyScan(testReaperAnomaly("hq-child-a"))
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err == nil {
+		t.Fatal("reconcile succeeded, want marker failure")
+	}
+	if len(lifecycle.durableMail) != 1 {
+		t.Fatalf("durable mail = %v, want stored mail before marker failure", lifecycle.durableMail)
+	}
+	if beads.ParseEscalationFields(lifecycle.issues[0].Description).AnomalyMailStored {
+		t.Fatal("mail-stored marker = true after failed marker write")
+	}
+
+	lifecycle.markerErr = nil
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, lifecycle.deps()); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.durableMail) != 1 {
+		t.Fatalf("marker retry duplicated mail: %v", lifecycle.durableMail)
+	}
+	if !beads.ParseEscalationFields(lifecycle.issues[0].Description).AnomalyMailStored {
+		t.Fatal("mail-stored marker = false after retry")
 	}
 }
 
@@ -238,6 +282,7 @@ type isolatedAnomalyLifecycle struct {
 	closeErr     error
 	mailWriteErr error
 	notifyErr    error
+	markerErr    error
 }
 
 func newIsolatedAnomalyLifecycle() *isolatedAnomalyLifecycle {
@@ -290,6 +335,15 @@ func (l *isolatedAnomalyLifecycle) deps() anomalyReconcileDeps {
 			return nil
 		},
 		wait: func() error { return l.notifyErr },
+		mark: func(issue *beads.Issue) error {
+			if l.markerErr != nil {
+				return l.markerErr
+			}
+			fields := beads.ParseEscalationFields(issue.Description)
+			fields.AnomalyMailStored = true
+			issue.Description = beads.FormatEscalationDescription(issue.Title, fields)
+			return nil
+		},
 	}
 }
 

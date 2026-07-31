@@ -27,6 +27,7 @@ type anomalyReconcileDeps struct {
 	create func(string, *beads.EscalationFields) (*beads.Issue, error)
 	close  func(string, string, string) error
 	send   func(*beads.Issue, reaper.Anomaly) error
+	mark   func(*beads.Issue) error
 	wait   func() error
 }
 
@@ -136,8 +137,14 @@ func reconcileAnomalyScans(scans []reaper.AnomalyScan, deps anomalyReconcileDeps
 }
 
 func sendAnomalyMail(deps anomalyReconcileDeps, issue *beads.Issue, anomaly reaper.Anomaly) error {
+	if beads.ParseEscalationFields(issue.Description).AnomalyMailStored {
+		return nil
+	}
 	if err := deps.send(issue, anomaly); err != nil {
 		return errors.New("store anomaly escalation mail: operation failed")
+	}
+	if err := deps.mark(issue); err != nil {
+		return errors.New("mark anomaly escalation mail stored: operation failed")
 	}
 	if err := deps.wait(); err != nil {
 		return errors.New("anomaly escalation notification: delivery not confirmed")
@@ -241,6 +248,16 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 					return err
 				}
 			}
+			return nil
+		},
+		mark: func(issue *beads.Issue) error {
+			fields := beads.ParseEscalationFields(issue.Description)
+			fields.AnomalyMailStored = true
+			description := beads.FormatEscalationDescription(issue.Title, fields)
+			if err := bd.Update(issue.ID, beads.UpdateOptions{Description: &description}); err != nil {
+				return err
+			}
+			issue.Description = description
 			return nil
 		},
 		wait: router.WaitPendingNotifications,

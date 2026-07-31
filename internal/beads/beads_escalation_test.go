@@ -274,10 +274,12 @@ func TestEscalationFieldsRoundTripAnomalyLifecycle(t *testing.T) {
 		AnomalyFamily:      "reaper-anomaly-family:v1:def",
 		AnomalyScope:       "hq",
 		PreviousOccurrence: "hq-esc-previous",
+		AnomalyMailStored:  true,
 	}
 
 	got := ParseEscalationFields(FormatEscalationDescription("Reaper anomaly", fields))
-	if got.AnomalyFamily != fields.AnomalyFamily || got.AnomalyScope != fields.AnomalyScope || got.PreviousOccurrence != fields.PreviousOccurrence {
+	if got.AnomalyFamily != fields.AnomalyFamily || got.AnomalyScope != fields.AnomalyScope ||
+		got.PreviousOccurrence != fields.PreviousOccurrence || got.AnomalyMailStored != fields.AnomalyMailStored {
 		t.Fatalf("lifecycle fields = %#v, want %#v", got, fields)
 	}
 }

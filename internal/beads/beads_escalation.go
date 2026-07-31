@@ -31,6 +31,7 @@ type EscalationFields struct {
 	AnomalyFamily      string // Stable anomaly family excluding affected IDs
 	AnomalyScope       string // Successfully observed database scope
 	PreviousOccurrence string // Most recent resolved occurrence in this lifecycle
+	AnomalyMailStored  bool   // Durable anomaly mail was stored for all configured targets
 }
 
 // FormatEscalationDescription creates a description string from escalation fields.
@@ -119,6 +120,7 @@ func FormatEscalationDescription(title string, fields *EscalationFields) string 
 	} else {
 		lines = append(lines, "previous_occurrence: null")
 	}
+	lines = append(lines, fmt.Sprintf("anomaly_mail_stored: %t", fields.AnomalyMailStored))
 
 	return strings.Join(lines, "\n")
 }
@@ -183,6 +185,8 @@ func ParseEscalationFields(description string) *EscalationFields {
 			fields.AnomalyScope = value
 		case "previous_occurrence":
 			fields.PreviousOccurrence = value
+		case "anomaly_mail_stored":
+			fields.AnomalyMailStored = value == "true"
 		}
 	}
 
