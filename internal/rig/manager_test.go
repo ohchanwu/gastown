@@ -28,6 +28,18 @@ func setupTestTown(t *testing.T) (string, *config.RigsConfig) {
 	return root, rigsConfig
 }
 
+func writeTestRoute(t *testing.T, root, prefix, routePath string) {
+	t.Helper()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	route := fmt.Sprintf("{\"prefix\":%q,\"path\":%q}\n", prefix, routePath)
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(route), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeFakeBD(t *testing.T, script string, windowsScript string) string {
 	t.Helper()
 	binDir := t.TempDir()
@@ -1810,6 +1822,29 @@ func createTestGitRepoForRig(t *testing.T, name string) string {
 	return repoDir
 }
 
+func createTestGitRepoForRigWithBeadsPrefix(t *testing.T, name, prefix string) string {
+	t.Helper()
+	repoDir := createTestGitRepoForRig(t, name)
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("issue-prefix: "+prefix+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"git", "add", ".beads/config.yaml"},
+		{"git", "commit", "-m", "Add existing beads config"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	return repoDir
+}
+
 // fakeBDForAddRig puts a minimal no-op bd shim on PATH so that AddRig's
 // InitBeads and initAgentBeads calls succeed.
 func fakeBDForAddRig(t *testing.T) {
@@ -1819,6 +1854,7 @@ func fakeBDForAddRig(t *testing.T) {
 cmd="$1"
 [[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
 shift
+[[ -n "$BD_CMD_LOG" ]] && printf '%s %s\n' "$cmd" "$*" >> "$BD_CMD_LOG"
 case "$cmd" in
   init|config|slot) exit 0 ;;
   show) echo "[]" ;;
@@ -1835,6 +1871,116 @@ esac
 	windowsScript := "@echo off\r\nif \"%1\"==\"init\" exit /b 0\r\nif \"%1\"==\"config\" exit /b 0\r\nif \"%1\"==\"slot\" exit /b 0\r\nif \"%1\"==\"--allow-stale\" shift\r\nif \"%1\"==\"show\" echo [] & exit /b 0\r\nif \"%1\"==\"create\" echo {\"id\":\"x\",\"title\":\"x\"} & exit /b 0\r\nexit /b 0\r\n"
 	binDir := writeFakeBD(t, script, windowsScript)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestAddRig_ExistingBeadsPrefixWinsBeforeCollisionCheck(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	fakeBDForAddRig(t)
+	repoDir := createTestGitRepoForRigWithBeadsPrefix(t, "source", "gastown")
+
+	root, rigsConfig := setupTestTown(t)
+	writeTestRoute(t, root, "gt-", "other")
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	added, err := manager.AddRig(AddRigOptions{
+		Name:          "gastown",
+		GitURL:        repoDir,
+		SkipDoltCheck: true,
+	})
+	if err != nil {
+		t.Fatalf("AddRig rejected derived-prefix collision before reading source prefix: %v", err)
+	}
+	if got := added.Config.Prefix; got != "gastown" {
+		t.Fatalf("prefix = %q, want source repository prefix %q", got, "gastown")
+	}
+}
+
+func TestAddRig_FinalPrefixCollisionDoesNotInitializeBeads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	t.Setenv("BD_CMD_LOG", cmdLog)
+	fakeBDForAddRig(t)
+	repoDir := createTestGitRepoForRigWithBeadsPrefix(t, "source", "gastown")
+
+	root, rigsConfig := setupTestTown(t)
+	writeTestRoute(t, root, "gastown-", "other")
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "gastown",
+		GitURL:        repoDir,
+		SkipDoltCheck: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "prefix collision") {
+		t.Fatalf("AddRig error = %v, want prefix collision", err)
+	}
+	if data, readErr := os.ReadFile(cmdLog); readErr == nil && len(data) > 0 {
+		t.Fatalf("bd ran before prefix validation:\n%s", data)
+	} else if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+}
+
+func TestAddRig_ExplicitPrefixCollisionFailsBeforeClone(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	writeTestRoute(t, root, "custom-", "other")
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "gastown",
+		GitURL:        filepath.Join(t.TempDir(), "missing"),
+		BeadsPrefix:   "custom",
+		SkipDoltCheck: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "prefix collision") {
+		t.Fatalf("AddRig error = %v, want prefix collision before clone", err)
+	}
+}
+
+func TestAddRig_SparseCheckoutStillDetectsExistingBeadsPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	fakeBDForAddRig(t)
+	repoDir := createTestGitRepoForRigWithBeadsPrefix(t, "source", "gastown")
+	if err := os.MkdirAll(filepath.Join(repoDir, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "src", "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", "src/main.go")
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "commit", "-m", "Add sparse checkout content")
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	root, rigsConfig := setupTestTown(t)
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	added, err := manager.AddRig(AddRigOptions{
+		Name:           "gastown",
+		GitURL:         repoDir,
+		SparseCheckout: []string{"src"},
+		SkipDoltCheck:  true,
+	})
+	if err != nil {
+		t.Fatalf("AddRig: %v", err)
+	}
+	if got := added.Config.Prefix; got != "gastown" {
+		t.Fatalf("prefix = %q, want sparse repository prefix %q", got, "gastown")
+	}
 }
 
 func TestAddRig_UpstreamURL(t *testing.T) {

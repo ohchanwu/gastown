@@ -362,10 +362,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if opts.BeadsPrefix == "" {
 		opts.BeadsPrefix = deriveBeadsPrefix(opts.Name)
 	}
-
-	// Check for prefix collision with existing rigs before expensive operations.
-	if err := beads.CheckPrefixAvailable(m.townRoot, opts.BeadsPrefix+"-", opts.Name); err != nil {
-		return nil, fmt.Errorf("prefix collision (derived prefix %q): %w", opts.BeadsPrefix, err)
+	if userProvidedPrefix {
+		if err := beads.CheckPrefixAvailable(m.townRoot, opts.BeadsPrefix+"-", opts.Name); err != nil {
+			return nil, fmt.Errorf("prefix collision (%q): %w", opts.BeadsPrefix, err)
+		}
 	}
 
 	localRepo, warn := resolveLocalRepo(opts.LocalRepo, opts.GitURL)
@@ -552,10 +552,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 
 	// Set up sparse checkout on mayor clone if requested
 	if len(opts.SparseCheckout) > 0 {
-		if err := git.InitSparseCheckout(mayorRigPath, opts.SparseCheckout); err != nil {
+		sparsePaths := opts.SparseCheckout
+		if !slices.Contains(sparsePaths, ".beads") {
+			sparsePaths = append(slices.Clone(sparsePaths), ".beads")
+		}
+		if err := git.InitSparseCheckout(mayorRigPath, sparsePaths); err != nil {
 			return nil, fmt.Errorf("initializing sparse checkout for mayor: %w", err)
 		}
-		fmt.Printf("   ✓ Configured sparse checkout: %v\n", opts.SparseCheckout)
+		fmt.Printf("   ✓ Configured sparse checkout: %v\n", sparsePaths)
 	}
 
 	// No explicit checkout needed - --branch already checked out the default branch
@@ -577,6 +581,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Check if source repo has tracked .beads/ directory.
 	// If so, we need to initialize the database (it doesn't exist after clone since DB files are gitignored).
 	sourceBeadsDir := filepath.Join(mayorRigPath, ".beads")
+	sourceBeadsConfig := filepath.Join(sourceBeadsDir, "config.yaml")
 	if _, err := os.Stat(sourceBeadsDir); err == nil {
 		// Remove any redirect file that might have been accidentally tracked.
 		// Redirect files are runtime/local config and should not be in git.
@@ -585,7 +590,6 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		_ = os.Remove(sourceRedirectFile) // Ignore error if doesn't exist
 
 		// Tracked beads exist - try to detect prefix from existing issues
-		sourceBeadsConfig := filepath.Join(sourceBeadsDir, "config.yaml")
 		if sourcePrefix := detectBeadsPrefixFromConfig(sourceBeadsConfig); sourcePrefix != "" {
 			fmt.Printf("  Detected existing beads prefix '%s' from source repo\n", sourcePrefix)
 			// Only error on mismatch if user explicitly provided --prefix
@@ -603,7 +607,17 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			// Detection failed (no issues yet) - use derived/provided prefix
 			fmt.Printf("  Using prefix '%s' for tracked beads (no existing issues to detect from)\n", opts.BeadsPrefix)
 		}
+	}
 
+	// Derived prefixes can only be validated after a clone reveals any tracked
+	// beads config. Explicit prefixes were already checked before cloning.
+	if !userProvidedPrefix {
+		if err := beads.CheckPrefixAvailable(m.townRoot, opts.BeadsPrefix+"-", opts.Name); err != nil {
+			return nil, fmt.Errorf("prefix collision (%q): %w", opts.BeadsPrefix, err)
+		}
+	}
+
+	if _, err := os.Stat(sourceBeadsDir); err == nil {
 		// Initialize bd database if runtime files are missing.
 		// DB files are gitignored so they won't exist after clone — bd init creates them.
 		// bd init --prefix will create the database on the Dolt server.
