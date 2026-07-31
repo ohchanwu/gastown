@@ -463,6 +463,35 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	}
 }
 
+func TestAutoCloseExcludesConvoyLabel(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		issues: map[string]*fakeIssue{
+			"stale-task":         {id: "stale-task", title: "Stale task", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"labeled-convoy":     {id: "labeled-convoy", title: "Tracked by convoy", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:convoy"}},
+			"typed-convoy":       {id: "typed-convoy", title: "Convoy", status: "open", issueType: "convoy", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"protected-standing": {id: "protected-standing", title: "Standing order", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:standing-orders"}},
+			"protected-keep":     {id: "protected-keep", title: "Keep", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:keep"}},
+			"protected-role":     {id: "protected-role", title: "Role", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:role"}},
+			"protected-rig":      {id: "protected-rig", title: "Rig", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:rig"}},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, true)
+	if err != nil {
+		t.Fatalf("AutoClose: %v", err)
+	}
+	if result.Closed != 1 {
+		t.Fatalf("AutoClose closed %d issues, want only the unprotected stale task: %#v", result.Closed, result.ClosedEntries)
+	}
+	if got := result.ClosedEntries[0].ID; got != "stale-task" {
+		t.Fatalf("AutoClose candidate = %q, want stale-task", got)
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
@@ -483,6 +512,15 @@ type fakeWisp struct {
 	createdAt time.Time
 }
 
+type fakeIssue struct {
+	id        string
+	title     string
+	status    string
+	issueType string
+	updatedAt time.Time
+	labels    []string
+}
+
 type fakeDep struct {
 	issueID           string
 	dependsOnID       string
@@ -493,9 +531,31 @@ type fakeDep struct {
 type fakeReaperState struct {
 	mu       sync.Mutex
 	wisps    map[string]*fakeWisp
+	issues   map[string]*fakeIssue
 	deps     []fakeDep
 	nextConn int
 	ops      map[int][]string
+}
+
+func (s *fakeReaperState) autoCloseCandidatesLocked(query string, cutoff time.Time) []*fakeIssue {
+	var candidates []*fakeIssue
+	for _, issue := range s.issues {
+		if (issue.status != "open" && issue.status != "in_progress") || !issue.updatedAt.Before(cutoff) || issue.issueType == "epic" || issue.issueType == "convoy" {
+			continue
+		}
+		protected := false
+		for _, label := range issue.labels {
+			if strings.Contains(query, "'"+label+"'") {
+				protected = true
+				break
+			}
+		}
+		if !protected {
+			candidates = append(candidates, issue)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].id < candidates[j].id })
+	return candidates
 }
 
 func (s *fakeReaperState) status(id string) string {
@@ -654,6 +714,8 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	c.state.record(c.id, "QUERY "+normalized)
 
 	switch {
+	case strings.Contains(normalized, "SELECT i.id, i.title, i.updated_at FROM issues i WHERE"):
+		return fakeIssueRows(c.state.autoCloseCandidatesLocked(normalized, namedTime(args))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -737,6 +799,14 @@ func fakeIDRows(ids []string) *fakeReaperRows {
 		rows[i] = []driver.Value{id}
 	}
 	return &fakeReaperRows{cols: []string{"id"}, rows: rows}
+}
+
+func fakeIssueRows(issues []*fakeIssue) *fakeReaperRows {
+	rows := make([][]driver.Value, len(issues))
+	for i, issue := range issues {
+		rows[i] = []driver.Value{issue.id, issue.title, issue.updatedAt}
+	}
+	return &fakeReaperRows{cols: []string{"id", "title", "updated_at"}, rows: rows}
 }
 
 func (r *fakeReaperRows) Columns() []string { return r.cols }
