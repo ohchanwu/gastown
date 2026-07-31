@@ -14,6 +14,7 @@ if (( ${#test_port} > 5 || 10#$test_port < 1 || 10#$test_port > 65535 )); then
   echo "test-isolation: configuration: GT_TEST_DOLT_PORT is outside the TCP port range" >&2
   exit 78
 fi
+test_port=$((10#$test_port))
 
 for selector in GT_DOLT_PORT BEADS_DOLT_PORT BEADS_DOLT_SERVER_PORT; do
   if [[ -n "${!selector:-}" && "${!selector}" == "$test_port" ]]; then

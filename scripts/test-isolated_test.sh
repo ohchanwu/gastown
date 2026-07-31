@@ -87,6 +87,18 @@ else
   fail "rejects an isolated port that aliases an inherited listener"
 fi
 
+rm -f "$CAPTURE"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+  BEADS_DOLT_PORT=3306 GT_TEST_DOLT_PORT=03306 \
+  bash "$LAUNCHER" 2>&1)" || status=$?
+if [[ "$status" -eq 78 && ! -e "$CAPTURE" && \
+      "$output" == *"test-isolation: configuration"* ]]; then
+  pass "rejects a numerically equivalent inherited listener port"
+else
+  fail "rejects a numerically equivalent inherited listener port"
+fi
+
 status=0
 output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" FAKE_GO_EXIT=9 \
   GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
