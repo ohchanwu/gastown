@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,29 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+func TestNotifyConvoyCompletionQuietRejectsMissingOrMalformedConvoy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+	for _, output := range []string{"not-json", "[]"} {
+		t.Run(output, func(t *testing.T) {
+			binDir := t.TempDir()
+			townRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nprintf '%s\\n' '" + output + "'\n"
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if err := notifyConvoyCompletionContextWithWarnings(context.Background(), townRoot, "hq-cv-test", "ignored", false); err == nil {
+				t.Fatalf("quiet notification accepted %q convoy output", output)
+			}
+		})
+	}
+}
 
 func TestNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
 	if runtime.GOOS == "windows" {

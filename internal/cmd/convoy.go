@@ -2082,17 +2082,27 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 }
 
 func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, title string) error {
+	return notifyConvoyCompletionContextWithWarnings(ctx, townBeads, convoyID, title, true)
+}
+
+func notifyConvoyCompletionContextWithWarnings(ctx context.Context, townBeads, convoyID, title string, showWarnings bool) error {
 	stdout, err := runBdJSONWithOptionsContext(ctx, townBeads, false, false, "show", convoyID, "--json")
 	if err != nil {
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
 	}
 
 	var convoys []struct {
 		Description string `json:"description"`
 		CreatedAt   string `json:"created_at"`
 	}
-	if err := json.Unmarshal(stdout, &convoys); err != nil || len(convoys) == 0 {
-		return nil
+	if err := json.Unmarshal(stdout, &convoys); err != nil {
+		return err
+	}
+	if len(convoys) == 0 {
+		return errors.New("convoy not found")
 	}
 
 	// ZFC: Use typed accessor instead of parsing description text
@@ -2144,6 +2154,9 @@ func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, tit
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if !showWarnings {
+				return err
+			}
 			style.PrintWarning("could not notify %s: %v", addr, err)
 		}
 	}
@@ -2157,6 +2170,9 @@ func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, tit
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if !showWarnings {
+				return err
+			}
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
 	}
@@ -2169,12 +2185,15 @@ func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, tit
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if !showWarnings {
+				return err
+			}
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
 		}
 	}
 
 	// Push notification to active Mayor session if configured.
-	if err := notifyMayorSessionContext(ctx, townBeads, convoyID, title); err != nil {
+	if err := notifyMayorSessionContextWithWarnings(ctx, townBeads, convoyID, title, showWarnings); err != nil {
 		return err
 	}
 
@@ -2183,6 +2202,9 @@ func notifyConvoyCompletionContext(ctx context.Context, townBeads, convoyID, tit
 	if err := runTownMutationAndExportContext(ctx, townBeads, "update", convoyID, "--description="+newDesc); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if !showWarnings {
+			return err
 		}
 		style.PrintWarning("could not record convoy completion notification state for %s: %v", convoyID, err)
 		return nil
@@ -2197,6 +2219,10 @@ func notifyMayorSession(townBeads, convoyID, title string) {
 }
 
 func notifyMayorSessionContext(ctx context.Context, townBeads, convoyID, title string) error {
+	return notifyMayorSessionContextWithWarnings(ctx, townBeads, convoyID, title, true)
+}
+
+func notifyMayorSessionContextWithWarnings(ctx context.Context, townBeads, convoyID, title string, showWarnings bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -2215,6 +2241,9 @@ func notifyMayorSessionContext(ctx context.Context, townBeads, convoyID, title s
 	if err := nudgeCmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if !showWarnings {
+			return err
 		}
 		style.PrintWarning("could not nudge Mayor session: %v", err)
 	}
