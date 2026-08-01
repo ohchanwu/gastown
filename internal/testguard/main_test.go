@@ -41,7 +41,14 @@ func TestCleanupSinceBaselineRejectsNonPrivateReceipt(t *testing.T) {
 	if err := os.WriteFile(path, []byte("[]"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanupSinceBaseline(path); err == nil {
+	if err := cleanupSinceBaseline(path, 101); err == nil {
 		t.Fatal("cleanup accepted a non-private baseline receipt")
+	}
+}
+
+func TestRequiredBaselineListenerRejectsMissingLauncher(t *testing.T) {
+	baseline := []doltserver.DoltListener{{PID: 101, Port: 4401}}
+	if _, err := requiredBaselineListener(baseline, 202); err == nil {
+		t.Fatal("accepted a baseline that omitted the known launcher process")
 	}
 }

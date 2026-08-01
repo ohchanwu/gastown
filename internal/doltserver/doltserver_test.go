@@ -505,8 +505,8 @@ func TestRemediateTestLeaksSinceSignalsOnlyNewTestOwnedListeners(t *testing.T) {
 
 	err := remediateTestLeaksSince(
 		[]LocalDoltServer{baseline, newLeak, town, canonical, unknown},
-		map[int]bool{baseline.PID: true},
-		func(pid int) error { terminated = append(terminated, pid); return nil },
+		map[DoltListener]bool{baseline.DoltListener: true},
+		func(selection TestLeakSelection) error { terminated = append(terminated, selection.PID); return nil },
 		func() []LocalDoltServer {
 			rescans++
 			if rescans == 1 {
@@ -523,6 +523,32 @@ func TestRemediateTestLeaksSinceSignalsOnlyNewTestOwnedListeners(t *testing.T) {
 	}
 }
 
+func TestRemediateTestLeaksSinceTreatsReusedBaselinePIDOnNewPortAsNew(t *testing.T) {
+	baseline := DoltListener{PID: 551, Port: 4551}
+	leak := LocalDoltServer{
+		DoltListener: DoltListener{PID: baseline.PID, Port: 4552},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.reused-pid"),
+	}
+	terminated := false
+	rescans := 0
+
+	err := remediateTestLeaksSince([]LocalDoltServer{leak}, map[DoltListener]bool{baseline: true},
+		func(TestLeakSelection) error { terminated = true; return nil }, func() []LocalDoltServer {
+			rescans++
+			if rescans == 1 {
+				return []LocalDoltServer{leak}
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("remediateTestLeaksSince: %v", err)
+	}
+	if !terminated {
+		t.Fatal("cleanup ignored a new listener that reused a baseline PID on another port")
+	}
+}
+
 func TestRemediateTestLeaksSinceRejectsChangedOwnerBeforeSignal(t *testing.T) {
 	original := LocalDoltServer{
 		DoltListener: DoltListener{PID: 561, Port: 4561},
@@ -536,7 +562,7 @@ func TestRemediateTestLeaksSinceRejectsChangedOwnerBeforeSignal(t *testing.T) {
 	err := remediateTestLeaksSince(
 		[]LocalDoltServer{original},
 		nil,
-		func(int) error { terminated = true; return nil },
+		func(TestLeakSelection) error { terminated = true; return nil },
 		func() []LocalDoltServer { return []LocalDoltServer{reused} },
 	)
 	if err == nil {
@@ -562,7 +588,7 @@ func TestRemediatePreviewedTestLeaksSignalsOnlyRevalidatedPreview(t *testing.T) 
 		[]LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured},
 		preview,
 		true,
-		func(pid int) error { terminated = append(terminated, pid); return nil },
+		func(selection TestLeakSelection) error { terminated = append(terminated, selection.PID); return nil },
 		func() []LocalDoltServer {
 			return []LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured}
 		},
@@ -580,7 +606,7 @@ func TestRemediatePreviewedTestLeaksDefaultsToNoSignals(t *testing.T) {
 	leak.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.preview")
 	terminated := false
 	if err := remediatePreviewedTestLeaks([]LocalDoltServer{leak}, []TestLeakSelection{newTestLeakSelection(leak)}, false,
-		func(int) error { terminated = true; return nil }, nil); err != nil {
+		func(TestLeakSelection) error { terminated = true; return nil }, nil); err != nil {
 		t.Fatalf("preview: %v", err)
 	}
 	if terminated {
@@ -599,12 +625,26 @@ func TestRemediatePreviewedTestLeaksRejectsPIDReuseChangedOwner(t *testing.T) {
 	terminated := false
 
 	err := remediatePreviewedTestLeaks([]LocalDoltServer{reused}, []TestLeakSelection{newTestLeakSelection(original)}, true,
-		func(int) error { terminated = true; return nil }, func() []LocalDoltServer { return []LocalDoltServer{reused} })
+		func(TestLeakSelection) error { terminated = true; return nil }, func() []LocalDoltServer { return []LocalDoltServer{reused} })
 	if err == nil {
 		t.Fatal("apply accepted reused PID/port with changed owner")
 	}
 	if terminated {
 		t.Fatal("apply signaled reused PID/port with changed owner")
+	}
+}
+
+func TestNewTestLeakSelectionIncludesProcessIdentity(t *testing.T) {
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 631, Port: 4631},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.same-owner"),
+		ProcessToken: "Mon Aug  1 12:00:00 2026",
+	}
+	reused := original
+	reused.ProcessToken = "Mon Aug  1 12:01:00 2026"
+	if newTestLeakSelection(original) == newTestLeakSelection(reused) {
+		t.Fatal("selection ignored a changed process start identity")
 	}
 }
 
