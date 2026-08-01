@@ -1,8 +1,10 @@
 package formula
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPatrolFormulasHaveBackoffLogic verifies that patrol formulas include
@@ -67,6 +69,38 @@ func TestPatrolFormulasHaveBackoffLogic(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeaconPatrolOuterDeadlineCoversAwaitSignalBackoff(t *testing.T) {
+	const overhead = time.Minute
+
+	// Regression: a 75s wrapper cannot contain the legitimate third 4m wait.
+	if 75*time.Second >= 4*time.Minute+overhead {
+		t.Fatal("regression fixture must reproduce the patrol budget inversion")
+	}
+
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	backoffMatch := regexp.MustCompile(`--backoff-max ([0-9]+[smh])`).FindSubmatch(content)
+	deadlineMatch := regexp.MustCompile(`outer tool deadline: ([0-9]+[smh])`).FindSubmatch(content)
+	if len(backoffMatch) != 2 || len(deadlineMatch) != 2 {
+		t.Fatal("deacon patrol must declare its backoff max and outer tool deadline")
+	}
+
+	backoff, err := time.ParseDuration(string(backoffMatch[1]))
+	if err != nil {
+		t.Fatalf("parsing deacon backoff max: %v", err)
+	}
+	deadline, err := time.ParseDuration(string(deadlineMatch[1]))
+	if err != nil {
+		t.Fatalf("parsing deacon outer tool deadline: %v", err)
+	}
+	if deadline < backoff+overhead {
+		t.Fatalf("outer tool deadline %v must cover backoff %v plus %v overhead", deadline, backoff, overhead)
 	}
 }
 
