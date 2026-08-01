@@ -208,7 +208,7 @@ var nudgeCanaryCmd = &cobra.Command{
 }
 
 func wakeCanaryStartupChallenge(nonce string) (string, string) {
-	return fmt.Sprintf("Reply with exactly the reverse of nonce %s and then wait for high-priority Witness mail notifications.", nonce), reverseString(nonce)
+	return fmt.Sprintf("Reply with exactly the reverse of nonce %s.", nonce), reverseString(nonce)
 }
 
 func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName string, turns int) (wakeCanaryResult, string, error) {

@@ -64,8 +64,8 @@ func TestWakeCanaryStartupChallengeRequiresFiniteReply(t *testing.T) {
 	if response != "321cba" {
 		t.Fatalf("startup response = %q, want reversed nonce", response)
 	}
-	if !strings.Contains(instruction, "abc123") || !strings.Contains(instruction, "Reply with exactly") || !strings.Contains(instruction, "then wait") {
-		t.Fatal("startup instruction lacks a finite reply contract")
+	if want := "Reply with exactly the reverse of nonce abc123."; instruction != want {
+		t.Fatalf("startup instruction = %q, want one finite request %q", instruction, want)
 	}
 	if strings.Contains(instruction, response) {
 		t.Fatal("startup instruction contains the expected response before the model turn")
