@@ -49,12 +49,28 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		t.Fatalf("capture baseline: %v", err)
 	}
 	baselineTokenCount := strings.Count(string(baseline), probeToken)
+	writeEvidence := func(content []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(evidencePath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Dir(evidencePath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(evidencePath, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(evidencePath, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	t.Cleanup(ticker.Stop)
 	timeout := time.NewTimer(180 * time.Second)
 	t.Cleanup(func() { timeout.Stop() })
 	stable := 0
+	var lastCapture []byte
 	for {
 		select {
 		case <-ticker.C:
@@ -63,6 +79,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				stable = 0
 				continue
 			}
+			lastCapture = content
 			styled := string(content)
 			busy := strings.Contains(styled, "esc to interrupt")
 			if !busy && strings.Count(styled, probeToken) > baselineTokenCount {
@@ -73,18 +90,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			if stable < 2 {
 				continue
 			}
-			if err := os.MkdirAll(filepath.Dir(evidencePath), 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(filepath.Dir(evidencePath), 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(evidencePath, content, 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(evidencePath, 0600); err != nil {
-				t.Fatal(err)
-			}
+			writeEvidence(content)
 			info, err := os.Stat(evidencePath)
 			if err != nil {
 				t.Fatal(err)
@@ -92,6 +98,9 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			t.Logf("private styled pane captured: path=%s bytes=%d mode=%o", evidencePath, info.Size(), info.Mode().Perm())
 			return
 		case <-timeout.C:
+			if len(lastCapture) > 0 {
+				writeEvidence(lastCapture)
+			}
 			t.Fatal("isolated Codex probe did not reach stable completed output")
 		}
 	}
