@@ -2196,7 +2196,14 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
+			// Codex hook review pre-selects "Review hooks"; choose
+			// "Trust all and continue" before accepting.
+			if strings.Contains(content, "Hooks need review") {
+				if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+					return err
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
 				return err
 			}
@@ -2222,7 +2229,8 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 func containsWorkspaceTrustDialog(content string) bool {
 	return strings.Contains(content, "trust this folder") ||
 		strings.Contains(content, "Quick safety check") ||
-		strings.Contains(content, "Do you trust the contents of this directory?")
+		strings.Contains(content, "Do you trust the contents of this directory?") ||
+		strings.Contains(content, "Hooks need review")
 }
 
 func containsBlockingStartupDialog(content string) (string, bool) {
@@ -2258,6 +2266,7 @@ func lastStartupBlockerLine(content string) int {
 		"trust this folder",
 		"Quick safety check",
 		"Do you trust the contents of this directory?",
+		"Hooks need review",
 		"Bypass Permissions mode",
 	}
 	last := -1

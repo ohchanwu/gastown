@@ -210,6 +210,7 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 	}{
 		{"claude trust prompt", "Quick safety check\nDo you trust this folder?", true},
 		{"codex trust prompt", "> You are in /tmp/demo\nDo you trust the contents of this directory?", true},
+		{"codex hook trust prompt", "Hooks need review", true},
 		{"bypass dialog", "Bypass Permissions mode\n1. No\n2. Yes, I accept", false},
 		{"shell prompt", "user@host:~$", false},
 	}
@@ -244,6 +245,12 @@ Skip until next version`,
 		{
 			name:        "codex trust modal",
 			content:     "> You are in /tmp/demo\nDo you trust the contents of this directory?",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "codex hook trust modal",
+			content:     "Hooks need review",
 			wantBlocked: true,
 			wantName:    "workspace trust prompt",
 		},

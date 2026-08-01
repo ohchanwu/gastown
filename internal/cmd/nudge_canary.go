@@ -98,13 +98,7 @@ func newWakeCanarySandbox(parent string) (*wakeCanarySandbox, error) {
 		cleanup()
 		return nil, fmt.Errorf("installing temporary Codex hooks: %w", err)
 	}
-	trustedWorkDir, err := filepath.EvalSymlinks(workDir)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("canonicalizing temporary Codex workdir: %w", err)
-	}
-	settings := fmt.Sprintf("bypass_hook_trust = true\n\n[features]\nhooks = true\n\n[projects.%q]\ntrust_level = \"trusted\"\n", trustedWorkDir)
-	if err := atomicfile.WriteFile(filepath.Join(runtimeConfigDir, "config.toml"), []byte(settings), 0600); err != nil {
+	if err := atomicfile.WriteFile(filepath.Join(runtimeConfigDir, "config.toml"), []byte("[features]\nhooks = true\n"), 0600); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("writing temporary Codex settings: %w", err)
 	}

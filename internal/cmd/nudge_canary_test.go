@@ -176,21 +176,6 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	if !strings.Contains(string(hooksData), "UserPromptSubmit") || !strings.Contains(string(hooksData), "mail check --inject") {
 		t.Fatalf("temporary Codex hooks lack receipt dispatcher: %s", hooksData)
 	}
-	configData, err := os.ReadFile(filepath.Join(sandbox.RuntimeConfigDir, "config.toml"))
-	if err != nil {
-		t.Fatalf("temporary Codex config missing: %v", err)
-	}
-	trustedWorkDir, err := filepath.EvalSymlinks(sandbox.WorkDir)
-	if err != nil {
-		t.Fatalf("canonicalize isolated workdir: %v", err)
-	}
-	wantTrust := fmt.Sprintf("[projects.%q]\ntrust_level = \"trusted\"", trustedWorkDir)
-	if !strings.Contains(string(configData), wantTrust) {
-		t.Fatalf("temporary Codex config does not trust isolated workdir")
-	}
-	if !strings.Contains(string(configData), "bypass_hook_trust = true") {
-		t.Fatalf("temporary Codex config does not trust generated hooks")
-	}
 	if sandbox.Socket == "" || sandbox.Socket == "gastown" {
 		t.Fatalf("canary socket is not isolated: %q", sandbox.Socket)
 	}
