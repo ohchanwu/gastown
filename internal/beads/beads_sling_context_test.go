@@ -43,6 +43,59 @@ esac
 	}
 }
 
+func TestListOpenSlingContextsContextCancelsAllowStaleProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	ResetBdAllowStaleCacheForTest()
+	binDir := t.TempDir()
+	probeStarted := filepath.Join(t.TempDir(), "probe-started")
+	queryStarted := filepath.Join(t.TempDir(), "query-started")
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ] && [ "$2" = "version" ]; then
+  : > "$GT_PROBE_STARTED"
+  exec sleep 2
+fi
+while [ "${1#--}" != "$1" ]; do shift; done
+if [ "$1" = "query" ]; then : > "$GT_QUERY_STARTED"; fi
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_PROBE_STARTED", probeStarted)
+	t.Setenv("GT_QUERY_STARTED", queryStarted)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := New(t.TempDir()).ListOpenSlingContextsContext(ctx)
+		done <- err
+	}()
+	waitForFile(t, probeStarted, time.Second)
+	cancel()
+
+	var err error
+	returnedPromptly := false
+	select {
+	case err = <-done:
+		returnedPromptly = true
+	case <-time.After(750 * time.Millisecond):
+		err = <-done // Reap the fixture before failing.
+	}
+	if !returnedPromptly {
+		t.Fatal("canceled list waited for the independent allow-stale probe timeout")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if _, statErr := os.Stat(queryStarted); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("query launch after canceled capability probe: %v", statErr)
+	}
+}
+
 func TestFormatParseSlingContextRoundTrip(t *testing.T) {
 	original := &capacity.SlingContextFields{
 		Version:          1,
