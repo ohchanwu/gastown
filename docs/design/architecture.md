@@ -185,8 +185,9 @@ subprocesses and enforce a package-exit listener baseline.
 
 The repository-wide isolated test launcher also records a mode-0600 listener
 baseline before packages start. Its outer EXIT trap covers package failures and
-timeouts, selecting only new, positively test-owned listeners and revalidating
-PID, port, class, and opaque ownership token before signaling. Baseline,
+timeouts, selecting only new listeners owned within that launcher's private
+temporary root and revalidating PID, port, class, process-start identity, and
+opaque ownership token before signaling. Concurrent runs, baseline,
 canonical, unknown, non-test-owned, and changed-owner listeners remain
 untouched, and cleanup failure overrides the suite status so retries never
 silently accept an orphan from an earlier attempt.

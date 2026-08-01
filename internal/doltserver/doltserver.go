@@ -969,8 +969,9 @@ const (
 // LocalDoltServer is one entry in the shared local listener inventory.
 type LocalDoltServer struct {
 	DoltListener
-	Class     DoltServerClass
-	OwnerPath string
+	Class        DoltServerClass
+	OwnerPath    string
+	ProcessToken string
 }
 
 // TestLeakSelection is the private, path-free identity recorded by a preview.
@@ -982,10 +983,10 @@ type TestLeakSelection struct {
 }
 
 func newTestLeakSelection(server LocalDoltServer) TestLeakSelection {
-	if server.Class != DoltServerOwnedTestLeak || server.OwnerPath == "" {
+	if server.Class != DoltServerOwnedTestLeak || server.OwnerPath == "" || server.ProcessToken == "" {
 		return TestLeakSelection{}
 	}
-	token := sha256.Sum256([]byte(filepath.Clean(server.OwnerPath)))
+	token := sha256.Sum256([]byte(filepath.Clean(server.OwnerPath) + "\x00" + server.ProcessToken))
 	return TestLeakSelection{
 		PID:            server.PID,
 		Port:           server.Port,
@@ -1011,21 +1012,23 @@ func (s LocalDoltServer) Actionable() bool {
 }
 
 type doltProcessEvidence struct {
-	DataDir     string
-	ConfigPath  string
-	CWD         string
-	CWDFromLsof bool
-	StateDir    string
+	DataDir      string
+	ConfigPath   string
+	CWD          string
+	CWDFromLsof  bool
+	StateDir     string
+	ProcessToken string
 }
 
 func processEvidence(townRoot string, pid int) doltProcessEvidence {
 	cwd := getProcessCWD(pid)
 	return doltProcessEvidence{
-		DataDir:     GetDoltDataDirFromProcess(pid),
-		ConfigPath:  getDoltConfigPathFromProcess(pid),
-		CWD:         cwd,
-		CWDFromLsof: runtime.GOOS == "darwin" && cwd != "",
-		StateDir:    getServerDataDir(townRoot, pid),
+		DataDir:      GetDoltDataDirFromProcess(pid),
+		ConfigPath:   getDoltConfigPathFromProcess(pid),
+		CWD:          cwd,
+		CWDFromLsof:  runtime.GOOS == "darwin" && cwd != "",
+		StateDir:     getServerDataDir(townRoot, pid),
+		ProcessToken: getProcessStartToken(pid),
 	}
 }
 
@@ -1034,11 +1037,24 @@ func (e doltProcessEvidence) ownerPath() string {
 }
 
 func isOwnedTestDataDir(path string) bool {
-	if path == "" || !strings.HasPrefix(filepath.Base(filepath.Clean(path)), "gastown-test-dolt.") {
+	if path == "" {
 		return false
 	}
-	rel, err := filepath.Rel(os.TempDir(), filepath.Clean(path))
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	roots := []string{filepath.Clean(os.TempDir())}
+	if resolved, err := filepath.EvalSymlinks(roots[0]); err == nil && resolved != roots[0] {
+		roots = append(roots, resolved)
+	}
+	for _, tempRoot := range roots {
+		rel, err := filepath.Rel(tempRoot, filepath.Clean(path))
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		root := strings.Split(rel, string(filepath.Separator))[0]
+		if strings.HasPrefix(root, "gastown-test-dolt.") && len(root) > len("gastown-test-dolt.") {
+			return true
+		}
+	}
+	return false
 }
 
 func isOwnedTestCWD(path string, fromLsof bool) bool {
@@ -1053,6 +1069,13 @@ func isOwnedTestCWD(path string, fromLsof bool) bool {
 
 	tempRoot := filepath.Clean(os.TempDir())
 	cleanPath := filepath.Clean(path)
+	if isOwnedTestDataDir(cleanPath) {
+		resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+		if err != nil {
+			return fromLsof && os.IsNotExist(err)
+		}
+		return isOwnedTestDataDir(resolvedPath)
+	}
 	resolvedTempRoot, err := filepath.EvalSymlinks(tempRoot)
 	if err != nil {
 		return false
@@ -1155,7 +1178,7 @@ func classifyLocalDoltServers(expectedPort int, expectedDataDir string, listener
 	servers := make([]LocalDoltServer, 0, len(listeners))
 	for _, listener := range listeners {
 		evidence := evidenceByPID[listener.PID]
-		server := LocalDoltServer{DoltListener: listener, Class: DoltServerUnknown, OwnerPath: evidence.ownerPath()}
+		server := LocalDoltServer{DoltListener: listener, Class: DoltServerUnknown, OwnerPath: evidence.ownerPath(), ProcessToken: evidence.ProcessToken}
 		switch {
 		case canonicalPIDs[listener.PID]:
 			server.Class = DoltServerCanonical
@@ -1176,16 +1199,26 @@ func classifyLocalDoltServers(expectedPort int, expectedDataDir string, listener
 }
 
 // InventoryLocalDoltServers discovers and classifies all local Dolt listeners once.
-func InventoryLocalDoltServers(townRoot string) []LocalDoltServer {
+func inventoryLocalDoltServers(townRoot string) ([]LocalDoltServer, error) {
 	config := DefaultConfig(townRoot)
-	if config.IsRemote() {
-		return classifyLocalDoltServers(0, "", FindAllDoltListeners(), func(pid int) doltProcessEvidence {
-			return processEvidence(townRoot, pid)
-		})
+	listeners, err := FindAllDoltListenersWithError()
+	if err != nil {
+		return nil, err
 	}
-	return classifyLocalDoltServers(config.Port, config.DataDir, FindAllDoltListeners(), func(pid int) doltProcessEvidence {
+	if config.IsRemote() {
+		return classifyLocalDoltServers(0, "", listeners, func(pid int) doltProcessEvidence {
+			return processEvidence(townRoot, pid)
+		}), nil
+	}
+	return classifyLocalDoltServers(config.Port, config.DataDir, listeners, func(pid int) doltProcessEvidence {
 		return processEvidence(townRoot, pid)
-	})
+	}), nil
+}
+
+// InventoryLocalDoltServers discovers and classifies all local Dolt listeners once.
+func InventoryLocalDoltServers(townRoot string) []LocalDoltServer {
+	servers, _ := inventoryLocalDoltServers(townRoot)
+	return servers
 }
 
 // FindAllDoltListeners discovers all Dolt processes with TCP listeners using lsof.
@@ -1193,7 +1226,7 @@ func InventoryLocalDoltServers(townRoot string) []LocalDoltServer {
 // (pgrep -f), avoiding fragile ps/pgrep pattern coupling (ZFC fix: gt-fj87).
 // The -a flag is critical: without it, lsof ORs -c and -i selections, matching ANY
 // process with TCP listeners (not just dolt). With -a, selections are ANDed (fix: gt-lzdp).
-func FindAllDoltListeners() []DoltListener {
+func FindAllDoltListenersWithError() ([]DoltListener, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1201,7 +1234,11 @@ func FindAllDoltListeners() []DoltListener {
 	setProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(output) == 0 && len(exitErr.Stderr) == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("discover Dolt listeners: %w", err)
 	}
 
 	// Parse lsof -F output. Lines are field-prefixed:
@@ -1243,6 +1280,11 @@ func FindAllDoltListeners() []DoltListener {
 			}
 		}
 	}
+	return listeners, nil
+}
+
+func FindAllDoltListeners() []DoltListener {
+	listeners, _ := FindAllDoltListenersWithError()
 	return listeners
 }
 
@@ -1298,6 +1340,19 @@ func getProcessArgs(pid int) []string {
 		return nil
 	}
 	return strings.Fields(strings.TrimSpace(string(out)))
+}
+
+func getProcessStartToken(pid int) string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func getProcessCWD(pid int) string {
@@ -1541,10 +1596,10 @@ func remediateOwnedLeaksSince(initial []LocalDoltServer, baseline map[int]bool, 
 	})
 }
 
-func testLeakSelectionsSince(inventory []LocalDoltServer, baseline map[int]bool) []TestLeakSelection {
+func testLeakSelectionsSince(inventory []LocalDoltServer, baseline map[DoltListener]bool) []TestLeakSelection {
 	var selections []TestLeakSelection
 	for _, server := range inventory {
-		if baseline[server.PID] {
+		if baseline[server.DoltListener] {
 			continue
 		}
 		if selection := newTestLeakSelection(server); selection.OwnershipToken != "" {
@@ -1554,8 +1609,11 @@ func testLeakSelectionsSince(inventory []LocalDoltServer, baseline map[int]bool)
 	return selections
 }
 
-func remediateTestLeaksSince(initial []LocalDoltServer, baseline map[int]bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+func remediateTestLeaksSince(initial []LocalDoltServer, baseline map[DoltListener]bool, terminate func(TestLeakSelection) error, rescan func() []LocalDoltServer) error {
 	preview := testLeakSelectionsSince(initial, baseline)
+	if len(preview) == 0 {
+		return nil
+	}
 	return remediatePreviewedTestLeaks(rescan(), preview, true, terminate, rescan)
 }
 
@@ -1573,7 +1631,7 @@ func previewedTestLeaks(inventory []LocalDoltServer, preview []TestLeakSelection
 	return leaks
 }
 
-func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSelection, apply bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSelection, apply bool, terminate func(TestLeakSelection) error, rescan func() []LocalDoltServer) error {
 	for _, wanted := range preview {
 		if wanted.Class != DoltServerOwnedTestLeak || wanted.OwnershipToken == "" {
 			return fmt.Errorf("invalid test-leak preview selection")
@@ -1584,9 +1642,82 @@ func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSe
 			}
 		}
 	}
-	return remediateInventory(previewedTestLeaks(initial, preview), apply, terminate, func() []LocalDoltServer {
-		return previewedTestLeaks(rescan(), preview)
-	})
+	if !apply {
+		return nil
+	}
+	for _, server := range previewedTestLeaks(initial, preview) {
+		if err := terminate(newTestLeakSelection(server)); err != nil {
+			return err
+		}
+	}
+	if remaining := len(previewedTestLeaks(rescan(), preview)); remaining > 0 {
+		return fmt.Errorf("%d previewed test-owned Dolt listener(s) remain", remaining)
+	}
+	return nil
+}
+
+func hasTestLeakSelection(inventory []LocalDoltServer, selection TestLeakSelection) bool {
+	for _, server := range inventory {
+		if newTestLeakSelection(server) == selection {
+			return true
+		}
+	}
+	return false
+}
+
+func terminateSelectedTestLeak(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error)) error {
+	process, err := os.FindProcess(selection.PID)
+	if err != nil {
+		return fmt.Errorf("finding Dolt process %d: %w", selection.PID, err)
+	}
+	return terminateSelectedTestLeakWith(selection, rescan, func(kill bool) error {
+		if kill {
+			return process.Kill()
+		}
+		return gracefulTerminate(process)
+	}, time.Sleep)
+}
+
+func terminateSelectedTestLeakWith(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error), signal func(bool) error, pause func(time.Duration)) error {
+	current, err := rescan()
+	if err != nil {
+		return err
+	}
+	if !hasTestLeakSelection(current, selection) {
+		return fmt.Errorf("test-leak ownership changed for PID %d port %d", selection.PID, selection.Port)
+	}
+	if err := signal(false); err != nil {
+		return fmt.Errorf("sending termination signal to Dolt PID %d: %w", selection.PID, err)
+	}
+	for i := 0; i < 10; i++ {
+		pause(500 * time.Millisecond)
+		current, err = rescan()
+		if err != nil {
+			return err
+		}
+		if !hasTestLeakSelection(current, selection) {
+			return nil
+		}
+	}
+	current, err = rescan()
+	if err != nil {
+		return err
+	}
+	if !hasTestLeakSelection(current, selection) {
+		return nil
+	}
+	if err := signal(true); err != nil {
+		return fmt.Errorf("killing Dolt PID %d: %w", selection.PID, err)
+	}
+	pause(100 * time.Millisecond)
+	current, err = rescan()
+	if err != nil {
+		return err
+	}
+	if hasTestLeakSelection(current, selection) {
+		return fmt.Errorf("Dolt PID %d remained alive after kill", selection.PID)
+	}
+	return nil
 }
 
 // RemediateLocalDoltServers previews by default and only signals listeners
@@ -1623,21 +1754,49 @@ func CleanupOwnedLocalDoltLeaks(townRoot string, baseline []DoltListener) error 
 
 // CleanupOwnedLocalTestLeaks removes only positively test-owned listeners that
 // appeared after baseline, revalidating ownership before signaling.
-func CleanupOwnedLocalTestLeaks(townRoot string, baseline []DoltListener) error {
-	baselinePIDs := make(map[int]bool, len(baseline))
+func CleanupOwnedLocalTestLeaks(townRoot string, baseline []DoltListener, ownerRoot string) error {
+	baselineListeners := make(map[DoltListener]bool, len(baseline))
 	for _, listener := range baseline {
-		baselinePIDs[listener.PID] = true
+		baselineListeners[listener] = true
 	}
-	return remediateTestLeaksSince(InventoryLocalDoltServers(townRoot), baselinePIDs, terminateLocalDoltServer, func() []LocalDoltServer {
-		return InventoryLocalDoltServers(townRoot)
+	rescan := func() ([]LocalDoltServer, error) {
+		inventory, err := inventoryLocalDoltServers(townRoot)
+		if err != nil {
+			return nil, err
+		}
+		return testLeaksWithin(inventory, ownerRoot), nil
+	}
+	initial, err := rescan()
+	if err != nil {
+		return err
+	}
+	return remediateTestLeaksSince(initial, baselineListeners, func(selection TestLeakSelection) error {
+		return terminateSelectedTestLeak(selection, rescan)
+	}, func() []LocalDoltServer {
+		servers, _ := rescan()
+		return servers
 	})
+}
+
+func testLeaksWithin(inventory []LocalDoltServer, ownerRoot string) []LocalDoltServer {
+	var owned []LocalDoltServer
+	for _, server := range inventory {
+		if server.Class == DoltServerOwnedTestLeak && pathWithin(ownerRoot, server.OwnerPath) {
+			owned = append(owned, server)
+		}
+	}
+	return owned
 }
 
 // RemediatePreviewedTestLeaks applies only to still-positive test-owned
 // listeners that were captured by a prior preview.
 func RemediatePreviewedTestLeaks(townRoot string, preview []TestLeakSelection, apply bool) ([]LocalDoltServer, error) {
 	initial := InventoryLocalDoltServers(townRoot)
-	err := remediatePreviewedTestLeaks(initial, preview, apply, terminateLocalDoltServer, func() []LocalDoltServer {
+	err := remediatePreviewedTestLeaks(initial, preview, apply, func(selection TestLeakSelection) error {
+		return terminateSelectedTestLeak(selection, func() ([]LocalDoltServer, error) {
+			return inventoryLocalDoltServers(townRoot)
+		})
+	}, func() []LocalDoltServer {
 		return InventoryLocalDoltServers(townRoot)
 	})
 	return initial, err

@@ -10,11 +10,16 @@ CAPTURE="$TMPDIR/go.env"
 PASS=0
 FAIL=0
 LISTENER_PID=""
+BLOCK_PID=""
 
 cleanup() {
   if [[ -n "$LISTENER_PID" ]] && kill -0 "$LISTENER_PID" 2>/dev/null; then
     kill "$LISTENER_PID"
     wait "$LISTENER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$BLOCK_PID" ]] && kill -0 "$BLOCK_PID" 2>/dev/null; then
+    kill "$BLOCK_PID"
+    wait "$BLOCK_PID" 2>/dev/null || true
   fi
   rm -rf "$TMPDIR"
 }
@@ -49,6 +54,11 @@ if [[ -n "${FAIL_IF_LEAK_PRESENT:-}" && -e "${FAKE_LEAK:-}" ]]; then
   exit 42
 fi
 [[ -n "${CREATE_FAKE_LEAK:-}" ]] && touch "${FAKE_LEAK:?}"
+if [[ -n "${FAKE_GO_BLOCK:-}" ]]; then
+  printf '%s\n' "$$" > "${FAKE_GO_PID_FILE:?}"
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
 printf '%s\n' \
   "GT_DOLT_PORT=$GT_DOLT_PORT" \
   "BEADS_DOLT_PORT=$BEADS_DOLT_PORT" \
@@ -223,6 +233,31 @@ if [[ "$status" -eq 1 && "$output" == *"test-isolation: cleanup"* ]]; then
   pass "fails visibly when outer cleanup fails"
 else
   fail "fails visibly when outer cleanup fails"
+fi
+
+rm -f "$guard_capture" "$fake_leak"
+block_pid_file="$TMPDIR/block.pid"
+PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GUARD_CAPTURE="$guard_capture" \
+  FAKE_LEAK="$fake_leak" CREATE_FAKE_LEAK=1 FAKE_GO_BLOCK=1 \
+  FAKE_GO_PID_FILE="$block_pid_file" GT_TEST_DOLT_PORT=44001 \
+  bash "$LAUNCHER" >/dev/null 2>&1 &
+launcher_pid=$!
+for _ in {1..100}; do
+  [[ -s "$block_pid_file" ]] && break
+  kill -0 "$launcher_pid" 2>/dev/null || break
+  sleep 0.02
+done
+BLOCK_PID="$(cat "$block_pid_file")"
+kill -TERM "$BLOCK_PID" "$launcher_pid"
+status=0
+wait "$launcher_pid" || status=$?
+wait "$BLOCK_PID" 2>/dev/null || true
+BLOCK_PID=""
+if [[ "$status" -eq 143 && ! -e "$fake_leak" && \
+      "$(cat "$guard_capture")" == $'snapshot\ncleanup' ]]; then
+  pass "reaps test-owned leaks when an active suite is terminated"
+else
+  fail "reaps test-owned leaks when an active suite is terminated"
 fi
 
 make_plan="$(make --no-print-directory -n -C "$REPO_ROOT" test)"

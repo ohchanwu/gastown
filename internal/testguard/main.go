@@ -4,23 +4,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: testguard snapshot|cleanup RECEIPT")
+	if len(os.Args) != 5 {
+		fmt.Fprintln(os.Stderr, "usage: testguard snapshot|cleanup RECEIPT LAUNCHER_PID OWNER_ROOT")
+		os.Exit(2)
+	}
+	launcherPID, err := strconv.Atoi(os.Args[3])
+	if err != nil || launcherPID <= 0 {
+		fmt.Fprintln(os.Stderr, "testguard: launcher PID must be positive")
 		os.Exit(2)
 	}
 
-	var err error
 	switch os.Args[1] {
 	case "snapshot":
-		err = writeBaseline(os.Args[2], doltserver.FindAllDoltListeners())
+		var baseline []doltserver.DoltListener
+		baseline, err = doltserver.FindAllDoltListenersWithError()
+		if err == nil {
+			_, err = requiredBaselineListener(baseline, launcherPID)
+		}
+		if err == nil {
+			err = writeBaseline(os.Args[2], baseline)
+		}
 	case "cleanup":
-		err = cleanupSinceBaseline(os.Args[2])
+		err = cleanupSinceBaseline(os.Args[2], launcherPID, os.Args[4])
 	default:
 		err = fmt.Errorf("unknown mode %q", os.Args[1])
 	}
@@ -46,7 +58,16 @@ func writeBaseline(path string, baseline []doltserver.DoltListener) error {
 	return file.Close()
 }
 
-func cleanupSinceBaseline(path string) error {
+func requiredBaselineListener(baseline []doltserver.DoltListener, launcherPID int) (doltserver.DoltListener, error) {
+	for _, listener := range baseline {
+		if listener.PID == launcherPID {
+			return listener, nil
+		}
+	}
+	return doltserver.DoltListener{}, fmt.Errorf("launcher PID %d missing from listener inventory", launcherPID)
+}
+
+func cleanupSinceBaseline(path string, launcherPID int, ownerRoot string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat baseline receipt: %w", err)
@@ -62,9 +83,27 @@ func cleanupSinceBaseline(path string) error {
 	if err := json.Unmarshal(data, &baseline); err != nil {
 		return fmt.Errorf("decode baseline receipt: %w", err)
 	}
+	required, err := requiredBaselineListener(baseline, launcherPID)
+	if err != nil {
+		return err
+	}
+	current, err := doltserver.FindAllDoltListenersWithError()
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, listener := range current {
+		if listener == required {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("launcher listener PID %d port %d missing during cleanup", required.PID, required.Port)
+	}
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("find Gas Town workspace: %w", err)
 	}
-	return doltserver.CleanupOwnedLocalTestLeaks(townRoot, baseline)
+	return doltserver.CleanupOwnedLocalTestLeaks(townRoot, baseline, ownerRoot)
 }

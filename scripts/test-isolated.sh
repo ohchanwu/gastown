@@ -11,7 +11,7 @@ cleanup() {
 	status=$?
 	trap - EXIT
 	cleanup_failed=false
-	if [[ -n "$guard_receipt" ]] && ! "$guard" cleanup "$guard_receipt"; then
+	if [[ -n "$guard_receipt" ]] && ! "$guard" cleanup "$guard_receipt" "$server_pid" "$data_dir"; then
 		echo "test-isolation: cleanup: test-owned Dolt listener cleanup failed" >&2
 		cleanup_failed=true
 	fi
@@ -95,13 +95,15 @@ if [[ "$owns_listener" != true ]]; then
 fi
 
 baseline_receipt="$data_dir/listener-baseline.json"
-if ! "$guard" snapshot "$baseline_receipt"; then
+if ! "$guard" snapshot "$baseline_receipt" "$server_pid" "$data_dir"; then
 	echo "test-isolation: configuration: could not snapshot the Dolt listener baseline" >&2
 	exit 78
 fi
 guard_receipt="$baseline_receipt"
 
+mkdir "$data_dir/tmp"
 if env \
+	TMPDIR="$data_dir/tmp" \
   GT_DOLT_HOST=127.0.0.1 \
   GT_DOLT_PORT="$test_port" \
   DOLT_PORT="$test_port" \

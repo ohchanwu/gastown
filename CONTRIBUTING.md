@@ -169,8 +169,10 @@ listener therefore fails closed before the suite starts.
 
 Before running packages, the launcher snapshots every existing Dolt listener
 to a mode-0600 receipt in its private temporary directory. Its outer EXIT trap
-then removes only listeners that are both new relative to that baseline and
-still positively test-owned. Cleanup also runs after package failure or
+then removes only listeners that are new relative to that baseline, still
+positively owned by that launcher's private temporary root, and still have the
+same process-start identity. Concurrent test runs are therefore left alone.
+Cleanup also runs after package failure or
 termination, so a retry cannot absorb a prior attempt's leak into its baseline.
 Baseline, canonical, unknown, non-test-owned, and changed-owner listeners are
 never signaled; incomplete cleanup is a visible test failure.

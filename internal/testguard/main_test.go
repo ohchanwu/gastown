@@ -41,7 +41,7 @@ func TestCleanupSinceBaselineRejectsNonPrivateReceipt(t *testing.T) {
 	if err := os.WriteFile(path, []byte("[]"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanupSinceBaseline(path, 101); err == nil {
+	if err := cleanupSinceBaseline(path, 101, t.TempDir()); err == nil {
 		t.Fatal("cleanup accepted a non-private baseline receipt")
 	}
 }
