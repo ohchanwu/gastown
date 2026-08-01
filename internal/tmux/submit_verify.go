@@ -279,7 +279,9 @@ func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) boo
 		prefix := []rune(strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")))
 		promptX := runeIndex(lines[i], prefix)
 		if codexPrompt {
-			return promptX >= 0 && cursorY == i && cursorX == promptX+len(prefix)
+			inputX := promptX + len(prefix)
+			return promptX >= 0 && cursorY == i &&
+				(cursorX == inputX || cursorX == inputX+1 && len(content) > 0 && allDim(contentDim))
 		}
 		if len(content) == 0 || allDim(contentDim) {
 			return true

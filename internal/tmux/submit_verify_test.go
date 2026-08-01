@@ -3,6 +3,7 @@ package tmux
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -154,6 +155,7 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 		{name: "dim placeholder", content: "transcript\n› \x1b[2mAsk anything\x1b[0m\n", cursorX: 1, cursorY: 1, want: true},
 		{name: "stale dim placeholder", content: "› \x1b[2mAsk anything\x1b[0m\ncurrent output\n", cursorX: 0, cursorY: 1, want: false},
 		{name: "normal placeholder at input origin", content: "transcript\n\x1b[1;2m›\x1b[0m Ask anything\n", cursorX: 1, cursorY: 1, want: true},
+		{name: "real Codex dim composer after spacer", content: "transcript\n\x1b[1;2m›\x1b[0m \x1b[2mxxxx xxxx xxxx xxxx xxx xxx xxx\x1b[0m\n", cursorX: 2, cursorY: 1, want: true},
 		{name: "codex steady cursor row without glyph", content: "completed output\n\nfooter\n", cursorX: 1, cursorY: 1, want: true},
 		{name: "staged prompt cursor after content", content: "transcript\n\x1b[1;2m›\x1b[0m staged delivery\n", cursorX: 16, cursorY: 1, want: false},
 		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", cursorX: 0, cursorY: 1, want: false},
@@ -171,6 +173,24 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 				t.Fatalf("paneAtIdlePrompt() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestProbeCapturedCodexIdlePane(t *testing.T) {
+	path := os.Getenv("GT_CAPTURED_IDLE_PANE")
+	if path == "" {
+		t.Skip("set GT_CAPTURED_IDLE_PANE for the private classifier probe")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > 25 {
+		lines = lines[len(lines)-25:]
+	}
+	if !paneAtIdlePrompt(strings.Join(lines, "\n"), "› ", 1, 22) {
+		t.Fatal("captured steady Codex pane classified as busy")
 	}
 }
 
