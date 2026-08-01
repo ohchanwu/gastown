@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -90,7 +92,8 @@ func (c *StalledPolecatCheck) Run(ctx *CheckContext) *CheckResult {
 				continue // Already pushed or can't check
 			}
 
-			if unpushedCount > 0 {
+			cleanupStatus := c.cleanupStatus(ctx.TownRoot, rigName, polecatName)
+			if shouldReportUnpushedPolecat(unpushedCount, cleanupStatus) {
 				stalled = append(stalled, stalledPolecatInfo{
 					name:          polecatName,
 					rigName:       rigName,
@@ -130,6 +133,25 @@ func (c *StalledPolecatCheck) Run(ctx *CheckContext) *CheckResult {
 		Details: details,
 		FixHint: "Run 'gt doctor --fix' to push stalled branches to remote",
 	}
+}
+
+func shouldReportUnpushedPolecat(unpushedCount int, cleanupStatus polecat.CleanupStatus) bool {
+	return unpushedCount > 0 && cleanupStatus != polecat.CleanupStatus("preserved")
+}
+
+func (c *StalledPolecatCheck) cleanupStatus(townRoot, rigName, polecatName string) polecat.CleanupStatus {
+	rigDir := beads.GetRigDirForName(townRoot, rigName)
+	if rigDir == "" {
+		return polecat.CleanupUnknown
+	}
+
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+	_, fields, err := beads.New(rigDir).GetAgentBead(agentBeadID)
+	if err != nil || fields == nil || fields.CleanupStatus == "" {
+		return polecat.CleanupUnknown
+	}
+	return polecat.CleanupStatus(fields.CleanupStatus)
 }
 
 // Fix pushes branches from stalled polecats to the remote.

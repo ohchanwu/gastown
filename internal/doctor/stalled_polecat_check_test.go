@@ -2,6 +2,8 @@ package doctor
 
 import (
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 func TestStalledPolecatCheck_Properties(t *testing.T) {
@@ -61,5 +63,26 @@ func TestStalledPolecatCheck_ResolveClonePath_NoDir(t *testing.T) {
 	path := check.resolveClonePath(t.TempDir(), "testrig", "furiosa")
 	if path != "" {
 		t.Errorf("resolveClonePath() = %q, want empty for nonexistent", path)
+	}
+}
+
+func TestShouldReportUnpushedPolecat(t *testing.T) {
+	tests := []struct {
+		name          string
+		unpushedCount int
+		cleanupStatus polecat.CleanupStatus
+		want          bool
+	}{
+		{name: "ordinary unpushed work is at risk", unpushedCount: 1, cleanupStatus: polecat.CleanupUnpushed, want: true},
+		{name: "preserved work is deliberately retained", unpushedCount: 1, cleanupStatus: polecat.CleanupStatus("preserved"), want: false},
+		{name: "no unpushed work", cleanupStatus: polecat.CleanupUnknown, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldReportUnpushedPolecat(tt.unpushedCount, tt.cleanupStatus); got != tt.want {
+				t.Fatalf("shouldReportUnpushedPolecat() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
