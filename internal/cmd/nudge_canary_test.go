@@ -59,6 +59,19 @@ func TestWaitForWakeCanaryIdleUsesStartupTurnBound(t *testing.T) {
 	}
 }
 
+func TestWakeCanaryStartupChallengeRequiresFiniteReply(t *testing.T) {
+	instruction, response := wakeCanaryStartupChallenge("abc123")
+	if response != "321cba" {
+		t.Fatalf("startup response = %q, want reversed nonce", response)
+	}
+	if !strings.Contains(instruction, "abc123") || !strings.Contains(instruction, "Reply with exactly") || !strings.Contains(instruction, "then wait") {
+		t.Fatal("startup instruction lacks a finite reply contract")
+	}
+	if strings.Contains(instruction, response) {
+		t.Fatal("startup instruction contains the expected response before the model turn")
+	}
+}
+
 func TestRunWakeCanaryPersistsSessionNotIdleBeforeLease(t *testing.T) {
 	previousCommit := Commit
 	Commit = "test-commit"

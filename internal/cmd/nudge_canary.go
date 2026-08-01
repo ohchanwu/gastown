@@ -186,21 +186,29 @@ var nudgeCanaryCmd = &cobra.Command{
 		if err := sandbox.linkCodexAuth(); err != nil {
 			return err
 		}
+		startupInstruction, startupResponse := wakeCanaryStartupChallenge(strings.TrimPrefix(nudge.NewDeliveryID(), "ndg-"))
 		if _, err := session.StartSession(sandbox.tmux, session.SessionConfig{
 			SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
 			TownRoot: sandbox.TownRoot, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
 			ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 			StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 			Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
-			Instructions:     "This is an isolated wake canary. For each high-priority Witness mail notification, reply with exactly the requested reversed nonce and no other text.",
+			Instructions:     startupInstruction,
 			WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 		}); err != nil {
 			return fmt.Errorf("starting isolated Codex Mayor: %w", err)
+		}
+		if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
+			return fmt.Errorf("confirming isolated Mayor startup turn: %w", err)
 		}
 		result, statePath, err := runWakeCanary(sandbox.tmux, sandbox.TownRoot, evidenceRoot, sandbox.Session, wakeCanaryTurns)
 		fmt.Printf("Mayor wake canary: %d/%d submitted, %d queued, %d failed\nState: %s\n", result.Submitted, result.Turns, result.Queued, result.Failed, statePath)
 		return err
 	},
+}
+
+func wakeCanaryStartupChallenge(nonce string) (string, string) {
+	return fmt.Sprintf("Reply with exactly the reverse of nonce %s and then wait for high-priority Witness mail notifications.", nonce), reverseString(nonce)
 }
 
 func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName string, turns int) (wakeCanaryResult, string, error) {
