@@ -266,6 +266,11 @@ func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) boo
 			return false
 		}
 	}
+	codexPrompt := strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")) == "›"
+	if codexPrompt && cursorX == 1 && cursorY >= 0 && cursorY+1 < len(lines) &&
+		strings.TrimSpace(string(lines[cursorY])) == "" && strings.TrimSpace(string(lines[cursorY+1])) != "" {
+		return true
+	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
 			continue
