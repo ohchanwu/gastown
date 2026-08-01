@@ -255,6 +255,11 @@ Skip until next version`,
 			wantName:    "workspace trust prompt",
 		},
 		{
+			name:        "accepted hook trust before codex turn",
+			content:     "Hooks need review\n2. Trust all and continue\n• Working (esc to interrupt)",
+			wantBlocked: false,
+		},
+		{
 			name:        "bypass modal",
 			content:     "Bypass Permissions mode\n1. No\n2. Yes, I accept",
 			wantBlocked: true,

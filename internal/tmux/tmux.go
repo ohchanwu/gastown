@@ -2199,6 +2199,10 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 			// Codex hook review pre-selects "Review hooks"; choose
 			// "Trust all and continue" before accepting.
 			if strings.Contains(content, "Hooks need review") {
+				if !strings.Contains(content, "Trust all and continue") {
+					time.Sleep(constants.DialogPollInterval)
+					continue
+				}
 				if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
 					return err
 				}
@@ -2234,7 +2238,7 @@ func containsWorkspaceTrustDialog(content string) bool {
 }
 
 func containsBlockingStartupDialog(content string) (string, bool) {
-	if promptAppearsAfterStartupBlocker(content) {
+	if agentActivityAppearsAfterStartupBlocker(content) {
 		return "", false
 	}
 	if containsCodexUpdateDialog(content) {
@@ -2249,13 +2253,15 @@ func containsBlockingStartupDialog(content string) (string, bool) {
 	return "", false
 }
 
-func promptAppearsAfterStartupBlocker(content string) bool {
-	promptLine := lastPromptIndicatorLine(content)
-	if promptLine < 0 {
-		return false
+func agentActivityAppearsAfterStartupBlocker(content string) bool {
+	activityLine := lastPromptIndicatorLine(content)
+	for i, line := range strings.Split(content, "\n") {
+		if hasBusyIndicator(line) && i > activityLine {
+			activityLine = i
+		}
 	}
 	blockerLine := lastStartupBlockerLine(content)
-	return blockerLine >= 0 && promptLine > blockerLine
+	return blockerLine >= 0 && activityLine > blockerLine
 }
 
 func lastStartupBlockerLine(content string) int {
