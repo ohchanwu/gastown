@@ -145,17 +145,21 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 	tests := []struct {
 		name    string
 		content string
+		cursorX int
+		cursorY int
 		want    bool
 	}{
-		{name: "bare composer", content: "transcript\n› \n", want: true},
-		{name: "dim placeholder", content: "transcript\n› \x1b[2mAsk anything\x1b[0m\n", want: true},
-		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", want: false},
-		{name: "busy without composer", content: "• Working (esc to interrupt)\n", want: false},
+		{name: "bare composer", content: "transcript\n› \n", cursorX: 1, cursorY: 1, want: true},
+		{name: "dim placeholder", content: "transcript\n› \x1b[2mAsk anything\x1b[0m\n", cursorX: 1, cursorY: 1, want: true},
+		{name: "normal placeholder at input origin", content: "transcript\n\x1b[1;2m›\x1b[0m Ask anything\n", cursorX: 1, cursorY: 1, want: true},
+		{name: "staged prompt cursor after content", content: "transcript\n\x1b[1;2m›\x1b[0m staged delivery\n", cursorX: 16, cursorY: 1, want: false},
+		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", cursorX: 0, cursorY: 1, want: false},
+		{name: "busy without composer", content: "• Working (esc to interrupt)\n", cursorX: 0, cursorY: 0, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := paneAtIdlePrompt(tt.content, "› "); got != tt.want {
+			if got := paneAtIdlePrompt(tt.content, "› ", tt.cursorX, tt.cursorY); got != tt.want {
 				t.Fatalf("paneAtIdlePrompt() = %v, want %v", got, tt.want)
 			}
 		})

@@ -3642,7 +3642,7 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		content, err := t.run("capture-pane", "-p", "-e", "-t", session, "-S", "-5")
+		content, err := t.run("capture-pane", "-p", "-e", "-t", session)
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
@@ -3654,8 +3654,20 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
+		cursor, err := t.run("display-message", "-p", "-t", session, "#{cursor_x}|#{cursor_y}")
+		if err != nil {
+			consecutiveIdle = 0
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		var cursorX, cursorY int
+		if _, err := fmt.Sscanf(strings.TrimSpace(cursor), "%d|%d", &cursorX, &cursorY); err != nil {
+			consecutiveIdle = 0
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
 
-		if paneAtIdlePrompt(content, promptPrefix) {
+		if paneAtIdlePrompt(content, promptPrefix, cursorX, cursorY) {
 			consecutiveIdle++
 			if consecutiveIdle >= requiredConsecutive {
 				return nil

@@ -254,7 +254,7 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
-func paneAtIdlePrompt(escContent, promptPrefix string) bool {
+func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) bool {
 	if promptPrefix == "" {
 		return false
 	}
@@ -271,7 +271,12 @@ func paneAtIdlePrompt(escContent, promptPrefix string) bool {
 			continue
 		}
 		content, contentDim := composerContent(lines[i], lineDims[i], promptPrefix)
-		return len(content) == 0 || allDim(contentDim)
+		if len(content) == 0 || allDim(contentDim) {
+			return true
+		}
+		prefix := []rune(strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")))
+		promptX := runeIndex(lines[i], prefix)
+		return promptX >= 0 && cursorY == i && cursorX == promptX+len(prefix)
 	}
 	return false
 }

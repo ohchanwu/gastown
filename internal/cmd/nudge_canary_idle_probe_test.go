@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +46,18 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Chmod(evidencePath, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMetadata := func() {
+		t.Helper()
+		cursor, cursorErr := exec.Command("tmux", "-L", sandbox.Socket, "display-message", "-p", "-t", sandbox.Session, "#{cursor_x}|#{cursor_y}|#{pane_width}|#{pane_height}").Output()
+		agent, agentErr := sandbox.tmux.GetEnvironment(sandbox.Session, "GT_AGENT")
+		metadata := fmt.Sprintf("cursor_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\ncursor=%s", cursorErr == nil, agentErr == nil, agent == "codex", cursor)
+		if err := os.WriteFile(evidencePath+".meta", []byte(metadata), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(evidencePath+".meta", 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -93,6 +106,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				continue
 			}
 			writeEvidence(content)
+			writeMetadata()
 			if err := sandbox.tmux.WaitForIdle(sandbox.Session, 3*time.Second); err != nil {
 				t.Fatalf("WaitForIdle after completed response: %v", err)
 			}

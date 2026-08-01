@@ -2490,6 +2490,47 @@ func TestWaitForIdle_RejectsStaleCodexPrompt(t *testing.T) {
 	}
 }
 
+func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+
+	tests := []struct {
+		name    string
+		command string
+		wantErr error
+	}{
+		{
+			name:    "empty composer with visible placeholder is idle",
+			command: "printf '\\033[1;2m›\\033[0m Ask anything\\r\\033[1C'; sleep 60",
+		},
+		{
+			name:    "staged prompt is not idle",
+			command: "printf '\\033[1;2m›\\033[0m staged delivery'; sleep 60",
+			wantErr: ErrIdleTimeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tm := newTestTmux(t)
+			sessionName := fmt.Sprintf("gt-test-codex-composer-cursor-%d", time.Now().UnixNano())
+			if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), tt.command); err != nil {
+				t.Fatalf("NewSessionWithCommand: %v", err)
+			}
+			t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+			if err := tm.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
+				t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+			}
+
+			err := tm.WaitForIdle(sessionName, 500*time.Millisecond)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("WaitForIdle() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestHasBusyIndicator(t *testing.T) {
 	t.Parallel()
 
