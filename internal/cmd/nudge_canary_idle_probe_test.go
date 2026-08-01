@@ -214,89 +214,6 @@ func TestProbeIsolatedCodexFirstDelivery(t *testing.T) {
 	if err := sandbox.linkCodexAuth(); err != nil {
 		t.Fatalf("linkCodexAuth: %v", err)
 	}
-	hookProbeMarker := ""
-	hookPayloadMeta := ""
-	if os.Getenv("GT_FIRST_DELIVERY_WRAP_HOOK") == "1" {
-		hookProbeMarker = filepath.Join(sandbox.TownRoot, ".runtime", "user-prompt-hook-invoked")
-		hookPayload := filepath.Join(sandbox.TownRoot, ".runtime", "user-prompt-hook-input.json")
-		hookPayloadMeta = filepath.Join(sandbox.TownRoot, ".runtime", "user-prompt-hook-input.meta")
-		hookError := filepath.Join(sandbox.TownRoot, ".runtime", "user-prompt-hook-error")
-		wrapper := filepath.Join(sandbox.TownRoot, "user-prompt-hook-probe")
-		script := fmt.Sprintf(`#!/bin/sh
-umask 077
-mkdir -p %s
-: > %s
-if [ "$(tmux display-message -t "$TMUX_PANE" -p '#{session_name}' 2>/dev/null)" = %s ]; then
-  export GT_PROBE_DIRECT_SESSION_MATCH=1
-fi
-tee %s | %s "$@" 2>%s
-rc=$?
-python3 - %s %s "$rc" %s %s %s %s <<'PY'
-import json, os, sys
-raw = open(sys.argv[1], 'rb').read()
-stderr = open(sys.argv[4], 'rb').read()
-first_line = raw.splitlines()[0] if raw.splitlines() else b''
-try:
-    json.loads(first_line)
-    first_line_valid = True
-except Exception:
-    first_line_valid = False
-try:
-    payload = json.loads(raw)
-    valid = True
-except Exception:
-    payload = {}
-    valid = False
-prompt = payload.get('prompt') if isinstance(payload.get('prompt'), str) else ''
-prefix = '[gt-delivery-id:'
-facts = {
-    'candidate_exit_zero': sys.argv[3] == '0',
-    'candidate_stderr_nonempty': bool(stderr),
-    'control_at_zero': prompt.startswith(prefix),
-    'control_present': prefix in prompt,
-    'cwd_match': os.getcwd() == sys.argv[5],
-    'delivery_receipt_error': b'delivery receipt error' in stderr,
-    'direct_session_match': os.environ.get('GT_PROBE_DIRECT_SESSION_MATCH') == '1',
-    'event_match': payload.get('hook_event_name') == 'UserPromptSubmit',
-    'first_line_json_valid': first_line_valid,
-    'has_event_field': 'hook_event_name' in payload,
-    'has_prompt_field': 'prompt' in payload,
-    'json_valid': valid,
-    'prompt_nonempty': bool(prompt),
-    'gt_root_match': os.environ.get('GT_ROOT') == sys.argv[6],
-    'gt_session_match': os.environ.get('GT_SESSION') == sys.argv[7],
-    'gt_town_root_match': os.environ.get('GT_TOWN_ROOT') == sys.argv[6],
-    'identity_error': b'identity' in stderr.lower(),
-    'not_found_error': b'not found' in stderr.lower(),
-    'raw_line_count': len(raw.splitlines()),
-    'tmux_env_present': bool(os.environ.get('TMUX')),
-    'tmux_pane_present': bool(os.environ.get('TMUX_PANE')),
-}
-with open(sys.argv[2], 'w') as out:
-    for key in sorted(facts):
-        out.write(f'{key}={str(facts[key]).lower()}\n')
-PY
-exit "$rc"
-`, filepath.Dir(hookProbeMarker), hookProbeMarker, sandbox.Session, hookPayload, candidateGT, hookError, hookPayload, hookPayloadMeta, hookError, sandbox.WorkDir, sandbox.TownRoot, sandbox.Session)
-		if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
-			t.Fatal(err)
-		}
-		hooksPath := filepath.Join(sandbox.RuntimeConfigDir, "hooks.json")
-		hooksData, err := os.ReadFile(hooksPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		oldCommand := candidateGT + " mail check --inject"
-		newCommand := wrapper + " mail check --inject"
-		updated := strings.Replace(string(hooksData), oldCommand, newCommand, 1)
-		if updated == string(hooksData) {
-			t.Fatal("UserPromptSubmit candidate command not found")
-		}
-		if err := os.WriteFile(hooksPath, []byte(updated), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	startupInstruction, startupResponse := wakeCanaryStartupChallenge("B3D8E4")
 	if _, err := session.StartSession(sandbox.tmux, session.SessionConfig{
 		SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
@@ -313,11 +230,7 @@ exit "$rc"
 		t.Fatalf("startup response: %v", err)
 	}
 
-	var idleErr error
-	idleCheckSkipped := os.Getenv("GT_FIRST_DELIVERY_CAPTURE_HOOK") == "1"
-	if !idleCheckSkipped {
-		idleErr = waitForWakeCanaryIdle(sandbox.tmux, sandbox.Session)
-	}
+	idleErr := waitForWakeCanaryIdle(sandbox.tmux, sandbox.Session)
 	deliveryID := nudge.NewDeliveryID()
 	receipt := tmux.SubmissionReceipt{Session: sandbox.Session, DeliveryID: deliveryID}
 	var deliveryErr error
@@ -344,12 +257,7 @@ exit "$rc"
 			}
 		}
 	}
-	_, hookProbeErr := os.Stat(hookProbeMarker)
-	hookFacts := ""
-	if data, readErr := os.ReadFile(hookPayloadMeta); readErr == nil {
-		hookFacts = string(data)
-	}
-	metadata := fmt.Sprintf("stage=%s\nidle_check_skipped=%t\nidle_timeout=%t\ntyped=%t\nsubmitted=%t\nsubmit_not_verified=%t\nsession_match=%t\ndelivery_match=%t\nhook_invoked=%t\nmatching_receipt_path_exists=%t\nreceipt_file_count=%d\n%s", stage, idleCheckSkipped, errors.Is(idleErr, tmux.ErrIdleTimeout), receipt.Typed, receipt.Submitted, errors.Is(deliveryErr, tmux.ErrSubmitNotVerified), receipt.Session == sandbox.Session, receipt.DeliveryID == deliveryID, hookProbeMarker != "" && hookProbeErr == nil, receiptPathErr == nil, receiptFiles, hookFacts)
+	metadata := fmt.Sprintf("stage=%s\nidle_timeout=%t\ntyped=%t\nsubmitted=%t\nsubmit_not_verified=%t\nsession_match=%t\ndelivery_match=%t\nmatching_receipt_path_exists=%t\nreceipt_file_count=%d\n", stage, errors.Is(idleErr, tmux.ErrIdleTimeout), receipt.Typed, receipt.Submitted, errors.Is(deliveryErr, tmux.ErrSubmitNotVerified), receipt.Session == sandbox.Session, receipt.DeliveryID == deliveryID, receiptPathErr == nil, receiptFiles)
 	if err := os.MkdirAll(filepath.Dir(evidencePath), 0700); err != nil {
 		t.Fatal(err)
 	}
