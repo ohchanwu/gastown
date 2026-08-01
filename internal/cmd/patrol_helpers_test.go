@@ -1281,8 +1281,9 @@ func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
 	}
 
 	_, _, found, findErr := findActivePatrol(cfg)
-	if findErr != nil {
-		t.Fatalf("findActivePatrol error: %v", findErr)
+	wantErr := fmt.Sprintf("discovery incomplete: patrol scan limit reached after %d candidates", maxPatrolDiscoveryScans)
+	if findErr == nil || findErr.Error() != wantErr {
+		t.Fatalf("findActivePatrol error = %v, want %q", findErr, wantErr)
 	}
 	if found {
 		t.Fatal("expected no active patrol (all stale)")
@@ -1306,14 +1307,9 @@ func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
 		}
 	}
 
-	// Cleanup must be capped: at most maxStalePurgePerRun beads closed per run
-	if closedCount > maxStalePurgePerRun {
-		t.Errorf("closed %d stale patrols, want at most %d (cap exceeded — Dolt DoS risk)",
-			closedCount, maxStalePurgePerRun)
-	}
-	// But at least some cleanup must happen (the cap should not be zero)
-	if closedCount == 0 {
-		t.Errorf("no stale patrols were closed, expected up to %d", maxStalePurgePerRun)
+	// Cleanup reaches, but never exceeds, the bounded stale batch.
+	if closedCount != maxStalePurgePerRun {
+		t.Errorf("closed %d stale patrols, want exactly %d", closedCount, maxStalePurgePerRun)
 	}
 	// Total accounted for
 	if closedCount+hookedCount != numStale {
