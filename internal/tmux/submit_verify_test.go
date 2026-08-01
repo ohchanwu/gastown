@@ -145,6 +145,7 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 	tests := []struct {
 		name    string
 		content string
+		prompt  string
 		cursorX int
 		cursorY int
 		want    bool
@@ -157,11 +158,16 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 		{name: "staged prompt cursor after content", content: "transcript\n\x1b[1;2m›\x1b[0m staged delivery\n", cursorX: 16, cursorY: 1, want: false},
 		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", cursorX: 0, cursorY: 1, want: false},
 		{name: "busy without composer", content: "• Working (esc to interrupt)\n", cursorX: 0, cursorY: 0, want: false},
+		{name: "Claude normal content at input origin", content: "transcript\n❯ staged delivery\n", prompt: "❯ ", cursorX: 1, cursorY: 1, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := paneAtIdlePrompt(tt.content, "› ", tt.cursorX, tt.cursorY); got != tt.want {
+			prompt := tt.prompt
+			if prompt == "" {
+				prompt = "› "
+			}
+			if got := paneAtIdlePrompt(tt.content, prompt, tt.cursorX, tt.cursorY); got != tt.want {
 				t.Fatalf("paneAtIdlePrompt() = %v, want %v", got, tt.want)
 			}
 		})

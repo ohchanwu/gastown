@@ -284,7 +284,7 @@ func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) boo
 		if len(content) == 0 || allDim(contentDim) {
 			return true
 		}
-		return promptX >= 0 && cursorY == i && cursorX == promptX+len(prefix)
+		return false
 	}
 	return false
 }
