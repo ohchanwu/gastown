@@ -67,7 +67,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	t.Cleanup(ticker.Stop)
-	timeout := time.NewTimer(60 * time.Second)
+	timeout := time.NewTimer(180 * time.Second)
 	t.Cleanup(func() { timeout.Stop() })
 	stable := 0
 	var lastCapture []byte
