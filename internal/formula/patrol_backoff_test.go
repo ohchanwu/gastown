@@ -1,8 +1,10 @@
 package formula
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPatrolFormulasHaveBackoffLogic verifies that patrol formulas include
@@ -67,6 +69,30 @@ func TestPatrolFormulasHaveBackoffLogic(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeaconPatrolOuterDeadlineCoversAwaitSignalBackoff(t *testing.T) {
+	// Regression: a 75s wrapper cannot contain the legitimate third 4m wait.
+	if 75*time.Second >= 4*time.Minute {
+		t.Fatal("regression fixture must reproduce the patrol budget inversion")
+	}
+
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	budgetMatch := regexp.MustCompile(`--command-budget ([0-9]+[smh])`).FindSubmatch(content)
+	if len(budgetMatch) != 2 {
+		t.Fatal("deacon patrol must pass an executable await-signal command budget")
+	}
+	budget, err := time.ParseDuration(string(budgetMatch[1]))
+	if err != nil {
+		t.Fatalf("parsing deacon await-signal command budget: %v", err)
+	}
+	if budget >= 75*time.Second {
+		t.Fatalf("await-signal command budget %v must return before the observed 75s wrapper", budget)
 	}
 }
 

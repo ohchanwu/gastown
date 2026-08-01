@@ -19,12 +19,13 @@ import (
 )
 
 var (
-	awaitSignalTimeout     string
-	awaitSignalBackoffBase string
-	awaitSignalBackoffMult int
-	awaitSignalBackoffMax  string
-	awaitSignalQuiet       bool
-	awaitSignalAgentBead   string
+	awaitSignalTimeout       string
+	awaitSignalBackoffBase   string
+	awaitSignalBackoffMult   int
+	awaitSignalBackoffMax    string
+	awaitSignalCommandBudget string
+	awaitSignalQuiet         bool
+	awaitSignalAgentBead     string
 )
 
 var moleculeAwaitSignalCmd = &cobra.Command{
@@ -86,7 +87,7 @@ var moleculeAwaitSignalShortcutCmd = &cobra.Command{
 
 // AwaitSignalResult is the result of an await-signal operation.
 type AwaitSignalResult struct {
-	Reason      string        `json:"reason"`                // "signal" or "timeout"
+	Reason      string        `json:"reason"`                // "signal", "timeout", or "context-yield"
 	Elapsed     time.Duration `json:"elapsed"`               // how long we waited
 	Signal      string        `json:"signal,omitempty"`      // the line that woke us (if signal)
 	IdleCycles  int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
@@ -102,6 +103,8 @@ func init() {
 		"Multiplier for exponential backoff (default: 2)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalBackoffMax, "backoff-max", "",
 		"Maximum interval cap for backoff (e.g., 10m)")
+	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalCommandBudget, "command-budget", "",
+		"Return for a resumable context check before this process budget expires (e.g., 60s)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
@@ -120,6 +123,8 @@ func init() {
 		"Multiplier for exponential backoff (default: 2)")
 	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalBackoffMax, "backoff-max", "",
 		"Maximum interval cap for backoff (e.g., 10m)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalCommandBudget, "command-budget", "",
+		"Return for a resumable context check before this process budget expires (e.g., 60s)")
 	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
 	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
@@ -132,6 +137,19 @@ func init() {
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
+	commandCtx := context.Background()
+	commandCancel := func() {}
+	var commandBudget time.Duration
+	if awaitSignalCommandBudget != "" {
+		var err error
+		commandBudget, err = time.ParseDuration(awaitSignalCommandBudget)
+		if err != nil || commandBudget <= 0 {
+			return fmt.Errorf("invalid command-budget %q", awaitSignalCommandBudget)
+		}
+		commandCtx, commandCancel = context.WithTimeout(commandCtx, commandBudget)
+	}
+	defer commandCancel()
+
 	// Find beads directory (rig-local for bead operations)
 	beadsDir, err := resolveAgentTrackingBeadsDir()
 	if err != nil {
@@ -148,14 +166,24 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	var idleCycles int
 	var backoffUntil time.Time // zero value means no active window
 	if awaitSignalAgentBead != "" {
-		labels, err := getAgentLabels(awaitSignalAgentBead, beadsDir)
+		allLabels, err := getAllAgentLabelsContext(commandCtx, awaitSignalAgentBead, beadsDir)
 		if err != nil {
+			if commandCtx.Err() != nil {
+				return fmt.Errorf("await-signal command budget expired before backoff state was read")
+			}
 			// Agent bead might not exist yet - that's OK, start at 0
 			if !awaitSignalQuiet {
 				fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
 					style.Dim.Render("⚠"), err)
 			}
 		} else {
+			labels := make(map[string]string)
+			for _, label := range allLabels {
+				parts := strings.SplitN(label, ":", 2)
+				if len(parts) == 2 {
+					labels[parts[0]] = parts[1]
+				}
+			}
 			if idleStr, ok := labels["idle"]; ok {
 				if n, err := parseIntSimple(idleStr); err == nil {
 					idleCycles = n
@@ -174,6 +202,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid timeout configuration: %w", err)
 	}
+	if commandBudget > 0 && awaitSignalAgentBead == "" && fullTimeout > commandBudget {
+		return fmt.Errorf("command-budget shorter than timeout requires --agent-bead for resumable state")
+	}
 
 	// Determine effective timeout: resume from persisted window or start fresh.
 	// This makes backoff resilient to interrupts (e.g., nudges that kill the
@@ -182,6 +213,8 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	timeout := fullTimeout
 	resumed := false
 	now := time.Now()
+	windowExpired := awaitSignalAgentBead != "" && !backoffUntil.IsZero() && !backoffUntil.After(now)
+	backoffDeadline := now.Add(timeout)
 	if awaitSignalAgentBead != "" && !backoffUntil.IsZero() && backoffUntil.After(now) {
 		remaining := backoffUntil.Sub(now)
 		// Sanity: remaining should not exceed the calculated full timeout.
@@ -189,17 +222,17 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		if remaining <= fullTimeout {
 			timeout = remaining
 			resumed = true
+			backoffDeadline = backoffUntil
 		}
 	}
 
 	// Persist the backoff window end time so interrupted invocations can resume.
-	if awaitSignalAgentBead != "" && !resumed {
-		windowEnd := now.Add(timeout)
-		if err := setAgentBackoffUntil(awaitSignalAgentBead, beadsDir, windowEnd); err != nil {
-			if !awaitSignalQuiet {
-				fmt.Printf("%s Failed to persist backoff window: %v\n",
-					style.Dim.Render("⚠"), err)
+	if awaitSignalAgentBead != "" && !resumed && !windowExpired {
+		if err := updateAgentAwaitSignalStateContext(commandCtx, awaitSignalAgentBead, beadsDir, nil, &backoffDeadline, false, false); err != nil {
+			if commandCtx.Err() != nil {
+				return fmt.Errorf("await-signal command budget expired before backoff state was persisted")
 			}
+			return fmt.Errorf("could not persist await-signal backoff state")
 		}
 	}
 
@@ -218,13 +251,12 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	// Tail events file for new activity
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	result, err := waitForActivitySignal(ctx, townRoot)
-	if err != nil {
-		return fmt.Errorf("feed subscription failed: %w", err)
+	result := &AwaitSignalResult{Reason: "timeout"}
+	if !windowExpired {
+		result, err = waitForActivitySignalUntil(commandCtx, townRoot, backoffDeadline)
+		if err != nil {
+			return fmt.Errorf("feed subscription failed: %w", err)
+		}
 	}
 
 	result.Elapsed = time.Since(startTime)
@@ -232,41 +264,37 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	// On timeout, increment idle cycles and clear backoff window
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
 		newIdleCycles := idleCycles + 1
-		if err := setAgentIdleCycles(awaitSignalAgentBead, beadsDir, newIdleCycles); err != nil {
+		if err := updateAgentAwaitSignalStateContext(commandCtx, awaitSignalAgentBead, beadsDir, &newIdleCycles, nil, true, true); err != nil {
+			if commandCtx.Err() == nil {
+				return fmt.Errorf("could not finalize await-signal timeout state")
+			}
 			if !awaitSignalQuiet {
-				fmt.Printf("%s Failed to update agent bead idle count: %v\n",
+				fmt.Printf("%s Deferred timeout state update: %v\n",
 					style.Dim.Render("⚠"), err)
 			}
+			result.Reason = "context-yield"
 		} else {
 			result.IdleCycles = newIdleCycles
 		}
-		// Update last_activity so watchers know agent is still alive
-		if err := updateAgentHeartbeat(awaitSignalAgentBead, beadsDir); err != nil {
-			if !awaitSignalQuiet {
-				fmt.Printf("%s Failed to update agent heartbeat: %v\n",
-					style.Dim.Render("⚠"), err)
-			}
-		}
-		// Clear the backoff window — timeout completed normally
-		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	} else if result.Reason == "signal" && awaitSignalAgentBead != "" {
-		// On signal, update last_activity to prove agent is alive
-		if err := updateAgentHeartbeat(awaitSignalAgentBead, beadsDir); err != nil {
+		if err := updateAgentAwaitSignalStateContext(commandCtx, awaitSignalAgentBead, beadsDir, nil, nil, true, true); err != nil {
+			if commandCtx.Err() == nil {
+				return fmt.Errorf("could not finalize await-signal signal state")
+			}
 			if !awaitSignalQuiet {
-				fmt.Printf("%s Failed to update agent heartbeat: %v\n",
+				fmt.Printf("%s Deferred signal state update: %v\n",
 					style.Dim.Render("⚠"), err)
 			}
+			result.Reason = "context-yield"
 		}
 		// Report current idle cycles (caller should reset)
 		result.IdleCycles = idleCycles
-		// Clear the backoff window — woken by real activity
-		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	}
 
 	// Set effort level based on idle cycles.
 	// On signal (activity detected) or first cycle (idle=0): full effort.
 	// On timeout with idle > 0: abbreviated effort (skip optional patrol steps).
-	if result.Reason == "signal" || result.IdleCycles == 0 {
+	if result.Reason == "signal" || result.Reason == "context-yield" || result.IdleCycles == 0 {
 		result.EffortLevel = "full"
 	} else {
 		result.EffortLevel = "abbreviated"
@@ -300,6 +328,11 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 				fmt.Printf("%s Timeout after %v (no activity)\n",
 					style.Dim.Render("⏱"), result.Elapsed.Round(time.Millisecond))
 			}
+		case "context-yield":
+			fmt.Printf("%s Command budget reached after %v; resume the same backoff window\n",
+				style.Dim.Render("↺"), result.Elapsed.Round(time.Millisecond))
+			fmt.Printf("\n%s Re-run await-signal with the same arguments.\n",
+				style.Bold.Render("CONTEXT: check"))
 		}
 
 		// Output effort recommendation for the next patrol cycle.
@@ -367,9 +400,17 @@ func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalRe
 	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
 }
 
+func waitForActivitySignalUntil(ctx context.Context, townRoot string, backoffDeadline time.Time) (*AwaitSignalResult, error) {
+	return waitForEventsFileUntil(ctx, filepath.Join(townRoot, events.EventsFile), backoffDeadline)
+}
+
 // waitForEventsFile tails the events file for new lines.
 // This replaces the former bd activity --follow subprocess approach.
 func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
+	return waitForEventsFileUntil(ctx, eventsPath, time.Time{})
+}
+
+func waitForEventsFileUntil(ctx context.Context, eventsPath string, backoffDeadline time.Time) (*AwaitSignalResult, error) {
 
 	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -388,13 +429,30 @@ func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResu
 	reader := bufio.NewReader(f)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+	var backoffC <-chan time.Time
+	var backoffTimer *time.Timer
+	if !backoffDeadline.IsZero() {
+		remaining := time.Until(backoffDeadline)
+		if remaining <= 0 {
+			return &AwaitSignalResult{Reason: "timeout"}, nil
+		}
+		backoffTimer = time.NewTimer(remaining)
+		defer backoffTimer.Stop()
+		backoffC = backoffTimer.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			reason := "timeout"
+			if !backoffDeadline.IsZero() && time.Now().Before(backoffDeadline) {
+				reason = "context-yield"
+			}
 			return &AwaitSignalResult{
-				Reason: "timeout",
+				Reason: reason,
 			}, nil
+		case <-backoffC:
+			return &AwaitSignalResult{Reason: "timeout"}, nil
 		case <-ticker.C:
 			line, err := reader.ReadString('\n')
 			if err == nil && line != "" {
@@ -496,6 +554,48 @@ func setAgentIdleCycles(agentBead, beadsDir string, cycles int) error {
 	}
 
 	return nil
+}
+
+func updateAgentAwaitSignalStateContext(ctx context.Context, agentBead, beadsDir string, idleCycles *int, backoffUntil *time.Time, clearBackoff, heartbeat bool) error {
+	allLabels, err := getAllAgentLabelsContext(ctx, agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+
+	newLabels := make([]string, 0, len(allLabels)+2)
+	for _, label := range allLabels {
+		if idleCycles != nil && strings.HasPrefix(label, "idle:") {
+			continue
+		}
+		if (backoffUntil != nil || clearBackoff) && strings.HasPrefix(label, "backoff-until:") {
+			continue
+		}
+		if heartbeat && strings.HasPrefix(label, "heartbeat:") {
+			continue
+		}
+		newLabels = append(newLabels, label)
+	}
+	if idleCycles != nil {
+		newLabels = append(newLabels, fmt.Sprintf("idle:%d", *idleCycles))
+	}
+	if backoffUntil != nil {
+		newLabels = append(newLabels, fmt.Sprintf("backoff-until:%d", backoffUntil.Unix()))
+	}
+	if heartbeat {
+		newLabels = append(newLabels, fmt.Sprintf("heartbeat:%d", time.Now().Unix()))
+	}
+
+	args := []string{"update", agentBead}
+	if len(newLabels) == 0 {
+		args = append(args, "--set-labels=")
+	} else {
+		for _, label := range newLabels {
+			args = append(args, "--set-labels="+label)
+		}
+	}
+	bdCtx, cancel := context.WithTimeout(ctx, bdCallTimeout)
+	defer cancel()
+	return beads.CommandContext(bdCtx, filepath.Dir(beadsDir), beadsDir, beads.MutationPinned, args...).Run()
 }
 
 // setAgentBackoffUntil persists a backoff-until:TIMESTAMP label on the agent bead.

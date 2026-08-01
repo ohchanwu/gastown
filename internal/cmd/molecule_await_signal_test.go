@@ -153,6 +153,193 @@ func TestWaitForEventsFile_MissingFile(t *testing.T) {
 	}
 }
 
+func TestWaitForEventsFileUntilResumesPastWrapperBudget(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
+	backoffDeadline := time.Now().Add(240 * time.Millisecond)
+
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	first, err := waitForEventsFileUntil(firstCtx, eventsPath, backoffDeadline)
+	firstCancel()
+	if err != nil {
+		t.Fatalf("first bounded wait: %v", err)
+	}
+	if first.Reason != "context-yield" {
+		t.Fatalf("first bounded wait reason = %q, want context-yield", first.Reason)
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), time.Second)
+	defer secondCancel()
+	second, err := waitForEventsFileUntil(secondCtx, eventsPath, backoffDeadline)
+	if err != nil {
+		t.Fatalf("resumed bounded wait: %v", err)
+	}
+	if second.Reason != "timeout" {
+		t.Fatalf("resumed bounded wait reason = %q, want timeout", second.Reason)
+	}
+}
+
+func TestGetAllAgentLabelsContextHonorsCommandBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/bin/sh\nsleep 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := getAllAgentLabelsContext(ctx, "hq-deacon", beadsDir)
+	if err == nil {
+		t.Fatal("delayed bd read unexpectedly succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("delayed bd read exceeded command budget: %v", elapsed)
+	}
+}
+
+func TestRunMoleculeAwaitSignalDelayedBDReadFailsClosedWithinCommandBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	root := t.TempDir()
+	for _, dir := range []string{filepath.Join(root, "mayor"), filepath.Join(root, ".beads"), filepath.Join(root, "bin")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "bd"), []byte("#!/bin/sh\nsleep 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Join(root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BEADS_DIR", filepath.Join(root, ".beads"))
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := awaitSignalTimeout
+	oldBackoffBase := awaitSignalBackoffBase
+	oldBackoffMult := awaitSignalBackoffMult
+	oldBackoffMax := awaitSignalBackoffMax
+	oldCommandBudget := awaitSignalCommandBudget
+	oldQuiet := awaitSignalQuiet
+	oldAgentBead := awaitSignalAgentBead
+	oldJSON := moleculeJSON
+	t.Cleanup(func() {
+		awaitSignalTimeout = oldTimeout
+		awaitSignalBackoffBase = oldBackoffBase
+		awaitSignalBackoffMult = oldBackoffMult
+		awaitSignalBackoffMax = oldBackoffMax
+		awaitSignalCommandBudget = oldCommandBudget
+		awaitSignalQuiet = oldQuiet
+		awaitSignalAgentBead = oldAgentBead
+		moleculeJSON = oldJSON
+	})
+	awaitSignalTimeout = "4m"
+	awaitSignalBackoffBase = ""
+	awaitSignalBackoffMult = 2
+	awaitSignalBackoffMax = ""
+	awaitSignalCommandBudget = "75ms"
+	awaitSignalQuiet = true
+	awaitSignalAgentBead = "hq-deacon"
+	moleculeJSON = false
+
+	start := time.Now()
+	err = runMoleculeAwaitSignal(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "expired before backoff state was read") {
+		t.Fatalf("runMoleculeAwaitSignal error = %v, want sanitized read-budget failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("await-signal exceeded its executable command budget: %v", elapsed)
+	}
+}
+
+func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fake bd")
+	}
+
+	root := t.TempDir()
+	for _, dir := range []string{filepath.Join(root, "mayor"), filepath.Join(root, ".beads"), filepath.Join(root, "bin")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	bdScript := "#!/bin/sh\ncase \"$1\" in\nshow) printf '[{\"labels\":[\"gt:agent\",\"idle:0\"]}]\\n' ;;\nupdate) sleep 5 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(root, "bin", "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Join(root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BEADS_DIR", filepath.Join(root, ".beads"))
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := awaitSignalTimeout
+	oldBackoffBase := awaitSignalBackoffBase
+	oldBackoffMult := awaitSignalBackoffMult
+	oldBackoffMax := awaitSignalBackoffMax
+	oldCommandBudget := awaitSignalCommandBudget
+	oldQuiet := awaitSignalQuiet
+	oldAgentBead := awaitSignalAgentBead
+	oldJSON := moleculeJSON
+	t.Cleanup(func() {
+		awaitSignalTimeout = oldTimeout
+		awaitSignalBackoffBase = oldBackoffBase
+		awaitSignalBackoffMult = oldBackoffMult
+		awaitSignalBackoffMax = oldBackoffMax
+		awaitSignalCommandBudget = oldCommandBudget
+		awaitSignalQuiet = oldQuiet
+		awaitSignalAgentBead = oldAgentBead
+		moleculeJSON = oldJSON
+	})
+	awaitSignalTimeout = "4m"
+	awaitSignalBackoffBase = ""
+	awaitSignalBackoffMult = 2
+	awaitSignalBackoffMax = ""
+	awaitSignalCommandBudget = "2s"
+	awaitSignalQuiet = true
+	awaitSignalAgentBead = "hq-deacon"
+	moleculeJSON = false
+
+	start := time.Now()
+	err = runMoleculeAwaitSignal(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "expired before backoff state was persisted") {
+		t.Fatalf("runMoleculeAwaitSignal error = %v, want sanitized persist-budget failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("await-signal exceeded its executable command budget: %v", elapsed)
+	}
+}
+
 func TestWaitForEventsFile_Timeout(t *testing.T) {
 	// When no new events are appended, waitForEventsFile should return timeout.
 	eventsPath := filepath.Join(t.TempDir(), ".events.jsonl")
@@ -386,6 +573,7 @@ esac
 	oldBackoffBase := awaitSignalBackoffBase
 	oldBackoffMult := awaitSignalBackoffMult
 	oldBackoffMax := awaitSignalBackoffMax
+	oldCommandBudget := awaitSignalCommandBudget
 	oldQuiet := awaitSignalQuiet
 	oldAgentBead := awaitSignalAgentBead
 	oldJSON := moleculeJSON
@@ -394,6 +582,7 @@ esac
 		awaitSignalBackoffBase = oldBackoffBase
 		awaitSignalBackoffMult = oldBackoffMult
 		awaitSignalBackoffMax = oldBackoffMax
+		awaitSignalCommandBudget = oldCommandBudget
 		awaitSignalQuiet = oldQuiet
 		awaitSignalAgentBead = oldAgentBead
 		moleculeJSON = oldJSON
@@ -403,6 +592,7 @@ esac
 	awaitSignalBackoffBase = ""
 	awaitSignalBackoffMult = 2
 	awaitSignalBackoffMax = ""
+	awaitSignalCommandBudget = ""
 	awaitSignalQuiet = true
 	awaitSignalAgentBead = "gt-gastown-refinery"
 	moleculeJSON = false

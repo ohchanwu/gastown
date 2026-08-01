@@ -262,9 +262,13 @@ const bdCallTimeout = 30 * time.Second
 
 // getAllAgentLabels retrieves all labels (including non-state) from an agent bead.
 func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
+	return getAllAgentLabelsContext(context.Background(), agentBead, beadsDir)
+}
+
+func getAllAgentLabelsContext(parent context.Context, agentBead, beadsDir string) ([]string, error) {
 	args := []string{"show", agentBead, "--json"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), bdCallTimeout)
+	ctx, cancel := context.WithTimeout(parent, bdCallTimeout)
 	defer cancel()
 
 	cmd := beads.CommandContext(ctx, filepath.Dir(beadsDir), beadsDir, beads.ReadOnlyPinned, args...)
