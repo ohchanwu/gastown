@@ -2332,6 +2332,10 @@ func lastPromptIndicatorLine(content string) int {
 		if trimmed == "" {
 			continue
 		}
+		if strings.HasPrefix(trimmed, "› ") {
+			last = i
+			continue
+		}
 		for _, suffix := range promptSuffixes {
 			if strings.HasSuffix(trimmed, suffix) {
 				last = i

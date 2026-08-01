@@ -3,7 +3,6 @@ package tmux
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 )
@@ -173,24 +172,6 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 				t.Fatalf("paneAtIdlePrompt() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestProbeCapturedCodexIdlePane(t *testing.T) {
-	path := os.Getenv("GT_CAPTURED_IDLE_PANE")
-	if path == "" {
-		t.Skip("set GT_CAPTURED_IDLE_PANE for the private classifier probe")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 25 {
-		lines = lines[len(lines)-25:]
-	}
-	if !paneAtIdlePrompt(strings.Join(lines, "\n"), "› ", 1, 22) {
-		t.Fatal("captured steady Codex pane classified as busy")
 	}
 }
 

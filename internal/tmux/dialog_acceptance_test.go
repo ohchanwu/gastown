@@ -288,6 +288,13 @@ session ready`,
 			wantBlocked: false,
 		},
 		{
+			name: "stale hook dialog before Codex placeholder",
+			content: `Hooks need review
+2. Trust all and continue
+› Ask anything`,
+			wantBlocked: false,
+		},
+		{
 			name: "stale trust dialog before shell prompt",
 			content: `Quick safety check
 Do you trust this folder?
