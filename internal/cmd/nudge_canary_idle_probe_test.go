@@ -51,7 +51,6 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 	if err := sandbox.linkCodexAuth(); err != nil {
 		t.Fatalf("linkCodexAuth: %v", err)
 	}
-
 	probeInstruction, probeToken := wakeCanaryStartupChallenge("A2F7C9")
 	var instructionObserved, instructionStranded, startupDialogObserved, modelTurnStarted, exactReplyObserved bool
 	observeStages := func(content []byte) {
@@ -206,13 +205,37 @@ func TestProbeIsolatedCodexFirstDelivery(t *testing.T) {
 		t.Fatal("GT_FIRST_DELIVERY_EVIDENCE must be an absolute path")
 	}
 
-	sandbox, err := newWakeCanarySandbox("", buildWakeCanaryCandidateGT(t))
+	candidateGT := buildWakeCanaryCandidateGT(t)
+	sandbox, err := newWakeCanarySandbox("", candidateGT)
 	if err != nil {
 		t.Fatalf("newWakeCanarySandbox: %v", err)
 	}
 	t.Cleanup(func() { _ = sandbox.Cleanup() })
 	if err := sandbox.linkCodexAuth(); err != nil {
 		t.Fatalf("linkCodexAuth: %v", err)
+	}
+	hookProbeMarker := ""
+	if os.Getenv("GT_FIRST_DELIVERY_WRAP_HOOK") == "1" {
+		hookProbeMarker = filepath.Join(sandbox.TownRoot, ".runtime", "user-prompt-hook-invoked")
+		wrapper := filepath.Join(sandbox.TownRoot, "user-prompt-hook-probe")
+		script := fmt.Sprintf("#!/bin/sh\numask 077\nmkdir -p %s\n: > %s\nexec %s \"$@\"\n", filepath.Dir(hookProbeMarker), hookProbeMarker, candidateGT)
+		if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+		hooksPath := filepath.Join(sandbox.RuntimeConfigDir, "hooks.json")
+		hooksData, err := os.ReadFile(hooksPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldCommand := candidateGT + " mail check --inject"
+		newCommand := wrapper + " mail check --inject"
+		updated := strings.Replace(string(hooksData), oldCommand, newCommand, 1)
+		if updated == string(hooksData) {
+			t.Fatal("UserPromptSubmit candidate command not found")
+		}
+		if err := os.WriteFile(hooksPath, []byte(updated), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	startupInstruction, startupResponse := wakeCanaryStartupChallenge("B3D8E4")
@@ -258,7 +281,8 @@ func TestProbeIsolatedCodexFirstDelivery(t *testing.T) {
 			}
 		}
 	}
-	metadata := fmt.Sprintf("stage=%s\nidle_timeout=%t\ntyped=%t\nsubmitted=%t\nsubmit_not_verified=%t\nsession_match=%t\ndelivery_match=%t\nmatching_receipt_path_exists=%t\nreceipt_file_count=%d\n", stage, errors.Is(idleErr, tmux.ErrIdleTimeout), receipt.Typed, receipt.Submitted, errors.Is(deliveryErr, tmux.ErrSubmitNotVerified), receipt.Session == sandbox.Session, receipt.DeliveryID == deliveryID, receiptPathErr == nil, receiptFiles)
+	_, hookProbeErr := os.Stat(hookProbeMarker)
+	metadata := fmt.Sprintf("stage=%s\nidle_timeout=%t\ntyped=%t\nsubmitted=%t\nsubmit_not_verified=%t\nsession_match=%t\ndelivery_match=%t\nhook_invoked=%t\nmatching_receipt_path_exists=%t\nreceipt_file_count=%d\n", stage, errors.Is(idleErr, tmux.ErrIdleTimeout), receipt.Typed, receipt.Submitted, errors.Is(deliveryErr, tmux.ErrSubmitNotVerified), receipt.Session == sandbox.Session, receipt.DeliveryID == deliveryID, hookProbeMarker != "" && hookProbeErr == nil, receiptPathErr == nil, receiptFiles)
 	if err := os.MkdirAll(filepath.Dir(evidencePath), 0700); err != nil {
 		t.Fatal(err)
 	}

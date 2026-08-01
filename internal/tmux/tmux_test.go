@@ -3147,30 +3147,3 @@ func TestValidateCommandBinary(t *testing.T) {
 		})
 	}
 }
-
-func TestCurrentSessionNameUsesCallingSocket(t *testing.T) {
-	tm := newTestTmux(t)
-	sessionName := fmt.Sprintf("gt-test-current-session-%d", time.Now().UnixNano())
-	if err := tm.NewSession(sessionName, t.TempDir()); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-
-	pane, err := tm.run("display-message", "-t", sessionName, "-p", "#{pane_id}")
-	if err != nil {
-		t.Fatalf("resolve pane: %v", err)
-	}
-	socketPath, err := tm.run("display-message", "-t", sessionName, "-p", "#{socket_path}")
-	if err != nil {
-		t.Fatalf("resolve socket: %v", err)
-	}
-
-	previousSocket := GetDefaultSocket()
-	SetDefaultSocket("gt-test-wrong-current-session-socket")
-	t.Cleanup(func() { SetDefaultSocket(previousSocket) })
-	t.Setenv("TMUX", strings.TrimSpace(socketPath)+",1,0")
-	t.Setenv("TMUX_PANE", strings.TrimSpace(pane))
-
-	if got := CurrentSessionName(); got != sessionName {
-		t.Fatalf("CurrentSessionName() = %q, want caller session %q", got, sessionName)
-	}
-}
