@@ -235,6 +235,12 @@ python3 - %s %s "$rc" %s %s %s %s <<'PY'
 import json, os, sys
 raw = open(sys.argv[1], 'rb').read()
 stderr = open(sys.argv[4], 'rb').read()
+first_line = raw.splitlines()[0] if raw.splitlines() else b''
+try:
+    json.loads(first_line)
+    first_line_valid = True
+except Exception:
+    first_line_valid = False
 try:
     payload = json.loads(raw)
     valid = True
@@ -252,6 +258,7 @@ facts = {
     'delivery_receipt_error': b'delivery receipt error' in stderr,
     'direct_session_match': os.environ.get('GT_PROBE_DIRECT_SESSION_MATCH') == '1',
     'event_match': payload.get('hook_event_name') == 'UserPromptSubmit',
+    'first_line_json_valid': first_line_valid,
     'has_event_field': 'hook_event_name' in payload,
     'has_prompt_field': 'prompt' in payload,
     'json_valid': valid,
@@ -261,6 +268,7 @@ facts = {
     'gt_town_root_match': os.environ.get('GT_TOWN_ROOT') == sys.argv[6],
     'identity_error': b'identity' in stderr.lower(),
     'not_found_error': b'not found' in stderr.lower(),
+    'raw_line_count': len(raw.splitlines()),
     'tmux_env_present': bool(os.environ.get('TMUX')),
     'tmux_pane_present': bool(os.environ.get('TMUX_PANE')),
 }
