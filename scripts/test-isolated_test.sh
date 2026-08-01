@@ -102,12 +102,17 @@ if [[ -n "${FAKE_DOLT_NEVER_LISTENS:-}" ]]; then
   while :; do sleep 1; done
 fi
 port=""
+data_dir=""
 while (( $# )); do
   case "$1" in
     --port) port="${2:-}"; shift 2 ;;
+    --data-dir) data_dir="${2:-}"; shift 2 ;;
     *) shift ;;
   esac
 done
+if [[ -n "${DOLT_CAPTURE:-}" ]]; then
+  printf '%s\n' "$data_dir" > "$DOLT_CAPTURE"
+fi
 exec python3 - "$port" <<'PY'
 import signal
 import socket
@@ -155,6 +160,25 @@ if PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GT_TEST_DOLT_PORT=44001 \
     fail "passes focused go test arguments through isolation"
 else
   fail "launches focused go test arguments"
+fi
+
+trailing_tmp_base="$TMPDIR/trailing-tmp"
+dolt_capture="$TMPDIR/dolt.data-dir"
+mkdir -p "$trailing_tmp_base"
+if (
+  PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" DOLT_CAPTURE="$dolt_capture" \
+    TMPDIR="$trailing_tmp_base/" GT_TEST_DOLT_PORT=44002 bash "$LAUNCHER"
+); then
+  case "$(cat "$dolt_capture")" in
+    "$trailing_tmp_base"/gastown-test-dolt.*)
+      pass "normalizes a trailing-slash TMPDIR before creating the sandbox"
+      ;;
+    *)
+      fail "normalizes a trailing-slash TMPDIR before creating the sandbox"
+      ;;
+  esac
+else
+  fail "launches with a trailing-slash TMPDIR"
 fi
 
 rm -f "$CAPTURE"

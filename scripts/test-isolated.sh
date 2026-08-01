@@ -85,7 +85,8 @@ for dependency in dolt go lsof; do
   fi
 done
 
-data_dir="$(mktemp -d "${TMPDIR:-/tmp}/gastown-test-dolt.XXXXXX")" || {
+temp_base="${TMPDIR:-/tmp}"
+data_dir="$(mktemp -d "${temp_base%/}/gastown-test-dolt.XXXXXX")" || {
   echo "test-isolation: configuration: could not create isolated Dolt data directory" >&2
   exit 78
 }
