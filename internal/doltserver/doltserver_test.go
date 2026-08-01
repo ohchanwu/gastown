@@ -486,6 +486,67 @@ func TestRemediateOwnedLeaksSinceRequiresOwnershipAndExcludesBaseline(t *testing
 	}
 }
 
+func TestRemediateTestLeaksSinceSignalsOnlyNewTestOwnedListeners(t *testing.T) {
+	baseline := LocalDoltServer{
+		DoltListener: DoltListener{PID: 551, Port: 4551},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.baseline"),
+	}
+	newLeak := LocalDoltServer{
+		DoltListener: DoltListener{PID: 552, Port: 4552},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.new"),
+	}
+	town := LocalDoltServer{DoltListener: DoltListener{PID: 553, Port: 4553}, Class: DoltServerOwnedTownLeak}
+	canonical := LocalDoltServer{DoltListener: DoltListener{PID: 554, Port: 4554}, Class: DoltServerCanonical}
+	unknown := LocalDoltServer{DoltListener: DoltListener{PID: 555, Port: 4555}, Class: DoltServerUnknown}
+	terminated := []int{}
+	rescans := 0
+
+	err := remediateTestLeaksSince(
+		[]LocalDoltServer{baseline, newLeak, town, canonical, unknown},
+		map[int]bool{baseline.PID: true},
+		func(pid int) error { terminated = append(terminated, pid); return nil },
+		func() []LocalDoltServer {
+			rescans++
+			if rescans == 1 {
+				return []LocalDoltServer{baseline, newLeak, town, canonical, unknown}
+			}
+			return []LocalDoltServer{baseline, town, canonical, unknown}
+		},
+	)
+	if err != nil {
+		t.Fatalf("remediateTestLeaksSince: %v", err)
+	}
+	if len(terminated) != 1 || terminated[0] != newLeak.PID {
+		t.Fatalf("terminated PIDs = %v, want only new test-owned leak %d", terminated, newLeak.PID)
+	}
+}
+
+func TestRemediateTestLeaksSinceRejectsChangedOwnerBeforeSignal(t *testing.T) {
+	original := LocalDoltServer{
+		DoltListener: DoltListener{PID: 561, Port: 4561},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.original-run"),
+	}
+	reused := original
+	reused.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.changed-owner")
+	terminated := false
+
+	err := remediateTestLeaksSince(
+		[]LocalDoltServer{original},
+		nil,
+		func(int) error { terminated = true; return nil },
+		func() []LocalDoltServer { return []LocalDoltServer{reused} },
+	)
+	if err == nil {
+		t.Fatal("cleanup accepted a listener whose ownership changed after selection")
+	}
+	if terminated {
+		t.Fatal("cleanup signaled a listener whose ownership changed after selection")
+	}
+}
+
 func TestRemediatePreviewedTestLeaksSignalsOnlyRevalidatedPreview(t *testing.T) {
 	previewed := LocalDoltServer{DoltListener: DoltListener{PID: 601, Port: 4601}, Class: DoltServerOwnedTestLeak}
 	previewed.OwnerPath = filepath.Join(os.TempDir(), "gastown-test-dolt.previewed")

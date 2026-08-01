@@ -167,6 +167,14 @@ temporary data directory on the requested loopback port and verifies that its
 child process owns the listener. An inherited or otherwise preexisting
 listener therefore fails closed before the suite starts.
 
+Before running packages, the launcher snapshots every existing Dolt listener
+to a mode-0600 receipt in its private temporary directory. Its outer EXIT trap
+then removes only listeners that are both new relative to that baseline and
+still positively test-owned. Cleanup also runs after package failure or
+termination, so a retry cannot absorb a prior attempt's leak into its baseline.
+Baseline, canonical, unknown, non-test-owned, and changed-owner listeners are
+never signaled; incomplete cleanup is a visible test failure.
+
 Launcher failures have two classifications:
 
 - `test-isolation: configuration` (exit 78): the isolated port is missing,

@@ -1541,6 +1541,24 @@ func remediateOwnedLeaksSince(initial []LocalDoltServer, baseline map[int]bool, 
 	})
 }
 
+func testLeakSelectionsSince(inventory []LocalDoltServer, baseline map[int]bool) []TestLeakSelection {
+	var selections []TestLeakSelection
+	for _, server := range inventory {
+		if baseline[server.PID] {
+			continue
+		}
+		if selection := newTestLeakSelection(server); selection.OwnershipToken != "" {
+			selections = append(selections, selection)
+		}
+	}
+	return selections
+}
+
+func remediateTestLeaksSince(initial []LocalDoltServer, baseline map[int]bool, terminate func(int) error, rescan func() []LocalDoltServer) error {
+	preview := testLeakSelectionsSince(initial, baseline)
+	return remediatePreviewedTestLeaks(rescan(), preview, true, terminate, rescan)
+}
+
 func previewedTestLeaks(inventory []LocalDoltServer, preview []TestLeakSelection) []LocalDoltServer {
 	selected := make(map[TestLeakSelection]bool, len(preview))
 	for _, selection := range preview {
@@ -1599,6 +1617,18 @@ func CleanupOwnedLocalDoltLeaks(townRoot string, baseline []DoltListener) error 
 		baselinePIDs[listener.PID] = true
 	}
 	return remediateOwnedLeaksSince(InventoryLocalDoltServers(townRoot), baselinePIDs, terminateLocalDoltServer, func() []LocalDoltServer {
+		return InventoryLocalDoltServers(townRoot)
+	})
+}
+
+// CleanupOwnedLocalTestLeaks removes only positively test-owned listeners that
+// appeared after baseline, revalidating ownership before signaling.
+func CleanupOwnedLocalTestLeaks(townRoot string, baseline []DoltListener) error {
+	baselinePIDs := make(map[int]bool, len(baseline))
+	for _, listener := range baseline {
+		baselinePIDs[listener.PID] = true
+	}
+	return remediateTestLeaksSince(InventoryLocalDoltServers(townRoot), baselinePIDs, terminateLocalDoltServer, func() []LocalDoltServer {
 		return InventoryLocalDoltServers(townRoot)
 	})
 }

@@ -180,10 +180,16 @@ CWD; if that exact reported path has since been deleted, ENOENT plus the same
 strict shape is accepted as positive evidence. This exception is limited to
 provenance-marked `lsof` CWD evidence, not arbitrary path strings. Traversal,
 extant symlink escapes, town paths, arbitrary temp paths, and lookalike names
-remain unknown.
-Staged-convoy tests
-register per-test cleanup before subprocesses and enforce a package-exit
-listener baseline.
+remain unknown. Staged-convoy tests register per-test cleanup before
+subprocesses and enforce a package-exit listener baseline.
+
+The repository-wide isolated test launcher also records a mode-0600 listener
+baseline before packages start. Its outer EXIT trap covers package failures and
+timeouts, selecting only new, positively test-owned listeners and revalidating
+PID, port, class, and opaque ownership token before signaling. Baseline,
+canonical, unknown, non-test-owned, and changed-owner listeners remain
+untouched, and cleanup failure overrides the suite status so retries never
+silently accept an orphan from an earlier attempt.
 
 `gt dolt cleanup-test-leaks` is the user-facing test-leak path. Preview is the
 default and atomically writes a mode-0600 receipt under a mode-0700 `.runtime`

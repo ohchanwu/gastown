@@ -4,13 +4,26 @@ set -uo pipefail
 
 server_pid=""
 data_dir=""
+guard=""
+guard_receipt=""
 
 cleanup() {
+	status=$?
+	trap - EXIT
+	cleanup_failed=false
+	if [[ -n "$guard_receipt" ]] && ! "$guard" cleanup "$guard_receipt"; then
+		echo "test-isolation: cleanup: test-owned Dolt listener cleanup failed" >&2
+		cleanup_failed=true
+	fi
   if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
     kill "$server_pid"
     wait "$server_pid" 2>/dev/null || true
   fi
   [[ -n "$data_dir" ]] && rm -rf -- "$data_dir"
+	if [[ "$cleanup_failed" == true ]]; then
+		exit 1
+	fi
+	exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -37,7 +50,7 @@ for selector in GT_DOLT_PORT BEADS_DOLT_PORT BEADS_DOLT_SERVER_PORT; do
   fi
 done
 
-for dependency in dolt lsof; do
+for dependency in dolt go lsof; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
     echo "test-isolation: configuration: required command '$dependency' is unavailable" >&2
     exit 78
@@ -48,6 +61,11 @@ data_dir="$(mktemp -d "${TMPDIR:-/tmp}/gastown-test-dolt.XXXXXX")" || {
   echo "test-isolation: configuration: could not create isolated Dolt data directory" >&2
   exit 78
 }
+guard="$data_dir/testguard"
+if ! go build -o "$guard" ./internal/testguard; then
+	echo "test-isolation: configuration: could not build the Dolt listener guard" >&2
+	exit 78
+fi
 dolt sql-server \
   --host 127.0.0.1 \
   --port "$test_port" \
@@ -75,6 +93,13 @@ if [[ "$owns_listener" != true ]]; then
   echo "test-isolation: configuration: launcher could not own the isolated Dolt listener" >&2
   exit 78
 fi
+
+baseline_receipt="$data_dir/listener-baseline.json"
+if ! "$guard" snapshot "$baseline_receipt"; then
+	echo "test-isolation: configuration: could not snapshot the Dolt listener baseline" >&2
+	exit 78
+fi
+guard_receipt="$baseline_receipt"
 
 if env \
   GT_DOLT_HOST=127.0.0.1 \

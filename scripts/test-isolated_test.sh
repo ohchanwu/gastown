@@ -23,6 +23,32 @@ trap cleanup EXIT
 mkdir -p "$TMPDIR/bin"
 cat > "$TMPDIR/bin/go" <<'FAKE_GO'
 #!/usr/bin/env bash
+if [[ "${1:-}" == build && "${2:-}" == -o ]]; then
+  cat > "${3:?guard output required}" <<'FAKE_GUARD'
+#!/usr/bin/env bash
+case "${1:-}" in
+    snapshot)
+      printf 'baseline\n' > "${2:?baseline receipt required}"
+      [[ -n "${GUARD_CAPTURE:-}" ]] && printf 'snapshot\n' >> "$GUARD_CAPTURE"
+      ;;
+    cleanup)
+      [[ -n "${GUARD_CAPTURE:-}" ]] && printf 'cleanup\n' >> "$GUARD_CAPTURE"
+      if [[ -n "${FAKE_GUARD_CLEANUP_EXIT:-}" ]]; then
+        exit "$FAKE_GUARD_CLEANUP_EXIT"
+      fi
+      [[ -n "${FAKE_LEAK:-}" ]] && rm -f -- "$FAKE_LEAK"
+      ;;
+esac
+exit 0
+FAKE_GUARD
+  chmod +x "${3}"
+  exit 0
+fi
+
+if [[ -n "${FAIL_IF_LEAK_PRESENT:-}" && -e "${FAKE_LEAK:-}" ]]; then
+  exit 42
+fi
+[[ -n "${CREATE_FAKE_LEAK:-}" ]] && touch "${FAKE_LEAK:?}"
 printf '%s\n' \
   "GT_DOLT_PORT=$GT_DOLT_PORT" \
   "BEADS_DOLT_PORT=$BEADS_DOLT_PORT" \
@@ -167,6 +193,36 @@ if [[ "$status" -eq 9 && "$output" == *"test-isolation: suite"* ]]; then
   pass "classifies suite failures and preserves their status"
 else
   fail "classifies suite failures and preserves their status"
+fi
+
+rm -f "$CAPTURE"
+guard_capture="$TMPDIR/guard.calls"
+fake_leak="$TMPDIR/orphaned-test-listener"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GUARD_CAPTURE="$guard_capture" \
+  FAKE_LEAK="$fake_leak" CREATE_FAKE_LEAK=1 FAKE_GO_EXIT=9 \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
+retry_status=0
+PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GUARD_CAPTURE="$guard_capture" \
+  FAKE_LEAK="$fake_leak" FAIL_IF_LEAK_PRESENT=1 \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" >/dev/null 2>&1 || retry_status=$?
+expected_guard_calls=$'snapshot\ncleanup\nsnapshot\ncleanup'
+if [[ "$status" -eq 9 && "$retry_status" -eq 0 && ! -e "$fake_leak" && \
+      "$(cat "$guard_capture")" == "$expected_guard_calls" ]]; then
+  pass "reaps a failed run before a clean retry"
+else
+  fail "reaps a failed run before a clean retry"
+fi
+
+rm -f "$guard_capture" "$fake_leak"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GUARD_CAPTURE="$guard_capture" \
+  FAKE_LEAK="$fake_leak" CREATE_FAKE_LEAK=1 FAKE_GO_EXIT=9 FAKE_GUARD_CLEANUP_EXIT=7 \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
+if [[ "$status" -eq 1 && "$output" == *"test-isolation: cleanup"* ]]; then
+  pass "fails visibly when outer cleanup fails"
+else
+  fail "fails visibly when outer cleanup fails"
 fi
 
 make_plan="$(make --no-print-directory -n -C "$REPO_ROOT" test)"
