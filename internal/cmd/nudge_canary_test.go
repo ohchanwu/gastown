@@ -188,6 +188,9 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	if !strings.Contains(string(configData), wantTrust) {
 		t.Fatalf("temporary Codex config does not trust isolated workdir")
 	}
+	if !strings.Contains(string(configData), "bypass_hook_trust = true") {
+		t.Fatalf("temporary Codex config does not trust generated hooks")
+	}
 	if sandbox.Socket == "" || sandbox.Socket == "gastown" {
 		t.Fatalf("canary socket is not isolated: %q", sandbox.Socket)
 	}
