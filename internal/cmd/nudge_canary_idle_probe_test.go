@@ -5,12 +5,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/session"
 )
+
+var idlePaneProbeANSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+
+func idlePaneProbeHasExactReply(styled, token string) bool {
+	for _, line := range strings.Split(styled, "\n") {
+		plain := strings.TrimSpace(idlePaneProbeANSI.ReplaceAllString(line, ""))
+		if plain == token || strings.TrimPrefix(plain, "• ") == token {
+			return true
+		}
+	}
+	return false
+}
+
+func idlePaneProbeCompleted(styled, token string) bool {
+	return !strings.Contains(styled, "esc to interrupt") && idlePaneProbeHasExactReply(styled, token)
+}
 
 func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 	if os.Getenv("GT_RUN_IDLE_PANE_PROBE") != "1" {
@@ -31,6 +48,23 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 	}
 
 	const probeToken = "IDLE_PANE_PROBE_COMPLETE_7F2A"
+	const probeInstruction = "Reply with exactly " + probeToken + " and then wait."
+	var instructionObserved, instructionStranded, startupDialogObserved, modelTurnStarted, exactReplyObserved bool
+	observeStages := func(content []byte) {
+		styled := string(content)
+		plain := idlePaneProbeANSI.ReplaceAllString(styled, "")
+		for _, line := range strings.Split(plain, "\n") {
+			if strings.Contains(line, probeInstruction) {
+				instructionObserved = true
+				if strings.HasPrefix(strings.TrimSpace(line), "›") {
+					instructionStranded = true
+				}
+			}
+		}
+		startupDialogObserved = startupDialogObserved || strings.Contains(plain, "Do you trust the contents of this directory?") || strings.Contains(plain, "Hooks need review")
+		modelTurnStarted = modelTurnStarted || strings.Contains(plain, "esc to interrupt")
+		exactReplyObserved = exactReplyObserved || idlePaneProbeHasExactReply(styled, probeToken)
+	}
 	capture := func() ([]byte, error) {
 		return exec.Command("tmux", "-L", sandbox.Socket, "capture-pane", "-p", "-e", "-t", sandbox.Session, "-S", "-").Output()
 	}
@@ -65,7 +99,9 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				promptRows++
 			}
 		}
-		metadata := fmt.Sprintf("cursor_query_ok=%t\ncursor_parse_ok=%t\nvisible_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\nvisible_lines=%d\nprompt_rows=%d\nprompt_row=%d\nprompt_on_cursor_row=%t\ncursor_x=%d\ncursor_y=%d\n", cursorErr == nil, cursorParseErr == nil, visibleErr == nil, agentErr == nil, agent == "codex", len(visibleLines), promptRows, promptRow, promptRow == cursorY, cursorX, cursorY)
+		plainVisible := idlePaneProbeANSI.ReplaceAllString(string(visible), "")
+		startupDialogActive := strings.Contains(plainVisible, "Do you trust the contents of this directory?") || strings.Contains(plainVisible, "Hooks need review")
+		metadata := fmt.Sprintf("cursor_query_ok=%t\ncursor_parse_ok=%t\nvisible_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\ninstruction_observed=%t\ninstruction_stranded=%t\nruntime_receipt_observed=%t\nstartup_dialog_observed=%t\nstartup_dialog_active=%t\nmodel_turn_started=%t\nexact_reply_observed=%t\nvisible_lines=%d\nprompt_rows=%d\nprompt_row=%d\nprompt_on_cursor_row=%t\ncursor_x=%d\ncursor_y=%d\n", cursorErr == nil, cursorParseErr == nil, visibleErr == nil, agentErr == nil, agent == "codex", instructionObserved, instructionStranded, modelTurnStarted || exactReplyObserved, startupDialogObserved, startupDialogActive, modelTurnStarted, exactReplyObserved, len(visibleLines), promptRows, promptRow, promptRow == cursorY, cursorX, cursorY)
 		if err := os.WriteFile(evidencePath+".meta", []byte(metadata), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +115,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 		Beacon:           session.BeaconConfig{Recipient: "isolated idle-pane probe", Sender: "self", Topic: "probe"},
-		Instructions:     "Reply with exactly " + probeToken + " and then wait.",
+		Instructions:     probeInstruction,
 		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}); err != nil {
 		if content, captureErr := capture(); captureErr == nil {
@@ -87,11 +123,9 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		}
 		t.Fatalf("StartSession: %v", err)
 	}
-	baseline, err := capture()
-	if err != nil {
-		t.Fatalf("capture baseline: %v", err)
+	if content, captureErr := capture(); captureErr == nil {
+		observeStages(content)
 	}
-	baselineTokenCount := strings.Count(string(baseline), probeToken)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	t.Cleanup(ticker.Stop)
 	timeout := time.NewTimer(180 * time.Second)
@@ -107,9 +141,9 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				continue
 			}
 			lastCapture = content
+			observeStages(content)
 			styled := string(content)
-			busy := strings.Contains(styled, "esc to interrupt")
-			if !busy && strings.Count(styled, probeToken) > baselineTokenCount {
+			if idlePaneProbeCompleted(styled, probeToken) {
 				stable++
 			} else {
 				stable = 0
@@ -135,5 +169,26 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			}
 			t.Fatal("isolated Codex probe did not reach stable completed output")
 		}
+	}
+}
+
+func TestIdlePaneProbeRecognizesReplyAlreadyPresentAtBaseline(t *testing.T) {
+	const token = "IDLE_PANE_PROBE_COMPLETE_7F2A"
+
+	if idlePaneProbeCompleted("Reply with exactly "+token+" and then wait.\n", token) {
+		t.Fatal("instruction-only snapshot reported completion")
+	}
+	completed := "Reply with exactly " + token + " and then wait.\n" + token + "\n"
+	if !idlePaneProbeCompleted(completed, token) {
+		t.Fatal("exact reply already present at baseline was missed")
+	}
+	if !idlePaneProbeCompleted("\x1b[2m"+token+"\x1b[0m\n", token) {
+		t.Fatal("styled exact reply was missed")
+	}
+	if !idlePaneProbeCompleted("• "+token+"\n", token) {
+		t.Fatal("Codex-decorated exact reply was missed")
+	}
+	if idlePaneProbeCompleted(completed+"esc to interrupt\n", token) {
+		t.Fatal("busy snapshot reported stable completion")
 	}
 }
