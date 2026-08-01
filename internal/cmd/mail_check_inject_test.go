@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +10,37 @@ import (
 	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/mail"
 )
+
+func TestRunMailCheckReceiptUsesManagedHookIdentityOutsideWorkspace(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(townRoot, "mayor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv("GT_TOWN_ROOT", "")
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_SESSION", "gt-test-codex-managed-hook")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	if resolved, err := findMailWorkDir(); err != nil || resolved != townRoot {
+		t.Fatalf("managed mail root: match=%t err=%v", resolved == townRoot, err)
+	}
+
+	deliveryID := "ndg-managed-hook-receipt"
+	input := &hookInput{
+		HookEventName: "UserPromptSubmit",
+		Prompt:        delivery.ControlMessage(deliveryID, "private hook prompt"),
+	}
+	if err := recordCodexSubmissionReceiptFromHook(input); err != nil {
+		t.Fatalf("recordCodexSubmissionReceiptFromHook: %v", err)
+	}
+	if _, err := os.Stat(delivery.ReceiptPath(townRoot, os.Getenv("GT_SESSION"))); err != nil {
+		t.Fatalf("managed hook receipt path exists: %t", err == nil)
+	}
+	if _, ok, err := delivery.FindSubmittedAfter(townRoot, os.Getenv("GT_SESSION"), deliveryID, time.Time{}); err != nil || !ok {
+		t.Fatalf("managed hook receipt: ok=%t err=%v", ok, err)
+	}
+}
 
 func TestRecordCodexSubmissionReceiptFromHookInput(t *testing.T) {
 	townRoot := t.TempDir()

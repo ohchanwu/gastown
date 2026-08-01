@@ -28,11 +28,15 @@ func buildWakeCanaryCandidateGT(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate := filepath.Join(t.TempDir(), "gt")
-	cmd := exec.Command("go", "build", "-o", candidate, "./cmd/gt")
+	buildDir := t.TempDir()
+	candidate := filepath.Join(buildDir, "gt")
+	cmd := exec.Command("make", "build", "BUILD_DIR="+buildDir)
 	cmd.Dir = repoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build candidate gt: %v: %s", err, output)
+	}
+	if output, err := exec.Command(candidate, "version").CombinedOutput(); err != nil {
+		t.Fatalf("run candidate gt: %v: %s", err, output)
 	}
 	return candidate
 }

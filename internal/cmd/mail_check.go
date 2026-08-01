@@ -25,13 +25,26 @@ func recordCodexSubmissionReceipt(townRoot, session string, input *hookInput) er
 	return err
 }
 
+func recordCodexSubmissionReceiptFromHook(input *hookInput) error {
+	if input == nil || input.HookEventName != "UserPromptSubmit" {
+		return nil
+	}
+	townRoot, err := findMailWorkDir()
+	if err != nil {
+		return err
+	}
+	sessionName := os.Getenv("GT_SESSION")
+	if sessionName == "" {
+		sessionName = tmux.CurrentSessionName()
+	}
+	return recordCodexSubmissionReceipt(townRoot, sessionName, input)
+}
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
 	if mailCheckInject {
 		input := readStdinJSON()
-		if townRoot, err := workspace.FindFromCwd(); err == nil {
-			if err := recordCodexSubmissionReceipt(townRoot, tmux.CurrentSessionName(), input); err != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: delivery receipt error: %v\n", err)
-			}
+		if err := recordCodexSubmissionReceiptFromHook(input); err != nil {
+			fmt.Fprintf(os.Stderr, "gt mail check: delivery receipt error: %v\n", err)
 		}
 	}
 
