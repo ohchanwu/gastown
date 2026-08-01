@@ -2505,6 +2505,10 @@ func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
 			command: "printf '\\033[1;2m›\\033[0m Ask anything\\r\\033[1C'; sleep 60",
 		},
 		{
+			name:    "steady empty cursor row with footer is idle",
+			command: "printf 'completed output\\n\\nfooter\\r\\033[1A\\033[1C'; sleep 60",
+		},
+		{
 			name:    "staged prompt is not idle",
 			command: "printf '\\033[1;2m›\\033[0m staged delivery'; sleep 60",
 			wantErr: ErrIdleTimeout,
