@@ -1172,21 +1172,32 @@ func (t *Tmux) IsAvailable() bool {
 // Uses "=" prefix for exact matching, preventing prefix matches
 // (e.g., "gt-deacon-boot" won't match when checking for "gt-deacon").
 func (t *Tmux) HasSession(name string) (bool, error) {
+	exists, err := t.HasSessionContext(context.Background(), name)
+	if errors.Is(err, ErrNoServer) {
+		return false, nil
+	}
+	// Preserve psmux's historical empty-error fallback for legacy callers.
+	if err != nil && runtime.GOOS == "windows" {
+		return false, nil
+	}
+	return exists, err
+}
+
+// HasSessionContext checks for an exact session under ctx. Unlike HasSession,
+// it reports a missing tmux server as infrastructure uncertainty.
+func (t *Tmux) HasSessionContext(ctx context.Context, name string) (bool, error) {
 	// psmux (Windows tmux alternative) doesn't support the "=" exact-match
 	// prefix for session targets. Use the bare name on Windows.
 	target := "=" + name
 	if runtime.GOOS == "windows" {
 		target = name
 	}
-	_, err := t.run("has-session", "-t", target)
+	_, err := t.runContext(ctx, "has-session", "-t", target)
 	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
-			return false, nil
+		if ctx.Err() != nil {
+			return false, ctx.Err()
 		}
-		// psmux (Windows) returns exit code 1 with empty stderr, bypassing
-		// wrapError's string matching. Fall back to treating any error as
-		// "not found" on Windows only.
-		if runtime.GOOS == "windows" {
+		if errors.Is(err, ErrSessionNotFound) {
 			return false, nil
 		}
 		return false, err

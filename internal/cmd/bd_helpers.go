@@ -185,7 +185,7 @@ func resolveBdCmdTimeout() time.Duration {
 }
 
 func (b *bdCmd) buildContextCommand(ctx context.Context) *exec.Cmd {
-	args := b.resolvedArgs()
+	args := b.resolvedArgsContext(ctx)
 	cmd := exec.CommandContext(ctx, "bd", args...)
 	util.SetProcessGroup(cmd)
 	cmd.Dir = b.dir
@@ -209,8 +209,8 @@ func (b *bdCmd) wrapCommandError(ctx context.Context, err error, deadline time.D
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("%s timed out after %v: %w", b.argsDesc(), deadline, err)
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s stopped: %w", b.argsDesc(), ctx.Err())
 	}
 	return b.wrapTimeout(err, deadline)
 }
@@ -235,6 +235,10 @@ func (b *bdCmd) argsDesc() string {
 // resolvedArgs returns the final args, normalizing requested stale-read support
 // to bd's global flag position when supported and stripping it when unsupported.
 func (b *bdCmd) resolvedArgs() []string {
+	return b.resolvedArgsContext(context.Background())
+}
+
+func (b *bdCmd) resolvedArgsContext(ctx context.Context) []string {
 	filtered := make([]string, 0, len(b.args))
 	requestedAllowStale := b.allowStale
 	for _, a := range b.args {
@@ -247,7 +251,7 @@ func (b *bdCmd) resolvedArgs() []string {
 	if !requestedAllowStale {
 		return b.args
 	}
-	if beads.BdSupportsAllowStaleWithEnv(b.buildEnv()) {
+	if beads.BdSupportsAllowStaleWithEnvContext(ctx, b.buildEnv()) {
 		return append([]string{"--allow-stale"}, filtered...)
 	}
 	return filtered
@@ -256,8 +260,12 @@ func (b *bdCmd) resolvedArgs() []string {
 // Run builds and runs the command, returning any error.
 // This is a convenience method equivalent to Build().Run().
 func (b *bdCmd) Run() error {
+	return b.RunContext(context.Background())
+}
+
+func (b *bdCmd) RunContext(ctx context.Context) error {
 	deadline := resolveBdCmdTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	return b.wrapCommandError(ctx, b.buildContextCommand(ctx).Run(), deadline)
 }
@@ -267,8 +275,12 @@ func (b *bdCmd) Run() error {
 // Note: Output() captures stdout but Stderr must still be configured
 // separately if you want to capture stderr instead of it going to os.Stderr.
 func (b *bdCmd) Output() ([]byte, error) {
+	return b.OutputContext(context.Background())
+}
+
+func (b *bdCmd) OutputContext(ctx context.Context) ([]byte, error) {
 	deadline := resolveBdCmdTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	out, err := b.buildContextCommand(ctx).Output()
 	return out, b.wrapCommandError(ctx, err, deadline)

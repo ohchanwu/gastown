@@ -59,6 +59,12 @@ func BdSupportsAllowStale() bool {
 // BdSupportsAllowStaleWithEnv returns true if the installed bd binary accepts
 // --allow-stale, probing with the provided environment when supplied.
 func BdSupportsAllowStaleWithEnv(env []string) bool {
+	return BdSupportsAllowStaleWithEnvContext(context.Background(), env)
+}
+
+// BdSupportsAllowStaleWithEnvContext is BdSupportsAllowStaleWithEnv with a
+// caller-controlled lifetime for the capability probe.
+func BdSupportsAllowStaleWithEnvContext(ctx context.Context, env []string) bool {
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
 		return false
@@ -73,10 +79,10 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 		return cachedResult
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), bdAllowStaleProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, bdAllowStaleProbeTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.CommandContext(probeCtx, bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetProcessGroup(cmd)
 	if env != nil {
 		cmd.Env = env
@@ -85,6 +91,9 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	cmd.Stdout = &combinedOut
 	cmd.Stderr = &combinedOut
 	err = cmd.Run()
+	if ctx.Err() != nil {
+		return false
+	}
 	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
 	// Check output for "unknown flag" to detect lack of support. Treat probe
 	// errors/timeouts as unsupported so higher-level commands fail closed
@@ -114,7 +123,13 @@ func MaybePrependAllowStale(args []string) []string {
 // MaybePrependAllowStaleWithEnv prepends --allow-stale to args if bd supports it,
 // probing with the provided environment when supplied.
 func MaybePrependAllowStaleWithEnv(env []string, args []string) []string {
-	if BdSupportsAllowStaleWithEnv(env) {
+	return MaybePrependAllowStaleWithEnvContext(context.Background(), env, args)
+}
+
+// MaybePrependAllowStaleWithEnvContext is MaybePrependAllowStaleWithEnv with
+// caller cancellation applied to the capability probe.
+func MaybePrependAllowStaleWithEnvContext(ctx context.Context, env []string, args []string) []string {
+	if BdSupportsAllowStaleWithEnvContext(ctx, env) {
 		return append([]string{"--allow-stale"}, args...)
 	}
 	return args
@@ -784,17 +799,16 @@ func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args 
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
 
+	// Bound the whole invocation, including the capability probe, so a slow bd
+	// cannot outlive the caller's command contract.
+	ctx, cancel := context.WithTimeout(ctx, resolveBdSubprocessTimeout())
+	defer cancel()
+
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.getResolvedBeadsDir()
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
-	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
-
-	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
-	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
-	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(ctx, resolveBdSubprocessTimeout())
-	defer cancel()
+	fullArgs := MaybePrependAllowStaleWithEnvContext(ctx, runEnv, args)
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
