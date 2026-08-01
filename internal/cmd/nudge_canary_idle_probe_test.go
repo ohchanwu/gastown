@@ -48,8 +48,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		t.Fatalf("linkCodexAuth: %v", err)
 	}
 
-	const probeToken = "IDLE_PANE_PROBE_COMPLETE_7F2A"
-	const probeInstruction = "Reply with exactly " + probeToken + " and then wait."
+	probeInstruction, probeToken := wakeCanaryStartupChallenge("A2F7C9")
 	var instructionObserved, instructionStranded, startupDialogObserved, modelTurnStarted, exactReplyObserved bool
 	observeStages := func(content []byte) {
 		styled := string(content)
@@ -115,7 +114,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		TownRoot: sandbox.TownRoot, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
 		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
-		Beacon:           session.BeaconConfig{Recipient: "isolated idle-pane probe", Sender: "self", Topic: "probe"},
+		Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
 		Instructions:     probeInstruction,
 		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}); err != nil {
@@ -154,7 +153,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			}
 			writeEvidence(content)
 			writeMetadata()
-			if err := sandbox.tmux.WaitForIdle(sandbox.Session, 3*time.Second); err != nil {
+			if err := waitForWakeCanaryIdle(sandbox.tmux, sandbox.Session); err != nil {
 				t.Fatalf("WaitForIdle after completed response: %v", err)
 			}
 			info, err := os.Stat(evidencePath)
