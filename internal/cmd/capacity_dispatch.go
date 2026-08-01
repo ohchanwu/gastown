@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -824,7 +825,11 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
 // mayor/rig/.beads), and both paths would otherwise return the same contexts.
 func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
-	records, err := listAllSlingContextRecords(townRoot)
+	return listAllSlingContextsContext(context.Background(), townRoot)
+}
+
+func listAllSlingContextsContext(ctx context.Context, townRoot string) ([]*beads.Issue, error) {
+	records, err := listAllSlingContextRecordsContext(ctx, townRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -836,6 +841,10 @@ func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
 }
 
 func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
+	return listAllSlingContextRecordsContext(context.Background(), townRoot)
+}
+
+func listAllSlingContextRecordsContext(ctx context.Context, townRoot string) ([]slingContextRecord, error) {
 	var records []slingContextRecord
 	seen := make(map[string]bool)
 	dirs, err := beadsSearchDirs(townRoot)
@@ -843,9 +852,12 @@ func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
 		return nil, err
 	}
 	for _, dir := range dirs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		beadsDir := beads.ResolveBeadsDir(dir)
 		b := beads.NewWithBeadsDir(dir, beadsDir)
-		contexts, err := b.ListOpenSlingContexts()
+		contexts, err := b.ListOpenSlingContextsContext(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("listing sling contexts in %s: %w", beadsDir, err)
 		}

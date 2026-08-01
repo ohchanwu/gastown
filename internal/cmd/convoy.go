@@ -1766,7 +1766,14 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	stranded, err := findStrandedConvoys(townBeads)
+	ctx := context.Background()
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
+	ctx, cancel := context.WithTimeout(ctx, convoyCheckDeadline)
+	defer cancel()
+
+	stranded, err := findStrandedConvoysContext(ctx, townBeads)
 	if err != nil {
 		return err
 	}
@@ -1843,28 +1850,51 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 // findStrandedConvoys finds convoys with ready work but no workers,
 // or empty convoys (0 tracked issues) that need cleanup.
 func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
+	return findStrandedConvoysContext(context.Background(), townBeads)
+}
+
+func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strandedConvoyInfo, error) {
 	stranded := []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
 
-	convoys, err := listConvoyIssues(townBeads, "open", false)
+	convoys, err := listConvoyIssuesContext(ctx, townRoot, "open", false)
 	if err != nil {
-		return nil, fmt.Errorf("listing convoys: %w", err)
+		return nil, convoyStrandedScanError(ctx)
+	}
+	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
+	results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+		return getTrackedIssuesCachedWithoutWorkers(ctx, townRoot, convoy.ID, cache)
+	})
+	if timedOut {
+		return nil, convoyStrandedScanError(ctx)
 	}
 
-	// Check each convoy for stranded state
-	for _, convoy := range convoys {
+	var trackedIDs []string
+	for _, result := range results {
+		if !result.done || result.err != nil {
+			return nil, convoyStrandedScanError(ctx)
+		}
+		for _, tracked := range result.tracked {
+			trackedIDs = append(trackedIDs, tracked.ID)
+		}
+	}
+	if err := enrichConvoyWorkersContext(ctx, townRoot, results, getWorkersForIssuesContext); err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
+	scheduledSet, err := areScheduledContext(ctx, trackedIDs)
+	if err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
+
+	// Results retain input order, so normal and JSON output stay deterministic.
+	for _, result := range results {
+		convoy := result.convoy
+		tracked := result.tracked
 		// Extract base_branch from convoy description fields
 		var baseBranch string
 		if cf := beads.ParseConvoyFields(&beads.Issue{Description: convoy.Description}); cf != nil {
 			baseBranch = cf.BaseBranch
 		}
 
-		tracked, err := getTrackedIssues(townBeads, convoy.ID)
-		if err != nil {
-			// Write to stderr explicitly — stdout may be consumed as JSON
-			// by the daemon's JSON parser (fixes #2142).
-			fmt.Fprintf(os.Stderr, "⚠ Warning: skipping convoy %s: %v\n", convoy.ID, err)
-			continue
-		}
 		// Empty convoys (0 tracked issues) are stranded — they need
 		// attention (auto-close via convoy check or manual cleanup).
 		if len(tracked) == 0 {
@@ -1885,17 +1915,14 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
 		// Non-slingable types (epics, convoys, etc.) are also excluded.
 
-		// Batch-check scheduling status for all tracked issues (single DB query).
-		var trackedIDs []string
-		for _, t := range tracked {
-			trackedIDs = append(trackedIDs, t.ID)
-		}
-		scheduledSet := areScheduled(trackedIDs)
-
 		var readyIssues []string
 		for _, t := range tracked {
-			if isReadyIssue(t, scheduledSet) {
-				if !isSlingableBead(townBeads, t.ID) {
+			ready, err := isReadyIssueContext(ctx, t, scheduledSet)
+			if err != nil {
+				return nil, convoyStrandedScanError(ctx)
+			}
+			if ready {
+				if !isSlingableBead(townRoot, t.ID) {
 					continue
 				}
 				if !convoyops.IsSlingableType(t.IssueType) {
@@ -1933,6 +1960,45 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	return stranded, nil
 }
 
+func convoyStrandedScanError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("convoy stranded scan incomplete: %w", err)
+	}
+	return errors.New("convoy stranded scan incomplete")
+}
+
+func enrichConvoyWorkersContext(
+	ctx context.Context,
+	townRoot string,
+	results []convoyLookupResult,
+	lookup func(context.Context, string, []string) (map[string]*workerInfo, error),
+) error {
+	seen := make(map[string]bool)
+	var issueIDs []string
+	for _, result := range results {
+		for _, tracked := range result.tracked {
+			if tracked.Status == "closed" || seen[tracked.ID] {
+				continue
+			}
+			seen[tracked.ID] = true
+			issueIDs = append(issueIDs, tracked.ID)
+		}
+	}
+	workers, err := lookup(ctx, townRoot, issueIDs)
+	if err != nil {
+		return err
+	}
+	for i := range results {
+		for j := range results[i].tracked {
+			if worker := workers[results[i].tracked[j].ID]; worker != nil {
+				results[i].tracked[j].Worker = worker.Worker
+				results[i].tracked[j].WorkerAge = worker.Age
+			}
+		}
+	}
+	return nil
+}
+
 // isReadyIssue checks if an issue is ready for dispatch (stranded).
 // An issue is ready if:
 // - status = "open" AND (no assignee OR assignee session is dead)
@@ -1940,31 +2006,36 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 // - AND not blocked (cross-rig-aware from issue details)
 // scheduledSet is a pre-computed set of bead IDs with open sling contexts (from areScheduled).
 func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
+	ready, _ := isReadyIssueContext(context.Background(), t, scheduledSet)
+	return ready
+}
+
+func isReadyIssueContext(ctx context.Context, t trackedIssueInfo, scheduledSet map[string]bool) (bool, error) {
 	status := strings.TrimSpace(t.Status)
 
 	// Unresolved issues are not safe to dispatch.
 	if status == "" || status == trackedStatusUnknown {
-		return false
+		return false, nil
 	}
 
 	// Closed issues are never ready
 	if status == "closed" || status == "tombstone" {
-		return false
+		return false, nil
 	}
 
 	// Must not be blocked
 	if t.Blocked {
-		return false
+		return false, nil
 	}
 
 	// Scheduled beads are not stranded — they're waiting for dispatch capacity.
 	if scheduledSet[t.ID] {
-		return false
+		return false, nil
 	}
 
 	// Open issues with no assignee are trivially ready
 	if status == "open" && t.Assignee == "" {
-		return true
+		return true, nil
 	}
 
 	// For issues with an assignee (or non-open status with molecule attached),
@@ -1972,26 +2043,23 @@ func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
 	if t.Assignee == "" {
 		// Non-open status but no assignee is an edge case (shouldn't happen
 		// normally, but could occur if molecule detached improperly)
-		return true
+		return true, nil
 	}
 
 	// Has assignee - check if session is alive
 	// Use the shared assigneeToSessionName from rig.go
 	sessionName, _ := assigneeToSessionName(t.Assignee)
 	if sessionName == "" {
-		return true // Can't determine session = treat as ready
+		return false, errors.New("assignee session unresolved")
 	}
 
-	// Check if tmux session exists
-	checkCmd := tmux.BuildCommand("has-session", "-t", sessionName)
-	if err := checkCmd.Run(); err != nil {
-		// Session doesn't exist = orphaned molecule or dead worker
-		// This is the key fix: issues with in_progress/hooked status but
-		// dead workers are now correctly detected as stranded
-		return true
+	// Only a confirmed missing session makes assigned work ready. Cancellation,
+	// missing server, and other probe failures leave the full scan uncertain.
+	exists, err := tmux.NewTmux().HasSessionContext(ctx, sessionName)
+	if err != nil {
+		return false, err
 	}
-
-	return false // Session exists = worker is active
+	return !exists, nil
 }
 
 // isSlingableBead reports whether a bead can be dispatched via gt sling.
@@ -2873,6 +2941,32 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 }
 
 func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cache *convoyIssueDetailsCache) ([]trackedIssueInfo, error) {
+	tracked, err := getTrackedIssuesCachedWithoutWorkers(ctx, townBeads, convoyID, cache)
+	if err != nil {
+		return nil, err
+	}
+	issueIDs := make([]string, 0, len(tracked))
+	for _, issue := range tracked {
+		if issue.Status != "closed" {
+			issueIDs = append(issueIDs, issue.ID)
+		}
+	}
+	workers, workerErr := getWorkersForIssuesFromCwdContext(ctx, issueIDs)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if workerErr == nil {
+		for i := range tracked {
+			if worker := workers[tracked[i].ID]; worker != nil {
+				tracked[i].Worker = worker.Worker
+				tracked[i].WorkerAge = worker.Age
+			}
+		}
+	}
+	return tracked, nil
+}
+
+func getTrackedIssuesCachedWithoutWorkers(ctx context.Context, townBeads, convoyID string, cache *convoyIssueDetailsCache) ([]trackedIssueInfo, error) {
 	// Prefer raw SQL — works for cross-database deps where tracked beads
 	// live in different Dolt databases. Falls back to bd dep list if bd sql
 	// is not available (older bd versions).
@@ -2925,15 +3019,6 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 		deps = append(deps, dep)
 	}
 
-	// Collect non-closed issue IDs for worker lookup
-	openIssueIDs := make([]string, 0, len(deps))
-	for _, dep := range deps {
-		if dep.Status != "closed" {
-			openIssueIDs = append(openIssueIDs, dep.ID)
-		}
-	}
-	workersMap := getWorkersForIssues(openIssueIDs)
-
 	// Build result
 	var tracked []trackedIssueInfo
 	for _, dep := range deps {
@@ -2946,12 +3031,6 @@ func getTrackedIssuesCached(ctx context.Context, townBeads, convoyID string, cac
 			Blocked:   dep.Blocked,
 			Assignee:  dep.Assignee,
 			Labels:    dep.Labels,
-		}
-
-		// Add worker info if available
-		if worker, ok := workersMap[dep.ID]; ok {
-			info.Worker = worker.Worker
-			info.WorkerAge = worker.Age
 		}
 
 		tracked = append(tracked, info)
@@ -3181,15 +3260,22 @@ type workerInfo struct {
 // Optimized to batch queries per rig (O(R) instead of O(N×R)) and
 // parallelize across rigs.
 func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
-	result := make(map[string]*workerInfo)
-	if len(issueIDs) == 0 {
-		return result
-	}
+	result, _ := getWorkersForIssuesFromCwdContext(context.Background(), issueIDs)
+	return result
+}
 
-	// Find town root
+func getWorkersForIssuesFromCwdContext(ctx context.Context, issueIDs []string) (map[string]*workerInfo, error) {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
-		return result
+		return map[string]*workerInfo{}, err
+	}
+	return getWorkersForIssuesContext(ctx, townRoot, issueIDs)
+}
+
+func getWorkersForIssuesContext(ctx context.Context, townRoot string, issueIDs []string) (map[string]*workerInfo, error) {
+	result := make(map[string]*workerInfo)
+	if len(issueIDs) == 0 {
+		return result, nil
 	}
 
 	// Build a set of target issue IDs for fast lookup
@@ -3199,7 +3285,10 @@ func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
 	}
 
 	// Discover rigs with beads directories
-	rigDirs, _ := filepath.Glob(filepath.Join(townRoot, "*", "polecats"))
+	rigDirs, err := filepath.Glob(filepath.Join(townRoot, "*", "polecats"))
+	if err != nil {
+		return nil, err
+	}
 	var beadsDirs []string
 	for _, polecatsDir := range rigDirs {
 		rigDir := filepath.Dir(polecatsDir)
@@ -3210,53 +3299,67 @@ func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
 	}
 
 	if len(beadsDirs) == 0 {
-		return result
+		return result, nil
 	}
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Query all rigs in parallel using bd list
+	// Query rigs through the same bounded parent context as the convoy scan.
 	type rigResult struct {
+		index  int
 		agents []struct {
 			ID           string `json:"id"`
 			HookBead     string `json:"hook_bead"`
 			LastActivity string `json:"last_activity"`
 		}
+		err error
 	}
 
 	resultChan := make(chan rigResult, len(beadsDirs))
-	var wg sync.WaitGroup
-
-	for _, dir := range beadsDirs {
-		wg.Add(1)
-		go func(workDir string) {
-			defer wg.Done()
-
-			out, err := BdCmd("list", "--label=gt:agent", "--status=open", "--json", "--limit=0", "--flat").
-				Dir(workDir).
-				StripBeadsDir().
-				Stderr(io.Discard).
-				Output()
-			if err != nil {
-				resultChan <- rigResult{}
-				return
+	jobs := make(chan int, len(beadsDirs))
+	for i := range beadsDirs {
+		jobs <- i
+	}
+	close(jobs)
+	workers := convoyLookupConcurrency
+	if len(beadsDirs) < workers {
+		workers = len(beadsDirs)
+	}
+	for range workers {
+		go func() {
+			for i := range jobs {
+				out, err := BdCmd("list", "--label=gt:agent", "--status=open", "--json", "--limit=0", "--flat").
+					Dir(beadsDirs[i]).
+					StripBeadsDir().
+					Stderr(io.Discard).
+					OutputContext(scanCtx)
+				rr := rigResult{index: i, err: err}
+				if err == nil {
+					rr.err = json.Unmarshal(out, &rr.agents)
+				}
+				resultChan <- rr
 			}
-
-			var rr rigResult
-			if err := json.Unmarshal(out, &rr.agents); err != nil {
-				resultChan <- rigResult{}
-				return
-			}
-			resultChan <- rr
-		}(dir)
+		}()
 	}
 
-	// Wait for all queries to complete
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	rigResults := make([]rigResult, len(beadsDirs))
+	for range beadsDirs {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case rr := <-resultChan:
+			if rr.err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, rr.err
+			}
+			rigResults[rr.index] = rr
+		}
+	}
 
-	// Collect results from all rigs, filtering by target issue IDs
-	for rr := range resultChan {
+	// Aggregate in rig order so duplicate assignments resolve deterministically.
+	for _, rr := range rigResults {
 		for _, agent := range rr.agents {
 			// Only include agents working on issues we care about
 			if !targetIDs[agent.HookBead] {
@@ -3289,7 +3392,7 @@ func getWorkersForIssues(issueIDs []string) map[string]*workerInfo {
 		}
 	}
 
-	return result
+	return result, nil
 }
 
 // parseWorkerFromAgentBead extracts worker identity from agent bead ID.

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -325,27 +326,32 @@ func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName string)
 // beads as scheduled to prevent false stranded detection and duplicate
 // scheduling attempts.
 func areScheduled(beadIDs []string) map[string]bool {
+	result, err := areScheduledContext(context.Background(), beadIDs)
+	if err == nil {
+		return result
+	}
+	result = make(map[string]bool, len(beadIDs))
+	for _, id := range beadIDs {
+		result[id] = true
+	}
+	return result
+}
+
+func areScheduledContext(ctx context.Context, beadIDs []string) (map[string]bool, error) {
 	result := make(map[string]bool)
 	if len(beadIDs) == 0 {
-		return result
+		return result, nil
 	}
 
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
-		// Can't determine town root — fail closed (treat all as scheduled)
-		for _, id := range beadIDs {
-			result[id] = true
-		}
-		return result
+		return nil, fmt.Errorf("cannot determine town root")
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	contexts, err := listAllSlingContexts(townRoot)
+	contexts, err := listAllSlingContextsContext(ctx, townRoot)
 	if err != nil {
-		for _, id := range beadIDs {
-			result[id] = true
-		}
-		return result
+		return nil, err
 	}
 
 	// Build lookup of work bead IDs from open contexts. Cleanup owns stale-state
@@ -364,7 +370,7 @@ func areScheduled(beadIDs []string) map[string]bool {
 			result[id] = true
 		}
 	}
-	return result
+	return result, nil
 }
 
 // isScheduled checks if a single bead has an open sling context.

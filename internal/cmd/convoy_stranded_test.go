@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func TestIsReadyIssue_BlockingAndStatus(t *testing.T) {
@@ -69,6 +73,84 @@ func TestIsReadyIssue_BlockingAndStatus(t *testing.T) {
 				t.Fatalf("isReadyIssue() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestIsReadyIssueFailsClosedOnTmuxInfrastructureError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf 'private tmux infrastructure failure\\n' >&2\nexit 2\n"
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	got := isReadyIssue(trackedIssueInfo{
+		ID:       "gt-work",
+		Status:   "open",
+		Assignee: "gastown/polecats/capable",
+	}, nil)
+	if got {
+		t.Fatal("tmux infrastructure failure marked assigned work ready")
+	}
+}
+
+func TestIsReadyIssueContextCancelsTmuxProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nexec sleep 2\n"
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	ready, err := isReadyIssueContext(ctx, trackedIssueInfo{
+		ID:       "gt-work",
+		Status:   "open",
+		Assignee: "gastown/polecats/capable",
+	}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if ready {
+		t.Fatal("canceled tmux probe marked assigned work ready")
+	}
+	if elapsed := time.Since(started); elapsed >= 750*time.Millisecond {
+		t.Fatalf("canceled tmux probe returned after %s", elapsed.Round(time.Millisecond))
+	}
+}
+
+func TestIsReadyIssueContextAcceptsConfirmedMissingSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf \"can't find session: missing\\n\" >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ready, err := isReadyIssueContext(context.Background(), trackedIssueInfo{
+		ID:       "gt-work",
+		Status:   "open",
+		Assignee: "gastown/polecats/capable",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready {
+		t.Fatal("confirmed missing assignee session was not ready")
 	}
 }
 

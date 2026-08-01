@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -92,7 +93,13 @@ func (b *Beads) FindOpenSlingContext(workBeadID string) (*Issue, *capacity.Sling
 
 // ListOpenSlingContexts returns all open sling context beads.
 func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
-	return b.List(ListOptions{
+	return b.ListOpenSlingContextsContext(context.Background())
+}
+
+// ListOpenSlingContextsContext returns all open sling context beads and stops
+// the underlying bd process when ctx is canceled.
+func (b *Beads) ListOpenSlingContextsContext(ctx context.Context) ([]*Issue, error) {
+	return b.ListContext(ctx, ListOptions{
 		Status:    "open",
 		Label:     capacity.LabelSlingContext,
 		Priority:  -1,
