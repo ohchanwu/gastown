@@ -70,11 +70,30 @@ exit 1
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	workDir := t.TempDir()
 	go func() {
-		_, err := New(t.TempDir()).ListOpenSlingContextsContext(ctx)
+		_, err := New(workDir).ListOpenSlingContextsContext(ctx)
 		done <- err
 	}()
-	waitForFile(t, probeStarted, time.Second)
+	probeDeadline := time.NewTimer(30 * time.Second)
+	probePoll := time.NewTicker(10 * time.Millisecond)
+	defer probeDeadline.Stop()
+	defer probePoll.Stop()
+	waiting := true
+	for waiting {
+		select {
+		case err := <-done:
+			t.Fatalf("list returned before capability probe started: %v", err)
+		case <-probeDeadline.C:
+			cancel()
+			<-done
+			t.Fatal("capability probe did not start")
+		case <-probePoll.C:
+			if _, err := os.Stat(probeStarted); err == nil {
+				waiting = false
+			}
+		}
+	}
 	cancel()
 
 	var err error

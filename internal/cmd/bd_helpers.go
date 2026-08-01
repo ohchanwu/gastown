@@ -209,6 +209,9 @@ func (b *bdCmd) wrapCommandError(ctx context.Context, err error, deadline time.D
 	if err == nil {
 		return nil
 	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("%s timed out after %v: %w", b.argsDesc(), deadline, ctx.Err())
+	}
 	if ctx.Err() != nil {
 		return fmt.Errorf("%s stopped: %w", b.argsDesc(), ctx.Err())
 	}

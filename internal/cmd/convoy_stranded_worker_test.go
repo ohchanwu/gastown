@@ -46,6 +46,35 @@ func TestEnrichConvoyWorkersScansOnce(t *testing.T) {
 	}
 }
 
+func TestEnrichConvoyWorkersUsesTownRootForRealScan(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+
+	townRoot := t.TempDir()
+	for _, suffix := range []string{"polecats", filepath.Join("mayor", "rig", ".beads")} {
+		if err := os.MkdirAll(filepath.Join(townRoot, "alpha", suffix), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf '%s\n' '[{"id":"gt-alpha-polecat-worker","hook_bead":"gt-a"}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	results := []convoyLookupResult{{done: true, tracked: []trackedIssueInfo{{ID: "gt-a", Status: "open"}}}}
+	if err := enrichConvoyWorkersContext(context.Background(), townRoot, results, getWorkersForIssuesContext); err != nil {
+		t.Fatal(err)
+	}
+	if got := results[0].tracked[0].Worker; got != "alpha/polecat/worker" {
+		t.Fatalf("worker from town-root rig scan = %q", got)
+	}
+}
+
 func TestGetWorkersForIssuesContextCancelsAndCapsRigQueries(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture")

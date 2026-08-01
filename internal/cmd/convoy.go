@@ -1853,16 +1853,16 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	return findStrandedConvoysContext(context.Background(), townBeads)
 }
 
-func findStrandedConvoysContext(ctx context.Context, townBeads string) ([]strandedConvoyInfo, error) {
+func findStrandedConvoysContext(ctx context.Context, townRoot string) ([]strandedConvoyInfo, error) {
 	stranded := []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
 
-	convoys, err := listConvoyIssuesContext(ctx, townBeads, "open", false)
+	convoys, err := listConvoyIssuesContext(ctx, townRoot, "open", false)
 	if err != nil {
 		return nil, convoyStrandedScanError(ctx)
 	}
 	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
 	results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
-		return getTrackedIssuesCachedWithoutWorkers(ctx, townBeads, convoy.ID, cache)
+		return getTrackedIssuesCachedWithoutWorkers(ctx, townRoot, convoy.ID, cache)
 	})
 	if timedOut {
 		return nil, convoyStrandedScanError(ctx)
@@ -1877,7 +1877,7 @@ func findStrandedConvoysContext(ctx context.Context, townBeads string) ([]strand
 			trackedIDs = append(trackedIDs, tracked.ID)
 		}
 	}
-	if err := enrichConvoyWorkersContext(ctx, townBeads, results, getWorkersForIssuesContext); err != nil {
+	if err := enrichConvoyWorkersContext(ctx, townRoot, results, getWorkersForIssuesContext); err != nil {
 		return nil, convoyStrandedScanError(ctx)
 	}
 	scheduledSet, err := areScheduledContext(ctx, trackedIDs)
@@ -1922,7 +1922,7 @@ func findStrandedConvoysContext(ctx context.Context, townBeads string) ([]strand
 				return nil, convoyStrandedScanError(ctx)
 			}
 			if ready {
-				if !isSlingableBead(townBeads, t.ID) {
+				if !isSlingableBead(townRoot, t.ID) {
 					continue
 				}
 				if !convoyops.IsSlingableType(t.IssueType) {
