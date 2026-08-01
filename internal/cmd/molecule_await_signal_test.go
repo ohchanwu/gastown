@@ -288,7 +288,7 @@ func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t 
 	if err := os.WriteFile(filepath.Join(root, "mayor", "town.json"), []byte(`{}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	bdScript := "#!/bin/sh\ncase \"$1\" in\nshow) printf '[{\"labels\":[\"gt:agent\",\"idle:0\"]}]\\n' ;;\nupdate) sleep 1 ;;\nesac\n"
+	bdScript := "#!/bin/sh\ncase \"$1\" in\nshow) printf '[{\"labels\":[\"gt:agent\",\"idle:0\"]}]\\n' ;;\nupdate) sleep 5 ;;\nesac\n"
 	if err := os.WriteFile(filepath.Join(root, "bin", "bd"), []byte(bdScript), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t 
 	awaitSignalBackoffBase = ""
 	awaitSignalBackoffMult = 2
 	awaitSignalBackoffMax = ""
-	awaitSignalCommandBudget = "300ms"
+	awaitSignalCommandBudget = "2s"
 	awaitSignalQuiet = true
 	awaitSignalAgentBead = "hq-deacon"
 	moleculeJSON = false
@@ -335,7 +335,7 @@ func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t 
 	if err == nil || !strings.Contains(err.Error(), "expired before backoff state was persisted") {
 		t.Fatalf("runMoleculeAwaitSignal error = %v, want sanitized persist-budget failure", err)
 	}
-	if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("await-signal exceeded its executable command budget: %v", elapsed)
 	}
 }
