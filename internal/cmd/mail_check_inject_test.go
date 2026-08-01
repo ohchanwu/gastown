@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +11,49 @@ import (
 	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/mail"
 )
+
+func TestRunMailCheckReceiptUsesManagedHookIdentityOutsideWorkspace(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(townRoot, "mayor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_SESSION", "gt-test-codex-managed-hook")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+
+	deliveryID := "ndg-managed-hook-receipt"
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(writer).Encode(&hookInput{
+		HookEventName: "UserPromptSubmit",
+		Prompt:        delivery.ControlMessage(deliveryID, "private hook prompt"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = reader
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = reader.Close()
+	})
+	oldInject, oldIdentity := mailCheckInject, mailCheckIdentity
+	mailCheckInject, mailCheckIdentity = true, "mayor/"
+	t.Cleanup(func() { mailCheckInject, mailCheckIdentity = oldInject, oldIdentity })
+
+	if err := runMailCheck(nil, nil); err != nil {
+		t.Fatalf("runMailCheck: %v", err)
+	}
+	if _, ok, err := delivery.FindSubmittedAfter(townRoot, os.Getenv("GT_SESSION"), deliveryID, time.Time{}); err != nil || !ok {
+		t.Fatalf("managed hook receipt: ok=%t err=%v", ok, err)
+	}
+}
 
 func TestRecordCodexSubmissionReceiptFromHookInput(t *testing.T) {
 	townRoot := t.TempDir()
