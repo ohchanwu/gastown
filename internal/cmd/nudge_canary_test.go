@@ -337,15 +337,28 @@ func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
 		RuntimeConfigDir: t.TempDir(),
 		Session:          session.MayorSessionName(),
 	}
-	cfg := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
-	prompt := session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions)
-
-	canaryCommand, err := config.BuildAgentStartupCommandWithAgentOverride(
-		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, cfg.AgentOverride,
-	)
+	cfg, err := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
 	if err != nil {
-		t.Fatalf("build canary startup command: %v", err)
+		t.Fatalf("build canary session config: %v", err)
 	}
+	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(cfg.TownRoot, cfg.RigPath, cfg.AgentOverride)
+	if err != nil {
+		t.Fatalf("resolve canary runtime: %v", err)
+	}
+	env := config.AgentEnv(config.AgentEnvConfig{
+		Role: cfg.Role, Rig: cfg.RigName, AgentName: cfg.AgentName, TownRoot: cfg.TownRoot,
+		RuntimeConfigDir: cfg.RuntimeConfigDir, Agent: cfg.AgentOverride, SessionName: cfg.SessionID,
+	})
+	env = session.MergeRuntimeLivenessEnv(env, runtimeConfig)
+
+	if got := env["GT_AGENT"]; got != "codex" {
+		t.Fatalf("canary GT_AGENT = %q, want receipt-compatible codex identity", got)
+	}
+	if got := env["GT_PROCESS_NAMES"]; got != "codex" {
+		t.Fatalf("canary GT_PROCESS_NAMES = %q, want codex", got)
+	}
+
+	prompt := session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions)
 	ordinaryCommand, err := config.BuildAgentStartupCommandWithAgentOverride(
 		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, "codex",
 	)
@@ -354,8 +367,11 @@ func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
 	}
 
 	const flag = "--dangerously-bypass-hook-trust"
-	if !strings.Contains(canaryCommand, " "+flag+" ") {
-		t.Fatalf("canary startup command lacks %s: %q", flag, canaryCommand)
+	if !strings.Contains(cfg.Command, " "+flag+" ") {
+		t.Fatalf("canary startup command lacks %s: %q", flag, cfg.Command)
+	}
+	if strings.Contains(cfg.Command, "GT_AGENT=") {
+		t.Fatalf("pure canary agent command unexpectedly overrides GT_AGENT: %q", cfg.Command)
 	}
 	if strings.Contains(ordinaryCommand, flag) {
 		t.Fatalf("ordinary startup command unexpectedly contains %s: %q", flag, ordinaryCommand)

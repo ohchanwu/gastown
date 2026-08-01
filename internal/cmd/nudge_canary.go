@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/atomicfile"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -218,7 +219,11 @@ var nudgeCanaryCmd = &cobra.Command{
 			return err
 		}
 		startupInstruction, startupResponse := wakeCanaryStartupChallenge(strings.TrimPrefix(nudge.NewDeliveryID(), "ndg-"))
-		if _, err := session.StartSession(sandbox.tmux, wakeCanarySessionConfig(sandbox, startupInstruction)); err != nil {
+		sessionConfig, err := wakeCanarySessionConfig(sandbox, startupInstruction)
+		if err != nil {
+			return err
+		}
+		if _, err := session.StartSession(sandbox.tmux, sessionConfig); err != nil {
 			return fmt.Errorf("starting isolated Codex Mayor: %w", err)
 		}
 		if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
@@ -230,16 +235,23 @@ var nudgeCanaryCmd = &cobra.Command{
 	},
 }
 
-func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction string) session.SessionConfig {
-	return session.SessionConfig{
+func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction string) (session.SessionConfig, error) {
+	cfg := session.SessionConfig{
 		SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
-		TownRoot: sandbox.TownRoot, AgentOverride: "codex --dangerously-bypass-hook-trust", RuntimeConfigDir: sandbox.RuntimeConfigDir,
+		TownRoot: sandbox.TownRoot, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
 		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 		Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
 		Instructions:     startupInstruction,
 		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}
+	const launchOverride = "codex --dangerously-bypass-hook-trust"
+	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(sandbox.TownRoot, "", launchOverride)
+	if err != nil {
+		return session.SessionConfig{}, fmt.Errorf("building isolated Codex Mayor command: %w", err)
+	}
+	cfg.Command = runtimeConfig.BuildCommandWithPrompt(session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions))
+	return cfg, nil
 }
 
 func wakeCanaryStartupChallenge(nonce string) (string, string) {
