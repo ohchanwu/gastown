@@ -2470,6 +2470,26 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 	}
 }
 
+func TestWaitForIdle_RejectsStaleCodexPrompt(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+
+	tm := newTestTmux(t)
+	sessionName := fmt.Sprintf("gt-test-stale-codex-prompt-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "printf '› initialize the canary\\nquiet startup output\\n'; sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+
+	if err := tm.WaitForIdle(sessionName, 500*time.Millisecond); !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("WaitForIdle stale Codex prompt = %v, want ErrIdleTimeout", err)
+	}
+}
+
 func TestHasBusyIndicator(t *testing.T) {
 	t.Parallel()
 

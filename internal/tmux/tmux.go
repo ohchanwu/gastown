@@ -3607,7 +3607,6 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
-	prefix := strings.TrimSpace(promptPrefix)
 
 	// Require 2 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
@@ -3618,7 +3617,7 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		lines, err := t.CapturePaneLines(session, 5)
+		content, err := t.run("capture-pane", "-p", "-e", "-t", session, "-S", "-5")
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
@@ -3631,38 +3630,7 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 			continue
 		}
 
-		// Busy indicator check: if "esc to interrupt" is visible anywhere in
-		// the recent pane output, the agent is actively working — NOT idle,
-		// regardless of whether the prompt prefix is also visible.
-		statusBarBusy := false
-		for _, line := range lines {
-			if hasBusyIndicator(line) {
-				statusBarBusy = true
-				break
-			}
-		}
-		if statusBarBusy {
-			consecutiveIdle = 0
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-
-		// Scan all captured lines for the prompt prefix.
-		// Claude Code renders a status bar below the prompt line,
-		// so the prompt may not be the last non-empty line.
-		promptFound := false
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				continue
-			}
-			if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
-				promptFound = true
-				break
-			}
-		}
-
-		if promptFound {
+		if paneAtIdlePrompt(content, promptPrefix) {
 			consecutiveIdle++
 			if consecutiveIdle >= requiredConsecutive {
 				return nil

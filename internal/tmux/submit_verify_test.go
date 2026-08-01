@@ -139,6 +139,29 @@ func TestAnalyzeSubmission(t *testing.T) {
 	}
 }
 
+func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "bare composer", content: "transcript\n› \n", want: true},
+		{name: "dim placeholder", content: "transcript\n› \x1b[2mAsk anything\x1b[0m\n", want: true},
+		{name: "stale submitted prompt", content: "› initialize the canary\nquiet startup output\n", want: false},
+		{name: "busy without composer", content: "• Working (esc to interrupt)\n", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := paneAtIdlePrompt(tt.content, "› "); got != tt.want {
+				t.Fatalf("paneAtIdlePrompt() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("nudge to session: %w", fmt.Errorf("submit: %w", ErrSubmitNotVerified))

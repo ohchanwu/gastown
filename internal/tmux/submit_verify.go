@@ -254,6 +254,28 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
+func paneAtIdlePrompt(escContent, promptPrefix string) bool {
+	if promptPrefix == "" {
+		return false
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, lineDims := splitRunesAndDim(plain, dim)
+
+	for _, line := range lines {
+		if hasBusyIndicator(string(line)) {
+			return false
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
+			continue
+		}
+		content, contentDim := composerContent(lines[i], lineDims[i], promptPrefix)
+		return len(content) == 0 || allDim(contentDim)
+	}
+	return false
+}
+
 func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe {
 	content, err := t.run("capture-pane", "-p", "-e", "-t", target, "-S", "-25")
 	if err != nil {

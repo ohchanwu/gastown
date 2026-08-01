@@ -13,7 +13,9 @@ func TestRecordCodexSubmissionReceiptFromHookInput(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-codex-hook"
 	deliveryID := "ndg-hook-receipt"
-	baseline := time.Now()
+	// This unit invokes the hook writer directly, without a transport attempt.
+	// Strict post-attempt ordering is covered by delivery receipt tests.
+	baseline := time.Time{}
 	input := &hookInput{
 		HookEventName: "UserPromptSubmit",
 		Prompt:        delivery.ControlMessage(deliveryID, "private hook prompt"),
