@@ -1003,6 +1003,47 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 	}
 }
 
+func TestFindActivePatrolPrefersHookedRootAcrossTablesAndStatuses(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "deacon"
+	hookedID := createHookedPatrol(t, b, molName, assignee, false)
+
+	duplicate, err := b.Create(beads.CreateOptions{
+		Title:     molName + " (stale duplicate)",
+		Priority:  -1,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create duplicate patrol wisp: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := b.Update(duplicate.ID, beads.UpdateOptions{
+		Status:   &inProgress,
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("assign duplicate patrol wisp: %v", err)
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	})
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find current hooked patrol")
+	}
+	if patrolID != hookedID {
+		t.Fatalf("patrolID = %q, want current hooked root %q", patrolID, hookedID)
+	}
+}
+
 func TestFindActivePatrolMultiple(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)

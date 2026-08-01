@@ -68,7 +68,23 @@ func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*b
 		}
 		assigned = append(assigned, beadsForStatus...)
 	}
-	return mergeBeadLists(assigned, nil), nil
+	return dedupeBeadsPreserveOrder(assigned), nil
+}
+
+func dedupeBeadsPreserveOrder(issues []*beads.Issue) []*beads.Issue {
+	deduped := make([]*beads.Issue, 0, len(issues))
+	seen := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			continue
+		}
+		if _, ok := seen[issue.ID]; ok {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		deduped = append(deduped, issue)
+	}
+	return deduped
 }
 
 func listChildrenAcrossTables(b *beads.Beads, parentID string) ([]*beads.Issue, error) {
