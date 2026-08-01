@@ -199,6 +199,39 @@ token derived from that positive owner evidence; `--apply`
 revalidates all four before signaling. Paths and tokens are never rendered.
 Unpreviewed and non-test listeners remain report-only.
 
+## Control-Plane Delivery and Recovery
+
+Mayor wake delivery is receipt-based, not pane-delta-based. Each submission has
+an opaque delivery ID, and success requires a runtime receipt for the same
+session and delivery ID that is strictly newer than the attempt baseline.
+Same-session submission locks prevent overlapping writers. A failed or
+unverified submission remains in the durable queue under a claim/ack contract;
+only a matching submitted receipt permits acknowledgement and deletion.
+Notification results preserve queued and failed identities so callers cannot
+mistake partial delivery for success.
+
+`gt nudge-canary --confirm-live` verifies this path with 20 receipt-confirmed
+turns in a temporary town, isolated Mayor identity, and dedicated tmux socket.
+The canary requires zero attached clients and sole lock ownership, waits for a
+steady idle state between turns, and removes only artifacts it owns. Its hook
+trust bypass is scoped to the isolated canary launch. The latest sanitized
+result is written atomically to `.runtime/canary/control-plane.json` with mode
+0600 and contributes to `gt health` and Doctor's control-plane verdict.
+
+Global convoy checking and stranded detection use bounded worker pools, a
+per-run tracked-issue cache, deterministic output, and a 30-second command
+deadline. Lookup uncertainty is isolated per convoy and fails closed: a convoy
+can close only after every tracked issue was checked and found complete.
+Reconciliation remains dry-run-first and never treats age alone as proof of
+completion. Reaper anomaly occurrences are durably linked and deduplicated,
+while convoy issue types and `gt:convoy` tracking records remain protected from
+age-based closure.
+
+Doctor treats an exact persisted polecat cleanup status of `preserved` as
+intentional recovery evidence: it neither reports that work as stalled nor
+offers to push it through `--fix`. Missing, malformed, and unknown statuses stay
+fail-closed and continue to warn.
+
 For write concurrency, all agents write directly to `main` using transaction
 discipline (`BEGIN` / `DOLT_COMMIT` / `COMMIT` atomically). This eliminates
 branch proliferation and ensures immediate cross-agent visibility.
