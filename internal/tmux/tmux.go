@@ -2143,8 +2143,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
-	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
-		return fmt.Errorf("workspace trust dialog: %w", err)
+	// Codex 0.146 can show folder trust followed by hook trust. Each pass is
+	// already bounded and exits early when no workspace dialog is present.
+	for range 2 {
+		if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
+			return fmt.Errorf("workspace trust dialog: %w", err)
+		}
 	}
 	if err := t.AcceptBypassPermissionsWarning(session); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)

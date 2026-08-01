@@ -72,6 +72,24 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		}
 	}
 
+	startupDeadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(startupDeadline) {
+		content, captureErr := capture()
+		if captureErr == nil {
+			text := string(content)
+			if strings.Contains(text, "Do you trust the contents of this directory?") {
+				if err := sandbox.tmux.AcceptWorkspaceTrustDialog(sandbox.Session); err != nil {
+					t.Fatalf("accept standard workspace trust: %v", err)
+				}
+				break
+			}
+			if strings.Contains(text, "Hooks need review") {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	var before []byte
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
