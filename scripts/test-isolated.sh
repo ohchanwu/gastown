@@ -7,6 +7,7 @@ data_dir=""
 guard=""
 guard_receipt=""
 launcher_identity=""
+launcher_custody=""
 
 cleanup() {
 	status=$?
@@ -24,8 +25,19 @@ cleanup() {
 			echo "test-isolation: cleanup: launcher Dolt identity changed or could not be stopped" >&2
 			cleanup_failed=true
 		fi
+	elif [[ -n "$launcher_custody" ]]; then
+		if "$guard" stop-custody "$server_pid" "$$" "$launcher_custody"; then
+			wait "$server_pid" 2>/dev/null || true
+			server_pid=""
+		else
+			echo "test-isolation: cleanup: pre-identity launcher custody changed or could not be stopped" >&2
+			cleanup_failed=true
+		fi
+	elif [[ -n "$server_pid" ]]; then
+		echo "test-isolation: cleanup: launcher ownership was never captured; preserving its data directory" >&2
+		cleanup_failed=true
 	fi
-  [[ -n "$data_dir" ]] && rm -rf -- "$data_dir"
+	[[ -n "$data_dir" && -z "$server_pid" ]] && rm -rf -- "$data_dir"
 	if [[ "$cleanup_failed" == true ]]; then
 		exit 1
 	fi
@@ -80,11 +92,17 @@ dolt sql-server \
   --loglevel error >"$data_dir/server.log" 2>&1 &
 server_pid=$!
 
+if ! launcher_custody="$("$guard" custody "$server_pid" "$$")" || [[ -z "$launcher_custody" ]]; then
+	echo "test-isolation: configuration: could not capture pre-identity launcher custody" >&2
+	exit 78
+fi
+
 owns_listener=false
 for _ in {1..200}; do
   if ! kill -0 "$server_pid" 2>/dev/null; then
     wait "$server_pid" 2>/dev/null || true
     server_pid=""
+		launcher_custody=""
     break
   fi
   if lsof -nP -a -p "$server_pid" -iTCP:"$test_port" -sTCP:LISTEN \

@@ -982,6 +982,14 @@ type TestLeakSelection struct {
 	OwnershipToken string          `json:"ownership_token"`
 }
 
+// TestProcessCustody is an opaque identity for a launcher-owned child before
+// it has opened a listener.
+type TestProcessCustody struct {
+	PID            int
+	ParentPID      int
+	OwnershipToken string
+}
+
 func newTestLeakSelection(server LocalDoltServer) TestLeakSelection {
 	if server.Class != DoltServerOwnedTestLeak || server.OwnerPath == "" || server.ProcessToken == "" {
 		return TestLeakSelection{}
@@ -1361,6 +1369,48 @@ func getProcessStartToken(pid int) string {
 	return strings.TrimSpace(string(out))
 }
 
+func getProcessParentPID(pid int) int {
+	if runtime.GOOS == "windows" {
+		return 0
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=")
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	parent, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+	return parent
+}
+
+func processIsZombie(pid int) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "state=")
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+func currentTestProcessCustody(pid, parentPID int) TestProcessCustody {
+	start := getProcessStartToken(pid)
+	if pid <= 0 || parentPID <= 0 || start == "" || getProcessParentPID(pid) != parentPID || processIsZombie(pid) {
+		return TestProcessCustody{}
+	}
+	token := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s", pid, parentPID, start)))
+	return TestProcessCustody{PID: pid, ParentPID: parentPID, OwnershipToken: fmt.Sprintf("%x", token)}
+}
+
+// CaptureTestProcessCustody records a stable identity for a direct child.
+func CaptureTestProcessCustody(pid, parentPID int) (TestProcessCustody, error) {
+	custody := currentTestProcessCustody(pid, parentPID)
+	if custody.OwnershipToken == "" {
+		return TestProcessCustody{}, fmt.Errorf("PID %d is not a live direct child of PID %d", pid, parentPID)
+	}
+	return custody, nil
+}
+
 func getProcessCWD(pid int) string {
 	switch runtime.GOOS {
 	case "linux":
@@ -1693,45 +1743,71 @@ func terminateSelectedTestLeak(selection TestLeakSelection, rescan func() ([]Loc
 }
 
 func terminateSelectedTestLeakWith(selection TestLeakSelection, rescan func() ([]LocalDoltServer, error), signal func(bool) error, pause func(time.Duration)) error {
-	current, err := rescan()
+	return terminateRevalidatedProcess(selection.PID, func() (bool, error) {
+		current, err := rescan()
+		return hasTestLeakSelection(current, selection), err
+	}, signal, pause)
+}
+
+func terminateRevalidatedProcess(pid int, stillOwned func() (bool, error), signal func(bool) error, pause func(time.Duration)) error {
+	owned, err := stillOwned()
 	if err != nil {
 		return err
 	}
-	if !hasTestLeakSelection(current, selection) {
-		return fmt.Errorf("test-leak ownership changed for PID %d port %d", selection.PID, selection.Port)
+	if !owned {
+		return fmt.Errorf("process identity changed for PID %d", pid)
 	}
 	if err := signal(false); err != nil {
-		return fmt.Errorf("sending termination signal to Dolt PID %d: %w", selection.PID, err)
+		return fmt.Errorf("sending termination signal to PID %d: %w", pid, err)
 	}
 	for i := 0; i < 10; i++ {
 		pause(500 * time.Millisecond)
-		current, err = rescan()
+		owned, err = stillOwned()
 		if err != nil {
 			return err
 		}
-		if !hasTestLeakSelection(current, selection) {
+		if !owned {
 			return nil
 		}
 	}
-	current, err = rescan()
+	owned, err = stillOwned()
 	if err != nil {
 		return err
 	}
-	if !hasTestLeakSelection(current, selection) {
+	if !owned {
 		return nil
 	}
 	if err := signal(true); err != nil {
-		return fmt.Errorf("killing Dolt PID %d: %w", selection.PID, err)
+		return fmt.Errorf("killing PID %d: %w", pid, err)
 	}
 	pause(100 * time.Millisecond)
-	current, err = rescan()
+	owned, err = stillOwned()
 	if err != nil {
 		return err
 	}
-	if hasTestLeakSelection(current, selection) {
-		return fmt.Errorf("Dolt PID %d remained alive after kill", selection.PID)
+	if owned {
+		return fmt.Errorf("PID %d remained alive after kill", pid)
 	}
 	return nil
+}
+
+// TerminateTestProcessCustody stops only the still-matching direct child.
+func TerminateTestProcessCustody(custody TestProcessCustody) error {
+	if custody.PID <= 0 || custody.ParentPID <= 0 || custody.OwnershipToken == "" {
+		return fmt.Errorf("invalid test-process custody")
+	}
+	process, err := os.FindProcess(custody.PID)
+	if err != nil {
+		return fmt.Errorf("finding test process %d: %w", custody.PID, err)
+	}
+	return terminateRevalidatedProcess(custody.PID, func() (bool, error) {
+		return currentTestProcessCustody(custody.PID, custody.ParentPID) == custody, nil
+	}, func(kill bool) error {
+		if kill {
+			return process.Kill()
+		}
+		return gracefulTerminate(process)
+	}, time.Sleep)
 }
 
 // RemediateLocalDoltServers previews by default and only signals listeners

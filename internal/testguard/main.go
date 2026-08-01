@@ -58,6 +58,38 @@ func main() {
 		if err == nil {
 			fmt.Fprintln(os.Stdout, selection.OwnershipToken)
 		}
+	case "custody":
+		if len(os.Args) != 4 {
+			err = fmt.Errorf("usage: testguard custody LAUNCHER_PID PARENT_PID")
+			break
+		}
+		var pid, parentPID int
+		pid, err = positiveInt(os.Args[2], "launcher PID")
+		if err == nil {
+			parentPID, err = positiveInt(os.Args[3], "parent PID")
+		}
+		if err == nil {
+			var custody doltserver.TestProcessCustody
+			custody, err = doltserver.CaptureTestProcessCustody(pid, parentPID)
+			if err == nil {
+				fmt.Fprintln(os.Stdout, custody.OwnershipToken)
+			}
+		}
+	case "stop-custody":
+		if len(os.Args) != 5 {
+			err = fmt.Errorf("usage: testguard stop-custody LAUNCHER_PID PARENT_PID OWNERSHIP_TOKEN")
+			break
+		}
+		var pid, parentPID int
+		pid, err = positiveInt(os.Args[2], "launcher PID")
+		if err == nil {
+			parentPID, err = positiveInt(os.Args[3], "parent PID")
+		}
+		if err == nil {
+			err = doltserver.TerminateTestProcessCustody(doltserver.TestProcessCustody{
+				PID: pid, ParentPID: parentPID, OwnershipToken: os.Args[4],
+			})
+		}
 	case "stop":
 		if len(os.Args) != 6 {
 			err = fmt.Errorf("usage: testguard stop LAUNCHER_PID PORT OWNER_ROOT OWNERSHIP_TOKEN")

@@ -11,6 +11,7 @@ PASS=0
 FAIL=0
 LISTENER_PID=""
 BLOCK_PID=""
+LAUNCHER_DOLT_PID=""
 
 cleanup() {
   if [[ -n "$LISTENER_PID" ]] && kill -0 "$LISTENER_PID" 2>/dev/null; then
@@ -20,6 +21,10 @@ cleanup() {
   if [[ -n "$BLOCK_PID" ]] && kill -0 "$BLOCK_PID" 2>/dev/null; then
     kill "$BLOCK_PID"
     wait "$BLOCK_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$LAUNCHER_DOLT_PID" ]] && kill -0 "$LAUNCHER_DOLT_PID" 2>/dev/null; then
+    kill "$LAUNCHER_DOLT_PID"
+    wait "$LAUNCHER_DOLT_PID" 2>/dev/null || true
   fi
   rm -rf "$TMPDIR"
 }
@@ -32,7 +37,15 @@ if [[ "${1:-}" == build && "${2:-}" == -o ]]; then
   cat > "${3:?guard output required}" <<'FAKE_GUARD'
 #!/usr/bin/env bash
 case "${1:-}" in
+    custody)
+      printf 'fake-pre-identity-custody\n'
+      ;;
+    stop-custody)
+      [[ "${4:-}" == fake-pre-identity-custody ]] || exit 6
+      kill "${2:?launcher PID required}"
+      ;;
     identity)
+      [[ -z "${FAKE_GUARD_IDENTITY_EXIT:-}" ]] || exit "$FAKE_GUARD_IDENTITY_EXIT"
       printf 'fake-launcher-identity\n'
       ;;
     stop)
@@ -77,6 +90,11 @@ chmod +x "$TMPDIR/bin/go"
 
 cat > "$TMPDIR/bin/dolt" <<'FAKE_DOLT'
 #!/usr/bin/env bash
+[[ -n "${FAKE_DOLT_PID_FILE:-}" ]] && printf '%s\n' "$$" > "$FAKE_DOLT_PID_FILE"
+if [[ -n "${FAKE_DOLT_NEVER_LISTENS:-}" ]]; then
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
 port=""
 while (( $# )); do
   case "$1" in
@@ -240,6 +258,36 @@ if [[ "$status" -eq 1 && "$output" == *"test-isolation: cleanup"* ]]; then
   pass "fails visibly when outer cleanup fails"
 else
   fail "fails visibly when outer cleanup fails"
+fi
+
+never_pid_file="$TMPDIR/never-listens.pid"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+  FAKE_DOLT_NEVER_LISTENS=1 FAKE_DOLT_PID_FILE="$never_pid_file" \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
+LAUNCHER_DOLT_PID="$(cat "$never_pid_file")"
+remaining_run_dir="$(find "$TMPDIR" -maxdepth 1 -type d -name 'gastown-test-dolt.*' -print -quit)"
+if [[ "$status" -eq 78 && -z "$remaining_run_dir" ]] && \
+      ! kill -0 "$LAUNCHER_DOLT_PID" 2>/dev/null; then
+  LAUNCHER_DOLT_PID=""
+  pass "stops a launcher that stays alive without listening"
+else
+  fail "stops a launcher that stays alive without listening"
+fi
+
+identity_pid_file="$TMPDIR/identity-failure.pid"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+  FAKE_DOLT_PID_FILE="$identity_pid_file" FAKE_GUARD_IDENTITY_EXIT=7 \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
+LAUNCHER_DOLT_PID="$(cat "$identity_pid_file")"
+remaining_run_dir="$(find "$TMPDIR" -maxdepth 1 -type d -name 'gastown-test-dolt.*' -print -quit)"
+if [[ "$status" -eq 78 && -z "$remaining_run_dir" ]] && \
+      ! kill -0 "$LAUNCHER_DOLT_PID" 2>/dev/null; then
+  LAUNCHER_DOLT_PID=""
+  pass "stops a launcher when listener identity capture fails"
+else
+  fail "stops a launcher when listener identity capture fails"
 fi
 
 rm -f "$guard_capture" "$fake_leak"
