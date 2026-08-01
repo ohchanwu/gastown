@@ -1766,7 +1766,14 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	stranded, err := findStrandedConvoys(townBeads)
+	ctx := context.Background()
+	if cmd != nil {
+		ctx = cmd.Context()
+	}
+	ctx, cancel := context.WithTimeout(ctx, convoyCheckDeadline)
+	defer cancel()
+
+	stranded, err := findStrandedConvoysContext(ctx, townBeads)
 	if err != nil {
 		return err
 	}
@@ -1843,6 +1850,10 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 // findStrandedConvoys finds convoys with ready work but no workers,
 // or empty convoys (0 tracked issues) that need cleanup.
 func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
+	return findStrandedConvoysContext(context.Background(), townBeads)
+}
+
+func findStrandedConvoysContext(_ context.Context, townBeads string) ([]strandedConvoyInfo, error) {
 	stranded := []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
 
 	convoys, err := listConvoyIssues(townBeads, "open", false)
