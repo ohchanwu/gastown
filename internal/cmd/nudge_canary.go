@@ -152,7 +152,11 @@ func (s *wakeCanarySandbox) Cleanup() error {
 		_ = s.tmux.KillSessionWithProcesses(s.Session)
 		_ = s.tmux.KillServer()
 	}
-	return os.RemoveAll(s.TownRoot)
+	var socketErr error
+	if s.Socket != "" {
+		socketErr = removeWakeCanarySocketPath(s.Socket)
+	}
+	return errors.Join(socketErr, os.RemoveAll(s.TownRoot))
 }
 
 func init() {
