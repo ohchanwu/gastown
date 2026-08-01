@@ -2191,6 +2191,9 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 			time.Sleep(constants.DialogPollInterval)
 			continue
 		}
+		if agentActivityAppearsAfterStartupBlocker(content) {
+			return nil
+		}
 
 		// Look for characteristic trust dialog text before prompt detection.
 		// Codex trust screens include a leading ">" banner line, so prompt
@@ -2203,10 +2206,13 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 					time.Sleep(constants.DialogPollInterval)
 					continue
 				}
-				if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+				// Codex list pickers accept a numbered option directly. Re-capture
+				// afterward so a dropped startup keystroke is retried safely.
+				if _, err := t.run("send-keys", "-t", session, "2"); err != nil {
 					return err
 				}
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
+				return nil
 			}
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
 				return err

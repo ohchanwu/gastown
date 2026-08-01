@@ -55,16 +55,18 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 		Beacon:           session.BeaconConfig{Recipient: "isolated idle-pane probe", Sender: "self", Topic: "probe"},
 		Instructions:     "Reply with exactly " + probeToken + " and then wait.",
-		WaitForAgent:     true, WaitFatal: true,
+		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}); err != nil {
 		if content, captureErr := capture(); captureErr == nil {
 			writeEvidence(content)
 		}
 		t.Fatalf("StartSession: %v", err)
 	}
-	if err := sandbox.tmux.AcceptWorkspaceTrustDialog(sandbox.Session); err != nil {
-		t.Fatalf("AcceptWorkspaceTrustDialog: %v", err)
+	baseline, err := capture()
+	if err != nil {
+		t.Fatalf("capture baseline: %v", err)
 	}
+	baselineTokenCount := strings.Count(string(baseline), probeToken)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	t.Cleanup(ticker.Stop)
 	timeout := time.NewTimer(180 * time.Second)
@@ -82,7 +84,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			lastCapture = content
 			styled := string(content)
 			busy := strings.Contains(styled, "esc to interrupt")
-			if !busy && strings.Count(styled, probeToken) >= 2 {
+			if !busy && strings.Count(styled, probeToken) > baselineTokenCount {
 				stable++
 			} else {
 				stable = 0
@@ -91,6 +93,9 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				continue
 			}
 			writeEvidence(content)
+			if err := sandbox.tmux.WaitForIdle(sandbox.Session, 3*time.Second); err != nil {
+				t.Fatalf("WaitForIdle after completed response: %v", err)
+			}
 			info, err := os.Stat(evidencePath)
 			if err != nil {
 				t.Fatal(err)
