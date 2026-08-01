@@ -218,15 +218,7 @@ var nudgeCanaryCmd = &cobra.Command{
 			return err
 		}
 		startupInstruction, startupResponse := wakeCanaryStartupChallenge(strings.TrimPrefix(nudge.NewDeliveryID(), "ndg-"))
-		if _, err := session.StartSession(sandbox.tmux, session.SessionConfig{
-			SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
-			TownRoot: sandbox.TownRoot, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
-			ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
-			StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
-			Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
-			Instructions:     startupInstruction,
-			WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
-		}); err != nil {
+		if _, err := session.StartSession(sandbox.tmux, wakeCanarySessionConfig(sandbox, startupInstruction)); err != nil {
 			return fmt.Errorf("starting isolated Codex Mayor: %w", err)
 		}
 		if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
@@ -236,6 +228,18 @@ var nudgeCanaryCmd = &cobra.Command{
 		fmt.Printf("Mayor wake canary: %d/%d submitted, %d queued, %d failed\nState: %s\n", result.Submitted, result.Turns, result.Queued, result.Failed, statePath)
 		return err
 	},
+}
+
+func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction string) session.SessionConfig {
+	return session.SessionConfig{
+		SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
+		TownRoot: sandbox.TownRoot, AgentOverride: "codex --dangerously-bypass-hook-trust", RuntimeConfigDir: sandbox.RuntimeConfigDir,
+		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
+		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
+		Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
+		Instructions:     startupInstruction,
+		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
+	}
 }
 
 func wakeCanaryStartupChallenge(nonce string) (string, string) {

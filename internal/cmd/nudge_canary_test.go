@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
@@ -326,6 +327,38 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatalf("sandbox still exists after cleanup: %v", err)
+	}
+}
+
+func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
+	sandbox := &wakeCanarySandbox{
+		TownRoot:         t.TempDir(),
+		WorkDir:          t.TempDir(),
+		RuntimeConfigDir: t.TempDir(),
+		Session:          session.MayorSessionName(),
+	}
+	cfg := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
+	prompt := session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions)
+
+	canaryCommand, err := config.BuildAgentStartupCommandWithAgentOverride(
+		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, cfg.AgentOverride,
+	)
+	if err != nil {
+		t.Fatalf("build canary startup command: %v", err)
+	}
+	ordinaryCommand, err := config.BuildAgentStartupCommandWithAgentOverride(
+		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, "codex",
+	)
+	if err != nil {
+		t.Fatalf("build ordinary startup command: %v", err)
+	}
+
+	const flag = "--dangerously-bypass-hook-trust"
+	if !strings.Contains(canaryCommand, " "+flag+" ") {
+		t.Fatalf("canary startup command lacks %s: %q", flag, canaryCommand)
+	}
+	if strings.Contains(ordinaryCommand, flag) {
+		t.Fatalf("ordinary startup command unexpectedly contains %s: %q", flag, ordinaryCommand)
 	}
 }
 
