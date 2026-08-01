@@ -73,10 +73,8 @@ func TestPatrolFormulasHaveBackoffLogic(t *testing.T) {
 }
 
 func TestDeaconPatrolOuterDeadlineCoversAwaitSignalBackoff(t *testing.T) {
-	const overhead = time.Minute
-
 	// Regression: a 75s wrapper cannot contain the legitimate third 4m wait.
-	if 75*time.Second >= 4*time.Minute+overhead {
+	if 75*time.Second >= 4*time.Minute {
 		t.Fatal("regression fixture must reproduce the patrol budget inversion")
 	}
 
@@ -85,22 +83,16 @@ func TestDeaconPatrolOuterDeadlineCoversAwaitSignalBackoff(t *testing.T) {
 		t.Fatalf("reading deacon patrol formula: %v", err)
 	}
 
-	backoffMatch := regexp.MustCompile(`--backoff-max ([0-9]+[smh])`).FindSubmatch(content)
-	deadlineMatch := regexp.MustCompile(`outer tool deadline: ([0-9]+[smh])`).FindSubmatch(content)
-	if len(backoffMatch) != 2 || len(deadlineMatch) != 2 {
-		t.Fatal("deacon patrol must declare its backoff max and outer tool deadline")
+	budgetMatch := regexp.MustCompile(`--command-budget ([0-9]+[smh])`).FindSubmatch(content)
+	if len(budgetMatch) != 2 {
+		t.Fatal("deacon patrol must pass an executable await-signal command budget")
 	}
-
-	backoff, err := time.ParseDuration(string(backoffMatch[1]))
+	budget, err := time.ParseDuration(string(budgetMatch[1]))
 	if err != nil {
-		t.Fatalf("parsing deacon backoff max: %v", err)
+		t.Fatalf("parsing deacon await-signal command budget: %v", err)
 	}
-	deadline, err := time.ParseDuration(string(deadlineMatch[1]))
-	if err != nil {
-		t.Fatalf("parsing deacon outer tool deadline: %v", err)
-	}
-	if deadline < backoff+overhead {
-		t.Fatalf("outer tool deadline %v must cover backoff %v plus %v overhead", deadline, backoff, overhead)
+	if budget >= 75*time.Second {
+		t.Fatalf("await-signal command budget %v must return before the observed 75s wrapper", budget)
 	}
 }
 

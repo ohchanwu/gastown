@@ -72,7 +72,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 15
+version = 16
 
 [vars]
 [vars.wisp_type]
@@ -1196,14 +1196,15 @@ gt deacon heartbeat "pre-await checkpoint"
 
 Use await-signal with exponential backoff to wait for activity:
 
-When the shell/tool API requires a bounded outer wrapper, use `outer tool deadline: 16m`.
-This covers the configured 15m maximum backoff plus 1m for command setup and state updates.
-Never reuse a shorter generic command deadline for this wait.
-
 ```bash
 gt mol step await-signal --agent-bead hq-deacon \
-  --backoff-base 60s --backoff-mult 2 --backoff-max 15m
+  --backoff-base 60s --backoff-mult 2 --backoff-max 15m \
+  --command-budget 60s
 ```
+
+The executable 60s command budget includes agent-state reads, the wait, and state updates.
+If it outputs `CONTEXT: check`, invoke the same command again; it resumes the original
+backoff deadline instead of restarting the 2m/4m/15m wait.
 
 This command:
 1. Subscribes to `bd activity --follow` (beads activity feed)
