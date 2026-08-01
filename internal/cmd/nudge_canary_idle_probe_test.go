@@ -52,8 +52,20 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 	writeMetadata := func() {
 		t.Helper()
 		cursor, cursorErr := exec.Command("tmux", "-L", sandbox.Socket, "display-message", "-p", "-t", sandbox.Session, "#{cursor_x}|#{cursor_y}|#{pane_width}|#{pane_height}").Output()
+		visible, visibleErr := exec.Command("tmux", "-L", sandbox.Socket, "capture-pane", "-p", "-e", "-t", sandbox.Session).Output()
 		agent, agentErr := sandbox.tmux.GetEnvironment(sandbox.Session, "GT_AGENT")
-		metadata := fmt.Sprintf("cursor_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\ncursor=%s", cursorErr == nil, agentErr == nil, agent == "codex", cursor)
+		cursorX, cursorY := -1, -1
+		_, cursorParseErr := fmt.Sscanf(strings.TrimSpace(string(cursor)), "%d|%d", &cursorX, &cursorY)
+		promptRow := -1
+		promptRows := 0
+		visibleLines := strings.Split(string(visible), "\n")
+		for row, line := range visibleLines {
+			if strings.Contains(line, "›") {
+				promptRow = row
+				promptRows++
+			}
+		}
+		metadata := fmt.Sprintf("cursor_query_ok=%t\ncursor_parse_ok=%t\nvisible_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\nvisible_lines=%d\nprompt_rows=%d\nprompt_row=%d\nprompt_on_cursor_row=%t\ncursor_x=%d\ncursor_y=%d\n", cursorErr == nil, cursorParseErr == nil, visibleErr == nil, agentErr == nil, agent == "codex", len(visibleLines), promptRows, promptRow, promptRow == cursorY, cursorX, cursorY)
 		if err := os.WriteFile(evidencePath+".meta", []byte(metadata), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -119,6 +131,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		case <-timeout.C:
 			if len(lastCapture) > 0 {
 				writeEvidence(lastCapture)
+				writeMetadata()
 			}
 			t.Fatal("isolated Codex probe did not reach stable completed output")
 		}
