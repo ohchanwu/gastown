@@ -2,14 +2,44 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 )
+
+type wakeCanaryIdleWaiterStub struct {
+	session string
+	timeout time.Duration
+	err     error
+}
+
+func (s *wakeCanaryIdleWaiterStub) WaitForIdle(session string, timeout time.Duration) error {
+	s.session = session
+	s.timeout = timeout
+	return s.err
+}
+
+func TestWaitForWakeCanaryIdleUsesStartupTurnBound(t *testing.T) {
+	cause := errors.New("session busy")
+	waiter := &wakeCanaryIdleWaiterStub{err: cause}
+
+	err := waitForWakeCanaryIdle(waiter, session.MayorSessionName())
+	if !errors.Is(err, cause) {
+		t.Fatalf("waitForWakeCanaryIdle error = %v, want %v", err, cause)
+	}
+	if waiter.session != session.MayorSessionName() {
+		t.Fatalf("WaitForIdle session = %q, want %q", waiter.session, session.MayorSessionName())
+	}
+	if waiter.timeout != constants.ClaudeStartTimeout {
+		t.Fatalf("WaitForIdle timeout = %s, want %s", waiter.timeout, constants.ClaudeStartTimeout)
+	}
+}
 
 func TestRunWakeCanaryRejectsLiveMayorIdentity(t *testing.T) {
 	evidenceRoot := t.TempDir()
