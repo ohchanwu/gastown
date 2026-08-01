@@ -139,12 +139,14 @@ func init() {
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	commandCtx := context.Background()
 	commandCancel := func() {}
+	var commandBudget time.Duration
 	if awaitSignalCommandBudget != "" {
-		budget, err := time.ParseDuration(awaitSignalCommandBudget)
-		if err != nil || budget <= 0 {
+		var err error
+		commandBudget, err = time.ParseDuration(awaitSignalCommandBudget)
+		if err != nil || commandBudget <= 0 {
 			return fmt.Errorf("invalid command-budget %q", awaitSignalCommandBudget)
 		}
-		commandCtx, commandCancel = context.WithTimeout(commandCtx, budget)
+		commandCtx, commandCancel = context.WithTimeout(commandCtx, commandBudget)
 	}
 	defer commandCancel()
 
@@ -199,6 +201,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	fullTimeout, err := calculateEffectiveTimeout(idleCycles)
 	if err != nil {
 		return fmt.Errorf("invalid timeout configuration: %w", err)
+	}
+	if commandBudget > 0 && awaitSignalAgentBead == "" && fullTimeout > commandBudget {
+		return fmt.Errorf("command-budget shorter than timeout requires --agent-bead for resumable state")
 	}
 
 	// Determine effective timeout: resume from persisted window or start fresh.
@@ -260,6 +265,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
 		newIdleCycles := idleCycles + 1
 		if err := updateAgentAwaitSignalStateContext(commandCtx, awaitSignalAgentBead, beadsDir, &newIdleCycles, nil, true, true); err != nil {
+			if commandCtx.Err() == nil {
+				return fmt.Errorf("could not finalize await-signal timeout state")
+			}
 			if !awaitSignalQuiet {
 				fmt.Printf("%s Deferred timeout state update: %v\n",
 					style.Dim.Render("⚠"), err)
@@ -270,6 +278,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		}
 	} else if result.Reason == "signal" && awaitSignalAgentBead != "" {
 		if err := updateAgentAwaitSignalStateContext(commandCtx, awaitSignalAgentBead, beadsDir, nil, nil, true, true); err != nil {
+			if commandCtx.Err() == nil {
+				return fmt.Errorf("could not finalize await-signal signal state")
+			}
 			if !awaitSignalQuiet {
 				fmt.Printf("%s Deferred signal state update: %v\n",
 					style.Dim.Render("⚠"), err)
