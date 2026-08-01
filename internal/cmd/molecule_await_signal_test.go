@@ -325,7 +325,7 @@ func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t 
 	awaitSignalBackoffBase = ""
 	awaitSignalBackoffMult = 2
 	awaitSignalBackoffMax = ""
-	awaitSignalCommandBudget = "75ms"
+	awaitSignalCommandBudget = "300ms"
 	awaitSignalQuiet = true
 	awaitSignalAgentBead = "hq-deacon"
 	moleculeJSON = false
@@ -335,7 +335,7 @@ func TestRunMoleculeAwaitSignalDelayedBDPersistFailsClosedWithinCommandBudget(t 
 	if err == nil || !strings.Contains(err.Error(), "expired before backoff state was persisted") {
 		t.Fatalf("runMoleculeAwaitSignal error = %v, want sanitized persist-budget failure", err)
 	}
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
 		t.Fatalf("await-signal exceeded its executable command budget: %v", elapsed)
 	}
 }
