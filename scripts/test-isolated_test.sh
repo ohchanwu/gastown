@@ -32,6 +32,13 @@ if [[ "${1:-}" == build && "${2:-}" == -o ]]; then
   cat > "${3:?guard output required}" <<'FAKE_GUARD'
 #!/usr/bin/env bash
 case "${1:-}" in
+    identity)
+      printf 'fake-launcher-identity\n'
+      ;;
+    stop)
+      [[ "${5:-}" == fake-launcher-identity ]] || exit 6
+      kill "${2:?launcher PID required}"
+      ;;
     snapshot)
       printf 'baseline\n' > "${2:?baseline receipt required}"
       [[ -n "${GUARD_CAPTURE:-}" ]] && printf 'snapshot\n' >> "$GUARD_CAPTURE"

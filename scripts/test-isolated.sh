@@ -6,6 +6,7 @@ server_pid=""
 data_dir=""
 guard=""
 guard_receipt=""
+launcher_identity=""
 
 cleanup() {
 	status=$?
@@ -15,10 +16,15 @@ cleanup() {
 		echo "test-isolation: cleanup: test-owned Dolt listener cleanup failed" >&2
 		cleanup_failed=true
 	fi
-  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
-    kill "$server_pid"
-    wait "$server_pid" 2>/dev/null || true
-  fi
+	if [[ -n "$launcher_identity" ]]; then
+		if "$guard" stop "$server_pid" "$test_port" "$data_dir" "$launcher_identity"; then
+			wait "$server_pid" 2>/dev/null || true
+			server_pid=""
+		else
+			echo "test-isolation: cleanup: launcher Dolt identity changed or could not be stopped" >&2
+			cleanup_failed=true
+		fi
+	fi
   [[ -n "$data_dir" ]] && rm -rf -- "$data_dir"
 	if [[ "$cleanup_failed" == true ]]; then
 		exit 1
@@ -92,6 +98,11 @@ done
 if [[ "$owns_listener" != true ]]; then
   echo "test-isolation: configuration: launcher could not own the isolated Dolt listener" >&2
   exit 78
+fi
+
+if ! launcher_identity="$("$guard" identity "$server_pid" "$test_port" "$data_dir")" || [[ -z "$launcher_identity" ]]; then
+	echo "test-isolation: configuration: could not capture launcher Dolt identity" >&2
+	exit 78
 fi
 
 baseline_receipt="$data_dir/listener-baseline.json"

@@ -1221,6 +1221,12 @@ func InventoryLocalDoltServers(townRoot string) []LocalDoltServer {
 	return servers
 }
 
+// InventoryLocalDoltServersWithError preserves listener-discovery failures for
+// callers that must fail closed before signaling a process.
+func InventoryLocalDoltServersWithError(townRoot string) ([]LocalDoltServer, error) {
+	return inventoryLocalDoltServers(townRoot)
+}
+
 // FindAllDoltListeners discovers all Dolt processes with TCP listeners using lsof.
 // Uses process binary name matching (-c dolt) instead of command-line string matching
 // (pgrep -f), avoiding fragile ps/pgrep pattern coupling (ZFC fix: gt-fj87).
@@ -1609,12 +1615,16 @@ func testLeakSelectionsSince(inventory []LocalDoltServer, baseline map[DoltListe
 	return selections
 }
 
-func remediateTestLeaksSince(initial []LocalDoltServer, baseline map[DoltListener]bool, terminate func(TestLeakSelection) error, rescan func() []LocalDoltServer) error {
+func remediateTestLeaksSince(initial []LocalDoltServer, baseline map[DoltListener]bool, terminate func(TestLeakSelection) error, rescan func() ([]LocalDoltServer, error)) error {
 	preview := testLeakSelectionsSince(initial, baseline)
 	if len(preview) == 0 {
 		return nil
 	}
-	return remediatePreviewedTestLeaks(rescan(), preview, true, terminate, rescan)
+	current, err := rescan()
+	if err != nil {
+		return err
+	}
+	return remediatePreviewedTestLeaks(current, preview, true, terminate, rescan)
 }
 
 func previewedTestLeaks(inventory []LocalDoltServer, preview []TestLeakSelection) []LocalDoltServer {
@@ -1631,7 +1641,7 @@ func previewedTestLeaks(inventory []LocalDoltServer, preview []TestLeakSelection
 	return leaks
 }
 
-func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSelection, apply bool, terminate func(TestLeakSelection) error, rescan func() []LocalDoltServer) error {
+func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSelection, apply bool, terminate func(TestLeakSelection) error, rescan func() ([]LocalDoltServer, error)) error {
 	for _, wanted := range preview {
 		if wanted.Class != DoltServerOwnedTestLeak || wanted.OwnershipToken == "" {
 			return fmt.Errorf("invalid test-leak preview selection")
@@ -1650,7 +1660,11 @@ func remediatePreviewedTestLeaks(initial []LocalDoltServer, preview []TestLeakSe
 			return err
 		}
 	}
-	if remaining := len(previewedTestLeaks(rescan(), preview)); remaining > 0 {
+	current, err := rescan()
+	if err != nil {
+		return err
+	}
+	if remaining := len(previewedTestLeaks(current, preview)); remaining > 0 {
 		return fmt.Errorf("%d previewed test-owned Dolt listener(s) remain", remaining)
 	}
 	return nil
@@ -1772,10 +1786,7 @@ func CleanupOwnedLocalTestLeaks(townRoot string, baseline []DoltListener, ownerR
 	}
 	return remediateTestLeaksSince(initial, baselineListeners, func(selection TestLeakSelection) error {
 		return terminateSelectedTestLeak(selection, rescan)
-	}, func() []LocalDoltServer {
-		servers, _ := rescan()
-		return servers
-	})
+	}, rescan)
 }
 
 func testLeaksWithin(inventory []LocalDoltServer, ownerRoot string) []LocalDoltServer {
@@ -1791,13 +1802,16 @@ func testLeaksWithin(inventory []LocalDoltServer, ownerRoot string) []LocalDoltS
 // RemediatePreviewedTestLeaks applies only to still-positive test-owned
 // listeners that were captured by a prior preview.
 func RemediatePreviewedTestLeaks(townRoot string, preview []TestLeakSelection, apply bool) ([]LocalDoltServer, error) {
-	initial := InventoryLocalDoltServers(townRoot)
+	initial, inventoryErr := inventoryLocalDoltServers(townRoot)
+	if inventoryErr != nil {
+		return nil, inventoryErr
+	}
 	err := remediatePreviewedTestLeaks(initial, preview, apply, func(selection TestLeakSelection) error {
 		return terminateSelectedTestLeak(selection, func() ([]LocalDoltServer, error) {
 			return inventoryLocalDoltServers(townRoot)
 		})
-	}, func() []LocalDoltServer {
-		return InventoryLocalDoltServers(townRoot)
+	}, func() ([]LocalDoltServer, error) {
+		return inventoryLocalDoltServers(townRoot)
 	})
 	return initial, err
 }

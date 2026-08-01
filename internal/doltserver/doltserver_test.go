@@ -3,6 +3,7 @@ package doltserver
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -534,12 +535,12 @@ func TestRemediateTestLeaksSinceSignalsOnlyNewTestOwnedListeners(t *testing.T) {
 		[]LocalDoltServer{baseline, newLeak, town, canonical, unknown},
 		map[DoltListener]bool{baseline.DoltListener: true},
 		func(selection TestLeakSelection) error { terminated = append(terminated, selection.PID); return nil },
-		func() []LocalDoltServer {
+		func() ([]LocalDoltServer, error) {
 			rescans++
 			if rescans == 1 {
-				return []LocalDoltServer{baseline, newLeak, town, canonical, unknown}
+				return []LocalDoltServer{baseline, newLeak, town, canonical, unknown}, nil
 			}
-			return []LocalDoltServer{baseline, town, canonical, unknown}
+			return []LocalDoltServer{baseline, town, canonical, unknown}, nil
 		},
 	)
 	if err != nil {
@@ -562,12 +563,12 @@ func TestRemediateTestLeaksSinceTreatsReusedBaselinePIDOnNewPortAsNew(t *testing
 	rescans := 0
 
 	err := remediateTestLeaksSince([]LocalDoltServer{leak}, map[DoltListener]bool{baseline: true},
-		func(TestLeakSelection) error { terminated = true; return nil }, func() []LocalDoltServer {
+		func(TestLeakSelection) error { terminated = true; return nil }, func() ([]LocalDoltServer, error) {
 			rescans++
 			if rescans == 1 {
-				return []LocalDoltServer{leak}
+				return []LocalDoltServer{leak}, nil
 			}
-			return nil
+			return nil, nil
 		})
 	if err != nil {
 		t.Fatalf("remediateTestLeaksSince: %v", err)
@@ -592,7 +593,7 @@ func TestRemediateTestLeaksSinceRejectsChangedOwnerBeforeSignal(t *testing.T) {
 		[]LocalDoltServer{original},
 		nil,
 		func(TestLeakSelection) error { terminated = true; return nil },
-		func() []LocalDoltServer { return []LocalDoltServer{reused} },
+		func() ([]LocalDoltServer, error) { return []LocalDoltServer{reused}, nil },
 	)
 	if err == nil {
 		t.Fatal("cleanup accepted a listener whose ownership changed after selection")
@@ -618,8 +619,8 @@ func TestRemediatePreviewedTestLeaksSignalsOnlyRevalidatedPreview(t *testing.T) 
 		preview,
 		true,
 		func(selection TestLeakSelection) error { terminated = append(terminated, selection.PID); return nil },
-		func() []LocalDoltServer {
-			return []LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured}
+		func() ([]LocalDoltServer, error) {
+			return []LocalDoltServer{previewed, preexistingUnpreviewed, town, unknown, configured}, nil
 		},
 	)
 	if err == nil {
@@ -643,6 +644,21 @@ func TestRemediatePreviewedTestLeaksDefaultsToNoSignals(t *testing.T) {
 	}
 }
 
+func TestRemediatePreviewedTestLeaksPropagatesFinalInventoryError(t *testing.T) {
+	leak := LocalDoltServer{
+		DoltListener: DoltListener{PID: 612, Port: 4612},
+		Class:        DoltServerOwnedTestLeak,
+		OwnerPath:    filepath.Join(os.TempDir(), "gastown-test-dolt.inventory-error"),
+		ProcessToken: "inventory-error-start",
+	}
+	want := errors.New("listener inventory failed")
+	err := remediatePreviewedTestLeaks([]LocalDoltServer{leak}, []TestLeakSelection{newTestLeakSelection(leak)}, true,
+		func(TestLeakSelection) error { return nil }, func() ([]LocalDoltServer, error) { return nil, want })
+	if !errors.Is(err, want) {
+		t.Fatalf("cleanup error = %v, want %v", err, want)
+	}
+}
+
 func TestRemediatePreviewedTestLeaksRejectsPIDReuseChangedOwner(t *testing.T) {
 	original := LocalDoltServer{
 		DoltListener: DoltListener{PID: 621, Port: 4621},
@@ -655,7 +671,7 @@ func TestRemediatePreviewedTestLeaksRejectsPIDReuseChangedOwner(t *testing.T) {
 	terminated := false
 
 	err := remediatePreviewedTestLeaks([]LocalDoltServer{reused}, []TestLeakSelection{newTestLeakSelection(original)}, true,
-		func(TestLeakSelection) error { terminated = true; return nil }, func() []LocalDoltServer { return []LocalDoltServer{reused} })
+		func(TestLeakSelection) error { terminated = true; return nil }, func() ([]LocalDoltServer, error) { return []LocalDoltServer{reused}, nil })
 	if err == nil {
 		t.Fatal("apply accepted reused PID/port with changed owner")
 	}

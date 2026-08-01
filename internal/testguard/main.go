@@ -4,25 +4,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 func main() {
-	if len(os.Args) != 5 {
+	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: testguard snapshot|cleanup RECEIPT LAUNCHER_PID OWNER_ROOT")
 		os.Exit(2)
 	}
-	launcherPID, err := strconv.Atoi(os.Args[3])
-	if err != nil || launcherPID <= 0 {
-		fmt.Fprintln(os.Stderr, "testguard: launcher PID must be positive")
-		os.Exit(2)
-	}
 
+	var err error
 	switch os.Args[1] {
 	case "snapshot":
+		if len(os.Args) != 5 {
+			err = fmt.Errorf("usage: testguard snapshot RECEIPT LAUNCHER_PID OWNER_ROOT")
+			break
+		}
+		launcherPID, parseErr := positiveInt(os.Args[3], "launcher PID")
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
 		var baseline []doltserver.DoltListener
 		baseline, err = doltserver.FindAllDoltListenersWithError()
 		if err == nil {
@@ -32,7 +39,42 @@ func main() {
 			err = writeBaseline(os.Args[2], baseline)
 		}
 	case "cleanup":
-		err = cleanupSinceBaseline(os.Args[2], launcherPID, os.Args[4])
+		if len(os.Args) != 5 {
+			err = fmt.Errorf("usage: testguard cleanup RECEIPT LAUNCHER_PID OWNER_ROOT")
+			break
+		}
+		var launcherPID int
+		launcherPID, err = positiveInt(os.Args[3], "launcher PID")
+		if err == nil {
+			err = cleanupSinceBaseline(os.Args[2], launcherPID, os.Args[4])
+		}
+	case "identity":
+		if len(os.Args) != 5 {
+			err = fmt.Errorf("usage: testguard identity LAUNCHER_PID PORT OWNER_ROOT")
+			break
+		}
+		var selection doltserver.TestLeakSelection
+		selection, err = launcherSelection(os.Args[2], os.Args[3], os.Args[4])
+		if err == nil {
+			fmt.Fprintln(os.Stdout, selection.OwnershipToken)
+		}
+	case "stop":
+		if len(os.Args) != 6 {
+			err = fmt.Errorf("usage: testguard stop LAUNCHER_PID PORT OWNER_ROOT OWNERSHIP_TOKEN")
+			break
+		}
+		var selection doltserver.TestLeakSelection
+		selection, err = launcherSelection(os.Args[2], os.Args[3], os.Args[4])
+		if err == nil && selection.OwnershipToken != os.Args[5] {
+			err = fmt.Errorf("launcher process identity changed")
+		}
+		if err == nil {
+			var townRoot string
+			townRoot, err = workspace.FindFromCwdOrError()
+			if err == nil {
+				_, err = doltserver.RemediatePreviewedTestLeaks(townRoot, []doltserver.TestLeakSelection{selection}, true)
+			}
+		}
 	default:
 		err = fmt.Errorf("unknown mode %q", os.Args[1])
 	}
@@ -40,6 +82,44 @@ func main() {
 		fmt.Fprintf(os.Stderr, "testguard: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func positiveInt(value, name string) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be positive", name)
+	}
+	return n, nil
+}
+
+func launcherSelection(pidValue, portValue, ownerRoot string) (doltserver.TestLeakSelection, error) {
+	pid, err := positiveInt(pidValue, "launcher PID")
+	if err != nil {
+		return doltserver.TestLeakSelection{}, err
+	}
+	port, err := positiveInt(portValue, "launcher port")
+	if err != nil || port > 65535 {
+		return doltserver.TestLeakSelection{}, fmt.Errorf("launcher port must be in the TCP port range")
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return doltserver.TestLeakSelection{}, fmt.Errorf("find Gas Town workspace: %w", err)
+	}
+	inventory, err := doltserver.InventoryLocalDoltServersWithError(townRoot)
+	if err != nil {
+		return doltserver.TestLeakSelection{}, err
+	}
+	for _, server := range inventory {
+		rel, relErr := filepath.Rel(filepath.Clean(ownerRoot), filepath.Clean(server.OwnerPath))
+		inside := relErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+		if server.PID == pid && server.Port == port && inside {
+			selections := doltserver.TestLeakSelections([]doltserver.LocalDoltServer{server})
+			if len(selections) == 1 {
+				return selections[0], nil
+			}
+		}
+	}
+	return doltserver.TestLeakSelection{}, fmt.Errorf("launcher listener identity is not positively owned")
 }
 
 func writeBaseline(path string, baseline []doltserver.DoltListener) error {
