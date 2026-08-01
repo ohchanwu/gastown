@@ -847,6 +847,21 @@ func setupPatrolTestDB(t *testing.T) (string, *beads.Beads) {
 	return tmpDir, b
 }
 
+func openPatrolTestSQL(t *testing.T, workDir string) *sql.DB {
+	t.Helper()
+	dbName := beads.DatabaseNameFromMetadata(filepath.Join(workDir, ".beads"))
+	if dbName == "" {
+		t.Fatalf("no Dolt database metadata in %s", workDir)
+	}
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%s)/%s", testutil.DoltContainerPort(), dbName)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open patrol test database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 // createHookedPatrol creates a bead with a patrol title and hooks it.
 // If withOpenChild is true, creates an open child bead to simulate an active patrol.
 func createHookedPatrol(t *testing.T, b *beads.Beads, molName, assignee string, withOpenChild bool) string {
@@ -1003,6 +1018,164 @@ func TestFindActivePatrolZeroChildren(t *testing.T) {
 	}
 }
 
+func TestFindActivePatrolPrefersHookedRootAcrossTablesAndStatuses(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "deacon"
+	hookedID := createHookedPatrol(t, b, molName, assignee, false)
+
+	duplicate, err := b.Create(beads.CreateOptions{
+		Title:     molName + " (stale duplicate)",
+		Priority:  -1,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create duplicate patrol wisp: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := b.Update(duplicate.ID, beads.UpdateOptions{
+		Status:   &inProgress,
+		Assignee: &assignee,
+	}); err != nil {
+		t.Fatalf("assign duplicate patrol wisp: %v", err)
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	})
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected to find current hooked patrol")
+	}
+	if patrolID != hookedID {
+		t.Fatalf("patrolID = %q, want current hooked root %q", patrolID, hookedID)
+	}
+}
+
+func TestFindActivePatrolReconcilesDuplicateSnapshotTitle(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "deacon"
+	hookedID := createHookedPatrol(t, b, molName, assignee, false)
+	db := openPatrolTestSQL(t, tmpDir)
+	if _, err := db.Exec("UPDATE issues SET title = '' WHERE id = ?", hookedID); err != nil {
+		t.Fatalf("blank hooked snapshot title: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO wisps
+			(id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, ephemeral, no_history)
+		VALUES (?, ?, '', '', '', '', 'in_progress', 2, 'task', ?, 1, 1)`,
+		hookedID, molName+" (wisp)", assignee); err != nil {
+		t.Fatalf("insert duplicate wisp snapshot: %v", err)
+	}
+
+	patrolID, patrolLine, found, findErr := findActivePatrol(PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	})
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error: %v", findErr)
+	}
+	if !found || patrolID != hookedID {
+		t.Fatalf("findActivePatrol = (%q, %t), want hooked root %q", patrolID, found, hookedID)
+	}
+	if !strings.Contains(patrolLine, "[hooked]") {
+		t.Fatalf("patrolLine = %q, want hooked snapshot status", patrolLine)
+	}
+}
+
+func TestFindActivePatrolFailsClosedAtScanBudget(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "deacon"
+	staleIDs := make([]string, 0, maxStalePurgePerRun+2)
+	for i := 0; i < maxStalePurgePerRun+2; i++ {
+		rootID := createHookedPatrol(t, b, molName, assignee, true)
+		staleIDs = append(staleIDs, rootID)
+		children, err := b.List(beads.ListOptions{Parent: rootID, Status: "all", Priority: -1})
+		if err != nil {
+			t.Fatalf("list children of stale patrol %d: %v", i, err)
+		}
+		for _, child := range children {
+			if err := b.ForceCloseWithReason("test stale patrol", child.ID); err != nil {
+				t.Fatalf("close child of stale patrol %d: %v", i, err)
+			}
+		}
+	}
+
+	active, err := b.Create(beads.CreateOptions{
+		Title:     molName + " (active in-progress)",
+		Priority:  -1,
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("create active in-progress patrol: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := b.Update(active.ID, beads.UpdateOptions{Status: &inProgress, Assignee: &assignee}); err != nil {
+		t.Fatalf("assign active in-progress patrol: %v", err)
+	}
+
+	patrolID, _, found, findErr := findActivePatrol(PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	})
+	wantErr := fmt.Sprintf("discovery incomplete: patrol scan limit reached after %d candidates", maxStalePurgePerRun+1)
+	if findErr == nil || findErr.Error() != wantErr {
+		t.Fatalf("findActivePatrol error = %v, want %q", findErr, wantErr)
+	}
+	if found || patrolID != "" {
+		t.Fatalf("findActivePatrol = (%q, %t), want fail-closed empty result", patrolID, found)
+	}
+
+	var closed, hooked int
+	for _, staleID := range staleIDs {
+		issue, err := b.Show(staleID)
+		if err != nil {
+			t.Fatalf("show stale patrol %s: %v", staleID, err)
+		}
+		switch issue.Status {
+		case "closed":
+			closed++
+		case beads.StatusHooked:
+			hooked++
+		default:
+			t.Fatalf("stale patrol %s status = %q, want closed or hooked", staleID, issue.Status)
+		}
+	}
+	if closed != maxStalePurgePerRun || hooked != 2 {
+		t.Fatalf("first scan cleanup = %d closed, %d hooked; want %d closed, 2 hooked", closed, hooked, maxStalePurgePerRun)
+	}
+
+	patrolID, _, found, findErr = findActivePatrol(PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	})
+	if findErr != nil {
+		t.Fatalf("second findActivePatrol error: %v", findErr)
+	}
+	if !found || patrolID != active.ID {
+		t.Fatalf("second findActivePatrol = (%q, %t), want existing active root %q", patrolID, found, active.ID)
+	}
+}
+
 func TestFindActivePatrolMultiple(t *testing.T) {
 	requireBd(t)
 	tmpDir, b := setupPatrolTestDB(t)
@@ -1108,8 +1281,9 @@ func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
 	}
 
 	_, _, found, findErr := findActivePatrol(cfg)
-	if findErr != nil {
-		t.Fatalf("findActivePatrol error: %v", findErr)
+	wantErr := fmt.Sprintf("discovery incomplete: patrol scan limit reached after %d candidates", maxPatrolDiscoveryScans)
+	if findErr == nil || findErr.Error() != wantErr {
+		t.Fatalf("findActivePatrol error = %v, want %q", findErr, wantErr)
 	}
 	if found {
 		t.Fatal("expected no active patrol (all stale)")
@@ -1133,14 +1307,9 @@ func TestFindActivePatrol_StaleCleanupCapped(t *testing.T) {
 		}
 	}
 
-	// Cleanup must be capped: at most maxStalePurgePerRun beads closed per run
-	if closedCount > maxStalePurgePerRun {
-		t.Errorf("closed %d stale patrols, want at most %d (cap exceeded — Dolt DoS risk)",
-			closedCount, maxStalePurgePerRun)
-	}
-	// But at least some cleanup must happen (the cap should not be zero)
-	if closedCount == 0 {
-		t.Errorf("no stale patrols were closed, expected up to %d", maxStalePurgePerRun)
+	// Cleanup reaches, but never exceeds, the bounded stale batch.
+	if closedCount != maxStalePurgePerRun {
+		t.Errorf("closed %d stale patrols, want exactly %d", closedCount, maxStalePurgePerRun)
 	}
 	// Total accounted for
 	if closedCount+hookedCount != numStale {
