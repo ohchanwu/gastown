@@ -138,6 +138,16 @@ else
   fail "launches with an explicit isolated Dolt port"
 fi
 
+if PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" GT_TEST_DOLT_PORT=44001 \
+  bash "$LAUNCHER" -race ./internal/doltserver ./internal/testguard -count=1; then
+  expected=$'GT_DOLT_PORT=44001\nBEADS_DOLT_PORT=44001\nBEADS_DOLT_SERVER_PORT=44001\nargs=test -race ./internal/doltserver ./internal/testguard -count=1'
+  [[ "$(cat "$CAPTURE")" == "$expected" ]] && \
+    pass "passes focused go test arguments through isolation" || \
+    fail "passes focused go test arguments through isolation"
+else
+  fail "launches focused go test arguments"
+fi
+
 rm -f "$CAPTURE"
 status=0
 output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \

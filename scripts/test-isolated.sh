@@ -131,6 +131,10 @@ fi
 guard_receipt="$baseline_receipt"
 
 mkdir "$data_dir/tmp"
+test_args=("$@")
+if (( ${#test_args[@]} == 0 )); then
+	test_args=(./...)
+fi
 if env \
 	TMPDIR="$data_dir/tmp" \
   GT_DOLT_HOST=127.0.0.1 \
@@ -140,7 +144,7 @@ if env \
   BEADS_DOLT_PORT="$test_port" \
   BEADS_DOLT_SERVER_HOST=127.0.0.1 \
   BEADS_DOLT_SERVER_PORT="$test_port" \
-  go test ./...; then
+  go test "${test_args[@]}"; then
   exit 0
 else
   status=$?

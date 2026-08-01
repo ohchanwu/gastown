@@ -142,9 +142,7 @@ func launcherSelection(pidValue, portValue, ownerRoot string) (doltserver.TestLe
 		return doltserver.TestLeakSelection{}, err
 	}
 	for _, server := range inventory {
-		rel, relErr := filepath.Rel(filepath.Clean(ownerRoot), filepath.Clean(server.OwnerPath))
-		inside := relErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-		if server.PID == pid && server.Port == port && inside {
+		if server.PID == pid && server.Port == port && pathWithinOrEqual(ownerRoot, server.OwnerPath) {
 			selections := doltserver.TestLeakSelections([]doltserver.LocalDoltServer{server})
 			if len(selections) == 1 {
 				return selections[0], nil
@@ -152,6 +150,11 @@ func launcherSelection(pidValue, portValue, ownerRoot string) (doltserver.TestLe
 		}
 	}
 	return doltserver.TestLeakSelection{}, fmt.Errorf("launcher listener identity is not positively owned")
+}
+
+func pathWithinOrEqual(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func writeBaseline(path string, baseline []doltserver.DoltListener) error {

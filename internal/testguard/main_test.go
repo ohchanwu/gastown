@@ -52,3 +52,16 @@ func TestRequiredBaselineListenerRejectsMissingLauncher(t *testing.T) {
 		t.Fatal("accepted a baseline that omitted the known launcher process")
 	}
 }
+
+func TestPathWithinOrEqualAcceptsLauncherRootOnly(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "gastown-test-dolt.run")
+	if !pathWithinOrEqual(root, root) {
+		t.Fatal("launcher root did not own itself")
+	}
+	if !pathWithinOrEqual(root, filepath.Join(root, "tmp", "child")) {
+		t.Fatal("launcher root did not own its descendant")
+	}
+	if pathWithinOrEqual(root, root+"-sibling") {
+		t.Fatal("launcher root owned a sibling path")
+	}
+}
