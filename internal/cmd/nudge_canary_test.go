@@ -2,14 +2,144 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+type wakeCanaryIdleWaiterStub struct {
+	session string
+	timeout time.Duration
+	err     error
+}
+
+func buildWakeCanaryCandidateGT(t *testing.T) string {
+	t.Helper()
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(t.TempDir(), "gt")
+	cmd := exec.Command("go", "build", "-o", candidate, "./cmd/gt")
+	cmd.Dir = repoRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build candidate gt: %v: %s", err, output)
+	}
+	return candidate
+}
+
+func (s *wakeCanaryIdleWaiterStub) WaitForIdle(session string, timeout time.Duration) error {
+	s.session = session
+	s.timeout = timeout
+	return s.err
+}
+
+func TestWaitForWakeCanaryIdleUsesStartupTurnBound(t *testing.T) {
+	cause := errors.New("session busy")
+	waiter := &wakeCanaryIdleWaiterStub{err: cause}
+
+	err := waitForWakeCanaryIdle(waiter, session.MayorSessionName())
+	if !errors.Is(err, cause) {
+		t.Fatalf("waitForWakeCanaryIdle error = %v, want %v", err, cause)
+	}
+	if waiter.session != session.MayorSessionName() {
+		t.Fatalf("WaitForIdle session = %q, want %q", waiter.session, session.MayorSessionName())
+	}
+	if waiter.timeout != constants.ClaudeStartTimeout {
+		t.Fatalf("WaitForIdle timeout = %s, want %s", waiter.timeout, constants.ClaudeStartTimeout)
+	}
+}
+
+func TestRunWakeCanaryPersistsSessionNotIdleBeforeLease(t *testing.T) {
+	previousCommit := Commit
+	Commit = "test-commit"
+	t.Cleanup(func() { Commit = previousCommit })
+
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-wake-canary-idle-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+
+	runtimeTownRoot := t.TempDir()
+	evidenceRoot := t.TempDir()
+	sessionName := session.MayorSessionName()
+	if err := tm.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+
+	release, err := tm.AcquireNudgeLease(runtimeTownRoot, sessionName)
+	if err != nil {
+		t.Fatalf("AcquireNudgeLease: %v", err)
+	}
+	t.Cleanup(release)
+
+	type canaryResult struct {
+		result    wakeCanaryResult
+		statePath string
+		err       error
+	}
+	done := make(chan canaryResult, 1)
+	go func() {
+		result, statePath, err := runWakeCanary(tm, runtimeTownRoot, evidenceRoot, sessionName, 1)
+		done <- canaryResult{result: result, statePath: statePath, err: err}
+	}()
+
+	statePath := filepath.Join(evidenceRoot, constants.DirRuntime, "canary", "control-plane.json")
+	deadline := time.NewTimer(5 * time.Second)
+	t.Cleanup(func() { deadline.Stop() })
+	poll := time.NewTicker(10 * time.Millisecond)
+	t.Cleanup(poll.Stop)
+	for {
+		select {
+		case <-poll.C:
+			data, readErr := os.ReadFile(statePath)
+			if readErr != nil {
+				continue
+			}
+			var state wakeCanaryState
+			if json.Unmarshal(data, &state) == nil && state.Result == "running" {
+				goto waiting
+			}
+		case <-deadline.C:
+			t.Fatal("runWakeCanary did not persist running state")
+		}
+	}
+
+waiting:
+	if err := tm.KillSession(sessionName); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err == nil || !strings.Contains(got.err.Error(), "steady-state idle") {
+			t.Fatalf("runWakeCanary error = %v, want steady-state idle failure", got.err)
+		}
+		if got.result.Submitted != 0 || got.result.Queued != 0 || got.result.Failed != 0 {
+			t.Fatalf("runWakeCanary result = %+v, want zero delivery attempts", got.result)
+		}
+		data, readErr := os.ReadFile(got.statePath)
+		if readErr != nil {
+			t.Fatalf("read failed canary state: %v", readErr)
+		}
+		var state wakeCanaryState
+		if err := json.Unmarshal(data, &state); err != nil {
+			t.Fatalf("decode failed canary state: %v", err)
+		}
+		if state.Result != "failed" || state.FailureCode != "session-not-idle" {
+			t.Fatalf("failed canary state = %+v, want session-not-idle", state)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runWakeCanary did not stop after the session disappeared")
+	}
+}
 
 func TestRunWakeCanaryRejectsLiveMayorIdentity(t *testing.T) {
 	evidenceRoot := t.TempDir()
@@ -41,7 +171,8 @@ func TestIsolatedCanaryEnvStripsLiveRouting(t *testing.T) {
 
 func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	parent := t.TempDir()
-	sandbox, err := newWakeCanarySandbox(parent)
+	candidateGT := filepath.Join(parent, "candidate", "gt")
+	sandbox, err := newWakeCanarySandbox(parent, candidateGT)
 	if err != nil {
 		t.Fatalf("newWakeCanarySandbox: %v", err)
 	}
@@ -61,6 +192,27 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	}
 	if !strings.Contains(string(hooksData), "UserPromptSubmit") || !strings.Contains(string(hooksData), "mail check --inject") {
 		t.Fatalf("temporary Codex hooks lack receipt dispatcher: %s", hooksData)
+	}
+	var installed struct {
+		Hooks struct {
+			SessionStart []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"SessionStart"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(hooksData, &installed); err != nil {
+		t.Fatalf("parse temporary Codex hooks: %v", err)
+	}
+	if len(installed.Hooks.SessionStart) != 1 || len(installed.Hooks.SessionStart[0].Hooks) != 1 {
+		t.Fatal("temporary Codex hooks lack one SessionStart command")
+	}
+	if got, want := installed.Hooks.SessionStart[0].Hooks[0].Command, candidateGT+" prime --hook"; got != want {
+		t.Fatalf("SessionStart command = %q, want exact candidate command %q", got, want)
+	}
+	if strings.Contains(string(hooksData), "cmd.test") {
+		t.Fatal("temporary Codex hooks resolve to the Go test binary")
 	}
 	if sandbox.Socket == "" || sandbox.Socket == "gastown" {
 		t.Fatalf("canary socket is not isolated: %q", sandbox.Socket)

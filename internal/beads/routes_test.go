@@ -376,6 +376,9 @@ func TestGetRigNameForPrefix(t *testing.T) {
 
 func TestGetRigDirForName(t *testing.T) {
 	tmpDir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatal(err)

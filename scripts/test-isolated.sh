@@ -2,6 +2,10 @@
 
 set -uo pipefail
 
+# Tests assert repository-default permissions; do not inherit a restrictive
+# interactive-shell umask into the hermetic suite.
+umask 022
+
 server_pid=""
 data_dir=""
 guard=""
@@ -139,9 +143,12 @@ guard_receipt="$baseline_receipt"
 mkdir "$data_dir/tmp"
 test_args=("$@")
 if (( ${#test_args[@]} == 0 )); then
-	test_args=(./...)
+	test_args=(-timeout=15m -p 1 ./...)
 fi
-if env \
+if env -u GT_TEST_DOLT_PORT \
+	GT_TEST_ISOLATED=1 \
+	GIT_CONFIG_GLOBAL=/dev/null \
+	GIT_CONFIG_SYSTEM=/dev/null \
 	TMPDIR="$data_dir/tmp" \
   GT_DOLT_HOST=127.0.0.1 \
   GT_DOLT_PORT="$test_port" \

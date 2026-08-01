@@ -697,7 +697,7 @@ func TestCloseConvoyPinsTownDatabaseUnderStaleEnv(t *testing.T) {
 	}
 
 	binDir := t.TempDir()
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -860,7 +860,7 @@ func TestConvoyInfo_IsOwnedDirect(t *testing.T) {
 func setupTownWithBdStub(t *testing.T, bdScript string) (townRoot, logPath string) {
 	t.Helper()
 
-	townRoot = t.TempDir()
+	townRoot = canonicalTestTempDir(t)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}

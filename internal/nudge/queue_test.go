@@ -102,6 +102,72 @@ func TestEnqueueTightensLegacyQueuePermissions(t *testing.T) {
 	}
 }
 
+func TestListQueuedReadsWithoutConsuming(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "hq-mayor"
+	queuedAt := time.Now().Add(-time.Minute)
+	want := QueuedNudge{
+		DeliveryID: "ndg-health", Priority: PriorityUrgent, Timestamp: queuedAt,
+		LastErrorCode: "submission-unconfirmed", Message: "private message",
+	}
+	if err := Enqueue(townRoot, session, want); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	got, err := ListQueued(townRoot, session)
+	if err != nil {
+		t.Fatalf("ListQueued: %v", err)
+	}
+	if len(got) != 1 || got[0].DeliveryID != want.DeliveryID || got[0].LastErrorCode != want.LastErrorCode {
+		t.Fatalf("ListQueued = %#v", got)
+	}
+	if pending, err := Pending(townRoot, session); err != nil || pending != 1 {
+		t.Fatalf("Pending after ListQueued = %d, %v; want 1", pending, err)
+	}
+}
+
+func TestListQueuedIncludesClaimWithoutConsumingIt(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "hq-mayor"
+	if err := Enqueue(townRoot, session, QueuedNudge{Priority: PriorityUrgent, Message: "private"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+
+	got, err := ListQueued(townRoot, session)
+	if err != nil || len(got) != 1 || got[0].DeliveryID != claim.Nudge.DeliveryID {
+		t.Fatalf("ListQueued = %#v, %v", got, err)
+	}
+	if err := claim.Nack("test", time.Now()); err != nil {
+		t.Fatalf("claim was consumed by ListQueued: %v", err)
+	}
+}
+
+func TestListQueuedSkipsRecordAckedAfterReadDir(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "hq-mayor"
+	if err := Enqueue(townRoot, session, QueuedNudge{Priority: PriorityUrgent}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRead := readQueueRecord
+	readQueueRecord = func(path string) ([]byte, error) {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		return nil, os.ErrNotExist
+	}
+	t.Cleanup(func() { readQueueRecord = oldRead })
+
+	got, err := ListQueued(townRoot, session)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("ListQueued = %#v, %v; want empty snapshot", got, err)
+	}
+}
+
 func TestClaimDueRequiresMatchingPostClaimReceipt(t *testing.T) {
 	townRoot := t.TempDir()
 	const session = "gt-test-claim"

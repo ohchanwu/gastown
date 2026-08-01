@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,6 +47,18 @@ var templateFS embed.FS
 // The install directory is settingsDir for agents that support --settings (useSettingsDir=true),
 // or workDir for all others.
 func InstallForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile string, useSettingsDir bool) error {
+	return installForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile, useSettingsDir, resolveGTBinary())
+}
+
+// InstallForRoleWithGTBinary installs hooks using an explicit gt executable.
+func InstallForRoleWithGTBinary(provider, settingsDir, workDir, role, hooksDir, hooksFile string, useSettingsDir bool, gtBin string) error {
+	if gtBin == "" {
+		return errors.New("gt binary path is required")
+	}
+	return installForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile, useSettingsDir, gtBin)
+}
+
+func installForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile string, useSettingsDir bool, gtBin string) error {
 	if provider == "" || hooksDir == "" || hooksFile == "" {
 		return nil
 	}
@@ -68,7 +81,7 @@ func InstallForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile st
 		// Stale file detected — fall through to overwrite with current template
 	}
 
-	return writeTemplate(provider, role, hooksFile, targetPath)
+	return writeTemplate(provider, role, hooksFile, targetPath, gtBin)
 }
 
 // needsUpgrade returns true if an existing hooks file contains stale patterns
@@ -164,13 +177,16 @@ func installTargetPath(settingsDir, workDir, hooksDir, hooksFile string, useSett
 
 // resolveAndSubstitute resolves the template and performs {{GT_BIN}} substitution.
 func resolveAndSubstitute(provider, hooksFile, role string) ([]byte, error) {
+	return resolveAndSubstituteWithGTBinary(provider, hooksFile, role, resolveGTBinary())
+}
+
+func resolveAndSubstituteWithGTBinary(provider, hooksFile, role, gtBin string) ([]byte, error) {
 	content, err := resolveTemplate(provider, hooksFile, role)
 	if err != nil {
 		return nil, fmt.Errorf("resolving template for %s: %w", provider, err)
 	}
 
 	if bytes.Contains(content, []byte("{{GT_BIN}}")) {
-		gtBin := resolveGTBinary()
 		gtBinBytes := []byte(gtBin)
 		if isSettingsFile(hooksFile) {
 			// JSON-encode the path so Windows backslashes are properly escaped.
@@ -186,8 +202,8 @@ func resolveAndSubstitute(provider, hooksFile, role string) ([]byte, error) {
 }
 
 // writeTemplate resolves a template, substitutes placeholders, and writes it to targetPath.
-func writeTemplate(provider, role, hooksFile, targetPath string) error {
-	content, err := resolveAndSubstitute(provider, hooksFile, role)
+func writeTemplate(provider, role, hooksFile, targetPath, gtBin string) error {
+	content, err := resolveAndSubstituteWithGTBinary(provider, hooksFile, role, gtBin)
 	if err != nil {
 		return err
 	}

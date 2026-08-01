@@ -184,7 +184,7 @@ func TestRunDoneWithRoutedIssueIgnoresCurrentRigMirror(t *testing.T) {
 
 func setupRoutedSourceTestTown(t *testing.T) (workDir, currentBeadsDir, ownerBeadsDir string) {
 	t.Helper()
-	townRoot := t.TempDir()
+	townRoot := canonicalTestTempDir(t)
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
 		t.Fatalf("mkdir mayor: %v", err)
 	}

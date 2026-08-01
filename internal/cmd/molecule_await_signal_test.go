@@ -315,7 +315,7 @@ func TestRunMoleculeAwaitSignalAgentBeadUsesCwdRigBeadsDirWhenBeadsDirPointsTown
 		t.Skip("uses a POSIX shell fake bd")
 	}
 
-	tmp := t.TempDir()
+	tmp := canonicalTestTempDir(t)
 	townRoot := filepath.Join(tmp, "gt")
 	townBeads := filepath.Join(townRoot, ".beads")
 	rigWorkDir := filepath.Join(townRoot, "gastown", "refinery", "rig")

@@ -2143,8 +2143,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
-	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
-		return fmt.Errorf("workspace trust dialog: %w", err)
+	// Codex 0.146 can show folder trust followed by hook trust. Each pass is
+	// already bounded and exits early when no workspace dialog is present.
+	for range 2 {
+		if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
+			return fmt.Errorf("workspace trust dialog: %w", err)
+		}
 	}
 	if err := t.AcceptBypassPermissionsWarning(session); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)
@@ -2191,12 +2195,29 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 			time.Sleep(constants.DialogPollInterval)
 			continue
 		}
+		if agentActivityAppearsAfterStartupBlocker(content) {
+			return nil
+		}
 
 		// Look for characteristic trust dialog text before prompt detection.
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
+			// Codex hook review pre-selects "Review hooks"; choose
+			// "Trust all and continue" before accepting.
+			if strings.Contains(content, "Hooks need review") {
+				if !strings.Contains(content, "Trust all and continue") {
+					time.Sleep(constants.DialogPollInterval)
+					continue
+				}
+				// Codex list pickers accept a numbered option directly. Re-capture
+				// afterward so a dropped startup keystroke is retried safely.
+				if _, err := t.run("send-keys", "-t", session, "2"); err != nil {
+					return err
+				}
+				time.Sleep(500 * time.Millisecond)
+				return nil
+			}
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
 				return err
 			}
@@ -2222,11 +2243,12 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 func containsWorkspaceTrustDialog(content string) bool {
 	return strings.Contains(content, "trust this folder") ||
 		strings.Contains(content, "Quick safety check") ||
-		strings.Contains(content, "Do you trust the contents of this directory?")
+		strings.Contains(content, "Do you trust the contents of this directory?") ||
+		strings.Contains(content, "Hooks need review")
 }
 
 func containsBlockingStartupDialog(content string) (string, bool) {
-	if promptAppearsAfterStartupBlocker(content) {
+	if agentActivityAppearsAfterStartupBlocker(content) {
 		return "", false
 	}
 	if containsCodexUpdateDialog(content) {
@@ -2241,13 +2263,15 @@ func containsBlockingStartupDialog(content string) (string, bool) {
 	return "", false
 }
 
-func promptAppearsAfterStartupBlocker(content string) bool {
-	promptLine := lastPromptIndicatorLine(content)
-	if promptLine < 0 {
-		return false
+func agentActivityAppearsAfterStartupBlocker(content string) bool {
+	activityLine := lastPromptIndicatorLine(content)
+	for i, line := range strings.Split(content, "\n") {
+		if hasBusyIndicator(line) && i > activityLine {
+			activityLine = i
+		}
 	}
 	blockerLine := lastStartupBlockerLine(content)
-	return blockerLine >= 0 && promptLine > blockerLine
+	return blockerLine >= 0 && activityLine > blockerLine
 }
 
 func lastStartupBlockerLine(content string) int {
@@ -2258,6 +2282,7 @@ func lastStartupBlockerLine(content string) int {
 		"trust this folder",
 		"Quick safety check",
 		"Do you trust the contents of this directory?",
+		"Hooks need review",
 		"Bypass Permissions mode",
 	}
 	last := -1
@@ -2306,6 +2331,14 @@ func lastPromptIndicatorLine(content string) int {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
+		}
+		if strings.HasPrefix(trimmed, "› ") {
+			rest := strings.TrimPrefix(trimmed, "› ")
+			dot := strings.IndexByte(rest, '.')
+			if dot <= 0 || strings.Trim(rest[:dot], "0123456789") != "" {
+				last = i
+				continue
+			}
 		}
 		for _, suffix := range promptSuffixes {
 			if strings.HasSuffix(trimmed, suffix) {
@@ -3607,7 +3640,6 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
-	prefix := strings.TrimSpace(promptPrefix)
 
 	// Require 2 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
@@ -3618,7 +3650,7 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		lines, err := t.CapturePaneLines(session, 5)
+		content, err := t.run("capture-pane", "-p", "-e", "-t", session)
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
@@ -3630,39 +3662,20 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-
-		// Busy indicator check: if "esc to interrupt" is visible anywhere in
-		// the recent pane output, the agent is actively working — NOT idle,
-		// regardless of whether the prompt prefix is also visible.
-		statusBarBusy := false
-		for _, line := range lines {
-			if hasBusyIndicator(line) {
-				statusBarBusy = true
-				break
-			}
+		cursor, err := t.run("display-message", "-p", "-t", session, "#{cursor_x}|#{cursor_y}")
+		if err != nil {
+			consecutiveIdle = 0
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
-		if statusBarBusy {
+		var cursorX, cursorY int
+		if _, err := fmt.Sscanf(strings.TrimSpace(cursor), "%d|%d", &cursorX, &cursorY); err != nil {
 			consecutiveIdle = 0
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
-		// Scan all captured lines for the prompt prefix.
-		// Claude Code renders a status bar below the prompt line,
-		// so the prompt may not be the last non-empty line.
-		promptFound := false
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				continue
-			}
-			if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
-				promptFound = true
-				break
-			}
-		}
-
-		if promptFound {
+		if paneAtIdlePrompt(content, promptPrefix, cursorX, cursorY) {
 			consecutiveIdle++
 			if consecutiveIdle >= requiredConsecutive {
 				return nil
@@ -4097,7 +4110,7 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 //  2. Unguarded form (set by EnsureBindingsOnSocket): direct run-shell
 //     invoking "gt agents menu" or "gt feed --window".
 func (t *Tmux) isGTBinding(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4115,7 +4128,7 @@ func (t *Tmux) isGTBinding(table, key string) bool {
 // --client for multi-client support. Older GT bindings without --client cause
 // switch-client to target the wrong client when multiple clients are attached.
 func (t *Tmux) isGTBindingWithClient(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4127,7 +4140,7 @@ func (t *Tmux) isGTBindingWithClient(table, key string) bool {
 // current prefix pattern. Returns false if the binding is stale (e.g., after
 // gt rig add introduces a new prefix not yet in the grep pattern).
 func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return false
 	}
@@ -4146,15 +4159,15 @@ func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
 // the presence of both "if-shell" and "gt " in the output), it is treated as
 // no prior binding to avoid recursive wrapping on repeated calls.
 func (t *Tmux) getKeyBinding(table, key string) string {
-	// tmux list-keys -T <table> <key> outputs a line like:
+	// tmux list-keys -T <table> outputs lines like:
 	//   bind-key -T prefix g if-shell "..." "run-shell 'gt agents menu'" ":"
 	// We need to extract just the command portion.
 	//
-	// Assumed format (tested with tmux 3.3+):
+	// Assumed format:
 	//   bind-key [-r] -T <table> <key> <command...>
 	// If tmux changes this format, parsing fails safely (returns ""),
 	// which causes the caller to use its default fallback.
-	output, err := t.run("list-keys", "-T", table, key)
+	output, err := t.keyBindingLine(table, key)
 	if err != nil || output == "" {
 		return ""
 	}
@@ -4200,6 +4213,25 @@ func (t *Tmux) getKeyBinding(table, key string) string {
 	}
 
 	return cmd
+}
+
+// keyBindingLine returns the binding for one key. Filtering the full table is
+// compatible with tmux 3.7, where the positional key argument may return an
+// empty successful result.
+func (t *Tmux) keyBindingLine(table, key string) (string, error) {
+	output, err := t.run("list-keys", "-T", table)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field == "-T" && i+2 < len(fields) && fields[i+1] == table && fields[i+2] == key {
+				return line, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // safePrefixRe matches the character set guaranteed by beadsPrefixRegexp in

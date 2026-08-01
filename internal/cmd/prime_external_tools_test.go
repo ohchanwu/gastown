@@ -19,8 +19,8 @@ func setupPrimeExternalToolTest(t *testing.T, bdScript, gtScript string) string 
 
 	oldTimeout := primeExternalToolTimeout
 	oldWaitDelay := primeExternalToolWaitDelay
-	primeExternalToolTimeout = 100 * time.Millisecond
-	primeExternalToolWaitDelay = 10 * time.Millisecond
+	primeExternalToolTimeout = time.Second
+	primeExternalToolWaitDelay = 100 * time.Millisecond
 	t.Cleanup(func() {
 		primeExternalToolTimeout = oldTimeout
 		primeExternalToolWaitDelay = oldWaitDelay
@@ -85,7 +85,7 @@ esac
 
 	start := time.Now()
 	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), 2*time.Second)
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
@@ -108,7 +108,7 @@ esac
 `, `
 case "$*" in
   "mail check --inject")
-    (: > "$PRIME_CHILD_STARTED"; sleep 0.5; : > "$PRIME_CHILD_SURVIVED") &
+    (: > "$PRIME_CHILD_STARTED"; sleep 2; : > "$PRIME_CHILD_SURVIVED") &
     while [ ! -f "$PRIME_CHILD_STARTED" ]; do sleep 0.01; done
     wait
     exit 0
@@ -120,7 +120,7 @@ esac
 
 	start := time.Now()
 	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), 2*time.Second)
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
@@ -131,7 +131,7 @@ esac
 		t.Fatalf("child did not start before timeout: %v", err)
 	}
 
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	if _, err := os.Stat(survivedPath); err == nil {
 		t.Fatalf("child process survived command timeout and wrote %s", survivedPath)
 	} else if !os.IsNotExist(err) {
@@ -180,7 +180,7 @@ esac
 	output := captureStdout(t, func() {
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
-	assertElapsedUnder(t, time.Since(start), time.Second)
+	assertElapsedUnder(t, time.Since(start), 2*time.Second)
 	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {

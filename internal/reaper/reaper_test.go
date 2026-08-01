@@ -424,7 +424,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 		t.Fatalf("real Reap: %v", err)
 	}
 	if realRun.MoleculeStepsClosed != 2 {
-		t.Fatalf("real MoleculeStepsClosed = %d, want 2", realRun.MoleculeStepsClosed)
+		t.Fatalf("real MoleculeStepsClosed = %d, want 2; ops=%v statuses=%v", realRun.MoleculeStepsClosed, state.opsSince(preRealOps), state.statuses())
 	}
 	if realRun.Reaped != 2 {
 		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
@@ -807,8 +807,6 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
 		return fakeCountRows(0), nil
-	case strings.Contains(normalized, "SELECT DISTINCT wd.issue_id FROM wisp_dependencies wd"):
-		return fakeIDRows(c.state.danglingChildIDsLocked()), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -819,6 +817,8 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 			return nil, err
 		}
 		return fakeIDRows(c.state.moleculeStepCandidatesLocked()), nil
+	case strings.Contains(normalized, "SELECT DISTINCT wd.issue_id FROM wisp_dependencies wd"):
+		return fakeIDRows(c.state.danglingChildIDsLocked()), nil
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", normalized)
 	}

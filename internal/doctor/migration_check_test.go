@@ -99,6 +99,7 @@ func setupRigsJSON(t *testing.T, townRoot string, rigNames []string) {
 }
 
 func TestGetServerAddr(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	check := NewDoltServerReachableCheck()
 
 	tests := []struct {
@@ -188,6 +189,7 @@ func TestGetServerAddr_NoMetadata(t *testing.T) {
 }
 
 func TestGetServerAddr_UsesConfigYAMLPort(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "")
 	check := NewDoltServerReachableCheck()
 	townRoot := t.TempDir()
 

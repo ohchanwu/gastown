@@ -254,6 +254,43 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
+func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) bool {
+	if promptPrefix == "" {
+		return false
+	}
+	plain, dim := stripAnsiTrackDim(escContent)
+	lines, lineDims := splitRunesAndDim(plain, dim)
+
+	for _, line := range lines {
+		if hasBusyIndicator(string(line)) {
+			return false
+		}
+	}
+	codexPrompt := strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")) == "›"
+	if codexPrompt && cursorX == 1 && cursorY >= 0 && cursorY+1 < len(lines) &&
+		strings.TrimSpace(string(lines[cursorY])) == "" && strings.TrimSpace(string(lines[cursorY+1])) != "" {
+		return true
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
+			continue
+		}
+		content, contentDim := composerContent(lines[i], lineDims[i], promptPrefix)
+		prefix := []rune(strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")))
+		promptX := runeIndex(lines[i], prefix)
+		if codexPrompt {
+			inputX := promptX + len(prefix)
+			return promptX >= 0 && cursorY == i &&
+				(cursorX == inputX || cursorX == inputX+1 && len(content) > 0 && allDim(contentDim))
+		}
+		if len(content) == 0 || allDim(contentDim) {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
 func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe {
 	content, err := t.run("capture-pane", "-p", "-e", "-t", target, "-S", "-25")
 	if err != nil {

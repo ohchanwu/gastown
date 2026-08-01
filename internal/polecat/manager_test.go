@@ -21,7 +21,26 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 )
+
+func TestAddWithOptionsRejectsCriticalDiskSpace(t *testing.T) {
+	previousCheckDiskSpace := checkDiskSpace
+	checkDiskSpace = func(string) (util.DiskSpaceLevel, string, error) {
+		return util.DiskSpaceCritical, "critical test disk", nil
+	}
+	t.Cleanup(func() { checkDiskSpace = previousCheckDiskSpace })
+
+	root := t.TempDir()
+	m := &Manager{rig: &rig.Rig{Name: "gastown", Path: root}}
+	_, err := m.AddWithOptions("toast", AddOptions{})
+	if !errors.Is(err, ErrDiskSpaceLow) {
+		t.Fatalf("AddWithOptions() error = %v, want %v", err, ErrDiskSpaceLow)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "polecats", "toast")); !os.IsNotExist(statErr) {
+		t.Fatalf("polecat directory should not exist after critical disk guard; stat error = %v", statErr)
+	}
+}
 
 func TestHasSubmittableWorkForWorkstateUsesBranchTargetStatus(t *testing.T) {
 	repo := setupManagerSquashPreservedRepo(t)

@@ -13,7 +13,10 @@ func TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag(t *testing
 		t.Skip("test uses Unix shell script mocks")
 	}
 
-	townRoot := t.TempDir()
+	townRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp town root: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0o755); err != nil {
 		t.Fatalf("mkdir town beads: %v", err)
 	}
@@ -24,10 +27,13 @@ func TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag(t *testing
 	); err != nil {
 		t.Fatalf("write routes.jsonl: %v", err)
 	}
+	expectedBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(expectedBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir routed rig beads: %v", err)
+	}
 
 	binDir := t.TempDir()
 	logPath := filepath.Join(binDir, "bd.log")
-	expectedBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
 	script := `#!/bin/sh
 for arg in "$@"; do
   case "$arg" in

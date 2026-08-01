@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 // writeFakeTmuxWithSession creates a fake tmux binary that reports the Deacon
@@ -53,12 +56,99 @@ if [[ "$cmd" == "has-session" ]]; then
   exit 0
 fi
 
+# WaitForCommand treats shell commands as not ready and retries for minutes.
+if [[ "$cmd" == "display-message" && "$*" == *"pane_current_command"* ]]; then
+  echo "claude"
+  exit 0
+fi
+
 exit 0
 `
 	path := filepath.Join(dir, "tmux")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake tmux: %v", err)
 	}
+}
+
+func assertNoNudgePollerLeak(t *testing.T, townRoot, sessionName string) {
+	t.Helper()
+	pidPath := filepath.Join(townRoot, ".runtime", "nudge_poller", sessionName+".pid")
+	t.Cleanup(func() {
+		data, err := os.ReadFile(pidPath)
+		if os.IsNotExist(err) {
+			return
+		}
+		if err != nil {
+			t.Errorf("read nudge poller pid: %v", err)
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			t.Errorf("parse nudge poller pid: %v", err)
+			return
+		}
+		running, matches := testNudgePollerIdentity(pid, sessionName)
+		if !running {
+			return
+		}
+		if !matches {
+			t.Errorf("refusing to stop pid %d: process identity does not match test nudge poller", pid)
+			return
+		}
+		if err := nudge.StopPoller(townRoot, sessionName); err != nil {
+			t.Errorf("stop nudge poller %d: %v", pid, err)
+			return
+		}
+
+		process, findErr := os.FindProcess(pid)
+		if findErr != nil {
+			return
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			running, matches = testNudgePollerIdentity(pid, sessionName)
+			if !running || !matches {
+				return
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		running, matches = testNudgePollerIdentity(pid, sessionName)
+		if !running || !matches {
+			return
+		}
+		if err := process.Kill(); err != nil {
+			t.Errorf("kill nudge poller %d: %v", pid, err)
+			return
+		}
+		deadline = time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			running, matches = testNudgePollerIdentity(pid, sessionName)
+			if !running || !matches {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		running, matches = testNudgePollerIdentity(pid, sessionName)
+		if running && matches {
+			t.Errorf("nudge poller %d still running after forced cleanup", pid)
+		}
+	})
+}
+
+func testNudgePollerIdentity(pid int, sessionName string) (running, matches bool) {
+	out, err := exec.Command("ps", "-ww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return false, false
+	}
+	argv := strings.Fields(string(out))
+	matches = len(argv) == 3 &&
+		filepath.Base(argv[0]) == "daemon.test" &&
+		argv[1] == "nudge-poller" &&
+		argv[2] == sessionName
+	return true, matches
 }
 
 // TestCheckDeaconHeartbeat_IdleGuard verifies that the nudge is suppressed when
@@ -135,6 +225,7 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			townRoot := t.TempDir()
+			assertNoNudgePollerLeak(t, townRoot, "hq-deacon")
 			fakeBinDir := t.TempDir()
 			tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
 			if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {

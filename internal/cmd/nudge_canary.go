@@ -57,7 +57,15 @@ type wakeCanarySandbox struct {
 	tmux             *tmux.Tmux
 }
 
-func newWakeCanarySandbox(parent string) (*wakeCanarySandbox, error) {
+type wakeCanaryIdleWaiter interface {
+	WaitForIdle(session string, timeout time.Duration) error
+}
+
+func waitForWakeCanaryIdle(waiter wakeCanaryIdleWaiter, sessionName string) error {
+	return waiter.WaitForIdle(sessionName, constants.ClaudeStartTimeout)
+}
+
+func newWakeCanarySandbox(parent, gtBin string) (*wakeCanarySandbox, error) {
 	townRoot, err := os.MkdirTemp(parent, "gt-wake-canary-")
 	if err != nil {
 		return nil, err
@@ -86,7 +94,7 @@ func newWakeCanarySandbox(parent string) (*wakeCanarySandbox, error) {
 		cleanup()
 		return nil, fmt.Errorf("initializing isolated Dolt database: %w", err)
 	}
-	if err := hooks.InstallForRole("codex", townRoot, townRoot, "mayor", ".codex", "hooks.json", false); err != nil {
+	if err := hooks.InstallForRoleWithGTBinary("codex", townRoot, townRoot, "mayor", ".codex", "hooks.json", false, gtBin); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("installing temporary Codex hooks: %w", err)
 	}
@@ -166,7 +174,11 @@ var nudgeCanaryCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		sandbox, err := newWakeCanarySandbox("")
+		gtBin, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolving gt executable for canary hooks: %w", err)
+		}
+		sandbox, err := newWakeCanarySandbox("", gtBin)
 		if err != nil {
 			return err
 		}
@@ -215,6 +227,9 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 	}
 	if state.InstalledBinaryCommit == "" {
 		return fail("binary-commit-unknown", fmt.Errorf("wake canary requires an installed binary commit"))
+	}
+	if err := waitForWakeCanaryIdle(t, sessionName); err != nil {
+		return fail("session-not-idle", fmt.Errorf("waiting for isolated Mayor steady-state idle: %w", err))
 	}
 	releaseLease, err := t.AcquireNudgeLease(runtimeTownRoot, sessionName)
 	if err != nil {

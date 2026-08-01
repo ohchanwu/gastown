@@ -52,6 +52,8 @@ const (
 	staleClaimThreshold = 5 * time.Minute
 )
 
+var readQueueRecord = os.ReadFile
+
 // nudgeConfig loads nudge-specific thresholds from town settings.
 func nudgeConfig(townRoot string) *config.NudgeThresholds {
 	return config.LoadOperationalConfig(townRoot).GetNudgeConfig()
@@ -454,6 +456,39 @@ func Pending(townRoot, session string) (int, error) {
 	}
 
 	return count, nil
+}
+
+// ListQueued returns a read-only snapshot of queued and in-flight deliveries.
+func ListQueued(townRoot, session string) ([]QueuedNudge, error) {
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading nudge queue: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	queued := make([]QueuedNudge, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".json") && !strings.Contains(entry.Name(), ".json.claimed.")) {
+			continue
+		}
+		data, err := readQueueRecord(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, errors.New("reading nudge queue record failed")
+		}
+		var n QueuedNudge
+		if err := json.Unmarshal(data, &n); err != nil {
+			return nil, errors.New("malformed nudge queue record preserved")
+		}
+		queued = append(queued, n)
+	}
+	return queued, nil
 }
 
 // QueueLen returns the number of pending nudges for a session without draining.
