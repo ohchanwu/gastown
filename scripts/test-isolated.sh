@@ -24,6 +24,12 @@ cleanup() {
 		else
 			echo "test-isolation: cleanup: launcher Dolt identity changed or could not be stopped" >&2
 			cleanup_failed=true
+			if [[ -n "$launcher_custody" ]] && "$guard" stop-custody "$server_pid" "$$" "$launcher_custody"; then
+				wait "$server_pid" 2>/dev/null || true
+				server_pid=""
+			else
+				echo "test-isolation: cleanup: direct-child custody fallback failed" >&2
+			fi
 		fi
 	elif [[ -n "$launcher_custody" ]]; then
 		if "$guard" stop-custody "$server_pid" "$$" "$launcher_custody"; then

@@ -50,6 +50,7 @@ case "${1:-}" in
       ;;
     stop)
       [[ "${5:-}" == fake-launcher-identity ]] || exit 6
+      [[ -z "${FAKE_GUARD_STOP_EXIT:-}" ]] || exit "$FAKE_GUARD_STOP_EXIT"
       kill "${2:?launcher PID required}"
       ;;
     snapshot)
@@ -298,6 +299,21 @@ if [[ "$status" -eq 78 && -z "$remaining_run_dir" ]] && \
   pass "stops a launcher when listener identity capture fails"
 else
   fail "stops a launcher when listener identity capture fails"
+fi
+
+fallback_pid_file="$TMPDIR/custody-fallback.pid"
+status=0
+output="$(PATH="$TMPDIR/bin:$PATH" CAPTURE="$CAPTURE" \
+  FAKE_DOLT_PID_FILE="$fallback_pid_file" FAKE_GUARD_STOP_EXIT=7 \
+  GT_TEST_DOLT_PORT=44001 bash "$LAUNCHER" 2>&1)" || status=$?
+LAUNCHER_DOLT_PID="$(cat "$fallback_pid_file")"
+remaining_run_dir="$(find "$TMPDIR" -maxdepth 1 -type d -name 'gastown-test-dolt.*' -print -quit)"
+if [[ "$status" -eq 1 && -z "$remaining_run_dir" ]] && \
+      ! kill -0 "$LAUNCHER_DOLT_PID" 2>/dev/null; then
+  LAUNCHER_DOLT_PID=""
+  pass "falls back to direct-child custody when identity stop fails"
+else
+  fail "falls back to direct-child custody when identity stop fails"
 fi
 
 rm -f "$guard_capture" "$fake_leak"
