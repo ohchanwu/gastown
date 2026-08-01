@@ -378,6 +378,46 @@ func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
 	}
 }
 
+func TestWakeCanarySessionConfigIgnoresCallerRigSettings(t *testing.T) {
+	callerDir := t.TempDir()
+	callerSettings := config.NewRigSettings()
+	callerSettings.Agents = map[string]*config.RuntimeConfig{
+		"codex": {Provider: "codex", Command: "caller-codex-wrapper", Args: []string{"--caller"}},
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(callerDir), callerSettings); err != nil {
+		t.Fatalf("save caller rig settings: %v", err)
+	}
+	t.Chdir(callerDir)
+
+	townRoot := t.TempDir()
+	workDir := filepath.Join(townRoot, "mayor", "rig")
+	if err := os.MkdirAll(workDir, 0700); err != nil {
+		t.Fatalf("create isolated workdir: %v", err)
+	}
+	sandbox := &wakeCanarySandbox{
+		TownRoot: townRoot, WorkDir: workDir, RuntimeConfigDir: filepath.Join(townRoot, ".codex"),
+		Session: session.MayorSessionName(),
+	}
+	cfg, err := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
+	if err != nil {
+		t.Fatalf("build canary session config: %v", err)
+	}
+
+	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(cfg.TownRoot, cfg.RigPath, cfg.AgentOverride)
+	if err != nil {
+		t.Fatalf("resolve StartSession runtime: %v", err)
+	}
+	if got := runtimeConfig.Command; got != "codex" {
+		t.Fatalf("StartSession runtime command = %q, want isolated codex", got)
+	}
+	if cfg.RigPath != sandbox.WorkDir {
+		t.Fatalf("canary rig path = %q, want sandbox workdir %q", cfg.RigPath, sandbox.WorkDir)
+	}
+	if strings.Contains(cfg.Command, "caller-codex-wrapper") {
+		t.Fatalf("canary command inherited caller wrapper: %q", cfg.Command)
+	}
+}
+
 func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	townRoot := t.TempDir()
 	state := wakeCanaryState{

@@ -238,7 +238,7 @@ var nudgeCanaryCmd = &cobra.Command{
 func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction string) (session.SessionConfig, error) {
 	cfg := session.SessionConfig{
 		SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
-		TownRoot: sandbox.TownRoot, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
+		TownRoot: sandbox.TownRoot, RigPath: sandbox.WorkDir, AgentOverride: "codex", RuntimeConfigDir: sandbox.RuntimeConfigDir,
 		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 		Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
@@ -246,7 +246,7 @@ func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction stri
 		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}
 	const launchOverride = "codex --dangerously-bypass-hook-trust"
-	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(sandbox.TownRoot, "", launchOverride)
+	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(sandbox.TownRoot, cfg.RigPath, launchOverride)
 	if err != nil {
 		return session.SessionConfig{}, fmt.Errorf("building isolated Codex Mayor command: %w", err)
 	}
