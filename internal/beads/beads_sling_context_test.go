@@ -1,10 +1,47 @@
 package beads
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
+
+func TestListOpenSlingContextsContextCancelsBD(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	ResetBdAllowStaleCacheForTest()
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ] && [ "$2" = "version" ]; then printf 'supported\n'; exit 0; fi
+while [ "${1#--}" != "$1" ]; do shift; done
+case "$1" in
+  query) exec sleep 2 ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := New(t.TempDir()).ListOpenSlingContextsContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 750*time.Millisecond {
+		t.Fatalf("canceled list returned after %s, want under 750ms", elapsed.Round(time.Millisecond))
+	}
+}
 
 func TestFormatParseSlingContextRoundTrip(t *testing.T) {
 	original := &capacity.SlingContextFields{

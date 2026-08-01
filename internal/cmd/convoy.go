@@ -1853,29 +1853,45 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	return findStrandedConvoysContext(context.Background(), townBeads)
 }
 
-func findStrandedConvoysContext(_ context.Context, townBeads string) ([]strandedConvoyInfo, error) {
+func findStrandedConvoysContext(ctx context.Context, townBeads string) ([]strandedConvoyInfo, error) {
 	stranded := []strandedConvoyInfo{} // Initialize as empty slice for proper JSON encoding
 
-	convoys, err := listConvoyIssues(townBeads, "open", false)
+	convoys, err := listConvoyIssuesContext(ctx, townBeads, "open", false)
 	if err != nil {
-		return nil, fmt.Errorf("listing convoys: %w", err)
+		return nil, convoyStrandedScanError(ctx)
+	}
+	cache := newConvoyIssueDetailsCacheContext(getIssueDetailsBatchContext)
+	results, timedOut := lookupConvoysBounded(ctx, convoys, func(ctx context.Context, convoy convoyListIssue) ([]trackedIssueInfo, error) {
+		return getTrackedIssuesCached(ctx, townBeads, convoy.ID, cache)
+	})
+	if timedOut {
+		return nil, convoyStrandedScanError(ctx)
 	}
 
-	// Check each convoy for stranded state
-	for _, convoy := range convoys {
+	var trackedIDs []string
+	for _, result := range results {
+		if !result.done || result.err != nil {
+			return nil, convoyStrandedScanError(ctx)
+		}
+		for _, tracked := range result.tracked {
+			trackedIDs = append(trackedIDs, tracked.ID)
+		}
+	}
+	scheduledSet, err := areScheduledContext(ctx, trackedIDs)
+	if err != nil {
+		return nil, convoyStrandedScanError(ctx)
+	}
+
+	// Results retain input order, so normal and JSON output stay deterministic.
+	for _, result := range results {
+		convoy := result.convoy
+		tracked := result.tracked
 		// Extract base_branch from convoy description fields
 		var baseBranch string
 		if cf := beads.ParseConvoyFields(&beads.Issue{Description: convoy.Description}); cf != nil {
 			baseBranch = cf.BaseBranch
 		}
 
-		tracked, err := getTrackedIssues(townBeads, convoy.ID)
-		if err != nil {
-			// Write to stderr explicitly — stdout may be consumed as JSON
-			// by the daemon's JSON parser (fixes #2142).
-			fmt.Fprintf(os.Stderr, "⚠ Warning: skipping convoy %s: %v\n", convoy.ID, err)
-			continue
-		}
 		// Empty convoys (0 tracked issues) are stranded — they need
 		// attention (auto-close via convoy check or manual cleanup).
 		if len(tracked) == 0 {
@@ -1895,13 +1911,6 @@ func findStrandedConvoysContext(_ context.Context, townBeads string) ([]stranded
 		// Town-level beads (hq- prefix with path=".") are excluded because
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
 		// Non-slingable types (epics, convoys, etc.) are also excluded.
-
-		// Batch-check scheduling status for all tracked issues (single DB query).
-		var trackedIDs []string
-		for _, t := range tracked {
-			trackedIDs = append(trackedIDs, t.ID)
-		}
-		scheduledSet := areScheduled(trackedIDs)
 
 		var readyIssues []string
 		for _, t := range tracked {
@@ -1942,6 +1951,13 @@ func findStrandedConvoysContext(_ context.Context, townBeads string) ([]stranded
 	}
 
 	return stranded, nil
+}
+
+func convoyStrandedScanError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("convoy stranded scan incomplete: %w", err)
+	}
+	return errors.New("convoy stranded scan incomplete")
 }
 
 // isReadyIssue checks if an issue is ready for dispatch (stranded).

@@ -1068,16 +1068,29 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	return b.ListContext(context.Background(), opts)
+}
+
+// ListContext returns issues matching opts and cancels any bd subprocess when
+// ctx is done.
+func (b *Beads) ListContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.store != nil {
 		return b.storeList(opts)
 	}
 	if opts.Ephemeral {
-		return b.listEphemeral(opts)
+		return b.listEphemeralContext(ctx, opts)
 	}
-	return b.listIssues(opts)
+	return b.listIssuesContext(ctx, opts)
 }
 
 func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
+	return b.listIssuesContext(context.Background(), opts)
+}
+
+func (b *Beads) listIssuesContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -1109,7 +1122,7 @@ func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 		args = append(args, "--limit=0")
 	}
 
-	out, err := b.run(args...)
+	out, err := b.runContext(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1188,6 +1201,10 @@ func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
 // not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
 // beads) live in a separate table since beads v0.59.
 func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
+	return b.listEphemeralContext(context.Background(), opts)
+}
+
+func (b *Beads) listEphemeralContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
 	// Build query expression: ephemeral=true AND <filters>
 	clauses := []string{"ephemeral=true"}
 
@@ -1222,7 +1239,7 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 		args = append(args, "--limit=0")
 	}
 
-	out, err := b.run(args...)
+	out, err := b.runContext(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
