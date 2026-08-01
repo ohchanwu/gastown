@@ -255,6 +255,12 @@ Skip until next version`,
 			wantName:    "workspace trust prompt",
 		},
 		{
+			name:        "codex hook chooser selection",
+			content:     "Hooks need review\n› 1. Review hooks\n  2. Trust all and continue",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
 			name:        "accepted hook trust before codex turn",
 			content:     "Hooks need review\n2. Trust all and continue\n• Working (esc to interrupt)",
 			wantBlocked: false,

@@ -2333,8 +2333,12 @@ func lastPromptIndicatorLine(content string) int {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "› ") {
-			last = i
-			continue
+			rest := strings.TrimPrefix(trimmed, "› ")
+			dot := strings.IndexByte(rest, '.')
+			if dot <= 0 || strings.Trim(rest[:dot], "0123456789") != "" {
+				last = i
+				continue
+			}
 		}
 		for _, suffix := range promptSuffixes {
 			if strings.HasSuffix(trimmed, suffix) {
