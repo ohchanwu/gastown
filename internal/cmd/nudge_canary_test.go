@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,21 @@ type wakeCanaryIdleWaiterStub struct {
 	session string
 	timeout time.Duration
 	err     error
+}
+
+func buildWakeCanaryCandidateGT(t *testing.T) string {
+	t.Helper()
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(t.TempDir(), "gt")
+	cmd := exec.Command("go", "build", "-o", candidate, "./cmd/gt")
+	cmd.Dir = repoRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build candidate gt: %v: %s", err, output)
+	}
+	return candidate
 }
 
 func (s *wakeCanaryIdleWaiterStub) WaitForIdle(session string, timeout time.Duration) error {
@@ -155,7 +171,8 @@ func TestIsolatedCanaryEnvStripsLiveRouting(t *testing.T) {
 
 func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	parent := t.TempDir()
-	sandbox, err := newWakeCanarySandbox(parent)
+	candidateGT := filepath.Join(parent, "candidate", "gt")
+	sandbox, err := newWakeCanarySandbox(parent, candidateGT)
 	if err != nil {
 		t.Fatalf("newWakeCanarySandbox: %v", err)
 	}
@@ -175,6 +192,27 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	}
 	if !strings.Contains(string(hooksData), "UserPromptSubmit") || !strings.Contains(string(hooksData), "mail check --inject") {
 		t.Fatalf("temporary Codex hooks lack receipt dispatcher: %s", hooksData)
+	}
+	var installed struct {
+		Hooks struct {
+			SessionStart []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"SessionStart"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(hooksData, &installed); err != nil {
+		t.Fatalf("parse temporary Codex hooks: %v", err)
+	}
+	if len(installed.Hooks.SessionStart) != 1 || len(installed.Hooks.SessionStart[0].Hooks) != 1 {
+		t.Fatal("temporary Codex hooks lack one SessionStart command")
+	}
+	if got, want := installed.Hooks.SessionStart[0].Hooks[0].Command, candidateGT+" prime --hook"; got != want {
+		t.Fatalf("SessionStart command = %q, want exact candidate command %q", got, want)
+	}
+	if strings.Contains(string(hooksData), "cmd.test") {
+		t.Fatal("temporary Codex hooks resolve to the Go test binary")
 	}
 	if sandbox.Socket == "" || sandbox.Socket == "gastown" {
 		t.Fatalf("canary socket is not isolated: %q", sandbox.Socket)

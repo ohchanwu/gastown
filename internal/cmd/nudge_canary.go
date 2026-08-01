@@ -65,7 +65,7 @@ func waitForWakeCanaryIdle(waiter wakeCanaryIdleWaiter, sessionName string) erro
 	return waiter.WaitForIdle(sessionName, constants.ClaudeStartTimeout)
 }
 
-func newWakeCanarySandbox(parent string) (*wakeCanarySandbox, error) {
+func newWakeCanarySandbox(parent, gtBin string) (*wakeCanarySandbox, error) {
 	townRoot, err := os.MkdirTemp(parent, "gt-wake-canary-")
 	if err != nil {
 		return nil, err
@@ -94,7 +94,7 @@ func newWakeCanarySandbox(parent string) (*wakeCanarySandbox, error) {
 		cleanup()
 		return nil, fmt.Errorf("initializing isolated Dolt database: %w", err)
 	}
-	if err := hooks.InstallForRole("codex", townRoot, townRoot, "mayor", ".codex", "hooks.json", false); err != nil {
+	if err := hooks.InstallForRoleWithGTBinary("codex", townRoot, townRoot, "mayor", ".codex", "hooks.json", false, gtBin); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("installing temporary Codex hooks: %w", err)
 	}
@@ -174,7 +174,11 @@ var nudgeCanaryCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		sandbox, err := newWakeCanarySandbox("")
+		gtBin, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolving gt executable for canary hooks: %w", err)
+		}
+		sandbox, err := newWakeCanarySandbox("", gtBin)
 		if err != nil {
 			return err
 		}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
@@ -38,7 +39,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 		t.Fatal("GT_IDLE_PANE_EVIDENCE must be an absolute path")
 	}
 
-	sandbox, err := newWakeCanarySandbox("")
+	sandbox, err := newWakeCanarySandbox("", buildWakeCanaryCandidateGT(t))
 	if err != nil {
 		t.Fatalf("newWakeCanarySandbox: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 	}
 	ticker := time.NewTicker(200 * time.Millisecond)
 	t.Cleanup(ticker.Stop)
-	timeout := time.NewTimer(180 * time.Second)
+	timeout := time.NewTimer(constants.ClaudeStartTimeout + 30*time.Second)
 	t.Cleanup(func() { timeout.Stop() })
 	stable := 0
 	var lastCapture []byte

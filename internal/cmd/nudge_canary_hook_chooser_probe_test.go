@@ -23,7 +23,7 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		t.Fatal("GT_HOOK_CHOOSER_EVIDENCE must be an absolute path")
 	}
 
-	sandbox, err := newWakeCanarySandbox("")
+	sandbox, err := newWakeCanarySandbox("", buildWakeCanaryCandidateGT(t))
 	if err != nil {
 		t.Fatalf("newWakeCanarySandbox: %v", err)
 	}
