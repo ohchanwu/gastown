@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -81,12 +81,24 @@ func TestRunWakeCanaryPersistsSessionNotIdleBeforeLease(t *testing.T) {
 	Commit = "test-commit"
 	t.Cleanup(func() { Commit = previousCommit })
 
-	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-wake-canary-idle-%d", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = tm.KillServer() })
-
+	socket := "gt-wake-canary-" + nudge.NewDeliveryID()
+	tm := tmux.NewTmuxWithSocket(socket)
+	socketPath := filepath.Join(tmux.SocketDir(), socket)
 	runtimeTownRoot := t.TempDir()
-	evidenceRoot := t.TempDir()
 	sessionName := session.MayorSessionName()
+	t.Cleanup(func() {
+		if _, err := os.Lstat(socketPath); !os.IsNotExist(err) {
+			t.Errorf("test tmux socket still exists after cleanup: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		sandbox := &wakeCanarySandbox{TownRoot: runtimeTownRoot, Socket: socket, Session: sessionName, tmux: tm}
+		if err := sandbox.Cleanup(); err != nil {
+			t.Errorf("cleanup test wake canary sandbox: %v", err)
+		}
+	})
+
+	evidenceRoot := t.TempDir()
 	if err := tm.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
 		t.Fatalf("NewSessionWithCommand: %v", err)
 	}
