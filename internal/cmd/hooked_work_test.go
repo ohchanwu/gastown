@@ -129,7 +129,10 @@ func TestDedupeBeadsPreserveOrderKeepsFirstStatusSnapshot(t *testing.T) {
 	inProgressDuplicate := &beads.Issue{ID: "gt-current", Status: "in_progress"}
 	other := &beads.Issue{ID: "gt-other", Status: "in_progress"}
 
-	got := dedupeBeadsPreserveOrder([]*beads.Issue{hooked, inProgressDuplicate, other})
+	got, err := dedupeBeadsPreserveOrder([]*beads.Issue{hooked, inProgressDuplicate, other})
+	if err != nil {
+		t.Fatalf("dedupeBeadsPreserveOrder error: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("dedupeBeadsPreserveOrder length = %d, want 2", len(got))
 	}
@@ -138,5 +141,15 @@ func TestDedupeBeadsPreserveOrderKeepsFirstStatusSnapshot(t *testing.T) {
 	}
 	if got[1] != other {
 		t.Fatalf("second bead = %#v, want %#v", got[1], other)
+	}
+}
+
+func TestDedupeBeadsPreserveOrderRejectsConflictingTitle(t *testing.T) {
+	_, err := dedupeBeadsPreserveOrder([]*beads.Issue{
+		{ID: "gt-current", Status: beads.StatusHooked, Title: "first title"},
+		{ID: "gt-current", Status: "in_progress", Title: "other title"},
+	})
+	if err == nil || err.Error() != "conflicting duplicate active work title" {
+		t.Fatalf("dedupeBeadsPreserveOrder error = %v, want sanitized title conflict", err)
 	}
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -68,23 +69,44 @@ func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*b
 		}
 		assigned = append(assigned, beadsForStatus...)
 	}
-	return dedupeBeadsPreserveOrder(assigned), nil
+	return dedupeBeadsPreserveOrder(assigned)
 }
 
-func dedupeBeadsPreserveOrder(issues []*beads.Issue) []*beads.Issue {
+func dedupeBeadsPreserveOrder(issues []*beads.Issue) ([]*beads.Issue, error) {
 	deduped := make([]*beads.Issue, 0, len(issues))
-	seen := make(map[string]struct{}, len(issues))
+	seen := make(map[string]int, len(issues))
 	for _, issue := range issues {
 		if issue == nil || issue.ID == "" {
 			continue
 		}
-		if _, ok := seen[issue.ID]; ok {
+		if index, ok := seen[issue.ID]; ok {
+			kept := deduped[index]
+			keptTitle := strings.TrimSpace(kept.Title)
+			duplicateTitle := strings.TrimSpace(issue.Title)
+			if keptTitle != "" && duplicateTitle != "" && keptTitle != duplicateTitle {
+				return nil, errors.New("conflicting duplicate active work title")
+			}
+			keptAssignee := strings.TrimSpace(kept.Assignee)
+			duplicateAssignee := strings.TrimSpace(issue.Assignee)
+			if keptAssignee != "" && duplicateAssignee != "" && keptAssignee != duplicateAssignee {
+				return nil, errors.New("conflicting duplicate active work assignee")
+			}
+			if keptTitle == "" && duplicateTitle != "" || keptAssignee == "" && duplicateAssignee != "" {
+				reconciled := *kept
+				if keptTitle == "" {
+					reconciled.Title = issue.Title
+				}
+				if keptAssignee == "" {
+					reconciled.Assignee = issue.Assignee
+				}
+				deduped[index] = &reconciled
+			}
 			continue
 		}
-		seen[issue.ID] = struct{}{}
+		seen[issue.ID] = len(deduped)
 		deduped = append(deduped, issue)
 	}
-	return deduped
+	return deduped, nil
 }
 
 func listChildrenAcrossTables(b *beads.Beads, parentID string) ([]*beads.Issue, error) {

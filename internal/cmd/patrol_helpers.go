@@ -36,6 +36,10 @@ type PatrolConfig struct {
 // Remaining stale beads are cleaned by burnPreviousPatrolWisps at cycle end.
 const maxStalePurgePerRun = 5
 
+// Allow one active candidate after the maximum stale cleanup batch. Additional
+// candidates are deferred to a later call so child discovery stays bounded.
+const maxPatrolDiscoveryScans = maxStalePurgePerRun + 1
+
 // findActivePatrol finds an active patrol molecule for the role.
 // Returns the patrol ID, display line, and whether one was found.
 // Returns an error if discovery fails (e.g. transient bd failure),
@@ -67,11 +71,18 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 	var activeBead *beads.Issue
 	var staleIDs []string
 	var skipped int // tracks patrols skipped due to child-listing errors
+	var scanned int
+	var scanLimited bool
 
 	for _, bead := range hookedBeads {
 		if !strings.HasPrefix(bead.Title, cfg.PatrolMolName) {
 			continue
 		}
+		if scanned == maxPatrolDiscoveryScans {
+			scanLimited = true
+			break
+		}
+		scanned++
 
 		hasOpen, err := checkHasOpenChildren(b, bead.ID)
 		if err != nil {
@@ -107,6 +118,9 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 
 	if activeBead != nil {
 		return activeBead.ID, formatBeadLine(activeBead), true, nil
+	}
+	if scanLimited {
+		return "", "", false, fmt.Errorf("discovery incomplete: patrol scan limit reached after %d candidates", maxPatrolDiscoveryScans)
 	}
 
 	// If we found matching patrols but skipped them all due to errors,
