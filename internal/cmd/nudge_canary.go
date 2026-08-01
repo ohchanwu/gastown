@@ -61,8 +61,35 @@ type wakeCanaryIdleWaiter interface {
 	WaitForIdle(session string, timeout time.Duration) error
 }
 
+type wakeCanaryTurnWaiter interface {
+	wakeCanaryIdleWaiter
+	WaitForResponse(sessionName, baseline, response string, timeout time.Duration) error
+}
+
+type tmuxWakeCanaryTurnWaiter struct {
+	tmux *tmux.Tmux
+}
+
+func (w tmuxWakeCanaryTurnWaiter) WaitForIdle(session string, timeout time.Duration) error {
+	return w.tmux.WaitForIdle(session, timeout)
+}
+
+func (w tmuxWakeCanaryTurnWaiter) WaitForResponse(sessionName, baseline, response string, timeout time.Duration) error {
+	return waitForCanaryResponse(w.tmux, sessionName, baseline, response, timeout)
+}
+
 func waitForWakeCanaryIdle(waiter wakeCanaryIdleWaiter, sessionName string) error {
 	return waiter.WaitForIdle(sessionName, constants.ClaudeStartTimeout)
+}
+
+func confirmWakeCanaryTurn(waiter wakeCanaryTurnWaiter, sessionName, baseline, response string) (string, error) {
+	if err := waiter.WaitForResponse(sessionName, baseline, response, 30*time.Second); err != nil {
+		return "model-turn-unconfirmed", err
+	}
+	if err := waitForWakeCanaryIdle(waiter, sessionName); err != nil {
+		return "model-turn-not-idle", fmt.Errorf("waiting for completed model turn steady-state idle: %w", err)
+	}
+	return "", nil
 }
 
 func newWakeCanarySandbox(parent, gtBin string) (*wakeCanarySandbox, error) {
@@ -285,9 +312,9 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 			result.Failed++
 			return fail("notification-failed", errors.New("Mayor notification wake failed"))
 		}
-		if err := waitForCanaryResponse(t, sessionName, before, response, 30*time.Second); err != nil {
+		if failureCode, err := confirmWakeCanaryTurn(tmuxWakeCanaryTurnWaiter{tmux: t}, sessionName, before, response); err != nil {
 			result.Failed++
-			return fail("model-turn-unconfirmed", err)
+			return fail(failureCode, err)
 		}
 		attached, attachmentErr = t.ClientAttachmentObserved(sessionName)
 		if attachmentErr != nil {

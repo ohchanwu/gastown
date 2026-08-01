@@ -22,6 +22,26 @@ type wakeCanaryIdleWaiterStub struct {
 	err     error
 }
 
+type wakeCanaryTurnWaiterStub struct {
+	events          []string
+	responseTimeout time.Duration
+	idleTimeout     time.Duration
+	responseErr     error
+	idleErr         error
+}
+
+func (s *wakeCanaryTurnWaiterStub) WaitForResponse(_, _, _ string, timeout time.Duration) error {
+	s.events = append(s.events, "response")
+	s.responseTimeout = timeout
+	return s.responseErr
+}
+
+func (s *wakeCanaryTurnWaiterStub) WaitForIdle(_ string, timeout time.Duration) error {
+	s.events = append(s.events, "idle")
+	s.idleTimeout = timeout
+	return s.idleErr
+}
+
 func buildWakeCanaryCandidateGT(t *testing.T) string {
 	t.Helper()
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
@@ -60,6 +80,48 @@ func TestWaitForWakeCanaryIdleUsesStartupTurnBound(t *testing.T) {
 	}
 	if waiter.timeout != constants.ClaudeStartTimeout {
 		t.Fatalf("WaitForIdle timeout = %s, want %s", waiter.timeout, constants.ClaudeStartTimeout)
+	}
+}
+
+func TestConfirmWakeCanaryTurnWaitsForSteadyIdleBeforeNextDelivery(t *testing.T) {
+	waiter := &wakeCanaryTurnWaiterStub{}
+
+	code, err := confirmWakeCanaryTurn(waiter, session.MayorSessionName(), "before", "response")
+	waiter.events = append(waiter.events, "next-delivery")
+
+	if err != nil || code != "" {
+		t.Fatalf("confirmWakeCanaryTurn = (%q, %v), want success", code, err)
+	}
+	if got, want := strings.Join(waiter.events, ","), "response,idle,next-delivery"; got != want {
+		t.Fatalf("turn ordering = %q, want %q", got, want)
+	}
+	if waiter.responseTimeout != 30*time.Second || waiter.idleTimeout != constants.ClaudeStartTimeout {
+		t.Fatalf("turn bounds = response %s idle %s", waiter.responseTimeout, waiter.idleTimeout)
+	}
+}
+
+func TestConfirmWakeCanaryTurnDistinguishesResponseAndIdleFailures(t *testing.T) {
+	responseErr := errors.New("response missing")
+	idleErr := errors.New("turn still active")
+	for _, tt := range []struct {
+		name       string
+		waiter     *wakeCanaryTurnWaiterStub
+		wantCode   string
+		wantErr    error
+		wantEvents string
+	}{
+		{name: "response unconfirmed", waiter: &wakeCanaryTurnWaiterStub{responseErr: responseErr}, wantCode: "model-turn-unconfirmed", wantErr: responseErr, wantEvents: "response"},
+		{name: "response observed but not idle", waiter: &wakeCanaryTurnWaiterStub{idleErr: idleErr}, wantCode: "model-turn-not-idle", wantErr: idleErr, wantEvents: "response,idle"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			code, err := confirmWakeCanaryTurn(tt.waiter, session.MayorSessionName(), "before", "response")
+			if code != tt.wantCode || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("confirmWakeCanaryTurn = (%q, %v), want (%q, %v)", code, err, tt.wantCode, tt.wantErr)
+			}
+			if got := strings.Join(tt.waiter.events, ","); got != tt.wantEvents {
+				t.Fatalf("turn events = %q, want %q", got, tt.wantEvents)
+			}
+		})
 	}
 }
 
