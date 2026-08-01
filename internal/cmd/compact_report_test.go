@@ -463,6 +463,67 @@ func TestFormatWeeklyRollupExplainsZeroDayCoverage(t *testing.T) {
 	}
 }
 
+func TestFindExistingWeeklyRollupSearchesClosedEvents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+
+	binDir := t.TempDir()
+	argsLog := filepath.Join(t.TempDir(), "bd-args.log")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" > "$BD_ARGS_LOG"
+status=false
+title=false
+limit=false
+for arg in "$@"; do
+  case "$arg" in
+    --status=closed) status=true ;;
+    '--title=Weekly Compaction Rollup 2026-07-25 to 2026-08-01') title=true ;;
+    --limit=0) limit=true ;;
+  esac
+done
+if [ "$status" = true ] && [ "$title" = true ] && [ "$limit" = true ]; then
+  printf '[{"id":"hq-near","title":"Weekly Compaction Rollup 2026-07-25 to 2026-08-01 duplicate"},{"id":"hq-week","title":"Weekly Compaction Rollup 2026-07-25 to 2026-08-01"}]\n'
+  exit 0
+fi
+printf '['
+i=1
+while [ "$i" -le 20 ]; do
+  [ "$i" -gt 1 ] && printf ','
+  printf '{"id":"hq-other-%s","title":"Unrelated closed event %s"}' "$i" "$i"
+  i=$((i + 1))
+done
+printf ']\n'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_ARGS_LOG", argsLog)
+
+	got, err := findExistingWeeklyRollup("2026-07-25", "2026-08-01")
+	if err != nil {
+		t.Fatalf("findExistingWeeklyRollup() error = %v", err)
+	}
+	if got != "hq-week" {
+		t.Fatalf("findExistingWeeklyRollup() = %q, want hq-week", got)
+	}
+
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("read bd args: %v", err)
+	}
+	for _, want := range []string{
+		"--status=closed",
+		"--title=Weekly Compaction Rollup 2026-07-25 to 2026-08-01",
+		"--limit=0",
+	} {
+		if !strings.Contains(string(args), want) {
+			t.Fatalf("bd args = %q, want %q", strings.TrimSpace(string(args)), want)
+		}
+	}
+}
+
 func TestNormalizeCompactionAnomalyRemovesUnsupportedHealthClaim(t *testing.T) {
 	got := normalizeCompactionAnomaly("0 patrol wisps (patrol agents may be down)")
 	if strings.Contains(got, "agents may be down") {
