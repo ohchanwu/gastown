@@ -2,8 +2,46 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestResolvePollerPromptDetectionUsesSessionMetadata(t *testing.T) {
+	socket := fmt.Sprintf("gt-test-poller-prompt-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() {
+		socketPath, _ := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
+		_ = transport.KillServer()
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			_ = os.Remove(path)
+		}
+	})
+	sessionName := "gt-test-custom-codex-mayor"
+	if err := transport.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
+		if _, lookupErr := exec.LookPath("tmux"); lookupErr != nil {
+			t.Skip("tmux unavailable")
+		}
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_AGENT", "custom-codex-mayor"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", "› "); err != nil {
+		t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
+	}
+
+	hasPrompt, _ := resolvePollerSessionMetadata(transport, sessionName)
+	if !hasPrompt {
+		t.Fatal("poller ignored resolved session prompt metadata")
+	}
+}
 
 func TestShouldSkipDrainUntilIdle(t *testing.T) {
 	t.Parallel()

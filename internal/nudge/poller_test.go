@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/util"
@@ -148,7 +149,8 @@ func TestBuildPollerCommand_UsesDetachedProcessGroup(t *testing.T) {
 		t.Skip("process group management is not supported on Windows")
 	}
 	townRoot := t.TempDir()
-	cmd := buildPollerCommand("/tmp/fake-gt", townRoot, "gt-gastown-crew-bear")
+	env := []string{"PATH=/usr/bin", "GT_TOWN_SOCKET=private-town"}
+	cmd := buildPollerCommand("/tmp/fake-gt", townRoot, "gt-gastown-crew-bear", env)
 
 	if got, want := cmd.Dir, townRoot; got != want {
 		t.Fatalf("cmd.Dir = %q, want %q", got, want)
@@ -164,6 +166,9 @@ func TestBuildPollerCommand_UsesDetachedProcessGroup(t *testing.T) {
 	}
 	if cmd.Stdout != nil || cmd.Stderr != nil {
 		t.Fatal("buildPollerCommand() should discard stdout/stderr")
+	}
+	if got := strings.Join(cmd.Env, "|"); got != "PATH=/usr/bin|GT_TOWN_SOCKET=private-town" {
+		t.Fatalf("buildPollerCommand() env = %q, want isolated child environment", got)
 	}
 	if cmd.SysProcAttr == nil {
 		t.Fatal("buildPollerCommand() did not configure SysProcAttr")

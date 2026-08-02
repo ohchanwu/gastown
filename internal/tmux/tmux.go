@@ -240,6 +240,25 @@ func NewTmuxWithSocketAndEnv(socket string, env []string) *Tmux {
 // IsIsolated reports whether this client targets a dedicated tmux socket.
 func (t *Tmux) IsIsolated() bool { return t != nil && t.socketName != "" }
 
+// PollerEnvironment returns the environment an external queue poller needs to
+// address the same tmux transport without escaping an isolated caller.
+func (t *Tmux) PollerEnvironment() []string {
+	env := os.Environ()
+	if t.commandEnv != nil {
+		env = t.commandEnv
+	}
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") {
+			result = append(result, entry)
+		}
+	}
+	if t.socketName != "" {
+		result = append(result, "GT_TOWN_SOCKET="+t.socketName)
+	}
+	return result
+}
+
 // NudgeLockAvailable proves no other process or goroutine currently owns the
 // target's nudge lock without retaining the lock after the check.
 func NudgeLockAvailable(townRoot, session string) bool {
@@ -3839,12 +3858,12 @@ const DefaultReadyPromptPrefix = "❯ "
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
 
-	// Require 6 consecutive idle polls to filter out transient states.
+	// Require 2 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
 	// in the pane buffer while Claude Code is still actively working.
-	// Six polls 200ms apart span a full second and confirm genuine idle state.
+	// Two polls 200ms apart (400ms window) confirms genuine idle state.
 	consecutiveIdle := 0
-	const requiredConsecutive = 6
+	const requiredConsecutive = 2
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

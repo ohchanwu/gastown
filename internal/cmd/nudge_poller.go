@@ -73,18 +73,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
-	agentName := ""
-	hasPromptDetection := false
-	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
-		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
-			hasPromptDetection = preset.ReadyPromptPrefix != ""
-			if preset.EscapeCancelsRequest {
-				nudgeOpts.SkipEscape = true
-			}
-		}
-	}
+	hasPromptDetection, nudgeOpts := resolvePollerSessionMetadata(t, sessionName)
 
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -144,6 +133,19 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func resolvePollerSessionMetadata(t *tmux.Tmux, sessionName string) (bool, tmux.NudgeOpts) {
+	var opts tmux.NudgeOpts
+	agentName, _ := t.GetEnvironment(sessionName, "GT_AGENT")
+	preset := config.GetAgentPresetByName(agentName)
+	if preset != nil && preset.EscapeCancelsRequest {
+		opts.SkipEscape = true
+	}
+	if prompt, err := t.GetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX"); err == nil {
+		return prompt != "", opts
+	}
+	return preset != nil && preset.ReadyPromptPrefix != "", opts
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {

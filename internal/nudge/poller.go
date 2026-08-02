@@ -52,6 +52,16 @@ func pollerPidFile(townRoot, session string) string {
 // The process is detached (Setpgid) so it survives the caller's exit.
 // Returns the PID of the launched process, or an error.
 func StartPoller(townRoot, session string) (int, error) {
+	return startPoller(townRoot, session, nil)
+}
+
+// StartPollerWithEnv launches a poller with an explicit child environment.
+// Isolated callers use this to preserve their private tmux/config boundary.
+func StartPollerWithEnv(townRoot, session string, env []string) (int, error) {
+	return startPoller(townRoot, session, env)
+}
+
+func startPoller(townRoot, session string, env []string) (int, error) {
 	pidDir := pollerPidDir(townRoot)
 	if err := os.MkdirAll(pidDir, 0755); err != nil {
 		return 0, fmt.Errorf("creating poller pid dir: %w", err)
@@ -68,7 +78,7 @@ func StartPoller(townRoot, session string) (int, error) {
 		return 0, fmt.Errorf("finding gt binary: %w", err)
 	}
 
-	cmd := buildPollerCommand(gtBin, townRoot, session)
+	cmd := buildPollerCommand(gtBin, townRoot, session, env)
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("starting nudge-poller: %w", err)
@@ -89,9 +99,12 @@ func StartPoller(townRoot, session string) (int, error) {
 	return pid, nil
 }
 
-func buildPollerCommand(gtBin, townRoot, session string) *exec.Cmd {
+func buildPollerCommand(gtBin, townRoot, session string, env []string) *exec.Cmd {
 	cmd := exec.Command(gtBin, "nudge-poller", session)
 	cmd.Dir = townRoot
+	if env != nil {
+		cmd.Env = append([]string(nil), env...)
+	}
 	cmd.Stdout = nil // discard
 	cmd.Stderr = nil // discard
 	util.SetDetachedProcessGroup(cmd)

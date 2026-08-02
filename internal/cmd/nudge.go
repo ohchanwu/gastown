@@ -397,8 +397,8 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) nudgeDeliveryRe
 			return nudgeDeliveryQueued
 		}
 
-		// Use WaitForIdle with a short timeout instead of single-snapshot
-		// IsIdle to get the consecutive-poll guard (2 polls 200ms apart).
+		// Use WaitForIdle instead of single-snapshot IsIdle to get the
+		// consecutive-poll guard.
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
 		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {

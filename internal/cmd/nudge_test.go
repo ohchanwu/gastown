@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -715,6 +716,74 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 		// Good — exited because queue was empty
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchAndDeliver did not exit within 2s for empty queue")
+	}
+}
+
+func TestIdleWatcherDeliversAfterStableIdleProof(t *testing.T) {
+	origTimeout := idleWatcherTimeout
+	idleWatcherTimeout = 4 * time.Second
+	t.Cleanup(func() { idleWatcherTimeout = origTimeout })
+
+	socket := fmt.Sprintf("gt-test-idle-watcher-%d", time.Now().UnixNano())
+	tm := tmux.NewTmuxWithSocket(socket)
+	townRoot := t.TempDir()
+	sessionName := "gt-test-idle-watcher"
+	captured := filepath.Join(townRoot, "submitted.txt")
+	command := fmt.Sprintf(`sh -c 'while true; do printf "\033[2J\033[H› \b"; IFS= read -r line || exit; printf "%%s\n" "$line" >> %q; done'`, captured)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), command, map[string]string{"GT_AGENT": "codex"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	socketPath, err := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
+	if err != nil {
+		t.Fatalf("resolve test socket path: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tm.KillServer()
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			_ = os.Remove(path)
+		}
+	})
+
+	queued := nudge.QueuedNudge{
+		DeliveryID: "ndg-idle-watcher-success",
+		Sender:     "witness",
+		Message:    "watcher delivery",
+		Priority:   nudge.PriorityNormal,
+	}
+	if err := nudge.Enqueue(townRoot, sessionName, queued); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	receiptDone := make(chan error, 1)
+	go func() {
+		want := delivery.ControlMessage(queued.DeliveryID, nudge.FormatForInjection([]nudge.QueuedNudge{queued}))
+		deadline := time.Now().Add(4 * time.Second)
+		for time.Now().Before(deadline) {
+			data, _ := os.ReadFile(captured)
+			if strings.Contains(string(data), want) {
+				matched, err := delivery.RecordPromptSubmitted(townRoot, sessionName, "codex", want, time.Now())
+				if err != nil {
+					receiptDone <- err
+				} else if !matched {
+					receiptDone <- errors.New("watcher delivery did not contain a receipt control message")
+				} else {
+					receiptDone <- nil
+				}
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		receiptDone <- errors.New("watcher delivery was not typed before timeout")
+	}()
+
+	if got := watchAndDeliver(tm, townRoot, sessionName); got != nudgeDeliverySubmitted {
+		t.Fatalf("watchAndDeliver() = %v, want %v", got, nudgeDeliverySubmitted)
+	}
+	if err := <-receiptDone; err != nil {
+		t.Fatal(err)
+	}
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 0 {
+		t.Fatalf("pending after watcher delivery = %d, want 0", pending)
 	}
 }
 

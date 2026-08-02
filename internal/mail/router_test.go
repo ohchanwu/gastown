@@ -1736,81 +1736,6 @@ func createNotifyTestSession(t *testing.T, socket, sessionName, command string) 
 	t.Fatalf("session %q never appeared on socket %q", sessionName, socket)
 }
 
-// TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff reproduces the
-// canary's startup-to-first-notification seam. A transient prompt must not let
-// the canary's idle gate return just before the router observes a busy pane and
-// falls back to its timeout queue.
-func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
-	socket := requireNotifyTestSocket(t)
-	sessionName := "gt-crew-startup-idle-handoff"
-	signals := t.TempDir()
-	beginIdleGap := filepath.Join(signals, "begin-idle-gap")
-	firstIdleReturned := filepath.Join(signals, "first-idle-returned")
-	busyStarted := filepath.Join(signals, "busy-started")
-	command := fmt.Sprintf(`sh -c '
-		while [ ! -e %q ]; do sleep 0.01; done
-		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
-		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-			[ -e %q ] && break
-			sleep 0.05
-		done
-		touch %q
-		printf "\033[2J\033[H• Working (esc to interrupt)\n"
-		sleep 2
-		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
-		cat
-	'`, beginIdleGap, firstIdleReturned, busyStarted)
-	createNotifyTestSession(t, socket, sessionName, command)
-
-	transport := tmux.NewTmuxWithSocket(socket)
-	if err := transport.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
-		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
-	}
-	if err := transport.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", "› "); err != nil {
-		t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
-	}
-	if err := os.WriteFile(beginIdleGap, nil, 0600); err != nil {
-		t.Fatalf("begin transient idle gap: %v", err)
-	}
-	if err := transport.WaitForIdle(sessionName, 5*time.Second); err != nil {
-		t.Fatalf("startup steady-idle gate: %v", err)
-	}
-	if err := os.WriteFile(firstIdleReturned, nil, 0600); err != nil {
-		t.Fatalf("signal first idle return: %v", err)
-	}
-
-	townRoot := t.TempDir()
-	r := &Router{
-		workDir:           t.TempDir(),
-		townRoot:          townRoot,
-		tmux:              transport,
-		IdleNotifyTimeout: 1500 * time.Millisecond,
-	}
-	err := r.notifyRecipient(&Message{
-		From:    "gastown/crew/sender",
-		To:      "gastown/crew/startup-idle-handoff",
-		Subject: "first notification after startup",
-	})
-	if !errors.Is(err, ErrNotificationQueued) {
-		t.Fatalf("notifyRecipient returned %v, want durable queued fallback", err)
-	}
-
-	nudges, err := nudge.Drain(townRoot, sessionName)
-	if err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	if len(nudges) != 1 {
-		t.Fatalf("Drain returned %d immediately deliverable nudges, want 1", len(nudges))
-	}
-	pane, err := transport.CapturePaneAll(sessionName)
-	if err != nil {
-		t.Fatalf("CapturePaneAll: %v", err)
-	}
-	if !strings.Contains(pane, "first notification after startup") {
-		t.Fatal("first notification exhausted the router idle wait instead of attempting direct delivery")
-	}
-}
-
 // TestNotifyRecipient_IdleUnsupportedRuntimeQueues verifies that an idle
 // runtime without a submit verifier retains a durable queued wake.
 func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
@@ -1825,11 +1750,22 @@ func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	townRoot := t.TempDir()
+	pollerStarts := 0
 	r := &Router{
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              tmux.NewTmuxWithSocket(socket),
 		IdleNotifyTimeout: 3 * time.Second,
+		startPoller: func(gotRoot, gotSession string, env []string) (int, error) {
+			pollerStarts++
+			if gotRoot != townRoot || gotSession != sessionName {
+				t.Fatalf("poller target = (%q, %q), want (%q, %q)", gotRoot, gotSession, townRoot, sessionName)
+			}
+			if !strings.Contains(strings.Join(env, "\n"), "GT_TOWN_SOCKET="+socket) {
+				t.Fatalf("poller environment does not target private socket %q", socket)
+			}
+			return 123, nil
+		},
 	}
 
 	msg := &Message{
@@ -1841,6 +1777,9 @@ func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 	err := r.notifyRecipient(msg)
 	if !errors.Is(err, ErrNotificationQueued) {
 		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
+	}
+	if pollerStarts != 1 {
+		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
 	// The unconfirmed notification and deferred reply reminder both persist.
@@ -1869,11 +1808,19 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	createNotifyTestSession(t, socket, sessionName, "sleep 300")
 
 	townRoot := t.TempDir()
+	pollerStarts := 0
 	r := &Router{
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              tmux.NewTmuxWithSocket(socket),
 		IdleNotifyTimeout: 1 * time.Second, // short timeout for test speed
+		startPoller: func(gotRoot, gotSession string, _ []string) (int, error) {
+			pollerStarts++
+			if gotRoot != townRoot || gotSession != sessionName {
+				t.Fatalf("poller target = (%q, %q), want (%q, %q)", gotRoot, gotSession, townRoot, sessionName)
+			}
+			return 123, nil
+		},
 	}
 
 	msg := &Message{
@@ -1885,6 +1832,9 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	err := r.notifyRecipient(msg)
 	if !errors.Is(err, ErrNotificationQueued) {
 		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
+	}
+	if pollerStarts != 1 {
+		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
 	// Two nudges should be queued:
@@ -1914,6 +1864,38 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	remaining, _ := nudge.Pending(townRoot, sessionName)
 	if remaining != 1 {
 		t.Errorf("expected 1 deferred reply-reminder still in queue, got %d", remaining)
+	}
+}
+
+func TestNotifyRecipient_QueuedRetryStarterFailureIsVisible(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "hq-mayor"
+	createNotifyTestSession(t, socket, sessionName, "sleep 300")
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              tmux.NewTmuxWithSocket(socket),
+		IdleNotifyTimeout: 10 * time.Millisecond,
+		startPoller: func(_, _ string, _ []string) (int, error) {
+			return 0, errors.New("poller unavailable")
+		},
+	}
+
+	err := r.notifyRecipient(&Message{
+		From: "gastown/crew/sender", To: "mayor/",
+		Subject: "urgent retry ownership", Priority: PriorityHigh,
+	})
+	if !errors.Is(err, ErrNotificationQueued) || !errors.Is(err, ErrNotificationFailed) {
+		t.Fatalf("notifyRecipient error = %v, want queued and failed retry ownership", err)
+	}
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 2 {
+		t.Fatalf("durable notification + reminder count = %d, want 2", pending)
+	}
+	nudges, drainErr := nudge.Drain(townRoot, sessionName)
+	if drainErr != nil || len(nudges) != 1 || nudges[0].Priority != nudge.PriorityUrgent || !nudges[0].DurableUntilAck {
+		t.Fatalf("urgent Mayor retry record = (%+v, %v), want one durable urgent item", nudges, drainErr)
 	}
 }
 
