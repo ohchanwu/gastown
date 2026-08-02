@@ -3850,12 +3850,12 @@ const DefaultReadyPromptPrefix = "❯ "
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
 
-	// Require 2 consecutive idle polls to filter out transient states.
+	// Require 6 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
 	// in the pane buffer while Claude Code is still actively working.
-	// Two polls 200ms apart (400ms window) confirms genuine idle state.
+	// Six polls 200ms apart span a full second and confirm genuine idle state.
 	consecutiveIdle := 0
-	const requiredConsecutive = 2
+	const requiredConsecutive = 6
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

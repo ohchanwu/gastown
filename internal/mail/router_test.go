@@ -1708,7 +1708,11 @@ func requireNotifyTestSocket(t *testing.T) string {
 	// Pre-kill any stale server on this socket (e.g., from a crashed prior run).
 	_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
 	t.Cleanup(func() {
+		socketPath, _ := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
 		_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			_ = os.Remove(path)
+		}
 	})
 	return socket
 }
@@ -1739,19 +1743,40 @@ func createNotifyTestSession(t *testing.T, socket, sessionName, command string) 
 func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 	socket := requireNotifyTestSocket(t)
 	sessionName := "gt-crew-startup-idle-handoff"
-	createNotifyTestSession(t, socket, sessionName, `sh -c '
-		sleep 0.5
-		printf "\033[2J\033[H❯ \n"
-		sleep 0.35
+	signals := t.TempDir()
+	beginIdleGap := filepath.Join(signals, "begin-idle-gap")
+	firstIdleReturned := filepath.Join(signals, "first-idle-returned")
+	busyStarted := filepath.Join(signals, "busy-started")
+	command := fmt.Sprintf(`sh -c '
+		while [ ! -e %q ]; do sleep 0.01; done
+		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
+		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+			[ -e %q ] && break
+			sleep 0.05
+		done
+		touch %q
 		printf "\033[2J\033[H• Working (esc to interrupt)\n"
-		sleep 0.9
-		printf "\033[2J\033[H❯ \n"
+		sleep 2
+		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
 		cat
-	'`)
+	'`, beginIdleGap, firstIdleReturned, busyStarted)
+	createNotifyTestSession(t, socket, sessionName, command)
 
 	transport := tmux.NewTmuxWithSocket(socket)
-	if err := transport.WaitForIdle(sessionName, 3*time.Second); err != nil {
+	if err := transport.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", "› "); err != nil {
+		t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
+	}
+	if err := os.WriteFile(beginIdleGap, nil, 0600); err != nil {
+		t.Fatalf("begin transient idle gap: %v", err)
+	}
+	if err := transport.WaitForIdle(sessionName, 5*time.Second); err != nil {
 		t.Fatalf("startup steady-idle gate: %v", err)
+	}
+	if err := os.WriteFile(firstIdleReturned, nil, 0600); err != nil {
+		t.Fatalf("signal first idle return: %v", err)
 	}
 
 	townRoot := t.TempDir()
@@ -1759,7 +1784,7 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              transport,
-		IdleNotifyTimeout: time.Second,
+		IdleNotifyTimeout: 1500 * time.Millisecond,
 	}
 	err := r.notifyRecipient(&Message{
 		From:    "gastown/crew/sender",
@@ -1777,7 +1802,11 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 	if len(nudges) != 1 {
 		t.Fatalf("Drain returned %d immediately deliverable nudges, want 1", len(nudges))
 	}
-	if nudges[0].DeliveryID == "" {
+	pane, err := transport.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(pane, "first notification after startup") {
 		t.Fatal("first notification exhausted the router idle wait instead of attempting direct delivery")
 	}
 }
