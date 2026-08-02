@@ -1732,6 +1732,56 @@ func createNotifyTestSession(t *testing.T, socket, sessionName, command string) 
 	t.Fatalf("session %q never appeared on socket %q", sessionName, socket)
 }
 
+// TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff reproduces the
+// canary's startup-to-first-notification seam. A transient prompt must not let
+// the canary's idle gate return just before the router observes a busy pane and
+// falls back to its timeout queue.
+func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "gt-crew-startup-idle-handoff"
+	createNotifyTestSession(t, socket, sessionName, `sh -c '
+		sleep 0.5
+		printf "\033[2J\033[H❯ \n"
+		sleep 0.35
+		printf "\033[2J\033[H• Working (esc to interrupt)\n"
+		sleep 0.9
+		printf "\033[2J\033[H❯ \n"
+		cat
+	'`)
+
+	transport := tmux.NewTmuxWithSocket(socket)
+	if err := transport.WaitForIdle(sessionName, 3*time.Second); err != nil {
+		t.Fatalf("startup steady-idle gate: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              transport,
+		IdleNotifyTimeout: time.Second,
+	}
+	err := r.notifyRecipient(&Message{
+		From:    "gastown/crew/sender",
+		To:      "gastown/crew/startup-idle-handoff",
+		Subject: "first notification after startup",
+	})
+	if !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want durable queued fallback", err)
+	}
+
+	nudges, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("Drain returned %d immediately deliverable nudges, want 1", len(nudges))
+	}
+	if nudges[0].DeliveryID == "" {
+		t.Fatal("first notification exhausted the router idle wait instead of attempting direct delivery")
+	}
+}
+
 // TestNotifyRecipient_IdleUnsupportedRuntimeQueues verifies that an idle
 // runtime without a submit verifier retains a durable queued wake.
 func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
