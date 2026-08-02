@@ -43,6 +43,9 @@ func TestTestMainPreservesSocketRootOnKillError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("tmux not supported on Windows")
 	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
 
 	evidence := filepath.Join(t.TempDir(), "kill-error-root.txt")
 	if os.Getenv(testMainKillErrorChildEnv) == "1" {
