@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -60,28 +61,28 @@ type wakeCanaryRoles struct {
 	PolecatProvider string
 }
 
-func resolveWakeCanaryRoles(townRoot, rigPath string) wakeCanaryRoles {
-	mayor := config.ResolveRoleAgentConfig(constants.RoleMayor, townRoot, rigPath)
-	polecat := config.ResolveRoleAgentConfig(constants.RolePolecat, townRoot, rigPath)
-	return wakeCanaryRoles{
+func configureWakeCanarySandboxRoles(sandbox *wakeCanarySandbox, sourceTownRoot, sourceRigPath string) (wakeCanaryRoles, error) {
+	mayor := config.ResolveRoleAgentConfig(constants.RoleMayor, sourceTownRoot, sourceRigPath)
+	polecat := config.ResolveRoleAgentConfig(constants.RolePolecat, sourceTownRoot, sourceRigPath)
+	roles := wakeCanaryRoles{
 		MayorPreset: mayor.ResolvedAgent, MayorProvider: mayor.Provider,
 		PolecatPreset: polecat.ResolvedAgent, PolecatProvider: polecat.Provider,
 	}
-}
-
-func configureWakeCanarySandboxRoles(sandbox *wakeCanarySandbox, sourceTownRoot, sourceRigPath string) error {
-	mayor := config.ResolveRoleAgentConfig(constants.RoleMayor, sourceTownRoot, sourceRigPath)
-	polecat := config.ResolveRoleAgentConfig(constants.RolePolecat, sourceTownRoot, sourceRigPath)
 	if mayor.Provider != "codex" || polecat.Provider != "codex" {
-		return fmt.Errorf("wake canary requires Codex-backed Mayor and polecat presets")
+		return roles, fmt.Errorf("wake canary requires Codex-backed Mayor and polecat presets")
+	}
+	canaryMayor := *mayor
+	canaryMayor.Args = append([]string(nil), mayor.Args...)
+	if !slices.Contains(canaryMayor.Args, "--dangerously-bypass-hook-trust") {
+		canaryMayor.Args = append(canaryMayor.Args, "--dangerously-bypass-hook-trust")
 	}
 	settings := config.NewTownSettings()
-	settings.Agents[mayor.ResolvedAgent] = mayor
 	settings.Agents[polecat.ResolvedAgent] = polecat
+	settings.Agents[mayor.ResolvedAgent] = &canaryMayor
 	settings.RoleAgents = map[string]string{
 		constants.RoleMayor: mayor.ResolvedAgent, constants.RolePolecat: polecat.ResolvedAgent,
 	}
-	return config.SaveTownSettings(config.TownSettingsPath(sandbox.TownRoot), settings)
+	return roles, config.SaveTownSettings(config.TownSettingsPath(sandbox.TownRoot), settings)
 }
 
 type wakeCanarySandbox struct {
@@ -250,7 +251,8 @@ var nudgeCanaryCmd = &cobra.Command{
 			return err
 		}
 		defer sandbox.Cleanup()
-		if err := configureWakeCanarySandboxRoles(sandbox, evidenceRoot, ""); err != nil {
+		roles, err := configureWakeCanarySandboxRoles(sandbox, evidenceRoot, "")
+		if err != nil {
 			return err
 		}
 		if err := sandbox.linkCodexAuth(); err != nil {
@@ -267,7 +269,7 @@ var nudgeCanaryCmd = &cobra.Command{
 		if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
 			return fmt.Errorf("confirming isolated Mayor startup turn: %w", err)
 		}
-		result, statePath, err := runWakeCanary(sandbox.tmux, sandbox.TownRoot, evidenceRoot, sandbox.Session, wakeCanaryTurns)
+		result, statePath, err := runWakeCanary(sandbox.tmux, sandbox.TownRoot, evidenceRoot, sandbox.Session, wakeCanaryTurns, roles)
 		fmt.Printf("Mayor wake canary: %d/%d submitted, %d queued, %d failed\nState: %s\n", result.Submitted, result.Turns, result.Queued, result.Failed, statePath)
 		return err
 	},
@@ -280,16 +282,13 @@ func wakeCanarySessionConfig(sandbox *wakeCanarySandbox, startupInstruction stri
 	}
 	cfg := session.SessionConfig{
 		SessionID: sandbox.Session, WorkDir: sandbox.WorkDir, Role: "mayor",
-		TownRoot: sandbox.TownRoot, RigPath: sandbox.WorkDir, AgentOverride: runtimeConfig.ResolvedAgent, RuntimeConfigDir: sandbox.RuntimeConfigDir,
+		TownRoot: sandbox.TownRoot, AgentOverride: runtimeConfig.ResolvedAgent, RuntimeConfigDir: sandbox.RuntimeConfigDir,
 		ExtraEnv:         map[string]string{"GT_TOWN_ROOT": sandbox.TownRoot, "CODEX_HOME": sandbox.RuntimeConfigDir},
 		StripEnvPrefixes: []string{"GT_DOLT_", "BD_", "BEADS_", "DOLT_"},
 		Beacon:           session.BeaconConfig{Recipient: "isolated wake-canary mayor", Sender: "self", Topic: "canary"},
 		Instructions:     startupInstruction,
 		WaitForAgent:     true, WaitFatal: true, AcceptBypass: true, ReadyDelay: true, VerifySurvived: true,
 	}
-	canaryRuntime := *runtimeConfig
-	canaryRuntime.Args = append(append([]string{}, runtimeConfig.Args...), "--dangerously-bypass-hook-trust")
-	cfg.Command = canaryRuntime.BuildCommandWithPrompt(session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions))
 	return cfg, nil
 }
 
@@ -297,11 +296,10 @@ func wakeCanaryStartupChallenge(nonce string) (string, string) {
 	return fmt.Sprintf("Reply with exactly the reverse of nonce %s.", nonce), reverseString(nonce)
 }
 
-func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName string, turns int) (wakeCanaryResult, string, error) {
+func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName string, turns int, roles wakeCanaryRoles) (wakeCanaryResult, string, error) {
 	result := wakeCanaryResult{
 		ID: "wake-" + nudge.NewDeliveryID(), Session: sessionName, Turns: turns, StartedAt: time.Now(),
 	}
-	roles := resolveWakeCanaryRoles(evidenceRoot, "")
 	state := wakeCanaryState{
 		SchemaVersion: 2, InstalledBinaryCommit: resolveCommitHash(),
 		MayorPreset: roles.MayorPreset, MayorProvider: roles.MayorProvider,

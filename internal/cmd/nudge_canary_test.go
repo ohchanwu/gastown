@@ -179,7 +179,7 @@ func TestRunWakeCanaryPersistsSessionNotIdleBeforeLease(t *testing.T) {
 	}
 	done := make(chan canaryResult, 1)
 	go func() {
-		result, statePath, err := runWakeCanary(tm, runtimeTownRoot, evidenceRoot, sessionName, 1)
+		result, statePath, err := runWakeCanary(tm, runtimeTownRoot, evidenceRoot, sessionName, 1, wakeCanaryRoles{})
 		done <- canaryResult{result: result, statePath: statePath, err: err}
 	}()
 
@@ -235,7 +235,7 @@ waiting:
 
 func TestRunWakeCanaryRejectsLiveMayorIdentity(t *testing.T) {
 	evidenceRoot := t.TempDir()
-	_, statePath, err := runWakeCanary(nil, t.TempDir(), evidenceRoot, "not-the-isolated-mayor", wakeCanaryTurns)
+	_, statePath, err := runWakeCanary(nil, t.TempDir(), evidenceRoot, "not-the-isolated-mayor", wakeCanaryTurns, wakeCanaryRoles{})
 	if err == nil || !strings.Contains(err.Error(), "isolated") {
 		t.Fatalf("runWakeCanary live Mayor error = %v, want isolated identity rejection", err)
 	}
@@ -245,6 +245,52 @@ func TestRunWakeCanaryRejectsLiveMayorIdentity(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"result": "failed"`) || !strings.Contains(string(data), `"failure_code": "identity-not-isolated"`) {
 		t.Fatalf("failed canary state = %s", data)
+	}
+}
+
+func TestRunWakeCanaryPersistsConfiguredRoleSnapshot(t *testing.T) {
+	previousCommit := Commit
+	Commit = "test-commit"
+	t.Cleanup(func() { Commit = previousCommit })
+
+	sourceTownRoot := t.TempDir()
+	settings := config.NewTownSettings()
+	settings.Agents["preset-a-mayor"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.Agents["preset-a-polecat"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.RoleAgents = map[string]string{
+		constants.RoleMayor: "preset-a-mayor", constants.RolePolecat: "preset-a-polecat",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(sourceTownRoot), settings); err != nil {
+		t.Fatalf("save preset A: %v", err)
+	}
+	sandbox := &wakeCanarySandbox{TownRoot: t.TempDir(), WorkDir: t.TempDir()}
+	roles, err := configureWakeCanarySandboxRoles(sandbox, sourceTownRoot, "")
+	if err != nil {
+		t.Fatalf("configure preset A: %v", err)
+	}
+
+	settings.Agents["preset-b-mayor"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.Agents["preset-b-polecat"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.RoleAgents[constants.RoleMayor] = "preset-b-mayor"
+	settings.RoleAgents[constants.RolePolecat] = "preset-b-polecat"
+	if err := config.SaveTownSettings(config.TownSettingsPath(sourceTownRoot), settings); err != nil {
+		t.Fatalf("save preset B: %v", err)
+	}
+
+	_, statePath, err := runWakeCanary(nil, t.TempDir(), sourceTownRoot, "not-isolated", 1, roles)
+	if err == nil {
+		t.Fatal("runWakeCanary accepted non-isolated identity")
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read canary state: %v", err)
+	}
+	var state wakeCanaryState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode canary state: %v", err)
+	}
+	if state.MayorPreset != "preset-a-mayor" || state.PolecatPreset != "preset-a-polecat" {
+		t.Fatalf("state certified mutable roles: %+v, want preset A snapshot", state)
 	}
 }
 
@@ -331,56 +377,65 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 }
 
 func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
+	sourceTownRoot := t.TempDir()
+	sourceSettings := config.NewTownSettings()
+	sourceSettings.Agents["night-mayor"] = &config.RuntimeConfig{
+		Provider: "codex", Command: "configured-codex",
+		Args: []string{"--model", "mayor"}, Env: map[string]string{"CANARY_MARKER": "enabled"},
+		ExecWrapper: []string{"role-wrapper", "--"},
+	}
+	sourceSettings.Agents["night-polecat"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	sourceSettings.RoleAgents = map[string]string{
+		constants.RoleMayor: "night-mayor", constants.RolePolecat: "night-polecat",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(sourceTownRoot), sourceSettings); err != nil {
+		t.Fatalf("save source town settings: %v", err)
+	}
 	sandbox := &wakeCanarySandbox{
 		TownRoot:         t.TempDir(),
 		WorkDir:          t.TempDir(),
 		RuntimeConfigDir: t.TempDir(),
 		Session:          session.MayorSessionName(),
 	}
-	settings := config.NewTownSettings()
-	settings.Agents["codex"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
-	settings.RoleAgents = map[string]string{constants.RoleMayor: "codex"}
-	if err := config.SaveTownSettings(config.TownSettingsPath(sandbox.TownRoot), settings); err != nil {
-		t.Fatalf("save canary town settings: %v", err)
+	roles, err := configureWakeCanarySandboxRoles(sandbox, sourceTownRoot, "")
+	if err != nil {
+		t.Fatalf("configure canary roles: %v", err)
 	}
-	cfg, err := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
+	if roles.MayorPreset != "night-mayor" || roles.PolecatPreset != "night-polecat" {
+		t.Fatalf("configured roles = %+v", roles)
+	}
+	const instruction = "complete the finite startup challenge"
+	cfg, err := wakeCanarySessionConfig(sandbox, instruction)
 	if err != nil {
 		t.Fatalf("build canary session config: %v", err)
 	}
-	runtimeConfig, _, err := config.ResolveAgentConfigWithOverride(cfg.TownRoot, cfg.RigPath, cfg.AgentOverride)
-	if err != nil {
-		t.Fatalf("resolve canary runtime: %v", err)
+	if cfg.Command != "" {
+		t.Fatalf("canary prebuilt command = %q, want standard startup builder", cfg.Command)
 	}
-	env := config.AgentEnv(config.AgentEnvConfig{
-		Role: cfg.Role, Rig: cfg.RigName, AgentName: cfg.AgentName, TownRoot: cfg.TownRoot,
-		RuntimeConfigDir: cfg.RuntimeConfigDir, Agent: cfg.AgentOverride, SessionName: cfg.SessionID,
-	})
-	env = session.MergeRuntimeLivenessEnv(env, runtimeConfig)
-
-	if got := env["GT_AGENT"]; got != "codex" {
-		t.Fatalf("canary GT_AGENT = %q, want receipt-compatible codex identity", got)
-	}
-	if got := env["GT_PROCESS_NAMES"]; got != "codex" {
-		t.Fatalf("canary GT_PROCESS_NAMES = %q, want codex", got)
-	}
-
 	prompt := session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions)
-	ordinaryCommand, err := config.BuildAgentStartupCommandWithAgentOverride(
-		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, "codex",
+	command, err := config.BuildAgentStartupCommandWithAgentOverride(
+		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath, prompt, cfg.AgentOverride,
 	)
 	if err != nil {
-		t.Fatalf("build ordinary startup command: %v", err)
+		t.Fatalf("build standard canary command: %v", err)
 	}
-
-	const flag = "--dangerously-bypass-hook-trust"
-	if !strings.Contains(cfg.Command, " "+flag+" ") {
-		t.Fatalf("canary startup command lacks %s: %q", flag, cfg.Command)
+	parts := []string{"CANARY_MARKER=enabled", "role-wrapper", "configured-codex", "--model mayor", "--dangerously-bypass-hook-trust", instruction}
+	last := -1
+	for _, part := range parts {
+		index := strings.Index(command[last+1:], part)
+		if index < 0 {
+			t.Fatalf("command ordering lacks %q after index %d: %q", part, last, command)
+		}
+		last += index + 1
 	}
-	if strings.Contains(cfg.Command, "GT_AGENT=") {
-		t.Fatalf("pure canary agent command unexpectedly overrides GT_AGENT: %q", cfg.Command)
+	ordinary, err := config.BuildAgentStartupCommandWithAgentOverride(
+		constants.RoleMayor, "", sourceTownRoot, "", prompt, "night-mayor",
+	)
+	if err != nil {
+		t.Fatalf("build ordinary configured command: %v", err)
 	}
-	if strings.Contains(ordinaryCommand, flag) {
-		t.Fatalf("ordinary startup command unexpectedly contains %s: %q", flag, ordinaryCommand)
+	if strings.Contains(ordinary, "--dangerously-bypass-hook-trust") {
+		t.Fatalf("ordinary startup command contains canary flag: %q", ordinary)
 	}
 }
 
@@ -424,14 +479,21 @@ func TestWakeCanarySessionConfigUsesIsolatedConfiguredMayorPreset(t *testing.T) 
 	if cfg.AgentOverride != "night-mayor" || runtimeConfig.Provider != "codex" {
 		t.Fatalf("StartSession runtime = %q/%q, want night-mayor/codex", cfg.AgentOverride, runtimeConfig.Provider)
 	}
-	if !strings.Contains(cfg.Command, "configured-codex") || !strings.Contains(cfg.Command, "--model mayor") {
-		t.Fatalf("canary command does not preserve configured preset: %q", cfg.Command)
+	if cfg.Command != "" {
+		t.Fatalf("canary prebuilt command = %q, want standard configured startup", cfg.Command)
 	}
-	if cfg.RigPath != sandbox.WorkDir {
-		t.Fatalf("canary rig path = %q, want sandbox workdir %q", cfg.RigPath, sandbox.WorkDir)
+	if cfg.RigPath != "" {
+		t.Fatalf("canary rig path = %q, want town-level configured startup", cfg.RigPath)
 	}
-	if strings.Contains(cfg.Command, "caller-codex-wrapper") {
-		t.Fatalf("canary command inherited caller wrapper: %q", cfg.Command)
+	command, err := config.BuildAgentStartupCommandWithAgentOverride(
+		cfg.Role, cfg.RigName, cfg.TownRoot, cfg.RigPath,
+		session.BuildStartupPrompt(cfg.Beacon, cfg.Instructions), cfg.AgentOverride,
+	)
+	if err != nil {
+		t.Fatalf("build StartSession command: %v", err)
+	}
+	if strings.Contains(command, "caller-codex-wrapper") || !strings.Contains(command, "configured-codex") {
+		t.Fatalf("canary command used wrong config: %q", command)
 	}
 }
 
@@ -482,7 +544,7 @@ func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	}
 }
 
-func TestResolveWakeCanaryRolesUsesConfiguredPresetsAndProviders(t *testing.T) {
+func TestConfigureWakeCanarySandboxRolesUsesConfiguredPresetsAndProviders(t *testing.T) {
 	townRoot := t.TempDir()
 	settings := config.NewTownSettings()
 	settings.Agents["codex-mayor"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
@@ -495,11 +557,54 @@ func TestResolveWakeCanaryRolesUsesConfiguredPresetsAndProviders(t *testing.T) {
 		t.Fatalf("SaveTownSettings: %v", err)
 	}
 
-	got := resolveWakeCanaryRoles(townRoot, "")
+	got, err := configureWakeCanarySandboxRoles(&wakeCanarySandbox{TownRoot: t.TempDir()}, townRoot, "")
+	if err != nil {
+		t.Fatalf("configureWakeCanarySandboxRoles: %v", err)
+	}
 	if got.MayorPreset != "codex-mayor" || got.MayorProvider != "codex" {
 		t.Fatalf("Mayor role evidence = %+v, want codex-mayor/codex", got)
 	}
 	if got.PolecatPreset != "codex-polecat" || got.PolecatProvider != "codex" {
 		t.Fatalf("polecat role evidence = %+v, want codex-polecat/codex", got)
+	}
+}
+
+func TestConfigureWakeCanarySandboxRolesUsesCodexDefaultFallback(t *testing.T) {
+	t.Setenv("GT_COST_TIER", "")
+	sourceTownRoot := t.TempDir()
+	settings := config.NewTownSettings()
+	settings.DefaultAgent = "codex"
+	settings.RoleAgents = map[string]string{
+		constants.RoleMayor: "missing-mayor", constants.RolePolecat: "missing-polecat",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(sourceTownRoot), settings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	sandbox := &wakeCanarySandbox{TownRoot: t.TempDir(), WorkDir: t.TempDir()}
+	roles, err := configureWakeCanarySandboxRoles(sandbox, sourceTownRoot, "")
+	if err != nil {
+		t.Fatalf("configure default fallback: %v", err)
+	}
+	if roles.MayorPreset != "codex" || roles.MayorProvider != "codex" ||
+		roles.PolecatPreset != "codex" || roles.PolecatProvider != "codex" {
+		t.Fatalf("fallback roles = %+v, want base codex", roles)
+	}
+}
+
+func TestConfigureWakeCanarySandboxRolesRejectsValidNonCodexPreset(t *testing.T) {
+	t.Setenv("GT_COST_TIER", "")
+	sourceTownRoot := t.TempDir()
+	settings := config.NewTownSettings()
+	settings.Agents["codex-mayor"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.Agents["claude-polecat"] = &config.RuntimeConfig{Provider: "claude", Command: "claude"}
+	settings.RoleAgents = map[string]string{
+		constants.RoleMayor: "codex-mayor", constants.RolePolecat: "claude-polecat",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(sourceTownRoot), settings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	sandbox := &wakeCanarySandbox{TownRoot: t.TempDir(), WorkDir: t.TempDir()}
+	if _, err := configureWakeCanarySandboxRoles(sandbox, sourceTownRoot, ""); err == nil || !strings.Contains(err.Error(), "Codex-backed") {
+		t.Fatalf("configure non-Codex preset error = %v", err)
 	}
 }
