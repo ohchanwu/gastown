@@ -4,6 +4,7 @@ package tmux
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -1854,7 +1855,8 @@ type NudgeOpts struct {
 	// DeliveryID binds runtime proof to one durable queue record.
 	DeliveryID string
 
-	receipt *SubmissionReceipt
+	receipt                 *SubmissionReceipt
+	beforeScopeRevalidation func()
 }
 
 type SubmissionReceipt = delivery.SubmissionReceipt
@@ -2041,29 +2043,152 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	return nil
 }
 
+type nudgeConfigPathState struct {
+	path    string
+	info    os.FileInfo
+	digest  [sha256.Size]byte
+	missing bool
+}
+
+type nudgeConfigScope []nudgeConfigPathState
+
+func captureNudgeConfigScope(townRoot, rigPath string) (nudgeConfigScope, error) {
+	paths := []string{
+		townRoot,
+		config.TownSettingsPath(townRoot),
+		config.DefaultAgentRegistryPath(townRoot),
+	}
+	if rigPath != "" {
+		paths = append(paths,
+			rigPath,
+			config.RigSettingsPath(rigPath),
+			config.RigAgentRegistryPath(rigPath),
+		)
+	}
+
+	scope := make(nudgeConfigScope, 0, len(paths))
+	for _, path := range paths {
+		state, err := captureNudgeConfigPath(path)
+		if err != nil {
+			return nil, err
+		}
+		scope = append(scope, state)
+	}
+	return scope, nil
+}
+
+func captureNudgeConfigPath(path string) (nudgeConfigPathState, error) {
+	state := nudgeConfigPathState{path: path}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			state.missing = true
+			return state, nil
+		}
+		return state, err
+	}
+	state.info = info
+	if info.Mode().IsRegular() {
+		data, err := os.ReadFile(path) //nolint:gosec // G304: path is from the canonical config scope
+		if err != nil {
+			return state, err
+		}
+		state.digest = sha256.Sum256(data)
+	}
+	return state, nil
+}
+
+func (scope nudgeConfigScope) validate() error {
+	for _, before := range scope {
+		after, err := captureNudgeConfigPath(before.path)
+		if err != nil {
+			return err
+		}
+		if before.missing != after.missing {
+			return errors.New("config path existence changed")
+		}
+		if before.missing {
+			continue
+		}
+		if !os.SameFile(before.info, after.info) || before.info.Mode() != after.info.Mode() || before.info.Size() != after.info.Size() || before.info.ModTime() != after.info.ModTime() || before.digest != after.digest {
+			return errors.New("config path identity changed")
+		}
+	}
+	return nil
+}
+
 // NudgeSessionWithReceipt delivers a nudge and reports how far it reached.
 func (t *Tmux) NudgeSessionWithReceipt(session, message string, opts NudgeOpts) (SubmissionReceipt, error) {
 	receipt := SubmissionReceipt{Session: session, DeliveryID: opts.DeliveryID}
 	if opts.DeliveryID == "" {
 		return receipt, fmt.Errorf("%w (delivery ID is required)", ErrSubmitNotVerified)
 	}
-	runtimeName, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || runtimeName != string(config.AgentCodex) {
-		return receipt, fmt.Errorf("%w: %q", ErrSubmitVerifierUnsupported, runtimeName)
-	}
 	if opts.TownRoot == "" {
 		return receipt, fmt.Errorf("%w (town root is required for runtime receipt)", ErrSubmitNotVerified)
+	}
+	runtimeName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil {
+		return receipt, fmt.Errorf("%w: %q", ErrSubmitVerifierUnsupported, runtimeName)
+	}
+	rigName := ""
+	if value, rigErr := t.GetEnvironment(session, "GT_RIG"); rigErr == nil {
+		rigName = value
+	}
+	if rigName == "." || rigName == ".." || filepath.IsAbs(rigName) || strings.ContainsAny(rigName, `/\`) {
+		return receipt, fmt.Errorf("%w: invalid rig name %q", ErrSubmitVerifierUnsupported, rigName)
+	}
+	canonicalTownRoot, err := filepath.Abs(opts.TownRoot)
+	if err == nil {
+		canonicalTownRoot, err = filepath.EvalSymlinks(canonicalTownRoot)
+	}
+	if err != nil {
+		return receipt, fmt.Errorf("%w: invalid town root", ErrSubmitVerifierUnsupported)
+	}
+	rigPath := ""
+	if rigName != "" {
+		var pathErr error
+		if pathErr == nil {
+			rigPath, pathErr = filepath.EvalSymlinks(filepath.Join(canonicalTownRoot, rigName))
+		}
+		if pathErr == nil {
+			var relativeRigPath string
+			relativeRigPath, pathErr = filepath.Rel(canonicalTownRoot, rigPath)
+			if relativeRigPath == "." || relativeRigPath == ".." || filepath.IsAbs(relativeRigPath) || strings.HasPrefix(relativeRigPath, ".."+string(filepath.Separator)) {
+				pathErr = errors.New("rig path escapes town root")
+			}
+		}
+		if pathErr != nil {
+			return receipt, fmt.Errorf("%w: %q", ErrSubmitVerifierUnsupported, runtimeName)
+		}
+	}
+	scope, err := captureNudgeConfigScope(canonicalTownRoot, rigPath)
+	if err != nil {
+		return receipt, fmt.Errorf("%w: config scope", ErrSubmitVerifierUnsupported)
+	}
+	runtimeConfig, _, err := config.ResolveAgentConfigWithOverrideStrict(canonicalTownRoot, rigPath, runtimeName)
+	if err != nil {
+		return receipt, fmt.Errorf("resolving runtime config: %w", err)
+	}
+	if opts.beforeScopeRevalidation != nil {
+		opts.beforeScopeRevalidation()
+	}
+	if err := scope.validate(); err != nil {
+		return receipt, fmt.Errorf("%w: config scope changed", ErrSubmitVerifierUnsupported)
+	}
+	if runtimeConfig.Provider != string(config.AgentCodex) {
+		return receipt, fmt.Errorf("%w: %q", ErrSubmitVerifierUnsupported, runtimeName)
 	}
 
 	baseline := time.Now()
 	opts.receipt = &receipt
+	opts.TownRoot = canonicalTownRoot
 	if err := t.NudgeSessionWithOpts(session, delivery.ControlMessage(opts.DeliveryID, message), opts); err != nil {
 		return receipt, err
 	}
 
 	deadline := time.Now().Add(submissionReceiptTimeout)
 	for {
-		matched, ok, findErr := delivery.FindSubmittedAfter(opts.TownRoot, session, opts.DeliveryID, baseline)
+		matched, ok, findErr := delivery.FindSubmittedAfter(canonicalTownRoot, session, opts.DeliveryID, baseline)
 		if findErr != nil {
 			return receipt, fmt.Errorf("%w (reading runtime receipt: %v)", ErrSubmitNotVerified, findErr)
 		}

@@ -607,6 +607,44 @@ func loadAgentRegistryFromPathLocked(path string) error {
 	return nil
 }
 
+func newAgentRegistrySnapshot() *AgentRegistry {
+	registry := &AgentRegistry{
+		Version: CurrentAgentRegistryVersion,
+		Agents:  make(map[string]*AgentPresetInfo, len(builtinPresets)),
+	}
+	for name, preset := range builtinPresets {
+		registry.Agents[string(name)] = cloneAgentPresetInfo(preset)
+	}
+	return registry
+}
+
+func mergeAgentRegistrySnapshot(registry *AgentRegistry, path string) error {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is from validated config scope
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var userRegistry rawAgentRegistry
+	if err := json.Unmarshal(data, &userRegistry); err != nil {
+		return err
+	}
+	for name, rawPreset := range userRegistry.Agents {
+		merged := cloneAgentPresetInfo(registry.Agents[name])
+		if merged == nil {
+			merged = &AgentPresetInfo{}
+		}
+		if err := json.Unmarshal(rawPreset, merged); err != nil {
+			return err
+		}
+		merged.Name = AgentPreset(name)
+		registry.Agents[name] = merged
+	}
+	return nil
+}
+
 func cloneAgentPresetInfo(src *AgentPresetInfo) *AgentPresetInfo {
 	if src == nil {
 		return nil

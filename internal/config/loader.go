@@ -1183,16 +1183,30 @@ func resolveAgentConfigInternal(townRoot, rigPath string) *RuntimeConfig {
 func ResolveAgentConfigWithOverride(townRoot, rigPath, agentOverride string) (*RuntimeConfig, string, error) {
 	resolveConfigMu.Lock()
 	defer resolveConfigMu.Unlock()
-	return resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride)
+	return resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride, false)
+}
+
+// ResolveAgentConfigWithOverrideStrict resolves an agent without suppressing config load errors.
+func ResolveAgentConfigWithOverrideStrict(townRoot, rigPath, agentOverride string) (*RuntimeConfig, string, error) {
+	resolveConfigMu.Lock()
+	defer resolveConfigMu.Unlock()
+	return resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride, true)
 }
 
 // resolveAgentConfigWithOverrideInternal is the lock-free version.
 // Caller must hold resolveConfigMu.
-func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride string) (*RuntimeConfig, string, error) {
+func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride string, strict bool) (*RuntimeConfig, string, error) {
 	// Load rig settings
-	rigSettings, err := LoadRigSettings(RigSettingsPath(rigPath))
-	if err != nil {
-		rigSettings = nil
+	var rigSettings *RigSettings
+	if rigPath != "" || !strict {
+		var err error
+		rigSettings, err = LoadRigSettings(RigSettingsPath(rigPath))
+		if err != nil {
+			if strict && !errors.Is(err, ErrNotFound) {
+				return nil, "", fmt.Errorf("loading rig settings: %w", err)
+			}
+			rigSettings = nil
+		}
 	}
 
 	// Backwards compatibility: if Runtime is set directly, use it (but still report agentOverride if present)
@@ -1207,14 +1221,27 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 	// Load town settings for agent lookup
 	townSettings, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot))
 	if err != nil {
+		if strict {
+			return nil, "", fmt.Errorf("loading town settings: %w", err)
+		}
 		townSettings = NewTownSettings()
 	}
 
-	// Load custom agent registry if it exists
-	_ = LoadAgentRegistry(DefaultAgentRegistryPath(townRoot))
-
-	// Load rig-level custom agent registry if it exists (for per-rig custom agents)
-	_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
+	var scopedRegistry *AgentRegistry
+	if strict {
+		scopedRegistry = newAgentRegistrySnapshot()
+		if err := mergeAgentRegistrySnapshot(scopedRegistry, DefaultAgentRegistryPath(townRoot)); err != nil {
+			return nil, "", fmt.Errorf("loading town agent registry: %w", err)
+		}
+		if rigPath != "" {
+			if err := mergeAgentRegistrySnapshot(scopedRegistry, RigAgentRegistryPath(rigPath)); err != nil {
+				return nil, "", fmt.Errorf("loading rig agent registry: %w", err)
+			}
+		}
+	} else {
+		_ = LoadAgentRegistry(DefaultAgentRegistryPath(townRoot))
+		_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
+	}
 
 	// Determine which agent name to use
 	agentName := ""
@@ -1262,7 +1289,11 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 		}
 		// Then check built-in presets
 		if rc == nil {
-			if preset := GetAgentPresetByName(agentName); preset != nil {
+			if strict {
+				if preset := scopedRegistry.Agents[agentName]; preset != nil {
+					rc = runtimeConfigFromAgentInfo(AgentPreset(agentName), preset)
+				}
+			} else if preset := GetAgentPresetByName(agentName); preset != nil {
 				rc = RuntimeConfigFromPreset(AgentPreset(agentName))
 			}
 		}
@@ -1281,7 +1312,20 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 	}
 
 	// Normal lookup path (no override)
-	rc := lookupAgentConfig(agentName, townSettings, rigSettings)
+	var rc *RuntimeConfig
+	if strict {
+		rc = lookupCustomAgentConfig(agentName, townSettings, rigSettings)
+		if rc == nil {
+			if preset := scopedRegistry.Agents[agentName]; preset != nil {
+				rc = runtimeConfigFromAgentInfo(AgentPreset(agentName), preset)
+			}
+		}
+		if rc == nil {
+			rc = DefaultRuntimeConfig()
+		}
+	} else {
+		rc = lookupAgentConfig(agentName, townSettings, rigSettings)
+	}
 	rc.ResolvedAgent = agentName
 
 	// If we have extra arguments from the override, append them to the config

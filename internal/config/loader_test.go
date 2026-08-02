@@ -5849,6 +5849,110 @@ func TestResolveAgentConfigWithOverrideSetsResolvedAgent(t *testing.T) {
 	}
 }
 
+func writeScopedAgentRegistry(t *testing.T, path, command string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	data, err := json.Marshal(AgentRegistry{
+		Version: CurrentAgentRegistryVersion,
+		Agents: map[string]*AgentPresetInfo{
+			"codex": {Command: command},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+func TestResolveAgentConfigWithOverrideStrictReloadsRegistries(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		registry  func(string, string) string
+		wantError string
+		needsRig  bool
+	}{
+		{name: "town", registry: func(townRoot, _ string) string { return DefaultAgentRegistryPath(townRoot) }, wantError: "loading town agent registry"},
+		{name: "rig", registry: func(_, rigPath string) string { return RigAgentRegistryPath(rigPath) }, wantError: "loading rig agent registry", needsRig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetRegistryForTesting()
+			t.Cleanup(ResetRegistryForTesting)
+			townRoot := t.TempDir()
+			rigPath := ""
+			if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+				t.Fatalf("SaveTownSettings: %v", err)
+			}
+			if tc.needsRig {
+				rigPath = filepath.Join(townRoot, "rig")
+				if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+					t.Fatalf("SaveRigSettings: %v", err)
+				}
+			}
+			registryPath := tc.registry(townRoot, rigPath)
+			writeScopedAgentRegistry(t, registryPath, tc.name+"-codex")
+
+			rc, _, err := ResolveAgentConfigWithOverrideStrict(townRoot, rigPath, "codex")
+			if err != nil || rc.Command != tc.name+"-codex" {
+				t.Fatalf("first strict resolution = (%#v, %v), want command %q", rc, err, tc.name+"-codex")
+			}
+			if err := os.WriteFile(registryPath, []byte(`{"agents":`), 0600); err != nil {
+				t.Fatalf("corrupt registry: %v", err)
+			}
+			if _, _, err := ResolveAgentConfigWithOverrideStrict(townRoot, rigPath, "codex"); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("second strict resolution error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestResolveAgentConfigWithOverrideStrictRegistryIsolation(t *testing.T) {
+	t.Run("town", func(t *testing.T) {
+		ResetRegistryForTesting()
+		t.Cleanup(ResetRegistryForTesting)
+		townA, townB := t.TempDir(), t.TempDir()
+		for _, townRoot := range []string{townA, townB} {
+			if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+				t.Fatalf("SaveTownSettings: %v", err)
+			}
+		}
+		writeScopedAgentRegistry(t, DefaultAgentRegistryPath(townA), "town-a-codex")
+		if _, _, err := ResolveAgentConfigWithOverrideStrict(townA, "", "codex"); err != nil {
+			t.Fatalf("resolve town A: %v", err)
+		}
+		rc, _, err := ResolveAgentConfigWithOverrideStrict(townB, "", "codex")
+		if err != nil || rc.Command != "codex" {
+			t.Fatalf("town B resolution = (%#v, %v), want builtin codex", rc, err)
+		}
+	})
+
+	t.Run("rig", func(t *testing.T) {
+		ResetRegistryForTesting()
+		t.Cleanup(ResetRegistryForTesting)
+		townRoot := t.TempDir()
+		rigA, rigB := filepath.Join(townRoot, "rig-a"), filepath.Join(townRoot, "rig-b")
+		if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+			t.Fatalf("SaveTownSettings: %v", err)
+		}
+		for _, rigPath := range []string{rigA, rigB} {
+			if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+				t.Fatalf("SaveRigSettings: %v", err)
+			}
+		}
+		writeScopedAgentRegistry(t, RigAgentRegistryPath(rigA), "rig-a-codex")
+		if _, _, err := ResolveAgentConfigWithOverrideStrict(townRoot, rigA, "codex"); err != nil {
+			t.Fatalf("resolve rig A: %v", err)
+		}
+		rc, _, err := ResolveAgentConfigWithOverrideStrict(townRoot, rigB, "codex")
+		if err != nil || rc.Command != "codex" {
+			t.Fatalf("rig B resolution = (%#v, %v), want builtin codex", rc, err)
+		}
+	})
+}
+
 func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()

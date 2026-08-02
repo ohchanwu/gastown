@@ -2009,6 +2009,280 @@ func TestNudgeSessionReceipt_DistinguishesTypedFromSubmitted(t *testing.T) {
 	}
 }
 
+func TestNudgeSessionReceipt_ResolvesVerifierByConfiguredProvider(t *testing.T) {
+	config.ResetRegistryForTesting()
+	t.Cleanup(config.ResetRegistryForTesting)
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	settings := config.NewTownSettings()
+	for _, name := range []string{"codex-mayor", "codex-polecat", "night-shift"} {
+		settings.Agents[name] = &config.RuntimeConfig{Provider: "codex", Command: "custom-codex"}
+	}
+	settings.Agents["unsupported"] = &config.RuntimeConfig{Provider: "generic", Command: "custom-agent"}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	rigSettings := config.NewRigSettings()
+	rigSettings.Agents = map[string]*config.RuntimeConfig{
+		"rig-night-shift": {Provider: "codex", Command: "custom-codex"},
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+	// Block the delivery lock before any input can be typed. Supported providers
+	// must reach this transport boundary; unsupported providers must fail closed
+	// before it.
+	if err := os.WriteFile(filepath.Join(townRoot, ".runtime"), []byte("blocked"), 0600); err != nil {
+		t.Fatalf("block runtime directory: %v", err)
+	}
+
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-provider-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_RIG", rigName); err != nil {
+		t.Fatalf("SetEnvironment GT_RIG: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		supported bool
+	}{
+		{name: "codex", supported: true},
+		{name: "codex-mayor", supported: true},
+		{name: "codex-polecat", supported: true},
+		{name: "night-shift", supported: true},
+		{name: "rig-night-shift", supported: true},
+		{name: "unsupported", supported: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tm.SetEnvironment(sessionName, "GT_AGENT", tc.name); err != nil {
+				t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+			}
+
+			receipt, err := tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{
+				TownRoot:   townRoot,
+				DeliveryID: "ndg-" + tc.name,
+			})
+			if got := !errors.Is(err, ErrSubmitVerifierUnsupported); got != tc.supported {
+				t.Fatalf("supported = %v, want %v (error: %v)", got, tc.supported, err)
+			}
+			if receipt.Typed || receipt.Submitted {
+				t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+			}
+		})
+	}
+}
+
+func TestNudgeSessionReceipt_RejectsInvalidRigNames(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(townRoot, ".runtime"), []byte("blocked"), 0600); err != nil {
+		t.Fatalf("block runtime directory: %v", err)
+	}
+
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-invalid-rig-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+
+	for _, rigName := range []string{".", "..", "../outside", filepath.Join(townRoot, "outside"), "nested/rig"} {
+		t.Run(rigName, func(t *testing.T) {
+			if err := tm.SetEnvironment(sessionName, "GT_RIG", rigName); err != nil {
+				t.Fatalf("SetEnvironment GT_RIG: %v", err)
+			}
+
+			root := townRoot
+			if rigName == "." || rigName == ".." {
+				root = "\x00" // Any filesystem lookup would fail before the lexical rejection.
+			}
+			receipt, err := tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{
+				TownRoot:   root,
+				DeliveryID: "ndg-invalid-rig",
+			})
+			if !errors.Is(err, ErrSubmitVerifierUnsupported) {
+				t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitVerifierUnsupported", err)
+			}
+			if receipt.Typed || receipt.Submitted {
+				t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+			}
+			if (rigName == "." || rigName == "..") && !strings.Contains(err.Error(), "invalid rig name") {
+				t.Fatalf("NudgeSessionWithReceipt error = %v, want lexical invalid-rig rejection", err)
+			}
+		})
+	}
+}
+
+func TestNudgeSessionReceipt_RejectsRigSymlinkEscape(t *testing.T) {
+	config.ResetRegistryForTesting()
+	t.Cleanup(config.ResetRegistryForTesting)
+
+	townRoot := t.TempDir()
+	outsideRig := t.TempDir()
+	rigSettings := config.NewRigSettings()
+	rigSettings.Agents = map[string]*config.RuntimeConfig{
+		"outside-codex": {Provider: "codex", Command: "custom-codex"},
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(outsideRig), rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+	if err := os.Symlink(outsideRig, filepath.Join(townRoot, "escaped")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".runtime"), []byte("blocked"), 0600); err != nil {
+		t.Fatalf("block runtime directory: %v", err)
+	}
+
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-symlink-rig-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", "outside-codex"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_RIG", "escaped"); err != nil {
+		t.Fatalf("SetEnvironment GT_RIG: %v", err)
+	}
+
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{
+		TownRoot:   townRoot,
+		DeliveryID: "ndg-symlink-rig",
+	})
+	if !errors.Is(err, ErrSubmitVerifierUnsupported) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitVerifierUnsupported", err)
+	}
+	if receipt.Typed || receipt.Submitted {
+		t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_RejectsRigReplacementBeforeTyping(t *testing.T) {
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), config.NewTownSettings()); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-replaced-rig-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_RIG", rigName); err != nil {
+		t.Fatalf("SetEnvironment GT_RIG: %v", err)
+	}
+
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{
+		TownRoot:   townRoot,
+		DeliveryID: "ndg-replaced-rig",
+		beforeScopeRevalidation: func() {
+			if err := os.Rename(rigPath, rigPath+"-old"); err != nil {
+				t.Fatalf("rename rig: %v", err)
+			}
+			if err := os.Mkdir(rigPath, 0700); err != nil {
+				t.Fatalf("replace rig: %v", err)
+			}
+		},
+	})
+	if !errors.Is(err, ErrSubmitVerifierUnsupported) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitVerifierUnsupported", err)
+	}
+	if receipt.Typed || receipt.Submitted {
+		t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_RejectsMalformedFormerlyUnsupportedRigConfig(t *testing.T) {
+	config.ResetRegistryForTesting()
+	t.Cleanup(config.ResetRegistryForTesting)
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	rigSettings := config.NewRigSettings()
+	rigSettings.Agents = map[string]*config.RuntimeConfig{
+		"codex": {Provider: "generic", Command: "custom-agent"},
+	}
+	rigSettingsPath := config.RigSettingsPath(rigPath)
+	if err := config.SaveRigSettings(rigSettingsPath, rigSettings); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".runtime"), []byte("blocked"), 0600); err != nil {
+		t.Fatalf("block runtime directory: %v", err)
+	}
+
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-malformed-rig-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_RIG", rigName); err != nil {
+		t.Fatalf("SetEnvironment GT_RIG: %v", err)
+	}
+
+	nudge := func(deliveryID string) (SubmissionReceipt, error) {
+		return tm.NudgeSessionWithReceipt(sessionName, "must not be typed", NudgeOpts{
+			TownRoot:   townRoot,
+			DeliveryID: deliveryID,
+		})
+	}
+	assertUnsupported := func(t *testing.T, deliveryID string) {
+		t.Helper()
+		receipt, err := nudge(deliveryID)
+		if !errors.Is(err, ErrSubmitVerifierUnsupported) {
+			t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitVerifierUnsupported", err)
+		}
+		if receipt.Typed || receipt.Submitted {
+			t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+		}
+	}
+	assertConfigError := func(t *testing.T, deliveryID string) {
+		t.Helper()
+		receipt, err := nudge(deliveryID)
+		if err == nil || !strings.Contains(err.Error(), "loading rig settings") {
+			t.Fatalf("NudgeSessionWithReceipt error = %v, want rig settings load error", err)
+		}
+		if receipt.Typed || receipt.Submitted {
+			t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
+		}
+	}
+
+	assertUnsupported(t, "ndg-generic-rig")
+	if err := os.WriteFile(rigSettingsPath, []byte(`{"agents":`), 0600); err != nil {
+		t.Fatalf("write malformed rig settings: %v", err)
+	}
+	assertConfigError(t, "ndg-malformed-rig")
+	if err := os.Remove(rigSettingsPath); err != nil {
+		t.Fatalf("remove rig settings: %v", err)
+	}
+	if err := os.Mkdir(rigSettingsPath, 0700); err != nil {
+		t.Fatalf("replace rig settings with directory: %v", err)
+	}
+	assertConfigError(t, "ndg-unreadable-rig")
+}
+
 func TestNudgeSessionReceipt_RejectsUnsupportedRuntime(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-nudge-unsupported-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
@@ -2036,6 +2310,16 @@ func TestNudgeSessionReceipt_RequiresDeliveryID(t *testing.T) {
 	}
 	if receipt.Typed || receipt.Submitted || receipt.DeliveryID != "" {
 		t.Fatalf("receipt = %#v, want untouched receipt", receipt)
+	}
+}
+
+func TestNudgeSessionReceipt_RequiresTownRootBeforeSessionRead(t *testing.T) {
+	receipt, err := newTestTmux(t).NudgeSessionWithReceipt("missing-session", "message", NudgeOpts{DeliveryID: "ndg-empty-root"})
+	if !errors.Is(err, ErrSubmitNotVerified) {
+		t.Fatalf("NudgeSessionWithReceipt error = %v, want ErrSubmitNotVerified", err)
+	}
+	if receipt.Typed || receipt.Submitted {
+		t.Fatalf("receipt = %#v, want no attempted delivery", receipt)
 	}
 }
 
