@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/atomicfile"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -26,6 +27,7 @@ type MailEvidence struct {
 type WakeEvidence struct {
 	Priority    string
 	QueuedAt    time.Time
+	Attempts    int
 	FailureCode string
 }
 
@@ -35,8 +37,12 @@ type ConvoyEvidence struct {
 }
 
 type CanaryEvidence struct {
-	BinaryCommit string
-	Result       string
+	BinaryCommit    string
+	MayorPreset     string
+	MayorProvider   string
+	PolecatPreset   string
+	PolecatProvider string
+	Result          string
 }
 
 type ControlPlaneEvidence struct {
@@ -48,6 +54,10 @@ type ControlPlaneEvidence struct {
 	ConvoyCheck            *ConvoyEvidence
 	Canary                 *CanaryEvidence
 	InstalledBinaryCommit  string
+	MayorPreset            string
+	MayorProvider          string
+	PolecatPreset          string
+	PolecatProvider        string
 }
 
 type ControlPlaneFailure struct {
@@ -70,6 +80,10 @@ type ConvoyCheckState struct {
 
 type canaryState struct {
 	InstalledBinaryCommit string `json:"installed_binary_commit"`
+	MayorPreset           string `json:"mayor_preset"`
+	MayorProvider         string `json:"mayor_provider"`
+	PolecatPreset         string `json:"polecat_preset"`
+	PolecatProvider       string `json:"polecat_provider"`
 	Result                string `json:"result"`
 }
 
@@ -104,7 +118,7 @@ func EvaluateControlPlane(evidence ControlPlaneEvidence) ControlPlaneVerdict {
 		if delivery.Priority != "urgent" {
 			continue
 		}
-		if delivery.FailureCode != "" || evidence.Now.Sub(delivery.QueuedAt) > wakeDeadline {
+		if evidence.Now.Sub(delivery.QueuedAt) > wakeDeadline {
 			add("wake-delivery", "gt nudge --help")
 		}
 	}
@@ -116,8 +130,12 @@ func EvaluateControlPlane(evidence ControlPlaneEvidence) ControlPlaneVerdict {
 	if evidence.ConvoyCheck != nil && (evidence.ConvoyCheck.TimedOut || evidence.ConvoyCheck.Duration > wakeDeadline) {
 		add("convoy", "gt convoy check --dry-run --json")
 	}
-	if evidence.Canary != nil && evidence.Canary.BinaryCommit == evidence.InstalledBinaryCommit && evidence.Canary.Result == "failed" {
-		add("wake-canary", "gt nudge-canary --help")
+	if canary := evidence.Canary; canary != nil {
+		if canary.BinaryCommit != evidence.InstalledBinaryCommit || canary.Result != "passed" ||
+			canary.MayorPreset != evidence.MayorPreset || canary.MayorProvider != evidence.MayorProvider ||
+			canary.PolecatPreset != evidence.PolecatPreset || canary.PolecatProvider != evidence.PolecatProvider {
+			add("wake-canary", "gt nudge-canary --help")
+		}
 	}
 
 	return ControlPlaneVerdict{Healthy: len(failures) == 0, Failures: failures}
@@ -168,8 +186,12 @@ func collectControlPlaneWithDolt(townRoot, installedBinaryCommit string, sources
 	if err != nil {
 		return ControlPlaneVerdict{}, errors.New("reading wake delivery evidence failed")
 	}
+	mayor := config.ResolveRoleAgentConfig(constants.RoleMayor, townRoot, "")
+	polecat := config.ResolveRoleAgentConfig(constants.RolePolecat, townRoot, "")
 	evidence := ControlPlaneEvidence{
 		Now: sources.now(), InstalledBinaryCommit: installedBinaryCommit,
+		MayorPreset: mayor.ResolvedAgent, MayorProvider: mayor.Provider,
+		PolecatPreset: polecat.ResolvedAgent, PolecatProvider: polecat.Provider,
 	}
 	if doltEvidence != nil {
 		evidence.ActionableDoltLeaks = doltEvidence.ActionableDoltLeaks
@@ -189,7 +211,8 @@ func collectControlPlaneWithDolt(townRoot, installedBinaryCommit string, sources
 	}
 	for _, delivery := range queued {
 		evidence.WakeDeliveries = append(evidence.WakeDeliveries, WakeEvidence{
-			Priority: delivery.Priority, QueuedAt: delivery.Timestamp, FailureCode: delivery.LastErrorCode,
+			Priority: delivery.Priority, QueuedAt: delivery.Timestamp,
+			Attempts: delivery.Attempts, FailureCode: delivery.LastErrorCode,
 		})
 	}
 
@@ -210,7 +233,11 @@ func collectControlPlaneWithDolt(townRoot, installedBinaryCommit string, sources
 		if json.Unmarshal(data, &state) != nil {
 			return ControlPlaneVerdict{}, errors.New("reading wake canary evidence failed")
 		}
-		evidence.Canary = &CanaryEvidence{BinaryCommit: state.InstalledBinaryCommit, Result: state.Result}
+		evidence.Canary = &CanaryEvidence{
+			BinaryCommit: state.InstalledBinaryCommit, Result: state.Result,
+			MayorPreset: state.MayorPreset, MayorProvider: state.MayorProvider,
+			PolecatPreset: state.PolecatPreset, PolecatProvider: state.PolecatProvider,
+		}
 	} else if !os.IsNotExist(err) {
 		return ControlPlaneVerdict{}, errors.New("reading wake canary evidence failed")
 	}

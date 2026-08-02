@@ -37,9 +37,12 @@ func TestEvaluateControlPlaneNamesConfirmedFailures(t *testing.T) {
 			subsystem: "wake-delivery", diagnostic: "gt nudge --help",
 		},
 		{
-			name: "failed urgent wake",
+			name: "retrying urgent wake past deadline",
 			mutate: func(e *ControlPlaneEvidence) {
-				e.WakeDeliveries = []WakeEvidence{{Priority: "urgent", QueuedAt: now, FailureCode: "submission-unconfirmed"}}
+				e.WakeDeliveries = []WakeEvidence{{
+					Priority: "urgent", QueuedAt: now.Add(-31 * time.Second), Attempts: 1,
+					FailureCode: "submission-unconfirmed",
+				}}
 			},
 			subsystem: "wake-delivery", diagnostic: "gt nudge --help",
 		},
@@ -198,7 +201,13 @@ func TestEvaluateControlPlaneIgnoresNonActionableEvidence(t *testing.T) {
 		InstalledBinaryCommit:  "candidate",
 		MayorMail:              []MailEvidence{{Priority: "low", Type: "notification", WrittenAt: now.Add(-time.Hour)}},
 		WakeDeliveries:         []WakeEvidence{{Priority: "normal", QueuedAt: now.Add(-time.Hour)}},
-		Canary:                 &CanaryEvidence{BinaryCommit: "previous", Result: "failed"},
+		Canary: &CanaryEvidence{
+			BinaryCommit: "candidate", Result: "passed",
+			MayorPreset: "codex", MayorProvider: "codex",
+			PolecatPreset: "codex", PolecatProvider: "codex",
+		},
+		MayorPreset: "codex", MayorProvider: "codex",
+		PolecatPreset: "codex", PolecatProvider: "codex",
 	}
 
 	got := EvaluateControlPlane(evidence)
@@ -217,17 +226,62 @@ func TestEvaluateControlPlaneRejectsCanaryForDifferentConfiguredRoles(t *testing
 		PolecatPreset:          "codex-polecat",
 		PolecatProvider:        "codex",
 		Canary: &CanaryEvidence{
-			BinaryCommit:   "candidate",
-			Result:         "passed",
-			MayorPreset:    "codex",
-			MayorProvider:  "codex",
-			PolecatPreset:  "codex",
+			BinaryCommit:    "candidate",
+			Result:          "passed",
+			MayorPreset:     "codex",
+			MayorProvider:   "codex",
+			PolecatPreset:   "codex",
 			PolecatProvider: "codex",
 		},
 	})
 
 	if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
 		t.Fatalf("verdict = %#v, want configured-role canary failure", got)
+	}
+}
+
+func TestEvaluateControlPlaneRejectsStaleOrWrongProviderCanary(t *testing.T) {
+	base := CanaryEvidence{
+		BinaryCommit: "candidate", Result: "passed",
+		MayorPreset: "codex-mayor", MayorProvider: "codex",
+		PolecatPreset: "codex-polecat", PolecatProvider: "codex",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*CanaryEvidence)
+	}{
+		{name: "stale binary", mutate: func(c *CanaryEvidence) { c.BinaryCommit = "previous" }},
+		{name: "wrong Mayor provider", mutate: func(c *CanaryEvidence) { c.MayorProvider = "claude" }},
+		{name: "wrong polecat provider", mutate: func(c *CanaryEvidence) { c.PolecatProvider = "claude" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			canary := base
+			tt.mutate(&canary)
+			got := EvaluateControlPlane(ControlPlaneEvidence{
+				Now: time.Now(), CanonicalDoltReachable: true, InstalledBinaryCommit: "candidate",
+				MayorPreset: "codex-mayor", MayorProvider: "codex",
+				PolecatPreset: "codex-polecat", PolecatProvider: "codex", Canary: &canary,
+			})
+			if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+				t.Fatalf("verdict = %#v, want wake-canary failure", got)
+			}
+		})
+	}
+}
+
+func TestEvaluateControlPlaneKeepsRetryingUrgentWakeHealthyBeforeDeadline(t *testing.T) {
+	now := time.Now()
+	got := EvaluateControlPlane(ControlPlaneEvidence{
+		Now:                    now,
+		CanonicalDoltReachable: true,
+		WakeDeliveries: []WakeEvidence{{
+			Priority: "urgent", QueuedAt: now.Add(-time.Second), Attempts: 1,
+			FailureCode: "submission-unconfirmed",
+		}},
+	})
+	if !got.Healthy || len(got.Failures) != 0 {
+		t.Fatalf("verdict = %#v, want retrying delivery healthy before deadline", got)
 	}
 }
 

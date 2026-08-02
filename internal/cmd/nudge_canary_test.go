@@ -337,6 +337,12 @@ func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
 		RuntimeConfigDir: t.TempDir(),
 		Session:          session.MayorSessionName(),
 	}
+	settings := config.NewTownSettings()
+	settings.Agents["codex"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.RoleAgents = map[string]string{constants.RoleMayor: "codex"}
+	if err := config.SaveTownSettings(config.TownSettingsPath(sandbox.TownRoot), settings); err != nil {
+		t.Fatalf("save canary town settings: %v", err)
+	}
 	cfg, err := wakeCanarySessionConfig(sandbox, "complete the finite startup challenge")
 	if err != nil {
 		t.Fatalf("build canary session config: %v", err)
@@ -378,7 +384,7 @@ func TestWakeCanaryLaunchBypassesHookTrustOnlyForCanary(t *testing.T) {
 	}
 }
 
-func TestWakeCanarySessionConfigIgnoresCallerRigSettings(t *testing.T) {
+func TestWakeCanarySessionConfigUsesIsolatedConfiguredMayorPreset(t *testing.T) {
 	callerDir := t.TempDir()
 	callerSettings := config.NewRigSettings()
 	callerSettings.Agents = map[string]*config.RuntimeConfig{
@@ -394,6 +400,14 @@ func TestWakeCanarySessionConfigIgnoresCallerRigSettings(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0700); err != nil {
 		t.Fatalf("create isolated workdir: %v", err)
 	}
+	townSettings := config.NewTownSettings()
+	townSettings.Agents["night-mayor"] = &config.RuntimeConfig{
+		Provider: "codex", Command: "configured-codex", Args: []string{"--model", "mayor"},
+	}
+	townSettings.RoleAgents = map[string]string{constants.RoleMayor: "night-mayor"}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("save isolated town settings: %v", err)
+	}
 	sandbox := &wakeCanarySandbox{
 		TownRoot: townRoot, WorkDir: workDir, RuntimeConfigDir: filepath.Join(townRoot, ".codex"),
 		Session: session.MayorSessionName(),
@@ -407,8 +421,11 @@ func TestWakeCanarySessionConfigIgnoresCallerRigSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve StartSession runtime: %v", err)
 	}
-	if got := runtimeConfig.Command; got != "codex" {
-		t.Fatalf("StartSession runtime command = %q, want isolated codex", got)
+	if cfg.AgentOverride != "night-mayor" || runtimeConfig.Provider != "codex" {
+		t.Fatalf("StartSession runtime = %q/%q, want night-mayor/codex", cfg.AgentOverride, runtimeConfig.Provider)
+	}
+	if !strings.Contains(cfg.Command, "configured-codex") || !strings.Contains(cfg.Command, "--model mayor") {
+		t.Fatalf("canary command does not preserve configured preset: %q", cfg.Command)
 	}
 	if cfg.RigPath != sandbox.WorkDir {
 		t.Fatalf("canary rig path = %q, want sandbox workdir %q", cfg.RigPath, sandbox.WorkDir)
@@ -421,8 +438,12 @@ func TestWakeCanarySessionConfigIgnoresCallerRigSettings(t *testing.T) {
 func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	townRoot := t.TempDir()
 	state := wakeCanaryState{
-		SchemaVersion:         1,
+		SchemaVersion:         2,
 		InstalledBinaryCommit: "abc123",
+		MayorPreset:           "codex-mayor",
+		MayorProvider:         "codex",
+		PolecatPreset:         "codex-polecat",
+		PolecatProvider:       "codex",
 		AttemptedAt:           time.Now(),
 		Result:                "passed",
 		LatencyMS:             42,
@@ -450,7 +471,8 @@ func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 6 || got["schema_version"] != float64(1) || got["result"] != "passed" {
+	if len(got) != 10 || got["schema_version"] != float64(2) || got["result"] != "passed" ||
+		got["mayor_preset"] != "codex-mayor" || got["polecat_preset"] != "codex-polecat" {
 		t.Fatalf("state schema = %#v", got)
 	}
 	for _, forbidden := range []string{"session", "nonce", "message", "delivery_id"} {
@@ -463,6 +485,8 @@ func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 func TestResolveWakeCanaryRolesUsesConfiguredPresetsAndProviders(t *testing.T) {
 	townRoot := t.TempDir()
 	settings := config.NewTownSettings()
+	settings.Agents["codex-mayor"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
+	settings.Agents["codex-polecat"] = &config.RuntimeConfig{Provider: "codex", Command: "codex"}
 	settings.RoleAgents = map[string]string{
 		constants.RoleMayor:   "codex-mayor",
 		constants.RolePolecat: "codex-polecat",
