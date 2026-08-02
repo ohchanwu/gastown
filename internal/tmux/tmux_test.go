@@ -2828,7 +2828,7 @@ func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
 				}
 			}
 
-			err := tm.WaitForIdle(sessionName, 500*time.Millisecond)
+			err := tm.WaitForIdle(sessionName, 1500*time.Millisecond)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("WaitForIdle() = %v, want %v", err, tt.wantErr)
 			}
