@@ -42,16 +42,21 @@ var (
 
 // SessionManager handles polecat session lifecycle.
 type SessionManager struct {
-	tmux *tmux.Tmux
-	rig  *rig.Rig
+	tmux                 *tmux.Tmux
+	rig                  *rig.Rig
+	deliverStartupPrompt func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
+	verifyStartupNudge   func(context.Context, string, *config.RuntimeConfig, string) error
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
-	return &SessionManager{
+	m := &SessionManager{
 		tmux: t,
 		rig:  r,
 	}
+	m.deliverStartupPrompt = m.deliverStartupPromptFallback
+	m.verifyStartupNudge = m.verifyStartupNudgeDelivery
+	return m
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -318,8 +323,24 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 
 // Start creates and starts a new session for a polecat.
 func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+	return m.StartContext(context.Background(), polecat, opts)
+}
+
+// StartContext creates a polecat session under one caller-cancelable deadline.
+func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts SessionStartOptions) (retErr error) {
 	if !m.hasPolecat(polecat) {
 		return fmt.Errorf("%w: %s", ErrPolecatNotFound, polecat)
+	}
+	townRoot := filepath.Dir(m.rig.Path)
+	startupTimeout := config.LoadOperationalConfig(townRoot).GetSessionConfig().ClaudeStartTimeoutD()
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+	startupDeadline, _ := ctx.Deadline()
+	remaining := func() time.Duration {
+		if left := time.Until(startupDeadline); left > 0 {
+			return left
+		}
+		return 0
 	}
 
 	sessionID := m.SessionName(polecat)
@@ -347,7 +368,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		if m.tmux.IsAgentAlive(sessionID) {
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 		}
-		if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+		if err := m.tmux.KillSessionWithProcessesContext(ctx, sessionID); err != nil {
 			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
 	}
@@ -374,7 +395,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// This was the root cause of gt-1j3m: Codex polecats sat idle because the startup
 	// sequence used Claude's ReadyPromptPrefix ("❯ ") to detect readiness in a Codex
 	// session, timing out instead of using Codex's delay-based readiness.
-	townRoot := filepath.Dir(m.rig.Path)
 	var runtimeConfig *config.RuntimeConfig
 	if opts.Agent != "" {
 		rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.Agent)
@@ -478,9 +498,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
 	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
-	if err := m.tmux.NewSessionWithCommandAndEnv(sessionID, workDir, command, envVars); err != nil {
+	if err := m.tmux.NewSessionWithCommandAndEnvContext(ctx, sessionID, workDir, command, envVars); err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if err := m.tmux.KillSessionWithProcessesContext(cleanupCtx, sessionID); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("cleaning failed-start session %s: %w", sessionID, err))
+		}
+	}()
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	// Declared pane identity replaces process-tree inference in IsRuntimeRunning
@@ -505,22 +535,23 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
 	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 
-	// Wait for Claude to start (non-fatal)
-	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	if err := m.tmux.WaitForCommandContext(ctx, sessionID, constants.SupportedShells, startupTimeout); err != nil {
+		return fmt.Errorf("waiting for polecat to start: %w", err)
+	}
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
 	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
 	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
-		_ = m.tmux.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("startup blocked: %w", err)
 	}
 
 	// Wait for runtime to be fully ready at the prompt (not just started).
 	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
-	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	if err := m.tmux.WaitForRuntimeReadyContext(ctx, sessionID, runtimeConfig, startupTimeout); err != nil {
+		return fmt.Errorf("waiting for polecat runtime readiness: %w", err)
+	}
 	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
-		_ = m.tmux.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("startup blocked: %w", err)
 	}
 
@@ -529,15 +560,20 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if fallbackInfo.SendBeaconNudge {
 		// Promptless runtimes need the full startup prompt delivered via nudge so
 		// the agent sees both the beacon and the initial work instructions.
-		debugSession("DeliverStartupPromptFallback",
-			runtime.DeliverStartupPromptFallback(m.tmux, sessionID, startupPromptFallback, runtimeConfig, constants.ClaudeStartTimeout))
+		deliveryErr := m.deliverStartupPrompt(ctx, sessionID, startupPromptFallback, runtimeConfig, remaining())
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("delivering startup prompt fallback: %w", err)
+		}
+		debugSession("DeliverStartupPromptFallback", deliveryErr)
 	} else {
 		if fallbackInfo.StartupNudgeDelayMs > 0 {
 			// Wait for agent to finish processing the beacon + gt prime before sending
 			// work instructions. Prompt-capable runtimes already got the beacon as the
 			// initial CLI prompt, so they only need the delayed startup nudge here.
 			primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
-			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
+			if err := m.tmux.WaitForRuntimeReadyContext(ctx, sessionID, primeWaitRC, startupTimeout); err != nil {
+				return fmt.Errorf("waiting for polecat prime readiness: %w", err)
+			}
 		}
 
 		if fallbackInfo.SendStartupNudge {
@@ -554,7 +590,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		if fallbackInfo.SendBeaconNudge {
 			verifyContent = startupPromptFallback
 		}
-		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent)
+		if err := m.verifyStartupNudge(ctx, sessionID, runtimeConfig, verifyContent); err != nil {
+			return fmt.Errorf("verifying startup nudge delivery: %w", err)
+		}
 	}
 
 	// Verify beacon delivery for hook+prompt agents (Mode A, hi-y44).
@@ -565,7 +603,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// synchronous call would add ~25s to every successful polecat startup on the
 	// common gt sling path. Non-fatal: the witness zombie patrol handles unrecovered stalls.
 	if !fallbackInfo.SendBeaconNudge && !fallbackInfo.SendStartupNudge {
-		go m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, startupNudgeContent)
+		go func() {
+			_ = m.verifyStartupNudge(context.Background(), sessionID, runtimeConfig, startupNudgeContent)
+		}()
 	}
 
 	// Legacy fallback for other startup paths (non-fatal)
@@ -581,7 +621,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
 	}
 	if status := m.tmux.CheckSessionHealth(sessionID, 0); status != tmux.SessionHealthy {
-		_ = m.tmux.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("session %s unhealthy during startup: %s", sessionID, status)
 	}
 
@@ -590,7 +629,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// polecats running non-Claude agents (e.g., opencode). Fail fast.
 	gtAgent, _ := m.tmux.GetEnvironment(sessionID, "GT_AGENT")
 	if gtAgent == "" {
-		_ = m.tmux.KillSessionWithProcesses(sessionID)
 		return fmt.Errorf("GT_AGENT not set in session %s (command=%q); "+
 			"witness patrol will misidentify this polecat as a zombie and auto-nuke it. "+
 			"Ensure RuntimeConfig.ResolvedAgent is set during agent config resolution",
@@ -885,6 +923,25 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	return nil
 }
 
+func (m *SessionManager) deliverStartupPromptFallback(
+	ctx context.Context,
+	sessionID, prompt string,
+	rc *config.RuntimeConfig,
+	timeout time.Duration,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// DeliverStartupPromptFallback bounds readiness with timeout. Its remaining
+	// context-blind nudge is also finite: lock acquisition is capped at 30s and
+	// composer submission uses fixed-count probes/retries.
+	err := runtime.DeliverStartupPromptFallback(m.tmux, sessionID, prompt, rc, timeout)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
 // verifyStartupNudgeDelivery checks if the polecat started working after the
 // startup nudge and retries the nudge if the agent is truly idle.
 // This fixes the Mode B race condition (GH#1379) where the startup nudge arrives
@@ -898,11 +955,11 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 //
 // Non-fatal: if verification fails or times out, the session is left running.
 // The witness zombie patrol will eventually detect and handle truly idle polecats.
-func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig, retryContent string) {
+func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, sessionID string, rc *config.RuntimeConfig, retryContent string) error {
 	// Only verify for agents with prompt detection. Without ReadyPromptPrefix,
 	// we can't distinguish "idle at prompt" from "busy processing".
 	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
-		return
+		return nil
 	}
 
 	// Use configurable thresholds from operational config so operators can tune
@@ -920,12 +977,24 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Wait for the agent to process the nudge before checking.
-		time.Sleep(verifyDelay)
+		timer := time.NewTimer(verifyDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		// Check if session is still alive
-		running, err := m.tmux.HasSession(sessionID)
+		running, err := m.tmux.HasSessionContext(ctx, sessionID)
 		if err != nil || !running {
-			return // Session died, nothing to verify
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return nil // Session died, nothing to verify
 		}
 
 		// Use IsIdle instead of IsAtPrompt: IsIdle checks for the "esc to
@@ -933,25 +1002,49 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// running tools, generating a response), the status bar shows the busy
 		// indicator and IsIdle returns false — even though ❯ may still be
 		// visible in the pane from before Claude started output.
-		if !m.tmux.IsIdle(sessionID) {
-			return // Agent is busy — nudge was received and is being processed
+		idle, err := m.tmux.IsIdleContext(ctx, sessionID, rc)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return nil
+		}
+		if !idle {
+			return nil // Agent is busy — nudge was received and is being processed
 		}
 
 		// Agent is truly idle (no busy indicator, prompt visible) — nudge was likely lost. Retry.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
 			attempt, maxRetries, sessionID)
-		if err := m.tmux.NudgeSession(sessionID, retryContent); err != nil {
-			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
-			return
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// NudgeSession has no context variant, but its lock acquisition is capped
+		// at 30s and composer submission uses fixed-count probes/retries.
+		nudgeErr := m.tmux.NudgeSession(sessionID, retryContent)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if nudgeErr != nil {
+			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, nudgeErr)
+			return nil
 		}
 	}
 
 	// If we exhausted retries and the agent is still idle, log a warning.
 	// The witness zombie patrol will handle this case.
-	if m.tmux.IsIdle(sessionID) {
+	idle, err := m.tmux.IsIdleContext(ctx, sessionID, rc)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return nil
+	}
+	if idle {
 		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: agent %s still idle after %d nudge retries\n",
 			sessionID, maxRetries)
 	}
+	return ctx.Err()
 }
 
 // hookIssue pins an issue to a polecat's hook using bd update.

@@ -2988,6 +2988,16 @@ func TestDefaultReadyPromptPrefix(t *testing.T) {
 	}
 }
 
+func TestIsIdleContext_Canceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := NewTmux().IsIdleContext(ctx, "nonexistent-session", nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("IsIdleContext error = %v, want context cancellation", err)
+	}
+}
+
 func TestGetSessionActivity(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-activity-" + t.Name()

@@ -1,12 +1,15 @@
 package polecat
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +35,17 @@ func setupTestRegistryForSession(t *testing.T) {
 // testSessionCounter provides unique session names across -count=N runs
 // to prevent "duplicate session" races with tmux's async cleanup.
 var testSessionCounter atomic.Int64
+
+type observedDoneContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
 
 func requireTmux(t *testing.T) {
 	t.Helper()
@@ -146,6 +160,214 @@ func TestStartPolecatNotFound(t *testing.T) {
 	err := m.Start("Unknown", SessionStartOptions{})
 	if err == nil {
 		t.Error("expected error for unknown polecat")
+	}
+}
+
+func TestStart_UsesOneDeadlineAndCleansOnlyItsSession(t *testing.T) {
+	requireTmux(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{
+		Session: &config.SessionThresholds{ClaudeStartTimeout: "200ms"},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	sessionID := m.SessionName("Toast")
+	_ = tm.KillSession(sessionID)
+	t.Cleanup(func() { _ = tm.KillSession(sessionID) })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Start("Toast", SessionStartOptions{WorkDir: workDir, Command: "sh"})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "creating session:") {
+			t.Fatalf("Start error = %v, want truthful session-creation phase", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start exceeded configured 200ms startup deadline")
+	}
+
+	if running, err := tm.HasSession(sessionID); err != nil || running {
+		t.Fatalf("owned failed-start session remains: running=%v err=%v", running, err)
+	}
+}
+
+func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
+	requireTmux(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	retries := 1
+	settings := config.NewTownSettings()
+	settings.DefaultAgent = "test-runtime"
+	settings.Agents = map[string]*config.RuntimeConfig{
+		"test-runtime": {
+			Provider:   "generic",
+			Command:    "awk",
+			PromptMode: "none",
+			Hooks:      &config.RuntimeHooksConfig{Provider: "claude"},
+			Tmux: &config.RuntimeTmuxConfig{
+				ProcessNames:      []string{"awk"},
+				ReadyPromptPrefix: "READY>",
+			},
+		},
+	}
+	settings.Operational = &config.OperationalConfig{
+		Session: &config.SessionThresholds{
+			ClaudeStartTimeout:      "20s",
+			StartupNudgeVerifyDelay: "10s",
+			StartupNudgeMaxRetries:  &retries,
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	sessionID := m.SessionName("Toast")
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(sessionID) })
+
+	verificationEntered := make(chan struct{})
+	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error {
+		return nil
+	}
+	m.verifyStartupNudge = func(ctx context.Context, _ string, _ *config.RuntimeConfig, _ string) error {
+		close(verificationEntered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	command := `awk 'BEGIN { print "READY>"; fflush(); if ((getline line) > 0) { print "esc to interrupt"; fflush(); system("sleep 30") } }'`
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- m.StartContext(ctx, "Toast", SessionStartOptions{
+			WorkDir: workDir,
+			Command: command,
+			Agent:   "test-runtime",
+		})
+	}()
+
+	select {
+	case <-verificationEntered:
+	case err := <-done:
+		t.Fatalf("StartContext returned before verification: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("StartContext did not enter startup nudge verification")
+	}
+
+	cancelledAt := time.Now()
+	cancel()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("StartContext did not return after post-ready cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartContext error = %v, want context cancellation", err)
+	}
+	if !strings.Contains(err.Error(), "verifying startup nudge delivery") {
+		t.Fatalf("StartContext error = %v, want post-ready verification phase", err)
+	}
+	if elapsed := time.Since(cancelledAt); elapsed > 6*time.Second {
+		t.Fatalf("post-ready cancellation took %v, want <= 6s including bounded process cleanup", elapsed)
+	}
+	if running, err := tm.HasSession(sessionID); err != nil || running {
+		t.Fatalf("cancelled start left session behind: running=%v err=%v", running, err)
+	}
+}
+
+func TestStart_ExpiredContextKillsOwnedChildOnly(t *testing.T) {
+	requireTmux(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{
+		Session: &config.SessionThresholds{ClaudeStartTimeout: "450ms"},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+
+	reg := session.NewPrefixRegistry()
+	reg.Register("xz", "testrig")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+
+	tm := tmux.NewTmux()
+	unrelated := fmt.Sprintf("gt-test-unrelated-%d", testSessionCounter.Add(1))
+	if err := tm.NewSessionWithCommand(unrelated, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("create unrelated session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(unrelated) })
+
+	m := NewSessionManager(tm, &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}})
+	sessionID := m.SessionName("Toast")
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	err := m.Start("Toast", SessionStartOptions{
+		WorkDir: workDir,
+		Command: fmt.Sprintf(`sh -c 'sleep 30 & echo $! > %q; wait'`, pidFile),
+	})
+	if err == nil {
+		t.Fatal("Start error = nil, want startup deadline failure")
+	}
+
+	payload, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatalf("read child pid: %v", readErr)
+	}
+	childPID := strings.TrimSpace(string(payload))
+	t.Cleanup(func() { _ = exec.Command("kill", "-KILL", childPID).Run() })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for exec.Command("kill", "-0", childPID).Run() == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := exec.Command("kill", "-0", childPID).Run(); err == nil {
+		t.Fatalf("attempt-owned child process %s survived failed-start cleanup", childPID)
+	}
+	if running, err := tm.HasSession(unrelated); err != nil || !running {
+		t.Fatalf("unrelated session removed: running=%v err=%v", running, err)
+	}
+	if running, err := tm.HasSession(sessionID); err != nil || running {
+		t.Fatalf("failed-start session remains: running=%v err=%v", running, err)
 	}
 }
 
@@ -583,7 +805,7 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	// plus overhead = ~60s. Use 90s for safety.
 	done := make(chan struct{})
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook")
+		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "check your hook")
 		close(done)
 	}()
 
@@ -604,7 +826,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	// Should return immediately without error for nil config
-	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "")
+	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", nil, "")
 
 	// And for config without prompt prefix
 	rc := &config.RuntimeConfig{
@@ -613,7 +835,60 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 			ReadyDelayMs:      1000,
 		},
 	}
-	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "")
+	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", rc, "")
+}
+
+func TestVerifyStartupNudgeDelivery_CancellationInterruptsPolling(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "test-rig")
+	retries := 1
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{
+		Session: &config.SessionThresholds{
+			StartupNudgeVerifyDelay: "10s",
+			StartupNudgeMaxRetries:  &retries,
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+
+	m := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "test-rig", Path: rigPath})
+	baseCtx, cancel := context.WithCancel(context.Background())
+	ctx := &observedDoneContext{Context: baseCtx, entered: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- m.verifyStartupNudgeDelivery(ctx, "nonexistent-session", &config.RuntimeConfig{
+			Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "READY"},
+		}, "check your hook")
+	}()
+
+	select {
+	case <-ctx.entered:
+	case <-time.After(time.Second):
+		t.Fatal("verifier did not begin context-aware polling")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("verifyStartupNudgeDelivery error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("verifier did not stop after cancellation")
+	}
+}
+
+func TestDeliverStartupPromptFallback_CanceledContextSkipsDelivery(t *testing.T) {
+	m := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "test-rig", Path: t.TempDir()})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := m.deliverStartupPromptFallback(ctx, "nonexistent-session", "begin", &config.RuntimeConfig{}, time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("deliverStartupPromptFallback error = %v, want context cancellation", err)
+	}
 }
 
 func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
@@ -732,7 +1007,7 @@ func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
 
 	launchStart := time.Now()
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
 		close(goroutineDone)
 	}()
 	callerReturned <- time.Since(launchStart)

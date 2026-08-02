@@ -1,9 +1,17 @@
 package tmux
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 // Tests for the two-step session creation (new-session + respawn-pane) and
@@ -35,6 +43,162 @@ func TestNewSessionWithCommand_BadWorkDir(t *testing.T) {
 	err := tm.NewSessionWithCommand(session, "/tmp/gastown-nonexistent-dir-99999", "echo hello")
 	if err == nil {
 		t.Error("NewSessionWithCommand should return error for non-existent workDir")
+	}
+}
+
+func TestNewSessionWithCommandAndEnv_InvalidInputPreservesOtherSocketSession(t *testing.T) {
+	session := "gt-test-owned-" + strings.ToLower(t.Name())
+	other := NewTmuxWithSocket("default")
+	_ = other.KillSession(session)
+	if err := other.NewSession(session, ""); err != nil {
+		t.Fatalf("create other-socket session: %v", err)
+	}
+	t.Cleanup(func() { _ = other.KillSession(session) })
+
+	owner := newTestTmux(t)
+	_ = owner.KillSession(session)
+	err := owner.NewSessionWithCommandAndEnv(session, t.TempDir()+"/missing", "sleep 10", nil)
+	if err == nil {
+		t.Fatal("expected invalid work directory error")
+	}
+	if running, err := other.HasSession(session); err != nil || !running {
+		t.Fatalf("other-socket session removed after validation failure: running=%v err=%v", running, err)
+	}
+}
+
+func TestNewSessionWithCommandAndEnv_ValidInputPreservesOtherSocketSession(t *testing.T) {
+	session := "gt-test-owned-valid"
+	owner := newTestTmux(t)
+	warmup := "gt-test-owner-warmup"
+	_ = owner.KillSession(warmup)
+	if err := owner.NewSession(warmup, ""); err != nil {
+		t.Fatalf("warm owner socket: %v", err)
+	}
+	t.Cleanup(func() { _ = owner.KillSession(warmup) })
+
+	other := NewTmuxWithSocket("default")
+	_ = other.KillSession(session)
+	if err := other.NewSession(session, ""); err != nil {
+		t.Fatalf("create other-socket session: %v", err)
+	}
+	t.Cleanup(func() { _ = other.KillSession(session) })
+
+	_ = owner.KillSession(session)
+	if err := owner.NewSessionWithCommandAndEnv(session, t.TempDir(), "sleep 10", nil); err != nil {
+		t.Fatalf("create owner session: %v", err)
+	}
+	t.Cleanup(func() { _ = owner.KillSession(session) })
+
+	if running, err := other.HasSession(session); err != nil || !running {
+		t.Fatalf("other-socket session removed by unrelated creation: running=%v err=%v", running, err)
+	}
+}
+
+func TestNewSessionWithCommandAndEnvContext_CancellationCleansCreatedSession(t *testing.T) {
+	tm := newTestTmux(t)
+	creator, ok := any(tm).(interface {
+		NewSessionWithCommandAndEnvContext(context.Context, string, string, string, map[string]string) error
+	})
+	if !ok {
+		t.Fatal("Tmux does not provide cancellation-aware session creation")
+	}
+
+	session := "gt-test-create-cancel-" + strings.ToLower(t.Name())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	err := creator.NewSessionWithCommandAndEnvContext(ctx, session, t.TempDir(), "sleep 10", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("creation error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("cancellation took %v, want <= 300ms", elapsed)
+	}
+	if running, err := tm.HasSession(session); err != nil || running {
+		t.Fatalf("cancelled creation left session behind: running=%v err=%v", running, err)
+	}
+}
+
+func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *testing.T) {
+	tm := newTestTmux(t)
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is required to launch a detached child")
+	}
+
+	unrelated := "gt-test-create-cancel-unrelated"
+	_ = tm.KillSession(unrelated)
+	if err := tm.NewSessionWithCommand(unrelated, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("create unrelated session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(unrelated) })
+
+	session := "gt-test-create-cancel-detached"
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	script := fmt.Sprintf(`import subprocess; p = subprocess.Popen(["sleep", "30"], start_new_session=True); open(%q, "w").write(str(p.pid)); p.wait()`, pidFile)
+	command := fmt.Sprintf("%q -c %q", python, script)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(session) })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tm.NewSessionWithCommandAndEnvContext(ctx, session, t.TempDir(), command, nil)
+	}()
+
+	var childPID string
+	deadline := time.Now().Add(3 * time.Second)
+	for childPID == "" && time.Now().Before(deadline) {
+		payload, readErr := os.ReadFile(pidFile)
+		if readErr == nil {
+			childPID = strings.TrimSpace(string(payload))
+		}
+		if childPID == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if childPID == "" {
+		t.Fatal("runtime command did not record detached child PID")
+	}
+	t.Cleanup(func() { _ = exec.Command("kill", "-KILL", childPID).Run() })
+
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("creation error = %v, want context canceled", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for exec.Command("kill", "-0", childPID).Run() == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := exec.Command("kill", "-0", childPID).Run(); err == nil {
+		t.Fatalf("attempt-owned detached child process %s survived cancelled creation", childPID)
+	}
+	if running, err := tm.HasSession(unrelated); err != nil || !running {
+		t.Fatalf("unrelated session removed by cancelled creation: running=%v err=%v", running, err)
+	}
+}
+
+func TestWaitForRuntimeReadyContext_CancellationStopsDelay(t *testing.T) {
+	tm := newTestTmux(t)
+	waiter, ok := any(tm).(interface {
+		WaitForRuntimeReadyContext(context.Context, string, *config.RuntimeConfig, time.Duration) error
+	})
+	if !ok {
+		t.Fatal("Tmux does not provide cancellation-aware runtime readiness")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyDelayMs: 30_000}}
+	started := time.Now()
+	err := waiter.WaitForRuntimeReadyContext(ctx, "unused", rc, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("WaitForRuntimeReadyContext error = %v, want cancellation", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("cancellation took %v, want <= 250ms", elapsed)
 	}
 }
 

@@ -19,6 +19,10 @@ const (
 )
 
 func (t *Tmux) ensureNewSessionSocketSafe() error {
+	return t.ensureNewSessionSocketSafeContext(context.Background())
+}
+
+func (t *Tmux) ensureNewSessionSocketSafeContext(ctx context.Context) error {
 	if t.socketName == "" {
 		return nil
 	}
@@ -39,23 +43,27 @@ func (t *Tmux) ensureNewSessionSocketSafe() error {
 		return fmt.Errorf("tmux socket %s is %s, not a Unix socket; refusing to start a new session because tmux could replace it (see gt-h9z)", socketPath, mode.Type())
 	}
 
-	return t.ensureLiveSocketSafe(socketPath)
+	return t.ensureLiveSocketSafeContext(ctx, socketPath)
 }
 
 func (t *Tmux) ensureLiveSocketSafe(socketPath string) error {
-	if stale, err := unixSocketStale(socketPath); err != nil || stale {
+	return t.ensureLiveSocketSafeContext(context.Background(), socketPath)
+}
+
+func (t *Tmux) ensureLiveSocketSafeContext(ctx context.Context, socketPath string) error {
+	if stale, err := unixSocketStaleContext(ctx, socketPath); err != nil || stale {
 		if stale {
 			return nil
 		}
 		return fmt.Errorf("tmux socket %s exists but cannot be safely contacted: %w", socketPath, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), newSessionSocketProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, newSessionSocketProbeTimeout)
 	defer cancel()
 	if err := t.runListSessionsProbe(ctx); err == nil {
 		return nil
 	} else if errors.Is(err, ErrNoServer) {
-		stale, recheckErr := unixSocketStale(socketPath)
+		stale, recheckErr := unixSocketStaleContext(ctx, socketPath)
 		if recheckErr == nil && stale {
 			return nil
 		}
@@ -69,7 +77,11 @@ func (t *Tmux) ensureLiveSocketSafe(socketPath string) error {
 }
 
 func unixSocketStale(socketPath string) (bool, error) {
-	conn, err := net.DialTimeout("unix", socketPath, newSessionSocketDialTimeout)
+	return unixSocketStaleContext(context.Background(), socketPath)
+}
+
+func unixSocketStaleContext(ctx context.Context, socketPath string) (bool, error) {
+	conn, err := (&net.Dialer{Timeout: newSessionSocketDialTimeout}).DialContext(ctx, "unix", socketPath)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
 			return true, nil

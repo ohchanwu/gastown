@@ -13,6 +13,21 @@ import (
 // the user's interactive tmux and avoids socket conflicts with other packages.
 func TestMain(m *testing.M) {
 	socket := fmt.Sprintf("gt-test-%d", os.Getpid())
+	socketDir, err := os.MkdirTemp("/tmp", "gt-tmux-tests-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create tmux test socket directory: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(socketDir)
+	oldSocketDir, hadSocketDir := os.LookupEnv("TMUX_TMPDIR")
+	_ = os.Setenv("TMUX_TMPDIR", socketDir)
+	defer func() {
+		if hadSocketDir {
+			_ = os.Setenv("TMUX_TMPDIR", oldSocketDir)
+		} else {
+			_ = os.Unsetenv("TMUX_TMPDIR")
+		}
+	}()
 
 	// Set defaultSocket so NewTmux() connects to the test server, not the
 	// user's personal server or the sentinel that indicates "no town context".

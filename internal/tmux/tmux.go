@@ -138,10 +138,14 @@ func GetDefaultSocket() string {
 }
 
 // SocketDir returns the directory where tmux stores its socket files.
-// On macOS, tmux uses /tmp (not $TMPDIR which points to /var/folders/...),
-// so we must use /tmp directly rather than os.TempDir().
+// TMUX_TMPDIR explicitly relocates tmux sockets; otherwise macOS uses /tmp
+// rather than $TMPDIR (which points to /var/folders/...).
 func SocketDir() string {
-	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
+	base := os.Getenv("TMUX_TMPDIR")
+	if base == "" {
+		base = "/tmp"
+	}
+	return filepath.Join(base, fmt.Sprintf("tmux-%d", os.Getuid()))
 }
 
 // IsInSameSocket checks if the current process is inside a tmux session on the
@@ -321,6 +325,9 @@ func (t *Tmux) runContext(ctx context.Context, args ...string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", t.wrapError(err, stderr.String(), args)
 	}
 
@@ -353,7 +360,11 @@ func (t *Tmux) wrapError(err error, stderr string, args []string) error {
 }
 
 func (t *Tmux) createNewSession(name, workDir string, env map[string]string) error {
-	if err := t.ensureNewSessionSocketSafe(); err != nil {
+	return t.createNewSessionContext(context.Background(), name, workDir, env)
+}
+
+func (t *Tmux) createNewSessionContext(ctx context.Context, name, workDir string, env map[string]string) error {
+	if err := t.ensureNewSessionSocketSafeContext(ctx); err != nil {
 		return err
 	}
 
@@ -369,13 +380,13 @@ func (t *Tmux) createNewSession(name, workDir string, env map[string]string) err
 	for _, k := range keys {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
 	}
-	if _, err := t.run(args...); err != nil {
+	if _, err := t.runContext(ctx, args...); err != nil {
 		return err
 	}
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
-	_, _ = t.run("set-option", "-wt", name, "window-size", "latest")
+	_, _ = t.runContext(ctx, "set-option", "-wt", name, "window-size", "latest")
 	return nil
 }
 
@@ -475,13 +486,14 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 // but -e provides defense-in-depth for the initial shell environment.
 // Requires tmux >= 3.2.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
+	return t.NewSessionWithCommandAndEnvContext(context.Background(), name, workDir, command, env)
+}
+
+// NewSessionWithCommandAndEnvContext is NewSessionWithCommandAndEnv bounded by ctx.
+func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, workDir, command string, env map[string]string) (retErr error) {
 	if err := validateSessionName(name); err != nil {
 		return err
 	}
-
-	// Kill stale same-named sessions on other sockets to prevent split-brain.
-	// This is best-effort: failures are silently ignored.
-	t.killSplitBrainSession(name)
 
 	if workDir != "" {
 		info, err := os.Stat(workDir)
@@ -498,17 +510,23 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 
 	// Two-step creation: create session with env vars and default shell, then
 	// replace the shell with the actual command after configuring remain-on-exit.
-	if err := t.createNewSession(name, workDir, env); err != nil {
+	if err := t.createNewSessionContext(ctx, name, workDir, env); err != nil {
 		return err
 	}
+	defer func() {
+		if retErr != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cleanupCancel()
+			_ = t.KillSessionWithProcessesContext(cleanupCtx, name)
+		}
+	}()
 
 	// Enable remain-on-exit BEFORE command runs so we can inspect exit status
-	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "on")
+	_, _ = t.runContext(ctx, "set-option", "-t", name, "remain-on-exit", "on")
 
 	// Replace the initial shell with the actual command.
 	if runtime.GOOS == "windows" {
-		if _, err := t.run("send-keys", "-t", name, command, "Enter"); err != nil {
-			_ = t.KillSession(name)
+		if _, err := t.runContext(ctx, "send-keys", "-t", name, command, "Enter"); err != nil {
 			return fmt.Errorf("failed to send command in session %q: %w", name, err)
 		}
 	} else {
@@ -517,13 +535,12 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
 		respawnArgs = append(respawnArgs, command)
-		if _, err := t.run(respawnArgs...); err != nil {
-			_ = t.KillSession(name)
+		if _, err := t.runContext(ctx, respawnArgs...); err != nil {
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
 		}
 	}
 
-	return t.checkSessionAfterCreate(name, command)
+	return t.checkSessionAfterCreateContext(ctx, name, command)
 }
 
 // checkSessionAfterCreate verifies that a newly created session's command didn't
@@ -531,12 +548,16 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 // to already be enabled on the session. Checks the exit status after a brief delay.
 // Only returns an error for non-zero exits (command failures), not clean exits (status 0).
 func (t *Tmux) checkSessionAfterCreate(name, command string) error {
+	return t.checkSessionAfterCreateContext(context.Background(), name, command)
+}
+
+func (t *Tmux) checkSessionAfterCreateContext(ctx context.Context, name, command string) error {
 	checkPaneDead := func() (bool, error) {
-		paneDead, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead}")
+		paneDead, _ := t.runContext(ctx, "display-message", "-p", "-t", name, "#{pane_dead}")
 		if strings.TrimSpace(paneDead) != "1" {
 			return false, nil
 		}
-		exitStatus, _ := t.run("display-message", "-p", "-t", name, "#{pane_dead_status}")
+		exitStatus, _ := t.runContext(ctx, "display-message", "-p", "-t", name, "#{pane_dead_status}")
 		status := strings.TrimSpace(exitStatus)
 		if status != "" && status != "0" {
 			_ = t.KillSession(name)
@@ -547,7 +568,9 @@ func (t *Tmux) checkSessionAfterCreate(name, command string) error {
 	}
 
 	// First check at 50ms: catches fast failures on lightly-loaded runners.
-	time.Sleep(50 * time.Millisecond)
+	if err := waitForContext(ctx, 50*time.Millisecond); err != nil {
+		return err
+	}
 	if dead, err := checkPaneDead(); dead {
 		return err
 	}
@@ -556,13 +579,15 @@ func (t *Tmux) checkSessionAfterCreate(name, command string) error {
 	// process startup takes longer than 50ms. This is the fix for CI getting
 	// false negatives on TestNewSessionWithCommand_ExecEnvBadBinary. Normal
 	// long-lived sessions (Claude, shell) will still be alive here and return nil.
-	time.Sleep(200 * time.Millisecond)
+	if err := waitForContext(ctx, 200*time.Millisecond); err != nil {
+		return err
+	}
 	if dead, err := checkPaneDead(); dead {
 		return err
 	}
 
 	// Pane is alive — restore default (no need to keep dead sessions around)
-	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "off")
+	_, _ = t.runContext(ctx, "set-option", "-t", name, "remain-on-exit", "off")
 	return nil
 }
 
@@ -710,6 +735,16 @@ const processKillGracePeriod = 2 * time.Second
 //
 // This ensures Claude processes and all their children are properly terminated.
 func (t *Tmux) KillSessionWithProcesses(name string) error {
+	return t.KillSessionWithProcessesContext(context.Background(), name)
+}
+
+// KillSessionWithProcessesContext bounds graceful waits while preserving the
+// same TERM-then-KILL cleanup sequence.
+func (t *Tmux) KillSessionWithProcessesContext(ctx context.Context, name string) error {
+	if ctx.Err() != nil {
+		return t.KillSession(name)
+	}
+
 	// Disarm auto-respawn BEFORE killing anything. The pane-died hook would
 	// otherwise respawn the process 3 seconds after we kill it, creating a
 	// zombie that fights every kill attempt.
@@ -756,7 +791,7 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {
 		}
 
 		// Wait for graceful shutdown (2s gives processes time to clean up)
-		time.Sleep(processKillGracePeriod)
+		_ = waitForContext(ctx, processKillGracePeriod)
 
 		// Send SIGKILL to any remaining descendants
 		for _, dpid := range descendants {
@@ -765,7 +800,7 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {
 
 		// Kill the pane process itself (may have called setsid() and detached)
 		_ = exec.Command("kill", "-TERM", pid).Run()
-		time.Sleep(processKillGracePeriod)
+		_ = waitForContext(ctx, processKillGracePeriod)
 		_ = exec.Command("kill", "-KILL", pid).Run()
 	}
 
@@ -873,24 +908,6 @@ func (t *Tmux) KillSessionWithProcessesExcluding(name string, excludePIDs []stri
 		return nil
 	}
 	return err
-}
-
-// killSplitBrainSession kills a same-named session on the "default" tmux socket
-// if this Tmux instance targets a different socket. This prevents split-brain
-// where stale sessions on the wrong socket shadow the real ones, causing nudge
-// and other session-discovery commands to fail.
-//
-// Best-effort: all errors are silently ignored. The stale session may not exist,
-// the default server may not be running, etc. — none of these should block
-// session creation on the correct socket.
-func (t *Tmux) killSplitBrainSession(name string) {
-	if t.socketName == "" || t.socketName == "default" || t.socketName == noTownSocket {
-		return // Already on default or no town context — nothing to clean up
-	}
-	other := NewTmuxWithSocket("default")
-	if running, _ := other.HasSession(name); running {
-		_ = other.KillSessionWithProcesses(name)
-	}
 }
 
 // collectReparentedGroupMembers returns process group members that have been
@@ -3542,17 +3559,31 @@ func (t *Tmux) resolveSessionProcessNamesChecked(session string) ([]string, erro
 // claude-original) where exec env does not replace the shell as the pane
 // foreground process. Replaces process-tree probing (IsAgentAlive) per gt-sk5u.
 func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return t.WaitForCommandContext(ctx, session, excludeCommands, timeout)
+}
+
+// WaitForCommandContext is WaitForCommand with caller cancellation.
+func (t *Tmux) WaitForCommandContext(ctx context.Context, session string, excludeCommands []string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	// ZFC: Clear agent-ready sentinel to prevent stale values from previous
 	// agent runs. The agent's SessionStart hook (gt prime --hook) sets this
 	// to "1" once the agent is running. Unsetting here ensures we only detect
 	// the NEW agent, not a leftover from a previous run.
 	_, _ = t.run("set-environment", "-u", "-t", session, EnvAgentReady)
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for command: %w", err)
+		}
 		cmd, err := t.GetPaneCommand(session)
 		if err != nil {
-			time.Sleep(constants.PollInterval)
+			if err := waitForContext(ctx, constants.PollInterval); err != nil {
+				return fmt.Errorf("waiting for command: %w", err)
+			}
 			continue
 		}
 		// Check if current command is NOT in the exclude list
@@ -3572,9 +3603,21 @@ func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout 
 		if ready, err := t.GetEnvironment(session, EnvAgentReady); err == nil && ready == "1" {
 			return nil
 		}
-		time.Sleep(constants.PollInterval)
+		if err := waitForContext(ctx, constants.PollInterval); err != nil {
+			return fmt.Errorf("waiting for command: %w", err)
+		}
 	}
-	return fmt.Errorf("timeout waiting for command (still running excluded command)")
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // WaitForShellReady polls until the pane is running a shell command.
@@ -3728,9 +3771,18 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return t.WaitForRuntimeReadyContext(ctx, session, rc, timeout)
+}
+
+// WaitForRuntimeReadyContext is WaitForRuntimeReady with caller cancellation.
+func (t *Tmux) WaitForRuntimeReadyContext(ctx context.Context, session string, rc *config.RuntimeConfig, timeout time.Duration) error {
 	if rc == nil || rc.Tmux == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	if rc.Tmux.ReadyPromptPrefix == "" {
 		if rc.Tmux.ReadyDelayMs <= 0 {
@@ -3741,16 +3793,22 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 		if delay > timeout {
 			delay = timeout
 		}
-		time.Sleep(delay)
+		if err := waitForContext(ctx, delay); err != nil {
+			return fmt.Errorf("waiting for runtime readiness: %w", err)
+		}
 		return nil
 	}
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for runtime prompt: %w", err)
+		}
 		// Capture last few lines of the pane
 		lines, err := t.CapturePaneLines(session, 10)
 		if err != nil {
-			time.Sleep(200 * time.Millisecond)
+			if err := waitForContext(ctx, 200*time.Millisecond); err != nil {
+				return fmt.Errorf("waiting for runtime prompt: %w", err)
+			}
 			continue
 		}
 		// Look for runtime prompt indicator at start of line
@@ -3759,9 +3817,10 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 				return nil
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		if err := waitForContext(ctx, 200*time.Millisecond); err != nil {
+			return fmt.Errorf("waiting for runtime prompt: %w", err)
+		}
 	}
-	return fmt.Errorf("timeout waiting for runtime prompt")
 }
 
 // DefaultReadyPromptPrefix is the Claude Code prompt prefix used for idle detection.
@@ -3860,14 +3919,30 @@ func (t *Tmux) IsIdle(session string) bool {
 	if err != nil {
 		return false
 	}
+	return isIdleLines(lines, readyPromptPrefixForSession(t, session))
+}
 
+// IsIdleContext checks the same idle snapshot under caller cancellation.
+func (t *Tmux) IsIdleContext(ctx context.Context, session string, rc *config.RuntimeConfig) (bool, error) {
+	out, err := t.runContext(ctx, "capture-pane", "-p", "-t", session, "-S", "-5")
+	if err != nil {
+		return false, err
+	}
+	lines := strings.Split(out, "\n")
+	promptPrefix := DefaultReadyPromptPrefix
+	if rc != nil && rc.Tmux != nil && rc.Tmux.ReadyPromptPrefix != "" {
+		promptPrefix = rc.Tmux.ReadyPromptPrefix
+	}
+	return isIdleLines(lines, promptPrefix), nil
+}
+
+func isIdleLines(lines []string, promptPrefix string) bool {
 	for _, line := range lines {
 		if hasBusyIndicator(line) {
 			return false
 		}
 	}
 
-	promptPrefix := readyPromptPrefixForSession(t, session)
 	for _, line := range lines {
 		if matchesPromptPrefix(line, promptPrefix) {
 			return true

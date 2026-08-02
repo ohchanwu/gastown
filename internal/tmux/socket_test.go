@@ -1,8 +1,19 @@
 package tmux
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 )
+
+func TestSocketDirHonorsTmuxTmpDir(t *testing.T) {
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	want := filepath.Join(os.Getenv("TMUX_TMPDIR"), "tmux-"+strconv.Itoa(os.Getuid()))
+	if got := SocketDir(); got != want {
+		t.Fatalf("SocketDir() = %q, want %q", got, want)
+	}
+}
 
 func TestSetGetDefaultSocket(t *testing.T) {
 	// Save and restore
