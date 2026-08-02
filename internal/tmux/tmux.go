@@ -398,6 +398,17 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	return t.createNewSession(name, workDir, nil)
 }
 
+// commandInWorkDir makes the child shell, rather than tmux's -c handling, the
+// authoritative working-directory boundary. A long-lived tmux server can keep
+// an unlinked cwd after its launching worktree is removed; tmux then accepts -c
+// but starts new panes in that dead directory.
+func commandInWorkDir(command, workDir string) string {
+	if workDir == "" {
+		return command
+	}
+	return "cd " + config.ShellQuote(workDir) + " && " + command
+}
+
 // NewSessionWithCommand creates a new detached tmux session that immediately runs a command.
 // Unlike NewSession + SendKeys, this avoids race conditions where the shell isn't ready
 // or the command arrives before the shell prompt. The command runs directly as the
@@ -465,7 +476,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -534,7 +545,7 @@ func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, wor
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.runContext(ctx, respawnArgs...); err != nil {
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
 		}

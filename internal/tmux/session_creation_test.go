@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +92,55 @@ func TestNewSessionWithCommandAndEnv_ValidInputPreservesOtherSocketSession(t *te
 
 	if running, err := other.HasSession(session); err != nil || !running {
 		t.Fatalf("other-socket session removed by unrelated creation: running=%v err=%v", running, err)
+	}
+}
+
+func TestNewSessionWithCommandAndEnvContext_EntersWorkDirWhenServerCWDIsUnlinked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unlinking a process working directory is a Unix-specific regression")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is required")
+	}
+
+	socket := fmt.Sprintf("gt-test-unlinked-cwd-%d", time.Now().UnixNano())
+	tm := NewTmuxWithSocket(socket)
+	serverCWD := filepath.Join(t.TempDir(), "server-cwd")
+	if err := os.Mkdir(serverCWD, 0o700); err != nil {
+		t.Fatalf("create server cwd: %v", err)
+	}
+	sentinel := "gt-test-unlinked-cwd-sentinel"
+	start := exec.Command("tmux", "-u", "-L", socket, "new-session", "-d", "-s", sentinel, "sleep 30")
+	start.Dir = serverCWD
+	if output, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start isolated tmux server: %v: %s", err, output)
+	}
+	t.Cleanup(func() { _ = tm.KillServer() })
+
+	if err := os.Remove(serverCWD); err != nil {
+		t.Fatalf("unlink server cwd: %v", err)
+	}
+
+	workDir := filepath.Join(t.TempDir(), "work dir 'quoted'")
+	if err := os.Mkdir(workDir, 0o700); err != nil {
+		t.Fatalf("create target work directory: %v", err)
+	}
+	session := "gt-test-unlinked-cwd-target"
+	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(session) })
+
+	if err := tm.NewSessionWithCommandAndEnvContext(context.Background(), session, workDir, "pwd -P; exec sleep 30", nil); err != nil {
+		t.Fatalf("create session from unlinked server cwd: %v", err)
+	}
+	got, err := tm.CapturePaneAll(session)
+	if err != nil {
+		t.Fatalf("capture pane cwd: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		t.Fatalf("resolve target work directory: %v", err)
+	}
+	if !strings.Contains(strings.ReplaceAll(got, "\n", ""), want) {
+		t.Fatalf("pane output does not contain cwd %q: %q", want, got)
 	}
 }
 
