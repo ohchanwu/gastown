@@ -459,3 +459,23 @@ func TestWriteWakeCanaryStateIsSanitizedAtomicAndPrivate(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveWakeCanaryRolesUsesConfiguredPresetsAndProviders(t *testing.T) {
+	townRoot := t.TempDir()
+	settings := config.NewTownSettings()
+	settings.RoleAgents = map[string]string{
+		constants.RoleMayor:   "codex-mayor",
+		constants.RolePolecat: "codex-polecat",
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	got := resolveWakeCanaryRoles(townRoot, "")
+	if got.MayorPreset != "codex-mayor" || got.MayorProvider != "codex" {
+		t.Fatalf("Mayor role evidence = %+v, want codex-mayor/codex", got)
+	}
+	if got.PolecatPreset != "codex-polecat" || got.PolecatProvider != "codex" {
+		t.Fatalf("polecat role evidence = %+v, want codex-polecat/codex", got)
+	}
+}

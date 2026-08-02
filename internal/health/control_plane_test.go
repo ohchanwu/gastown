@@ -207,6 +207,30 @@ func TestEvaluateControlPlaneIgnoresNonActionableEvidence(t *testing.T) {
 	}
 }
 
+func TestEvaluateControlPlaneRejectsCanaryForDifferentConfiguredRoles(t *testing.T) {
+	got := EvaluateControlPlane(ControlPlaneEvidence{
+		Now:                    time.Now(),
+		CanonicalDoltReachable: true,
+		InstalledBinaryCommit:  "candidate",
+		MayorPreset:            "codex-mayor",
+		MayorProvider:          "codex",
+		PolecatPreset:          "codex-polecat",
+		PolecatProvider:        "codex",
+		Canary: &CanaryEvidence{
+			BinaryCommit:   "candidate",
+			Result:         "passed",
+			MayorPreset:    "codex",
+			MayorProvider:  "codex",
+			PolecatPreset:  "codex",
+			PolecatProvider: "codex",
+		},
+	})
+
+	if got.Healthy || len(got.Failures) != 1 || got.Failures[0].Subsystem != "wake-canary" {
+		t.Fatalf("verdict = %#v, want configured-role canary failure", got)
+	}
+}
+
 func TestEvaluateControlPlaneCanonicalDoltFailureOutranksCleanup(t *testing.T) {
 	got := EvaluateControlPlane(ControlPlaneEvidence{
 		Now: time.Now(), CanonicalDoltReachable: false, ActionableDoltLeaks: 3,
