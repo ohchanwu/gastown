@@ -32,6 +32,41 @@ func setupTestRegistryForSession(t *testing.T) {
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
+func TestSessionManagerNudgePollerLifecycleUsesTmuxEnvironment(t *testing.T) {
+	townRoot := t.TempDir()
+	tmuxClient := tmux.NewTmuxWithSocketAndEnv("private-town", []string{"PATH=/usr/bin", "GT_TOWN_SOCKET=wrong"})
+	m := &SessionManager{tmux: tmuxClient}
+	sessionID := "gt-gastown-polecat-test"
+
+	var started, stopped string
+	var childEnv []string
+	m.startPoller = func(gotRoot, gotSession string, env []string) (int, error) {
+		if gotRoot != townRoot {
+			t.Fatalf("start root = %q, want %q", gotRoot, townRoot)
+		}
+		started = gotSession
+		childEnv = append([]string(nil), env...)
+		return 123, nil
+	}
+	m.stopPoller = func(gotRoot, gotSession string) error {
+		if gotRoot != townRoot {
+			t.Fatalf("stop root = %q, want %q", gotRoot, townRoot)
+		}
+		stopped = gotSession
+		return nil
+	}
+
+	m.startNudgePoller(townRoot, sessionID)
+	m.stopNudgePoller(townRoot, sessionID)
+
+	if started != sessionID || stopped != sessionID {
+		t.Fatalf("poller lifecycle = start %q, stop %q; want %q", started, stopped, sessionID)
+	}
+	if got := strings.Join(childEnv, "|"); got != "PATH=/usr/bin|GT_TOWN_SOCKET=private-town" {
+		t.Fatalf("poller environment = %q, want isolated tmux environment", got)
+	}
+}
+
 // testSessionCounter provides unique session names across -count=N runs
 // to prevent "duplicate session" races with tmux's async cleanup.
 var testSessionCounter atomic.Int64

@@ -10,10 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
-func TestResolvePollerPromptDetectionUsesSessionMetadata(t *testing.T) {
+func TestPollerCustomPromptBusyDoesNotClaimQueue(t *testing.T) {
 	socket := fmt.Sprintf("gt-test-poller-prompt-%d", time.Now().UnixNano())
 	transport := tmux.NewTmuxWithSocket(socket)
 	t.Cleanup(func() {
@@ -40,6 +41,22 @@ func TestResolvePollerPromptDetectionUsesSessionMetadata(t *testing.T) {
 	hasPrompt, _ := resolvePollerSessionMetadata(transport, sessionName)
 	if !hasPrompt {
 		t.Fatal("poller ignored resolved session prompt metadata")
+	}
+
+	claimed := false
+	claim, err := claimPollerNudgeWhenIdle(
+		hasPrompt,
+		func() error { return errors.New("session busy") },
+		func() (*nudge.ClaimedNudge, error) {
+			claimed = true
+			return nil, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim != nil || claimed {
+		t.Fatal("custom-prompt busy cycle claimed the queue")
 	}
 }
 

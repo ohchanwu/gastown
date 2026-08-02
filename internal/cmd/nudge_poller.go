@@ -101,13 +101,11 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
 			// best-effort behavior and drain on the poll interval.
-			waitErr := t.WaitForIdle(sessionName, idleTimeout)
-			if shouldSkipDrainUntilIdle(hasPromptDetection, waitErr) {
-				continue
-			}
-
-			// Claim and inject; acknowledge only after runtime-proven submission.
-			claim, err := nudge.ClaimDue(townRoot, sessionName)
+			claim, err := claimPollerNudgeWhenIdle(
+				hasPromptDetection,
+				func() error { return t.WaitForIdle(sessionName, idleTimeout) },
+				func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
+			)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: claim error for %s: %v\n", sessionName, err)
 				continue
@@ -133,6 +131,17 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func claimPollerNudgeWhenIdle(
+	hasPromptDetection bool,
+	waitForIdle func() error,
+	claimDue func() (*nudge.ClaimedNudge, error),
+) (*nudge.ClaimedNudge, error) {
+	if shouldSkipDrainUntilIdle(hasPromptDetection, waitForIdle()) {
+		return nil, nil
+	}
+	return claimDue()
 }
 
 func resolvePollerSessionMetadata(t *tmux.Tmux, sessionName string) (bool, tmux.NudgeOpts) {

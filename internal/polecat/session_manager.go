@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -46,6 +47,8 @@ type SessionManager struct {
 	rig                  *rig.Rig
 	deliverStartupPrompt func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
 	verifyStartupNudge   func(context.Context, string, *config.RuntimeConfig, string) error
+	startPoller          func(string, string, []string) (int, error)
+	stopPoller           func(string, string) error
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
@@ -56,7 +59,27 @@ func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	}
 	m.deliverStartupPrompt = m.deliverStartupPromptFallback
 	m.verifyStartupNudge = m.verifyStartupNudgeDelivery
+	m.startPoller = nudge.StartPollerWithEnv
+	m.stopPoller = nudge.StopPoller
 	return m
+}
+
+func (m *SessionManager) startNudgePoller(townRoot, sessionID string) {
+	if m.startPoller == nil {
+		return
+	}
+	if _, err := m.startPoller(townRoot, sessionID, m.tmux.PollerEnvironment()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not start nudge poller for %s: %v\n", sessionID, err)
+	}
+}
+
+func (m *SessionManager) stopNudgePoller(townRoot, sessionID string) {
+	if m.stopPoller == nil {
+		return
+	}
+	if err := m.stopPoller(townRoot, sessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not stop nudge poller for %s: %v\n", sessionID, err)
+	}
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -366,8 +389,10 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	}
 	if running {
 		if m.tmux.IsAgentAlive(sessionID) {
+			m.startNudgePoller(townRoot, sessionID)
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 		}
+		m.stopNudgePoller(townRoot, sessionID)
 		if err := m.tmux.KillSessionWithProcessesContext(ctx, sessionID); err != nil {
 			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
@@ -653,6 +678,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	// Record the agent instantiation event (GASTA root span).
 	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
 		"polecat", polecat, sessionID, m.rig.Name, townRoot, opts.Issue, workDir)
+	m.startNudgePoller(townRoot, sessionID)
 
 	return nil
 }
@@ -668,14 +694,17 @@ func (m *SessionManager) isSessionStale(sessionID string) bool {
 // Stop terminates a polecat session.
 func (m *SessionManager) Stop(polecat string, force bool) error {
 	sessionID := m.SessionName(polecat)
+	townRoot := filepath.Dir(m.rig.Path)
 
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if !running {
+		m.stopNudgePoller(townRoot, sessionID)
 		return ErrSessionNotFound
 	}
+	m.stopNudgePoller(townRoot, sessionID)
 
 	// Try graceful shutdown first
 	if !force {

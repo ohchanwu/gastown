@@ -13,6 +13,7 @@
 package nudge
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -62,41 +64,90 @@ func StartPollerWithEnv(townRoot, session string, env []string) (int, error) {
 }
 
 func startPoller(townRoot, session string, env []string) (int, error) {
+	return startPollerWithLauncher(townRoot, session, env, launchPoller, os.WriteFile)
+}
+
+type pollerLaunch struct {
+	pid       int
+	release   func() error
+	terminate func() error
+}
+
+func startPollerWithLauncher(
+	townRoot, session string,
+	env []string,
+	launcher func(string, string, []string) (pollerLaunch, error),
+	writePID func(string, []byte, os.FileMode) error,
+) (int, error) {
 	pidDir := pollerPidDir(townRoot)
 	if err := os.MkdirAll(pidDir, 0755); err != nil {
 		return 0, fmt.Errorf("creating poller pid dir: %w", err)
 	}
+
+	startLock := flock.New(pollerPidFile(townRoot, session) + ".lock")
+	if err := startLock.Lock(); err != nil {
+		return 0, fmt.Errorf("acquiring nudge-poller start lock: %w", err)
+	}
+	defer func() { _ = startLock.Unlock() }()
 
 	// Check if a poller is already running for this session.
 	if pid, alive := pollerAlive(townRoot, session); alive {
 		return pid, nil // already running
 	}
 
+	launched, err := launcher(townRoot, session, env)
+	if err != nil {
+		return 0, err
+	}
+
+	// Write PID file for later cleanup.
+	pidPath := pollerPidFile(townRoot, session)
+	if err := writePID(pidPath, []byte(strconv.Itoa(launched.pid)), 0644); err != nil {
+		persistErr := fmt.Errorf("persisting nudge-poller PID: %w", err)
+		if launched.terminate == nil {
+			return 0, persistErr
+		}
+		if terminateErr := launched.terminate(); terminateErr != nil {
+			return 0, errors.Join(persistErr, fmt.Errorf("terminating untracked nudge-poller: %w", terminateErr))
+		}
+		return 0, persistErr
+	}
+	if launched.release != nil {
+		_ = launched.release()
+	}
+
+	return launched.pid, nil
+}
+
+func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) {
 	// Find the gt binary.
 	gtBin, err := os.Executable()
 	if err != nil {
-		return 0, fmt.Errorf("finding gt binary: %w", err)
+		return pollerLaunch{}, fmt.Errorf("finding gt binary: %w", err)
 	}
 
 	cmd := buildPollerCommand(gtBin, townRoot, session, env)
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("starting nudge-poller: %w", err)
+		return pollerLaunch{}, fmt.Errorf("starting nudge-poller: %w", err)
 	}
 
-	pid := cmd.Process.Pid
-
-	// Write PID file for later cleanup.
-	pidPath := pollerPidFile(townRoot, session)
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		// Non-fatal — the process is running, we just can't track it.
-		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
-	}
-
-	// Release the process so it runs independently.
-	_ = cmd.Process.Release()
-
-	return pid, nil
+	return pollerLaunch{
+		pid:     cmd.Process.Pid,
+		release: cmd.Process.Release,
+		terminate: func() error {
+			killErr := cmd.Process.Kill()
+			waitErr := cmd.Wait()
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) {
+				waitErr = nil
+			}
+			if errors.Is(killErr, os.ErrProcessDone) {
+				killErr = nil
+			}
+			return errors.Join(killErr, waitErr)
+		},
+	}, nil
 }
 
 func buildPollerCommand(gtBin, townRoot, session string, env []string) *exec.Cmd {

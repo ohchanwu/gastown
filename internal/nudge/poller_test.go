@@ -1,16 +1,104 @@
 package nudge
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/util"
 )
+
+func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	release := make(chan struct{})
+	var launches atomic.Int32
+
+	launcher := func(string, string, []string) (pollerLaunch, error) {
+		switch launches.Add(1) {
+		case 1:
+			close(firstStarted)
+		case 2:
+			close(secondStarted)
+		}
+		<-release
+		return pollerLaunch{pid: os.Getpid()}, nil
+	}
+
+	results := make(chan int, 2)
+	errs := make(chan error, 2)
+	start := func() {
+		pid, err := startPollerWithLauncher(townRoot, session, nil, launcher, os.WriteFile)
+		results <- pid
+		errs <- err
+	}
+	go start()
+	<-firstStarted
+	secondCalling := make(chan struct{})
+	go func() {
+		close(secondCalling)
+		start()
+	}()
+	<-secondCalling
+
+	duplicate := false
+	select {
+	case <-secondStarted:
+		duplicate = true
+	case <-time.After(3 * time.Second):
+	}
+	close(release)
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if pid := <-results; pid != os.Getpid() {
+			t.Fatalf("pid = %d, want %d", pid, os.Getpid())
+		}
+	}
+	if duplicate || launches.Load() != 1 {
+		t.Fatalf("launcher called %d times, want 1 serialized start", launches.Load())
+	}
+}
+
+func TestStartPollerPIDWriteFailureTerminatesLaunchedProcess(t *testing.T) {
+	townRoot := t.TempDir()
+	writeErr := errors.New("injected PID write failure")
+	var terminated, released atomic.Int32
+
+	launcher := func(string, string, []string) (pollerLaunch, error) {
+		return pollerLaunch{
+			pid:       123,
+			release:   func() error { released.Add(1); return nil },
+			terminate: func() error { terminated.Add(1); return nil },
+		}, nil
+	}
+	writer := func(string, []byte, os.FileMode) error { return writeErr }
+
+	pid, err := startPollerWithLauncher(townRoot, "gt-gastown-polecat-test", nil, launcher, writer)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("error = %v, want injected PID write failure", err)
+	}
+	if pid != 0 {
+		t.Fatalf("pid = %d, want 0 on failed persistence", pid)
+	}
+	if got := terminated.Load(); got != 1 {
+		t.Fatalf("terminate calls = %d, want 1", got)
+	}
+	if got := released.Load(); got != 0 {
+		t.Fatalf("release calls = %d, want 0", got)
+	}
+}
 
 func TestPollerPidFile(t *testing.T) {
 	townRoot := t.TempDir()
