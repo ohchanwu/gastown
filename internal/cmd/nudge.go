@@ -180,6 +180,10 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
+// idleWatcherProbeTimeout leaves enough time for WaitForIdle's one-second
+// stability proof plus tmux command overhead without slowing the outer cadence.
+const idleWatcherProbeTimeout = 2 * time.Second
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -397,11 +401,11 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) nudgeDeliveryRe
 			return nudgeDeliveryQueued
 		}
 
-		// Use WaitForIdle with a short timeout instead of single-snapshot
-		// IsIdle to get the consecutive-poll guard (2 polls 200ms apart).
+		// Use WaitForIdle instead of single-snapshot IsIdle to get the
+		// consecutive-poll guard.
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
-		if err := t.WaitForIdle(sessionName, idleWatcherPollInterval); err == nil {
+		if err := t.WaitForIdle(sessionName, idleWatcherProbeTimeout); err == nil {
 			// Claim atomically reserves queued entries until delivery is proven.
 			// If another process raced and drained first, we get an
 			// empty slice and skip delivery to avoid duplicates.

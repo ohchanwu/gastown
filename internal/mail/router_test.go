@@ -1745,21 +1745,29 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 	sessionName := "gt-crew-startup-idle-handoff"
 	signals := t.TempDir()
 	beginIdleGap := filepath.Join(signals, "begin-idle-gap")
+	idlePromptObserved := filepath.Join(signals, "idle-prompt-observed")
 	firstIdleReturned := filepath.Join(signals, "first-idle-returned")
 	busyStarted := filepath.Join(signals, "busy-started")
+	releaseBusy := filepath.Join(signals, "release-busy")
 	command := fmt.Sprintf(`sh -c '
 		while [ ! -e %q ]; do sleep 0.01; done
 		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
-		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-			[ -e %q ] && break
+		while [ ! -e %q ]; do sleep 0.01; done
+		early=0
+		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+			if [ -e %q ]; then early=1; break; fi
 			sleep 0.05
 		done
 		touch %q
 		printf "\033[2J\033[H• Working (esc to interrupt)\n"
-		sleep 2
+		if [ "$early" -eq 1 ]; then
+			while [ ! -e %q ]; do sleep 0.01; done
+		else
+			sleep 2
+		fi
 		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
 		cat
-	'`, beginIdleGap, firstIdleReturned, busyStarted)
+	'`, beginIdleGap, idlePromptObserved, firstIdleReturned, busyStarted, releaseBusy)
 	createNotifyTestSession(t, socket, sessionName, command)
 
 	transport := tmux.NewTmuxWithSocket(socket)
@@ -1772,11 +1780,33 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 	if err := os.WriteFile(beginIdleGap, nil, 0600); err != nil {
 		t.Fatalf("begin transient idle gap: %v", err)
 	}
+	promptDeadline := time.Now().Add(time.Second)
+	for !transport.IsIdle(sessionName) {
+		if time.Now().After(promptDeadline) {
+			t.Fatal("transient idle prompt did not become observable")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(idlePromptObserved, nil, 0600); err != nil {
+		t.Fatalf("release transient idle countdown: %v", err)
+	}
 	if err := transport.WaitForIdle(sessionName, 5*time.Second); err != nil {
 		t.Fatalf("startup steady-idle gate: %v", err)
 	}
 	if err := os.WriteFile(firstIdleReturned, nil, 0600); err != nil {
 		t.Fatalf("signal first idle return: %v", err)
+	}
+	busyDeadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(busyStarted); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("observe busy transition: %v", err)
+		}
+		if time.Now().After(busyDeadline) {
+			t.Fatal("busy transition did not start before notification")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	townRoot := t.TempDir()
@@ -1784,13 +1814,16 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              transport,
-		IdleNotifyTimeout: 1500 * time.Millisecond,
+		IdleNotifyTimeout: 3 * time.Second,
 	}
 	err := r.notifyRecipient(&Message{
 		From:    "gastown/crew/sender",
 		To:      "gastown/crew/startup-idle-handoff",
 		Subject: "first notification after startup",
 	})
+	if signalErr := os.WriteFile(releaseBusy, nil, 0600); signalErr != nil {
+		t.Fatalf("release busy pane: %v", signalErr)
+	}
 	if !errors.Is(err, ErrNotificationQueued) {
 		t.Fatalf("notifyRecipient returned %v, want durable queued fallback", err)
 	}
