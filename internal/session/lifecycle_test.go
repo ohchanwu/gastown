@@ -163,6 +163,20 @@ func TestMergeRuntimeLivenessEnv_SetsResolvedAgentAndProcessNames(t *testing.T) 
 	}
 }
 
+func TestMergeRuntimeLivenessEnv_SetsResolvedReadyPromptPrefix(t *testing.T) {
+	env := map[string]string{"GT_AGENT": "codex-mayor"}
+	rc := &config.RuntimeConfig{
+		ResolvedAgent: "codex-mayor",
+		Tmux:          &config.RuntimeTmuxConfig{ReadyPromptPrefix: "› "},
+	}
+
+	got := MergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_READY_PROMPT_PREFIX"] != "› " {
+		t.Fatalf("GT_READY_PROMPT_PREFIX = %q, want %q", got["GT_READY_PROMPT_PREFIX"], "› ")
+	}
+}
+
 func TestMergeRuntimeLivenessEnv_RespectsExistingValues(t *testing.T) {
 	env := map[string]string{
 		"GT_AGENT":         "explicit-agent",

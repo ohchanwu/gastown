@@ -3754,6 +3754,9 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 }
 
 func submissionPromptForSession(t *Tmux, session string) (string, bool) {
+	if promptPrefix, err := t.GetEnvironment(session, "GT_READY_PROMPT_PREFIX"); err == nil && promptPrefix != "" {
+		return promptPrefix, true
+	}
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
 	if err != nil || agentName == "" {
 		return DefaultReadyPromptPrefix, false

@@ -2780,9 +2780,11 @@ func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		command string
-		wantErr error
+		name              string
+		command           string
+		agent             string
+		readyPromptPrefix string
+		wantErr           error
 	}{
 		{
 			name:    "empty composer with visible placeholder is idle",
@@ -2797,6 +2799,12 @@ func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
 			command: "printf '\\033[1;2m›\\033[0m staged delivery'; sleep 60",
 			wantErr: ErrIdleTimeout,
 		},
+		{
+			name:              "custom Codex alias uses resolved prompt",
+			command:           "printf '\\033[1;2m›\\033[0m Ask anything\\r\\033[1C'; sleep 60",
+			agent:             "codex-mayor",
+			readyPromptPrefix: "› ",
+		},
 	}
 
 	for _, tt := range tests {
@@ -2807,8 +2815,17 @@ func TestWaitForIdle_UsesCodexComposerCursor(t *testing.T) {
 				t.Fatalf("NewSessionWithCommand: %v", err)
 			}
 			t.Cleanup(func() { _ = tm.KillSession(sessionName) })
-			if err := tm.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
+			agent := tt.agent
+			if agent == "" {
+				agent = "codex"
+			}
+			if err := tm.SetEnvironment(sessionName, "GT_AGENT", agent); err != nil {
 				t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+			}
+			if tt.readyPromptPrefix != "" {
+				if err := tm.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", tt.readyPromptPrefix); err != nil {
+					t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
+				}
 			}
 
 			err := tm.WaitForIdle(sessionName, 500*time.Millisecond)

@@ -431,6 +431,10 @@ func MergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.Ru
 			envVars["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 		}
 	}
+	if _, hasReadyPrompt := envVars["GT_READY_PROMPT_PREFIX"]; !hasReadyPrompt &&
+		runtimeConfig.Tmux != nil && runtimeConfig.Tmux.ReadyPromptPrefix != "" {
+		envVars["GT_READY_PROMPT_PREFIX"] = runtimeConfig.Tmux.ReadyPromptPrefix
+	}
 
 	return envVars
 }
