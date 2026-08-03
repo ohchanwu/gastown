@@ -15,6 +15,10 @@ import (
 	"github.com/steveyegge/gastown/internal/util"
 )
 
+func testPollerIdentity(session string) pollerIdentity {
+	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session}
+}
+
 func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
@@ -31,13 +35,20 @@ func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
 			close(secondStarted)
 		}
 		<-release
-		return pollerLaunch{pid: os.Getpid()}, nil
+		return pollerLaunch{pid: os.Getpid(), identity: testPollerIdentity(session)}, nil
 	}
 
 	results := make(chan int, 2)
 	errs := make(chan error, 2)
 	start := func() {
-		pid, err := startPollerWithLauncher(townRoot, session, nil, launcher, os.WriteFile)
+		pid, err := startPollerWithLauncherStatus(townRoot, session, nil, launcher, os.WriteFile, func(root, name string) (int, bool, error) {
+			data, err := os.ReadFile(pollerPidFile(root, name))
+			if os.IsNotExist(err) {
+				return 0, false, nil
+			}
+			record, parseErr := parsePollerRecord(string(data))
+			return record.PID, parseErr == nil, parseErr
+		})
 		results <- pid
 		errs <- err
 	}
@@ -79,6 +90,7 @@ func TestStartPollerPIDWriteFailureTerminatesLaunchedProcess(t *testing.T) {
 	launcher := func(string, string, []string) (pollerLaunch, error) {
 		return pollerLaunch{
 			pid:       123,
+			identity:  testPollerIdentity("gt-gastown-polecat-test"),
 			release:   func() error { released.Add(1); return nil },
 			terminate: func() error { terminated.Add(1); return nil },
 		}, nil
@@ -157,11 +169,18 @@ func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
 
 	launcher := func(string, string, []string) (pollerLaunch, error) {
 		close(launchStarted)
-		return pollerLaunch{pid: os.Getpid()}, nil
+		return pollerLaunch{pid: os.Getpid(), identity: testPollerIdentity(session)}, nil
 	}
 	startDone := make(chan error, 1)
 	go func() {
-		_, err := startPollerWithLauncher(townRoot, session, nil, launcher, os.WriteFile)
+		_, err := startPollerWithLauncherStatus(townRoot, session, nil, launcher, os.WriteFile, func(root, name string) (int, bool, error) {
+			data, err := os.ReadFile(pollerPidFile(root, name))
+			if os.IsNotExist(err) {
+				return 0, false, nil
+			}
+			record, parseErr := parsePollerRecord(string(data))
+			return record.PID, parseErr == nil, parseErr
+		})
 		startDone <- err
 	}()
 
@@ -179,6 +198,263 @@ func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
 	}
 	if _, err := os.Stat(pollerPidFile(townRoot, session)); err != nil {
 		t.Fatalf("final PID custody missing after serialized transition: %v", err)
+	}
+}
+
+func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	record := formatPollerRecord(123, pollerIdentity{StartTime: "old", Command: "gt nudge-poller " + session}, session)
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), []byte(record), 0644); err != nil {
+		t.Fatal(err)
+	}
+	signaled := false
+	quarantined := ""
+	err := stopPollerWithOwnershipOps(townRoot, session,
+		os.ReadFile,
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) {
+			return pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session}, nil
+		},
+		func(int) error { signaled = true; return nil },
+		func(int, pollerRecord) error { return nil },
+		func(path string, _ []byte) error { quarantined = path + ".stale-test"; return nil },
+		os.Remove,
+	)
+	if err == nil {
+		t.Fatal("identity mismatch returned nil error")
+	}
+	if signaled {
+		t.Fatal("identity mismatch signaled unrelated process")
+	}
+	if quarantined == pollerPidFile(townRoot, session) || quarantined == "" {
+		t.Fatalf("quarantine path = %q, want deterministic non-colliding stale path", quarantined)
+	}
+}
+
+func TestStopPollerRemovesRecordOnlyAfterConfirmedExit(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	removed := ""
+	waited := false
+	err := stopPollerWithOwnershipOps(townRoot, session,
+		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) { return record.Identity, nil },
+		func(int) error { return nil },
+		func(int, pollerRecord) error { waited = true; return nil },
+		func(string, []byte) error { return nil },
+		func(path string) error { removed = path; return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waited || removed != pollerPidFile(townRoot, session) {
+		t.Fatalf("confirmed exit custody = waited %v, removed %q", waited, removed)
+	}
+}
+
+func TestStopPollerTimeoutPreservesRecord(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	removed := false
+	err := stopPollerWithOwnershipOps(townRoot, session,
+		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) { return record.Identity, nil },
+		func(int) error { return nil },
+		func(int, pollerRecord) error { return errors.New("exit confirmation timeout") },
+		func(string, []byte) error { removed = true; return nil },
+		os.Remove,
+	)
+	if err == nil {
+		t.Fatal("timeout returned nil error")
+	}
+	if removed {
+		t.Fatal("timeout removed live process ownership record")
+	}
+}
+
+func TestStopPollerReplacementRecordPreserved(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	oldRecord := []byte(formatPollerRecord(123, pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, session))
+	newRecord := []byte(formatPollerRecord(456, pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session}, session))
+	reads := 0
+	removed := false
+	err := stopPollerWithOwnershipOps(townRoot, session,
+		func(string) ([]byte, error) {
+			reads++
+			if reads == 1 {
+				return oldRecord, nil
+			}
+			return newRecord, nil
+		},
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) {
+			return pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, nil
+		},
+		func(int) error { return nil },
+		func(int, pollerRecord) error { return nil },
+		func(string, []byte) error { return nil },
+		func(string) error { removed = true; return nil },
+	)
+	if err == nil || removed || reads != 2 {
+		t.Fatalf("replacement transition = err %v removed %v reads %d", err, removed, reads)
+	}
+}
+
+func TestStopPollerRejectsSameStartDifferentCommand(t *testing.T) {
+	session := "gt-gastown-polecat-test"
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	signaled := false
+	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) {
+			return pollerIdentity{StartTime: "same", Command: "gt other-command " + session}, nil
+		},
+		func(int) error { signaled = true; return nil },
+		func(int, pollerRecord) error { return nil },
+		func(string, []byte) error { return nil },
+		func(string) error { return nil },
+	)
+	if err == nil || signaled {
+		t.Fatalf("same-start command mismatch = err %v signaled %v", err, signaled)
+	}
+}
+
+func TestStartPollerReadErrorBlocksLaunch(t *testing.T) {
+	launched := false
+	readErr := errors.New("permission denied")
+	_, err := startPollerWithLauncherStatus(t.TempDir(), "gt-gastown-polecat-test", nil,
+		func(string, string, []string) (pollerLaunch, error) { launched = true; return pollerLaunch{}, nil },
+		os.WriteFile,
+		func(string, string) (int, bool, error) { return 0, false, readErr },
+	)
+	if !errors.Is(err, readErr) || launched {
+		t.Fatalf("read error start = err %v launched %v", err, launched)
+	}
+}
+
+func TestStartPollerIdentityCleanupFailureIsReturned(t *testing.T) {
+	cleanupErr := errors.New("wait failed")
+	_, err := startPollerWithLauncher(t.TempDir(), "gt-gastown-polecat-test", nil,
+		func(string, string, []string) (pollerLaunch, error) {
+			return pollerLaunch{pid: 123, terminate: func() error { return cleanupErr }}, nil
+		}, os.WriteFile)
+	if !errors.Is(err, cleanupErr) || err == nil {
+		t.Fatalf("identity cleanup error = %v, want joined cleanup failure", err)
+	}
+}
+
+func TestPollerStatusLiveLegacyRequiresVerifiedMigration(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pid, alive, err := pollerStatusWithOps(townRoot, session,
+		func(string) ([]byte, error) { return []byte("123"), nil },
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) {
+			return pollerIdentity{StartTime: "current", Command: "gt nudge-poller " + session}, nil
+		},
+		func(string, []byte) error { t.Fatal("live legacy record quarantined"); return nil },
+		func(string) error { t.Fatal("live legacy record removed"); return nil },
+	)
+	if err == nil || pid != 123 || !alive {
+		t.Fatalf("live legacy status = pid %d alive %v err %v; want preserved migration error", pid, alive, err)
+	}
+}
+
+func TestStopPollerRemovesDeadStructuredRecord(t *testing.T) {
+	removed := false
+	session := "gt-gastown-polecat-test"
+	data := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+		func(string) ([]byte, error) { return data, nil },
+		func(int) bool { return false },
+		func(int) (pollerIdentity, error) {
+			t.Fatal("dead structured identity was queried")
+			return pollerIdentity{}, nil
+		},
+		func(int) error { t.Fatal("dead structured poller was signaled"); return nil },
+		func(int, pollerRecord) error { t.Fatal("dead structured poller was waited on"); return nil },
+		func(string, []byte) error { t.Fatal("dead structured record quarantined"); return nil },
+		func(string) error { removed = true; return nil },
+	)
+	if err != nil || !removed {
+		t.Fatalf("dead structured stop = err %v removed %v; want removal", err, removed)
+	}
+}
+
+func TestStopPollerRemovesRecordWhenIdentityLookupSeesExit(t *testing.T) {
+	removed := false
+	livenessChecks := 0
+	session := "gt-gastown-polecat-test"
+	data := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+		func(string) ([]byte, error) { return data, nil },
+		func(int) bool { livenessChecks++; return livenessChecks == 1 },
+		func(int) (pollerIdentity, error) { return pollerIdentity{}, errors.New("identity unavailable") },
+		func(int) error { t.Fatal("exited poller was signaled"); return nil },
+		func(int, pollerRecord) error { t.Fatal("exited poller was waited on"); return nil },
+		func(string, []byte) error { t.Fatal("exited record quarantined"); return nil },
+		func(string) error { removed = true; return nil },
+	)
+	if err != nil || !removed || livenessChecks != 2 {
+		t.Fatalf("identity-race stop = err %v removed %v liveness checks %d; want removal after recheck", err, removed, livenessChecks)
+	}
+}
+
+func TestStartPollerLiveLegacyDoesNotLaunchDuplicate(t *testing.T) {
+	launched := false
+	_, err := startPollerWithLauncherStatus(t.TempDir(), "gt-gastown-polecat-test", nil,
+		func(string, string, []string) (pollerLaunch, error) {
+			launched = true
+			return pollerLaunch{}, nil
+		},
+		os.WriteFile,
+		func(string, string) (int, bool, error) {
+			return 123, true, errors.New("legacy poller ownership requires separately verified migration")
+		},
+	)
+	if err == nil || launched {
+		t.Fatalf("live legacy start = err %v launched %v; want migration error without duplicate", err, launched)
+	}
+}
+
+func TestPollerStatusDeadLegacyRemovesRecord(t *testing.T) {
+	removed := false
+	_, alive, err := pollerStatusWithOps(t.TempDir(), "gt-gastown-polecat-test",
+		func(string) ([]byte, error) { return []byte("123"), nil },
+		func(int) bool { return false },
+		func(int) (pollerIdentity, error) {
+			t.Fatal("dead legacy identity was queried")
+			return pollerIdentity{}, nil
+		},
+		func(string, []byte) error { return nil },
+		func(string) error { removed = true; return nil },
+	)
+	if err != nil || alive || !removed {
+		t.Fatalf("dead legacy status = alive %v err %v removed %v", alive, err, removed)
+	}
+}
+
+func TestPollerStatusMalformedLegacyPreservesRecord(t *testing.T) {
+	removed := false
+	_, alive, err := pollerStatusWithOps(t.TempDir(), "gt-gastown-polecat-test",
+		func(string) ([]byte, error) { return []byte("not-a-pid"), nil },
+		func(int) bool { t.Fatal("malformed legacy liveness was queried"); return false },
+		func(int) (pollerIdentity, error) { return pollerIdentity{}, nil },
+		func(string, []byte) error { return nil },
+		func(string) error { removed = true; return nil },
+	)
+	if err == nil || alive || removed {
+		t.Fatalf("malformed legacy status = alive %v err %v removed %v; want visible migration error and custody", alive, err, removed)
 	}
 }
 
