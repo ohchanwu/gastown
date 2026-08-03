@@ -210,6 +210,11 @@ only a matching submitted receipt permits acknowledgement and deletion.
 Notification results preserve queued and failed identities so callers cannot
 mistake partial delivery for success.
 
+Nudge leases canonicalize the town root before constructing their lock path or
+comparing ownership. A caller that acquires a lease through a symlinked path
+therefore reuses that lease when receipt verification resolves the same town to
+its physical path; it cannot wait on its own cross-process lock.
+
 Durable mail storage and runtime wake delivery are separate guarantees. A mail
 write can succeed while its notification remains queued. The router therefore
 keeps unverified notifications retryable and uses the configured agent provider

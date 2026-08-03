@@ -1707,6 +1707,32 @@ func TestNudgeLeaseProvidesExclusiveOwnership(t *testing.T) {
 	}
 }
 
+func TestNudgeLeaseRecognizesCanonicalTownRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior requires Unix")
+	}
+	realRoot := t.TempDir()
+	linkedRoot := filepath.Join(t.TempDir(), "town-link")
+	if err := os.Symlink(realRoot, linkedRoot); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	tm := NewTmuxWithSocket("isolated")
+	release, err := tm.AcquireNudgeLease(linkedRoot, "hq-mayor")
+	if err != nil {
+		t.Fatalf("AcquireNudgeLease: %v", err)
+	}
+	defer release()
+
+	canonicalRoot, err := filepath.EvalSymlinks(linkedRoot)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if !tm.ownsNudgeLease(canonicalRoot, "hq-mayor") {
+		t.Fatal("lease owner did not recognize the same town through its canonical path")
+	}
+}
+
 func TestClientAttachmentLatchRecordsTransientAttachment(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-client-latch"

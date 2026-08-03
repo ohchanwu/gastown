@@ -283,7 +283,8 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 	if t.nudgeLease != nil {
 		return nil, fmt.Errorf("nudge lease already held for session %q", t.nudgeLease.session)
 	}
-	unlockFlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), nudgeLockTimeout)
+	canonicalTownRoot := canonicalNudgeTownRoot(townRoot)
+	unlockFlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), nudgeLockTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +292,7 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 		unlockFlock()
 		return nil, fmt.Errorf("nudge lock timeout for session %q", session)
 	}
-	lease := &nudgeLease{townRoot: townRoot, session: session}
+	lease := &nudgeLease{townRoot: canonicalTownRoot, session: session}
 	t.nudgeLease = lease
 	var once sync.Once
 	return func() {
@@ -310,7 +311,7 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 func (t *Tmux) ownsNudgeLease(townRoot, session string) bool {
 	t.leaseMu.Lock()
 	defer t.leaseMu.Unlock()
-	return t.nudgeLease != nil && t.nudgeLease.townRoot == townRoot && t.nudgeLease.session == session
+	return t.nudgeLease != nil && t.nudgeLease.townRoot == canonicalNudgeTownRoot(townRoot) && t.nudgeLease.session == session
 }
 
 // run executes a tmux command and returns stdout.
@@ -1510,7 +1511,22 @@ func releaseNudgeLock(session string) {
 // Lock files live alongside the nudge queue directory for self-documentation and cleanup.
 func nudgeFlockPath(townRoot, session string) string {
 	safe := strings.ReplaceAll(session, "/", "_")
-	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
+	return filepath.Join(canonicalNudgeTownRoot(townRoot), constants.DirRuntime, "nudge_queue", safe, ".lock")
+}
+
+func canonicalNudgeTownRoot(townRoot string) string {
+	if townRoot == "" {
+		return ""
+	}
+	absolute, err := filepath.Abs(townRoot)
+	if err != nil {
+		return townRoot
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return absolute
+	}
+	return canonical
 }
 
 const clientAttachmentLatch = "@gt-canary-client-attached"
