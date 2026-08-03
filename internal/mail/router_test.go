@@ -1858,11 +1858,22 @@ func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	townRoot := t.TempDir()
+	pollerStarts := 0
 	r := &Router{
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              tmux.NewTmuxWithSocket(socket),
 		IdleNotifyTimeout: 3 * time.Second,
+		startPoller: func(gotRoot, gotSession string, env []string) (int, error) {
+			pollerStarts++
+			if gotRoot != townRoot || gotSession != sessionName {
+				t.Fatalf("poller target = (%q, %q), want (%q, %q)", gotRoot, gotSession, townRoot, sessionName)
+			}
+			if !strings.Contains(strings.Join(env, "\n"), "GT_TOWN_SOCKET="+socket) {
+				t.Fatalf("poller environment does not target private socket %q", socket)
+			}
+			return 123, nil
+		},
 	}
 
 	msg := &Message{
@@ -1874,6 +1885,9 @@ func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {
 	err := r.notifyRecipient(msg)
 	if !errors.Is(err, ErrNotificationQueued) {
 		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
+	}
+	if pollerStarts != 1 {
+		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
 	// The unconfirmed notification and deferred reply reminder both persist.
@@ -1902,11 +1916,19 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	createNotifyTestSession(t, socket, sessionName, "sleep 300")
 
 	townRoot := t.TempDir()
+	pollerStarts := 0
 	r := &Router{
 		workDir:           t.TempDir(),
 		townRoot:          townRoot,
 		tmux:              tmux.NewTmuxWithSocket(socket),
 		IdleNotifyTimeout: 1 * time.Second, // short timeout for test speed
+		startPoller: func(gotRoot, gotSession string, _ []string) (int, error) {
+			pollerStarts++
+			if gotRoot != townRoot || gotSession != sessionName {
+				t.Fatalf("poller target = (%q, %q), want (%q, %q)", gotRoot, gotSession, townRoot, sessionName)
+			}
+			return 123, nil
+		},
 	}
 
 	msg := &Message{
@@ -1918,6 +1940,9 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	err := r.notifyRecipient(msg)
 	if !errors.Is(err, ErrNotificationQueued) {
 		t.Fatalf("notifyRecipient returned %v, want ErrNotificationQueued", err)
+	}
+	if pollerStarts != 1 {
+		t.Fatalf("external retry starts = %d, want 1", pollerStarts)
 	}
 
 	// Two nudges should be queued:
@@ -1947,6 +1972,38 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	remaining, _ := nudge.Pending(townRoot, sessionName)
 	if remaining != 1 {
 		t.Errorf("expected 1 deferred reply-reminder still in queue, got %d", remaining)
+	}
+}
+
+func TestNotifyRecipient_QueuedRetryStarterFailureIsVisible(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "hq-mayor"
+	createNotifyTestSession(t, socket, sessionName, "sleep 300")
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              tmux.NewTmuxWithSocket(socket),
+		IdleNotifyTimeout: 10 * time.Millisecond,
+		startPoller: func(_, _ string, _ []string) (int, error) {
+			return 0, errors.New("poller unavailable")
+		},
+	}
+
+	err := r.notifyRecipient(&Message{
+		From: "gastown/crew/sender", To: "mayor/",
+		Subject: "urgent retry ownership", Priority: PriorityHigh,
+	})
+	if !errors.Is(err, ErrNotificationQueued) || !errors.Is(err, ErrNotificationFailed) {
+		t.Fatalf("notifyRecipient error = %v, want queued and failed retry ownership", err)
+	}
+	if pending, _ := nudge.Pending(townRoot, sessionName); pending != 2 {
+		t.Fatalf("durable notification + reminder count = %d, want 2", pending)
+	}
+	nudges, drainErr := nudge.Drain(townRoot, sessionName)
+	if drainErr != nil || len(nudges) != 1 || nudges[0].Priority != nudge.PriorityUrgent || !nudges[0].DurableUntilAck {
+		t.Fatalf("urgent Mayor retry record = (%+v, %v), want one durable urgent item", nudges, drainErr)
 	}
 }
 

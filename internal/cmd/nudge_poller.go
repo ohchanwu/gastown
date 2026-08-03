@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -19,6 +20,8 @@ var (
 	nudgePollerIdleFlag     string
 )
 
+const nudgePollerStopInterval = 100 * time.Millisecond
+
 func init() {
 	rootCmd.AddCommand(nudgePollerCmd)
 	nudgePollerCmd.Flags().StringVar(&nudgePollerIntervalFlag, "interval", nudge.DefaultPollInterval, "Poll interval (e.g., 10s, 30s)")
@@ -36,7 +39,8 @@ turn-boundary hooks (Gemini, Codex, Cursor, etc.).
 
 This command runs as a long-lived background process. It exits when:
   - The target tmux session dies
-  - It receives SIGTERM (from StopPoller or session teardown)
+  - Its generation-bound cooperative stop request is published
+  - It receives SIGTERM or SIGINT from external process teardown
   - The poll loop encounters an unrecoverable error
 
 Normally launched automatically by 'gt crew start' for non-Claude agents.
@@ -73,18 +77,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
-	agentName := ""
-	hasPromptDetection := false
-	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
-		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
-			hasPromptDetection = preset.ReadyPromptPrefix != ""
-			if preset.EscapeCancelsRequest {
-				nudgeOpts.SkipEscape = true
-			}
-		}
-	}
+	hasPromptDetection, nudgeOpts := resolvePollerSessionMetadata(t, sessionName)
 
 	// Set up signal handling for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -92,11 +85,20 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	stopContext, cancelStopWatcher := context.WithCancel(cmd.Context())
+	defer cancelStopWatcher()
+	cooperativeStop := watchCooperativePollerStop(stopContext, nudgePollerStopInterval, func() bool {
+		return nudge.StopRequested(townRoot, sessionName)
+	})
 
 	for {
 		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
 		case <-sigCh:
 			return nil // graceful shutdown
+		case <-cooperativeStop:
+			return nil
 
 		case <-ticker.C:
 			// Check if session still exists.
@@ -112,13 +114,11 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
 			// best-effort behavior and drain on the poll interval.
-			waitErr := t.WaitForIdle(sessionName, idleTimeout)
-			if shouldSkipDrainUntilIdle(hasPromptDetection, waitErr) {
-				continue
-			}
-
-			// Claim and inject; acknowledge only after runtime-proven submission.
-			claim, err := nudge.ClaimDue(townRoot, sessionName)
+			claim, err := claimPollerNudgeWhenIdle(
+				hasPromptDetection,
+				func() error { return t.WaitForIdle(sessionName, idleTimeout) },
+				func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
+			)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "nudge-poller: claim error for %s: %v\n", sessionName, err)
 				continue
@@ -144,6 +144,50 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func watchCooperativePollerStop(ctx context.Context, interval time.Duration, stopRequested func() bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if stopRequested() {
+					close(stopped)
+					return
+				}
+			}
+		}
+	}()
+	return stopped
+}
+
+func claimPollerNudgeWhenIdle(
+	hasPromptDetection bool,
+	waitForIdle func() error,
+	claimDue func() (*nudge.ClaimedNudge, error),
+) (*nudge.ClaimedNudge, error) {
+	if shouldSkipDrainUntilIdle(hasPromptDetection, waitForIdle()) {
+		return nil, nil
+	}
+	return claimDue()
+}
+
+func resolvePollerSessionMetadata(t *tmux.Tmux, sessionName string) (bool, tmux.NudgeOpts) {
+	var opts tmux.NudgeOpts
+	agentName, _ := t.GetEnvironment(sessionName, "GT_AGENT")
+	preset := config.GetAgentPresetByName(agentName)
+	if preset != nil && preset.EscapeCancelsRequest {
+		opts.SkipEscape = true
+	}
+	if prompt, err := t.GetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX"); err == nil {
+		return prompt != "", opts
+	}
+	return preset != nil && preset.ReadyPromptPrefix != "", opts
 }
 
 func shouldSkipDrainUntilIdle(hasPromptDetection bool, waitErr error) bool {

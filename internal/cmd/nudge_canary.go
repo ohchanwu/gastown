@@ -129,6 +129,17 @@ func confirmWakeCanaryTurn(waiter wakeCanaryTurnWaiter, sessionName, baseline, r
 	return "", nil
 }
 
+func confirmWakeCanaryDelivery(outcome witness.MayorNotificationOutcome, confirm func() (string, error)) (string, error) {
+	switch outcome {
+	case witness.MayorNotificationSubmitted, witness.MayorNotificationQueued:
+		return confirm()
+	case witness.MayorNotificationWakeFailed:
+		return "notification-failed", errors.New("Mayor notification wake failed")
+	default:
+		return "notification-failed", fmt.Errorf("unexpected Mayor notification outcome %q", outcome)
+	}
+}
+
 func newWakeCanarySandbox(parent, gtBin string) (*wakeCanarySandbox, error) {
 	townRoot, err := os.MkdirTemp(parent, "gt-wake-canary-")
 	if err != nil {
@@ -212,6 +223,7 @@ func (s *wakeCanarySandbox) linkCodexAuth() error {
 }
 
 func (s *wakeCanarySandbox) Cleanup() error {
+	pollerErr := nudge.StopPoller(s.TownRoot, s.Session)
 	if s.tmux != nil {
 		_ = s.tmux.KillSessionWithProcesses(s.Session)
 		_ = s.tmux.KillServer()
@@ -220,7 +232,7 @@ func (s *wakeCanarySandbox) Cleanup() error {
 	if s.Socket != "" {
 		socketErr = removeWakeCanarySocketPath(s.Socket)
 	}
-	return errors.Join(socketErr, os.RemoveAll(s.TownRoot))
+	return errors.Join(pollerErr, socketErr, os.RemoveAll(s.TownRoot))
 }
 
 func init() {
@@ -329,11 +341,6 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 	if err := waitForWakeCanaryIdle(t, sessionName); err != nil {
 		return fail("session-not-idle", fmt.Errorf("waiting for isolated Mayor steady-state idle: %w", err))
 	}
-	releaseLease, err := t.AcquireNudgeLease(runtimeTownRoot, sessionName)
-	if err != nil {
-		return fail("nudge-lock-contended", fmt.Errorf("acquiring exclusive canary nudge lease: %w", err))
-	}
-	defer releaseLease()
 	if err := t.ArmClientAttachmentLatch(sessionName); err != nil {
 		return fail("client-latch-failed", fmt.Errorf("arming client attachment latch: %w", err))
 	}
@@ -356,24 +363,28 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 			result.Failed++
 			return fail("transcript-baseline-failed", captureErr)
 		}
+		releaseLease, leaseErr := t.AcquireNudgeLease(runtimeTownRoot, sessionName)
+		if leaseErr != nil {
+			result.Failed++
+			return fail("nudge-lock-contended", fmt.Errorf("acquiring exclusive canary nudge lease: %w", leaseErr))
+		}
 		outcome, sendErr := witness.DeliverMayorNotification(router,
 			fmt.Sprintf("Wake canary %d/%d: reverse nonce %s", turn, turns, nonce),
 			"Reply in the active model turn with the nonce reversed.")
+		releaseLease()
 		if sendErr != nil {
 			result.Failed++
 			return fail("mail-send-failed", sendErr)
 		}
-		if outcome == witness.MayorNotificationQueued {
-			result.Queued++
-			return fail("notification-queued", errors.New("Mayor notification queued"))
-		}
-		if outcome == witness.MayorNotificationWakeFailed {
+		failureCode, confirmErr := confirmWakeCanaryDelivery(outcome, func() (string, error) {
+			return confirmWakeCanaryTurn(tmuxWakeCanaryTurnWaiter{tmux: t}, sessionName, before, response)
+		})
+		if confirmErr != nil {
+			if outcome == witness.MayorNotificationQueued {
+				result.Queued++
+			}
 			result.Failed++
-			return fail("notification-failed", errors.New("Mayor notification wake failed"))
-		}
-		if failureCode, err := confirmWakeCanaryTurn(tmuxWakeCanaryTurnWaiter{tmux: t}, sessionName, before, response); err != nil {
-			result.Failed++
-			return fail(failureCode, err)
+			return fail(failureCode, confirmErr)
 		}
 		attached, attachmentErr = t.ClientAttachmentObserved(sessionName)
 		if attachmentErr != nil {

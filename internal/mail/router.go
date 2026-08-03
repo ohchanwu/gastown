@@ -61,9 +61,10 @@ const DefaultIdleNotifyTimeout = 3 * time.Second
 // - Town-level (mayor/, deacon/) -> {townRoot}/.beads
 // - Rig-level (rig/polecat) -> {townRoot}/{rig}/.beads
 type Router struct {
-	workDir  string // fallback directory to run bd commands in
-	townRoot string // town root directory (e.g., ~/gt)
-	tmux     *tmux.Tmux
+	workDir     string // fallback directory to run bd commands in
+	townRoot    string // town root directory (e.g., ~/gt)
+	tmux        *tmux.Tmux
+	startPoller func(townRoot, session string, env []string) (int, error)
 
 	// IdleNotifyTimeout controls how long to wait for a session to become
 	// idle before falling back to a queued nudge. Zero uses the default.
@@ -82,25 +83,35 @@ func NewRouter(workDir string) *Router {
 	townRoot := detectTownRoot(workDir)
 
 	return &Router{
-		workDir:  workDir,
-		townRoot: townRoot,
-		tmux:     tmux.NewTmux(),
+		workDir:     workDir,
+		townRoot:    townRoot,
+		tmux:        tmux.NewTmux(),
+		startPoller: nudge.StartPollerWithEnv,
 	}
 }
 
 // NewRouterWithTownRoot creates a router with an explicit town root.
 func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 	return &Router{
-		workDir:  workDir,
-		townRoot: townRoot,
-		tmux:     tmux.NewTmux(),
+		workDir:     workDir,
+		townRoot:    townRoot,
+		tmux:        tmux.NewTmux(),
+		startPoller: nudge.StartPollerWithEnv,
 	}
 }
 
 // NewRouterWithTownRootAndTmux creates a router on a dedicated tmux transport.
 // It is used by isolated canaries so they cannot address a live town session.
 func NewRouterWithTownRootAndTmux(workDir, townRoot string, transport *tmux.Tmux) *Router {
-	return &Router{workDir: workDir, townRoot: townRoot, tmux: transport}
+	return &Router{workDir: workDir, townRoot: townRoot, tmux: transport, startPoller: nudge.StartPollerWithEnv}
+}
+
+func (r *Router) startQueuedRetry(sessionID string) error {
+	if r.startPoller == nil {
+		return nil
+	}
+	_, err := r.startPoller(r.townRoot, sessionID, r.tmux.PollerEnvironment())
+	return err
 }
 
 // WaitPendingNotifications blocks until all in-flight async notifications
@@ -1745,6 +1756,9 @@ func (r *Router) notifyRecipient(msg *Message) error {
 					errs = append(errs, fmt.Sprintf("%s: direct=%v queue=%v", sessionID, deliveryErr, queueErr))
 					continue
 				}
+				if retryErr := r.startQueuedRetry(sessionID); retryErr != nil {
+					errs = append(errs, fmt.Sprintf("%s: starting queued retry: %v", sessionID, retryErr))
+				}
 				r.enqueueReplyReminder(msg, sessionID)
 				notified++
 				queuedCount++
@@ -1772,6 +1786,9 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 				continue
+			}
+			if retryErr := r.startQueuedRetry(sessionID); retryErr != nil {
+				errs = append(errs, fmt.Sprintf("%s: starting queued retry: %v", sessionID, retryErr))
 			}
 			r.enqueueReplyReminder(msg, sessionID)
 			notified++

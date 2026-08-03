@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/witness"
 )
 
 type wakeCanaryIdleWaiterStub struct {
@@ -123,6 +124,17 @@ func TestConfirmWakeCanaryTurnDistinguishesResponseAndIdleFailures(t *testing.T)
 				t.Fatalf("turn events = %q, want %q", got, tt.wantEvents)
 			}
 		})
+	}
+}
+
+func TestConfirmWakeCanaryDeliveryRequiresTurnProofAfterQueuedRetry(t *testing.T) {
+	confirmed := false
+	code, err := confirmWakeCanaryDelivery(witness.MayorNotificationQueued, func() (string, error) {
+		confirmed = true
+		return "", nil
+	})
+	if err != nil || code != "" || !confirmed {
+		t.Fatalf("queued retry confirmation = (%q, %v, called=%v), want successful turn proof", code, err, confirmed)
 	}
 }
 

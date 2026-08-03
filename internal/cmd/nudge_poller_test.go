@@ -1,9 +1,66 @@
 package cmd
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestPollerCustomPromptBusyDoesNotClaimQueue(t *testing.T) {
+	socket := fmt.Sprintf("gt-test-poller-prompt-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() {
+		socketPath, _ := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
+		_ = transport.KillServer()
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			_ = os.Remove(path)
+		}
+	})
+	sessionName := "gt-test-custom-codex-mayor"
+	if err := transport.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
+		if _, lookupErr := exec.LookPath("tmux"); lookupErr != nil {
+			t.Skip("tmux unavailable")
+		}
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_AGENT", "custom-codex-mayor"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", "› "); err != nil {
+		t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
+	}
+
+	hasPrompt, _ := resolvePollerSessionMetadata(transport, sessionName)
+	if !hasPrompt {
+		t.Fatal("poller ignored resolved session prompt metadata")
+	}
+
+	claimed := false
+	claim, err := claimPollerNudgeWhenIdle(
+		hasPrompt,
+		func() error { return errors.New("session busy") },
+		func() (*nudge.ClaimedNudge, error) {
+			claimed = true
+			return nil, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim != nil || claimed {
+		t.Fatal("custom-prompt busy cycle claimed the queue")
+	}
+}
 
 func TestShouldSkipDrainUntilIdle(t *testing.T) {
 	t.Parallel()
@@ -26,5 +83,23 @@ func TestShouldSkipDrainUntilIdle(t *testing.T) {
 				t.Errorf("shouldSkipDrainUntilIdle(%v, %v) = %v, want %v", tt.hasPromptDetection, tt.waitErr, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCooperativeStopWatcherBeatsShutdownDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requested atomic.Bool
+	started := time.Now()
+	stopped := watchCooperativePollerStop(ctx, 10*time.Millisecond, requested.Load)
+	time.AfterFunc(30*time.Millisecond, func() { requested.Store(true) })
+
+	select {
+	case <-stopped:
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("cooperative stop observed after %s", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("cooperative stop watcher missed the bounded stop request")
 	}
 }

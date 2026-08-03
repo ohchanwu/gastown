@@ -189,3 +189,8 @@ func processStartTime(pid int) (string, error) {
 	}
 	return strings.TrimSpace(string(out)), nil
 }
+
+// ProcessStartTime returns the stable OS start identity used for PID reuse checks.
+func ProcessStartTime(pid int) (string, error) {
+	return processStartTime(pid)
+}
