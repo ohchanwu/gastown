@@ -144,3 +144,17 @@ func TestCooperativeStopWatcherBeatsShutdownDeadline(t *testing.T) {
 		t.Fatal("cooperative stop watcher missed the bounded stop request")
 	}
 }
+
+func TestPollerHasSessionRetriesFalseError(t *testing.T) {
+	var calls int
+	got, err := pollerHasSessionWith(func() (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, errors.New("transient tmux error")
+		}
+		return true, nil
+	})
+	if err != nil || !got || calls != 2 {
+		t.Fatalf("result=%v err=%v calls=%d", got, err, calls)
+	}
+}
