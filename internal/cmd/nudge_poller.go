@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -119,12 +120,16 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
 			// best-effort behavior and drain on the poll interval.
-			claim, err := claimPollerNudgeWhenIdle(
+			claim, err := claimPollerNudgeWhenIdleContext(
+				stopContext, cooperativeStop,
 				hasPromptDetection,
 				func() error { return t.WaitForIdle(sessionName, idleTimeout) },
 				func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
 			)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
 				fmt.Fprintf(os.Stderr, "nudge-poller: claim error for %s: %v\n", sessionName, err)
 				continue
 			}
@@ -148,6 +153,25 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
+	}
+}
+
+func claimPollerNudgeWhenIdleContext(ctx context.Context, stop <-chan struct{}, hasPromptDetection bool, waitForIdle func() error, claimDue func() (*nudge.ClaimedNudge, error)) (*nudge.ClaimedNudge, error) {
+	if !hasPromptDetection {
+		return claimDue()
+	}
+	result := make(chan error, 1)
+	go func() { result <- waitForIdle() }()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-stop:
+		return nil, context.Canceled
+	case err := <-result:
+		if shouldSkipDrainUntilIdle(true, err) {
+			return nil, nil
+		}
+		return claimDue()
 	}
 }
 
