@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -156,5 +157,110 @@ func TestPollerHasSessionRetriesFalseError(t *testing.T) {
 	})
 	if err != nil || !got || calls != 2 {
 		t.Fatalf("result=%v err=%v calls=%d", got, err, calls)
+	}
+}
+
+func TestPollerCancellationWhileLeaseIsBusyDoesNotClaimQueue(t *testing.T) {
+	townRoot := t.TempDir()
+	const sessionName = "gt-test-lease-busy"
+	owner := tmux.NewTmuxWithSocket("lease-owner")
+	releaseOwner, err := owner.AcquireNudgeLease(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("owner lease: %v", err)
+	}
+	defer releaseOwner()
+
+	waiter := tmux.NewTmuxWithSocket("lease-waiter")
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	claims := 0
+	claim, release, err := claimPollerNudgeWhenIdleContext(
+		ctx,
+		false,
+		func(context.Context) error { return nil },
+		func(ctx context.Context) (func(), error) {
+			return waiter.AcquireNudgeLeaseContext(ctx, townRoot, sessionName)
+		},
+		func() (*nudge.ClaimedNudge, error) {
+			claims++
+			return nil, nil
+		},
+	)
+	if release != nil {
+		release()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || claim != nil || claims != 0 {
+		t.Fatalf("canceled lease cycle = claim %#v release %v err %v claims %d", claim, release != nil, err, claims)
+	}
+}
+
+func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
+	socket := fmt.Sprintf("gt-test-busy-poller-stop-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = transport.KillServer() })
+
+	townRoot := t.TempDir()
+	const sessionName = "gt-test-busy-poller"
+	if err := transport.NewSessionWithCommandAndEnv(sessionName, townRoot, "sleep 60", map[string]string{
+		"GT_AGENT":               "codex",
+		"GT_READY_PROMPT_PREFIX": "› ",
+	}); err != nil {
+		t.Fatalf("create busy session: %v", err)
+	}
+	queued := nudge.QueuedNudge{
+		DeliveryID:      "ndg-busy-stop",
+		Sender:          "mayor",
+		Message:         "must remain queued",
+		Priority:        nudge.PriorityUrgent,
+		DurableUntilAck: true,
+	}
+	if err := nudge.Enqueue(townRoot, sessionName, queued); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	pidDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pidDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(pidDir, sessionName+".pid")
+	generation := []byte("busy-poller-generation")
+	if err := os.WriteFile(pidPath, generation, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runNudgePollerLoop(context.Background(), townRoot, sessionName, transport, 10*time.Millisecond, 10*time.Second)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("busy poller exited before stop: %v", err)
+	default:
+	}
+
+	kills := 0
+	err := polecat.StopPollerBeforeReplacement(func() error {
+		if err := os.WriteFile(pidPath+".stop", generation, 0600); err != nil {
+			return err
+		}
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(time.Second):
+			return errors.New("busy poller did not stop within replacement bound")
+		}
+	}, func() error {
+		kills++
+		return transport.KillSession(sessionName)
+	})
+	if err != nil {
+		t.Fatalf("busy replacement: %v", err)
+	}
+	if kills != 1 {
+		t.Fatalf("replacement kills = %d, want 1", kills)
+	}
+	if pending, err := nudge.Pending(townRoot, sessionName); err != nil || pending != 1 {
+		t.Fatalf("pending after busy stop = %d, %v; want one untouched record", pending, err)
 	}
 }

@@ -68,7 +68,10 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --idle-timeout: %w", err)
 	}
 
-	t := tmux.NewTmux()
+	return runNudgePollerLoop(cmd.Context(), townRoot, sessionName, tmux.NewTmux(), pollInterval, idleTimeout)
+}
+
+func runNudgePollerLoop(ctx context.Context, townRoot, sessionName string, t *tmux.Tmux, pollInterval, idleTimeout time.Duration) error {
 
 	// Verify session exists before starting the loop.
 	if exists, err := pollerHasSession(t, sessionName); err != nil {
@@ -82,25 +85,33 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
 	hasPromptDetection, nudgeOpts := resolvePollerSessionMetadata(t, sessionName)
 
-	// Set up signal handling for graceful shutdown.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	// Make signals, caller cancellation, and generation-bound cooperative stop
+	// one context so idle and lease waits can terminate without abandoning a
+	// claimed queue record.
+	signalContext, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	pollerContext, cancelPoller := context.WithCancel(signalContext)
+	defer cancelPoller()
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-	stopContext, cancelStopWatcher := context.WithCancel(cmd.Context())
-	defer cancelStopWatcher()
-	cooperativeStop := watchCooperativePollerStop(stopContext, nudgePollerStopInterval, func() bool {
+	cooperativeStop := watchCooperativePollerStop(pollerContext, nudgePollerStopInterval, func() bool {
 		return nudge.StopRequested(townRoot, sessionName)
 	})
+	go func() {
+		select {
+		case <-cooperativeStop:
+			cancelPoller()
+		case <-pollerContext.Done():
+		}
+	}()
 
 	for {
 		select {
-		case <-cmd.Context().Done():
-			return cmd.Context().Err()
-		case <-sigCh:
-			return nil // graceful shutdown
-		case <-cooperativeStop:
+		case <-pollerContext.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return nil
 
 		case <-ticker.C:
@@ -120,14 +131,20 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// For runtimes with prompt detection, defer delivery until the session
 			// is actually idle. Runtimes without prompt detection preserve the old
 			// best-effort behavior and drain on the poll interval.
-			claim, err := claimPollerNudgeWhenIdleContext(
-				stopContext, cooperativeStop,
+			claim, releaseLease, err := claimPollerNudgeWhenIdleContext(
+				pollerContext,
 				hasPromptDetection,
-				func() error { return t.WaitForIdle(sessionName, idleTimeout) },
+				func(ctx context.Context) error { return t.WaitForIdleContext(ctx, sessionName, idleTimeout) },
+				func(ctx context.Context) (func(), error) {
+					return t.AcquireNudgeLeaseContext(ctx, townRoot, sessionName)
+				},
 				func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
 			)
 			if err != nil {
-				if errors.Is(err, context.Canceled) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					if parentErr := ctx.Err(); parentErr != nil {
+						return parentErr
+					}
 					return nil
 				}
 				fmt.Fprintf(os.Stderr, "nudge-poller: claim error for %s: %v\n", sessionName, err)
@@ -137,42 +154,57 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				continue // someone else drained it
 			}
 
-			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
-			nudgeOpts.TownRoot = townRoot
-			nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
-			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
-			if err != nil || !receipt.Submitted {
-				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-				if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-					fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
+			func() {
+				defer releaseLease()
+				formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
+				nudgeOpts.TownRoot = townRoot
+				nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
+				receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
+				if err != nil || !receipt.Submitted {
+					fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
+					if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+						fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
+					}
+				} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: ack error for %s: %v\n", sessionName, ackErr)
+					if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
+						fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
+					}
 				}
-			} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "nudge-poller: ack error for %s: %v\n", sessionName, ackErr)
-				if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-					fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
-				}
-			}
+			}()
 		}
 	}
 }
 
-func claimPollerNudgeWhenIdleContext(ctx context.Context, stop <-chan struct{}, hasPromptDetection bool, waitForIdle func() error, claimDue func() (*nudge.ClaimedNudge, error)) (*nudge.ClaimedNudge, error) {
-	if !hasPromptDetection {
-		return claimDue()
-	}
-	result := make(chan error, 1)
-	go func() { result <- waitForIdle() }()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-stop:
-		return nil, context.Canceled
-	case err := <-result:
-		if shouldSkipDrainUntilIdle(true, err) {
-			return nil, nil
+func claimPollerNudgeWhenIdleContext(
+	ctx context.Context,
+	hasPromptDetection bool,
+	waitForIdle func(context.Context) error,
+	acquireLease func(context.Context) (func(), error),
+	claimDue func() (*nudge.ClaimedNudge, error),
+) (*nudge.ClaimedNudge, func(), error) {
+	if hasPromptDetection {
+		if err := waitForIdle(ctx); err != nil {
+			if errors.Is(err, tmux.ErrIdleTimeout) {
+				return nil, nil, nil
+			}
+			return nil, nil, err
 		}
-		return claimDue()
 	}
+	release, err := acquireLease(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, nil, err
+	}
+	claim, err := claimDue()
+	if err != nil || claim == nil {
+		release()
+		return claim, nil, err
+	}
+	return claim, release, nil
 }
 
 func pollerHasSession(t *tmux.Tmux, session string) (bool, error) {

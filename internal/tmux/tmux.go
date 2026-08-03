@@ -282,25 +282,42 @@ func NudgeLockAvailable(townRoot, session string) bool {
 // AcquireNudgeLease retains exclusive ownership while a multi-step delivery
 // proof runs. Calls made through this Tmux instance reuse the held lease.
 func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
+	return t.AcquireNudgeLeaseContext(context.Background(), townRoot, session)
+}
+
+// AcquireNudgeLeaseContext is AcquireNudgeLease with caller cancellation while
+// waiting for cross-process or in-process ownership.
+func (t *Tmux) AcquireNudgeLeaseContext(ctx context.Context, townRoot, session string) (func(), error) {
 	t.leaseMu.Lock()
-	defer t.leaseMu.Unlock()
 	if t.nudgeLease != nil {
-		return nil, fmt.Errorf("nudge lease already held for session %q", t.nudgeLease.session)
+		existing := t.nudgeLease.session
+		t.leaseMu.Unlock()
+		return nil, fmt.Errorf("nudge lease already held for session %q", existing)
 	}
+	t.leaseMu.Unlock()
 	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolving nudge lease town root: %w", err)
 	}
-	unlockFlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), nudgeLockTimeout)
+	unlockFlock, err := acquireFlockLockContext(ctx, nudgeFlockPath(canonicalTownRoot, session), nudgeLockTimeout)
 	if err != nil {
 		return nil, err
 	}
-	if !acquireNudgeLock(session, nudgeLockTimeout) {
+	if err := acquireNudgeLockContext(ctx, session, nudgeLockTimeout); err != nil {
 		unlockFlock()
-		return nil, fmt.Errorf("nudge lock timeout for session %q", session)
+		return nil, err
 	}
 	lease := &nudgeLease{townRoot: canonicalTownRoot, session: session}
+	t.leaseMu.Lock()
+	if t.nudgeLease != nil {
+		existing := t.nudgeLease.session
+		t.leaseMu.Unlock()
+		releaseNudgeLock(session)
+		unlockFlock()
+		return nil, fmt.Errorf("nudge lease already held for session %q", existing)
+	}
 	t.nudgeLease = lease
+	t.leaseMu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -1502,20 +1519,30 @@ func getSessionNudgeSem(session string) chan struct{} {
 // acquireNudgeLock attempts to acquire the per-session nudge lock with a timeout.
 // Returns true if the lock was acquired, false if the timeout expired.
 func acquireNudgeLock(session string, timeout time.Duration) bool {
+	return acquireNudgeLockContext(context.Background(), session, timeout) == nil
+}
+
+func acquireNudgeLockContext(ctx context.Context, session string, timeout time.Duration) error {
 	sem := getSessionNudgeSem(session)
 	if timeout <= 0 {
 		select {
 		case sem <- struct{}{}:
-			return true
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
-			return false
+			return fmt.Errorf("nudge lock timeout for session %q", session)
 		}
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case sem <- struct{}{}:
-		return true
-	case <-time.After(timeout):
-		return false
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("nudge lock timeout for session %q", session)
 	}
 }
 
@@ -3168,7 +3195,12 @@ func (t *Tmux) SetEnvironment(session, key, value string) error {
 
 // GetEnvironment gets an environment variable from the session.
 func (t *Tmux) GetEnvironment(session, key string) (string, error) {
-	out, err := t.run("show-environment", "-t", session, key)
+	return t.GetEnvironmentContext(context.Background(), session, key)
+}
+
+// GetEnvironmentContext is GetEnvironment with caller cancellation.
+func (t *Tmux) GetEnvironmentContext(ctx context.Context, session, key string) (string, error) {
+	out, err := t.runContext(ctx, "show-environment", "-t", session, key)
 	if err != nil {
 		return "", err
 	}
@@ -3838,18 +3870,28 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 }
 
 func submissionPromptForSession(t *Tmux, session string) (string, bool) {
-	if promptPrefix, err := t.GetEnvironment(session, "GT_READY_PROMPT_PREFIX"); err == nil && promptPrefix != "" {
-		return promptPrefix, true
+	prompt, detected, _ := submissionPromptForSessionContext(context.Background(), t, session)
+	return prompt, detected
+}
+
+func submissionPromptForSessionContext(ctx context.Context, t *Tmux, session string) (string, bool, error) {
+	if promptPrefix, err := t.GetEnvironmentContext(ctx, session, "GT_READY_PROMPT_PREFIX"); err == nil && promptPrefix != "" {
+		return promptPrefix, true, nil
+	} else if ctx.Err() != nil {
+		return "", false, ctx.Err()
 	}
-	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	agentName, err := t.GetEnvironmentContext(ctx, session, "GT_AGENT")
+	if ctx.Err() != nil {
+		return "", false, ctx.Err()
+	}
 	if err != nil || agentName == "" {
-		return DefaultReadyPromptPrefix, false
+		return DefaultReadyPromptPrefix, false, nil
 	}
 	preset := config.GetAgentPresetByName(agentName)
 	if preset == nil || preset.ReadyPromptPrefix == "" {
-		return DefaultReadyPromptPrefix, false
+		return DefaultReadyPromptPrefix, false, nil
 	}
-	return preset.ReadyPromptPrefix, true
+	return preset.ReadyPromptPrefix, true, nil
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
@@ -3921,7 +3963,18 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	return t.WaitForIdleContext(context.Background(), session, timeout)
+}
+
+// WaitForIdleContext is WaitForIdle with caller cancellation. A caller
+// cancellation is returned verbatim; expiry of timeout remains ErrIdleTimeout.
+func (t *Tmux) WaitForIdleContext(ctx context.Context, session string, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	promptPrefix, _, err := submissionPromptForSessionContext(waitCtx, t, session)
+	if err != nil {
+		return err
+	}
 
 	// Require 6 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
@@ -3930,10 +3983,18 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	consecutiveIdle := 0
 	const requiredConsecutive = 6
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		content, err := t.run("capture-pane", "-p", "-e", "-t", session)
+	for {
+		if err := waitCtx.Err(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return ErrIdleTimeout
+		}
+		content, err := t.runContext(waitCtx, "capture-pane", "-p", "-e", "-t", session)
 		if err != nil {
+			if waitCtx.Err() != nil {
+				continue
+			}
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
 			// no point in polling further.
@@ -3941,19 +4002,25 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 				return err
 			}
 			consecutiveIdle = 0
-			time.Sleep(200 * time.Millisecond)
+			if err := waitForContext(waitCtx, 200*time.Millisecond); err != nil {
+				continue
+			}
 			continue
 		}
-		cursor, err := t.run("display-message", "-p", "-t", session, "#{cursor_x}|#{cursor_y}")
+		cursor, err := t.runContext(waitCtx, "display-message", "-p", "-t", session, "#{cursor_x}|#{cursor_y}")
 		if err != nil {
 			consecutiveIdle = 0
-			time.Sleep(200 * time.Millisecond)
+			if err := waitForContext(waitCtx, 200*time.Millisecond); err != nil {
+				continue
+			}
 			continue
 		}
 		var cursorX, cursorY int
 		if _, err := fmt.Sscanf(strings.TrimSpace(cursor), "%d|%d", &cursorX, &cursorY); err != nil {
 			consecutiveIdle = 0
-			time.Sleep(200 * time.Millisecond)
+			if err := waitForContext(waitCtx, 200*time.Millisecond); err != nil {
+				continue
+			}
 			continue
 		}
 
@@ -3965,9 +4032,10 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 		} else {
 			consecutiveIdle = 0
 		}
-		time.Sleep(200 * time.Millisecond)
+		if err := waitForContext(waitCtx, 200*time.Millisecond); err != nil {
+			continue
+		}
 	}
-	return ErrIdleTimeout
 }
 
 // IsAtPrompt checks if the agent is currently at an idle prompt (non-blocking).

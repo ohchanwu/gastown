@@ -1707,6 +1707,32 @@ func TestNudgeLeaseProvidesExclusiveOwnership(t *testing.T) {
 	}
 }
 
+func TestNudgeLeaseContextCancelsWhileOwnershipIsHeld(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-mayor"
+	owner := NewTmuxWithSocket("isolated-owner")
+	releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+	if err != nil {
+		t.Fatalf("AcquireNudgeLease owner: %v", err)
+	}
+	defer releaseOwner()
+
+	waiter := NewTmuxWithSocket("isolated-waiter")
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	releaseWaiter, err := waiter.AcquireNudgeLeaseContext(ctx, townRoot, session)
+	if releaseWaiter != nil {
+		releaseWaiter()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcquireNudgeLeaseContext error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("canceled lease acquisition took %s", elapsed)
+	}
+}
+
 func TestNudgeLeaseRecognizesCanonicalTownRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior requires Unix")
@@ -2831,6 +2857,30 @@ func TestWaitForIdle_Timeout(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Errorf("expected ErrIdleTimeout, got: %v", err)
+	}
+}
+
+func TestWaitForIdleContextCancelsBusyTmuxCommands(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+
+	tm := newTestTmux(t)
+	sessionName := fmt.Sprintf("gt-test-idle-cancel-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommand(sessionName, os.TempDir(), "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := tm.WaitForIdleContext(ctx, sessionName, 10*time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForIdleContext error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("canceled idle wait took %s", elapsed)
 	}
 }
 

@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,13 @@ var windowsFlockMu sync.Mutex
 // Since tmux is not supported on Windows, this is only reached in tests; it uses
 // a global mutex rather than per-path locking for simplicity.
 func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
+	return acquireFlockLockContext(context.Background(), lockPath, timeout)
+}
+
+func acquireFlockLockContext(ctx context.Context, lockPath string, timeout time.Duration) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(lockPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
@@ -31,9 +39,15 @@ func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
 		if windowsFlockMu.TryLock() {
 			return func() { windowsFlockMu.Unlock() }, nil
 		}
-		if time.Now().After(deadline) {
+		if timeout <= 0 || time.Now().After(deadline) {
 			return nil, fmt.Errorf("timeout after %s waiting for lock", timeout)
 		}
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }

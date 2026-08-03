@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,13 @@ import (
 // serialization. Returns an unlock function that must be called to release the lock.
 // Uses non-blocking flock in a polling loop to respect the timeout.
 func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
+	return acquireFlockLockContext(context.Background(), lockPath, timeout)
+}
+
+func acquireFlockLockContext(ctx context.Context, lockPath string, timeout time.Duration) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir := filepath.Dir(lockPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating lock dir: %w", err)
@@ -40,10 +48,17 @@ func acquireFlockLock(lockPath string, timeout time.Duration) (func(), error) {
 				f.Close()
 			}, nil
 		}
-		if time.Now().After(deadline) {
+		if timeout <= 0 || time.Now().After(deadline) {
 			f.Close()
 			return nil, fmt.Errorf("timeout after %s waiting for flock", timeout)
 		}
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			f.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }

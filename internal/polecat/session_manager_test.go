@@ -95,10 +95,10 @@ func TestStopNudgePollerFailurePropagatesWithoutReplacement(t *testing.T) {
 func TestStopPollerBeforeReplacementOrdering(t *testing.T) {
 	stopErr := errors.New("stop failed")
 	kills := 0
-	if err := stopPollerBeforeReplacement(func() error { return stopErr }, func() error { kills++; return nil }); !errors.Is(err, stopErr) || kills != 0 {
+	if err := StopPollerBeforeReplacement(func() error { return stopErr }, func() error { kills++; return nil }); !errors.Is(err, stopErr) || kills != 0 {
 		t.Fatalf("failed stop err=%v kills=%d", err, kills)
 	}
-	if err := stopPollerBeforeReplacement(func() error { return nil }, func() error { kills++; return nil }); err != nil || kills != 1 {
+	if err := StopPollerBeforeReplacement(func() error { return nil }, func() error { kills++; return nil }); err != nil || kills != 1 {
 		t.Fatalf("successful stop err=%v kills=%d", err, kills)
 	}
 }
