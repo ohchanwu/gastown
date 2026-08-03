@@ -1754,7 +1754,9 @@ func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
 		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
 		while [ ! -e %q ]; do sleep 0.01; done
 		early=0
-		for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+		# A 500ms transient still catches the former two-poll (200ms) proof,
+		# while leaving ample scheduling margin below the six-poll (1s) proof.
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
 			if [ -e %q ]; then early=1; break; fi
 			sleep 0.05
 		done

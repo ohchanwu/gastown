@@ -6,12 +6,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == "nudge-poller" {
+		os.Exit(runTestNudgePoller(os.Args[2]))
+	}
+
 	// Start an ephemeral Dolt container for this package's tests.
 	// convoy_manager_test.go calls setupTestStore which sets BEADS_TEST_MODE=1,
 	// causing the beads SDK to create testdb_<hash> databases. By routing
@@ -46,4 +52,19 @@ func TestMain(m *testing.M) {
 	}
 	testutil.TerminateDoltContainer()
 	os.Exit(code)
+}
+
+func runTestNudgePoller(session string) int {
+	townRoot := os.Getenv("GT_TOWN_ROOT")
+	if townRoot == "" || session == "" {
+		return 2
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if nudge.StopRequested(townRoot, session) {
+			return 0
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return 2
 }
