@@ -73,13 +73,11 @@ func (m *SessionManager) startNudgePoller(townRoot, sessionID string) {
 	}
 }
 
-func (m *SessionManager) stopNudgePoller(townRoot, sessionID string) {
+func (m *SessionManager) stopNudgePoller(townRoot, sessionID string) error {
 	if m.stopPoller == nil {
-		return
+		return nil
 	}
-	if err := m.stopPoller(townRoot, sessionID); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not stop nudge poller for %s: %v\n", sessionID, err)
-	}
+	return m.stopPoller(townRoot, sessionID)
 }
 
 // SessionStartOptions configures polecat session startup.
@@ -392,7 +390,9 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 			m.startNudgePoller(townRoot, sessionID)
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 		}
-		m.stopNudgePoller(townRoot, sessionID)
+		if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
+			return fmt.Errorf("stopping nudge poller: %w", err)
+		}
 		if err := m.tmux.KillSessionWithProcessesContext(ctx, sessionID); err != nil {
 			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
@@ -701,10 +701,14 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if !running {
-		m.stopNudgePoller(townRoot, sessionID)
+		if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
+			return err
+		}
 		return ErrSessionNotFound
 	}
-	m.stopNudgePoller(townRoot, sessionID)
+	if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
+		return err
+	}
 
 	// Try graceful shutdown first
 	if !force {
