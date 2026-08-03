@@ -17,7 +17,7 @@ import (
 )
 
 func testPollerIdentity(session string) pollerIdentity {
-	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session, Generation: "test-generation"}
+	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session, Generation: "test-generation", Transport: "fixture\x00fixture"}
 }
 
 func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {

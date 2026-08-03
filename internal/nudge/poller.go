@@ -132,6 +132,14 @@ func startPollerWithLauncherStatus(
 		return 0, err
 	}
 	defer func() { _ = startLock.Unlock() }()
+	effectiveTransport := normalizePollerTransport(effectivePollerEnv(env))
+	if data, readErr := os.ReadFile(pollerPidFile(townRoot, session)); readErr == nil {
+		if record, parseErr := parsePollerRecord(string(data)); parseErr == nil && !record.Legacy {
+			if record.Identity.Transport == "" || record.Identity.Transport != effectiveTransport {
+				return 0, errors.New("poller transport mismatch; preserving ownership")
+			}
+		}
+	}
 
 	// Check if a poller is already running for this session.
 	if pid, alive, statusErr := status(townRoot, session); statusErr != nil {
@@ -151,7 +159,7 @@ func startPollerWithLauncherStatus(
 	if launched.identity.StartTime == "" || launched.identity.Command == "" || launched.identity.Generation == "" || session == "" {
 		return 0, cleanupLaunchedPoller(launched, errors.New("nudge-poller identity unavailable"))
 	}
-	launched.identity.Transport = normalizePollerTransport(env)
+	launched.identity.Transport = effectiveTransport
 	record := formatPollerRecord(launched.pid, launched.identity, session)
 	if err := writePID(pidPath, []byte(record), 0644); err != nil {
 		persistErr := fmt.Errorf("persisting nudge-poller PID: %w", err)
@@ -168,6 +176,13 @@ func startPollerWithLauncherStatus(
 	}
 
 	return launched.pid, nil
+}
+
+func effectivePollerEnv(env []string) []string {
+	if env == nil {
+		return os.Environ()
+	}
+	return env
 }
 
 func normalizePollerTransport(env []string) string {
