@@ -14,11 +14,31 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 )
 
-func hookChooserTransitionAccepted(before, after string, dialog, trusting, busy bool) bool {
+func hookChooserTransitionAccepted(before, after string, dialog, progressAfterDialog bool) bool {
 	if before == "" || after == "" || before == after {
 		return false
 	}
-	return !dialog || trusting || busy
+	return !dialog || progressAfterDialog
+}
+
+func hookChooserProgressAfterDialog(content string) bool {
+	plain := idlePaneProbeANSI.ReplaceAllString(content, "")
+	lastBlocker := -1
+	lastProgress := -1
+	for i, line := range strings.Split(plain, "\n") {
+		normalized := strings.Join(strings.Fields(strings.ReplaceAll(line, "\u00a0", " ")), " ")
+		lower := strings.ToLower(normalized)
+		if normalized == "Hooks need review" || normalized == "› 1. Review hooks" ||
+			normalized == "2. Trust all and continue" ||
+			strings.Contains(lower, "hooks need review before they can run") ||
+			normalized == "Press t to trust all; enter to review hooks; esc to close" {
+			lastBlocker = i
+		}
+		if strings.Contains(normalized, "Trusting hooks") || strings.Contains(normalized, "esc to interrupt") {
+			lastProgress = i
+		}
+	}
+	return lastBlocker >= 0 && lastProgress > lastBlocker
 }
 
 func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
@@ -59,13 +79,14 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		return exec.Command("tmux", "-L", sandbox.Socket, "capture-pane", "-p", "-e", "-t", sandbox.Session, "-S", "-").Output()
 	}
 	type chooserState struct {
-		SHA256         string `json:"sha256"`
-		Dialog         bool   `json:"dialog"`
-		ReviewSelected bool   `json:"review_selected"`
-		TrustSelected  bool   `json:"trust_selected"`
-		TrustShortcut  bool   `json:"trust_shortcut"`
-		Trusting       bool   `json:"trusting"`
-		Busy           bool   `json:"busy"`
+		SHA256              string `json:"sha256"`
+		Dialog              bool   `json:"dialog"`
+		ReviewSelected      bool   `json:"review_selected"`
+		TrustSelected       bool   `json:"trust_selected"`
+		TrustShortcut       bool   `json:"trust_shortcut"`
+		Trusting            bool   `json:"trusting"`
+		Busy                bool   `json:"busy"`
+		ProgressAfterDialog bool   `json:"progress_after_dialog"`
 	}
 	hookReviewDialog := func(text string) bool {
 		return strings.Contains(text, "Hooks need review") ||
@@ -76,13 +97,14 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		sum := sha256.Sum256(content)
 		text := string(content)
 		return chooserState{
-			SHA256:         hex.EncodeToString(sum[:]),
-			Dialog:         hookReviewDialog(text),
-			ReviewSelected: strings.Contains(text, "› 1. Review hooks"),
-			TrustSelected:  strings.Contains(text, "› 2. Trust all and continue"),
-			TrustShortcut:  strings.Contains(strings.ToLower(text), "press t to trust all"),
-			Trusting:       strings.Contains(text, "Trusting hooks"),
-			Busy:           strings.Contains(text, "esc to interrupt"),
+			SHA256:              hex.EncodeToString(sum[:]),
+			Dialog:              hookReviewDialog(text),
+			ReviewSelected:      strings.Contains(text, "› 1. Review hooks"),
+			TrustSelected:       strings.Contains(text, "› 2. Trust all and continue"),
+			TrustShortcut:       strings.Contains(strings.ToLower(text), "press t to trust all"),
+			Trusting:            strings.Contains(text, "Trusting hooks"),
+			Busy:                strings.Contains(text, "esc to interrupt"),
+			ProgressAfterDialog: hookChooserProgressAfterDialog(text),
 		}
 	}
 
@@ -202,7 +224,7 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		t.Fatalf("tmux chooser target changed; private metadata: %s", evidencePath)
 	}
 	afterState := state(afterOneSecond)
-	if !hookChooserTransitionAccepted(beforeState.SHA256, afterState.SHA256, afterState.Dialog, afterState.Trusting, afterState.Busy) {
+	if !hookChooserTransitionAccepted(beforeState.SHA256, afterState.SHA256, afterState.Dialog, afterState.ProgressAfterDialog) {
 		t.Fatalf("tmux accepted the chooser command without proving the modal cleared or Codex resumed; private metadata: %s", evidencePath)
 	}
 }
@@ -214,21 +236,53 @@ func TestHookChooserTransitionAccepted(t *testing.T) {
 		before     string
 		after      string
 		dialog     bool
-		trusting   bool
-		busy       bool
+		progress   bool
 		wantAccept bool
 	}{
 		{name: "missing capture", before: "", after: "after", dialog: false, wantAccept: false},
 		{name: "unchanged modal", before: "same", after: "same", dialog: true, wantAccept: false},
 		{name: "pane churn with modal", before: "before", after: "after", dialog: true, wantAccept: false},
-		{name: "explicit trusting transition", before: "before", after: "after", dialog: true, trusting: true, wantAccept: true},
-		{name: "model resumed", before: "before", after: "after", dialog: true, busy: true, wantAccept: true},
+		{name: "explicit post-modal progress", before: "before", after: "after", dialog: true, progress: true, wantAccept: true},
 		{name: "modal cleared", before: "before", after: "after", dialog: false, wantAccept: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := hookChooserTransitionAccepted(tt.before, tt.after, tt.dialog, tt.trusting, tt.busy); got != tt.wantAccept {
+			if got := hookChooserTransitionAccepted(tt.before, tt.after, tt.dialog, tt.progress); got != tt.wantAccept {
 				t.Fatalf("hookChooserTransitionAccepted() = %v, want %v", got, tt.wantAccept)
+			}
+		})
+	}
+}
+
+func TestHookChooserProgressAfterDialog(t *testing.T) {
+	t.Parallel()
+	currentModal := "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close"
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "historical busy before active current modal",
+			content: "• Working (esc to interrupt)\ncompleted response\n" + currentModal,
+			want:    false,
+		},
+		{
+			name:    "trusting after current modal",
+			content: currentModal + "\nTrusting hooks",
+			want:    true,
+		},
+		{
+			name:    "busy after legacy modal",
+			content: "Hooks need review\n› 1. Review hooks\n2. Trust all and continue\n• Working (esc to interrupt)",
+			want:    true,
+		},
+		{name: "activity without modal", content: "• Working (esc to interrupt)", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hookChooserProgressAfterDialog(tt.content); got != tt.want {
+				t.Fatalf("hookChooserProgressAfterDialog() = %v, want %v", got, tt.want)
 			}
 		})
 	}
