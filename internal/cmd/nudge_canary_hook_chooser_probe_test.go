@@ -14,6 +14,13 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 )
 
+func hookChooserTransitionAccepted(before, after string, dialog, trusting, busy bool) bool {
+	if before == "" || after == "" || before == after {
+		return false
+	}
+	return !dialog || trusting || busy
+}
+
 func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 	if os.Getenv("GT_RUN_HOOK_CHOOSER_PROBE") != "1" {
 		t.Skip("set GT_RUN_HOOK_CHOOSER_PROBE=1 for the private isolated probe")
@@ -62,7 +69,8 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 	}
 	hookReviewDialog := func(text string) bool {
 		return strings.Contains(text, "Hooks need review") ||
-			strings.Contains(strings.ToLower(text), "hooks need review before they can run")
+			strings.Contains(strings.ToLower(text), "hooks need review before they can run") ||
+			strings.Contains(strings.ToLower(text), "press t to trust all; enter to review hooks; esc to close")
 	}
 	state := func(content []byte) chooserState {
 		sum := sha256.Sum256(content)
@@ -194,10 +202,34 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		t.Fatalf("tmux chooser target changed; private metadata: %s", evidencePath)
 	}
 	afterState := state(afterOneSecond)
-	if beforeState.SHA256 == afterState.SHA256 {
-		t.Fatalf("tmux accepted the chooser command but Codex hook review did not change; private metadata: %s", evidencePath)
+	if !hookChooserTransitionAccepted(beforeState.SHA256, afterState.SHA256, afterState.Dialog, afterState.Trusting, afterState.Busy) {
+		t.Fatalf("tmux accepted the chooser command without proving the modal cleared or Codex resumed; private metadata: %s", evidencePath)
 	}
-	if afterState.ReviewSelected && !afterState.TrustSelected && !afterState.Trusting && !afterState.Busy {
-		t.Fatalf("tmux accepted the chooser command but Codex remained on option 1; private metadata: %s", evidencePath)
+}
+
+func TestHookChooserTransitionAccepted(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		before     string
+		after      string
+		dialog     bool
+		trusting   bool
+		busy       bool
+		wantAccept bool
+	}{
+		{name: "missing capture", before: "", after: "after", dialog: false, wantAccept: false},
+		{name: "unchanged modal", before: "same", after: "same", dialog: true, wantAccept: false},
+		{name: "pane churn with modal", before: "before", after: "after", dialog: true, wantAccept: false},
+		{name: "explicit trusting transition", before: "before", after: "after", dialog: true, trusting: true, wantAccept: true},
+		{name: "model resumed", before: "before", after: "after", dialog: true, busy: true, wantAccept: true},
+		{name: "modal cleared", before: "before", after: "after", dialog: false, wantAccept: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hookChooserTransitionAccepted(tt.before, tt.after, tt.dialog, tt.trusting, tt.busy); got != tt.wantAccept {
+				t.Fatalf("hookChooserTransitionAccepted() = %v, want %v", got, tt.wantAccept)
+			}
+		})
 	}
 }

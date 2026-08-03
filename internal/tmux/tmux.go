@@ -2518,19 +2518,77 @@ func containsWorkspaceTrustDialog(content string) bool {
 		containsCodexHookTrustDialog(content)
 }
 
+const (
+	legacyCodexHookHeader       = "Hooks need review"
+	legacyCodexHookReviewOption = "› 1. Review hooks"
+	legacyCodexHookTrustOption  = "2. Trust all and continue"
+	currentCodexHookHeader      = "Hooks"
+	currentCodexHookAction      = "Press t to trust all; enter to review hooks; esc to close"
+)
+
+var currentCodexHookWarning = regexp.MustCompile(`^(?:⚠ )?[1-9][0-9]* hooks need review before they can run\.$`)
+
+func normalizeStartupDialogLine(line string) string {
+	plain, _ := stripAnsiTrackDim(strings.ReplaceAll(line, "\u00a0", " "))
+	return strings.Join(strings.Fields(string(plain)), " ")
+}
+
+func normalizedStartupDialogLines(content string) []string {
+	raw := strings.Split(content, "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		if normalized := normalizeStartupDialogLine(line); normalized != "" {
+			lines = append(lines, normalized)
+		}
+	}
+	return lines
+}
+
+func exactStartupDialogLineAfter(lines []string, value string, after int) int {
+	for i := after + 1; i < len(lines); i++ {
+		if lines[i] == value {
+			return i
+		}
+	}
+	return -1
+}
+
+func matchingStartupDialogLineAfter(lines []string, pattern *regexp.Regexp, after int) int {
+	for i := after + 1; i < len(lines); i++ {
+		if pattern.MatchString(lines[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isCodexHookTrustBlockerLine(line string) bool {
+	return line == legacyCodexHookHeader || line == legacyCodexHookReviewOption ||
+		line == legacyCodexHookTrustOption || currentCodexHookWarning.MatchString(line) ||
+		line == currentCodexHookAction
+}
+
 func containsCodexHookTrustDialog(content string) bool {
-	return strings.Contains(content, "Hooks need review") ||
-		strings.Contains(strings.ToLower(content), "hooks need review before they can run")
+	for _, line := range normalizedStartupDialogLines(content) {
+		if isCodexHookTrustBlockerLine(line) {
+			return true
+		}
+	}
+	return false
 }
 
 func codexHookTrustAcceptanceKey(content string) (string, bool) {
-	lower := strings.ToLower(content)
-	if strings.Contains(lower, "hooks need review before they can run") &&
-		strings.Contains(lower, "press t to trust all") {
+	lines := normalizedStartupDialogLines(content)
+	currentHeader := exactStartupDialogLineAfter(lines, currentCodexHookHeader, -1)
+	currentWarning := matchingStartupDialogLineAfter(lines, currentCodexHookWarning, currentHeader)
+	currentAction := exactStartupDialogLineAfter(lines, currentCodexHookAction, currentWarning)
+	if currentHeader >= 0 && currentWarning > currentHeader && currentAction > currentWarning {
 		return "t", true
 	}
-	if strings.Contains(content, "Hooks need review") &&
-		strings.Contains(content, "Trust all and continue") {
+	legacyHeader := exactStartupDialogLineAfter(lines, legacyCodexHookHeader, -1)
+	legacyReview := exactStartupDialogLineAfter(lines, legacyCodexHookReviewOption, legacyHeader)
+	legacyTrust := exactStartupDialogLineAfter(lines, legacyCodexHookTrustOption, legacyReview)
+	if legacyHeader >= 0 && legacyReview > legacyHeader && legacyTrust > legacyReview {
 		return "2", true
 	}
 	return "", false
@@ -2571,13 +2629,14 @@ func lastStartupBlockerLine(content string) int {
 		"trust this folder",
 		"Quick safety check",
 		"Do you trust the contents of this directory?",
-		"Hooks need review",
-		"hooks need review before they can run",
-		"Press t to trust all",
 		"Bypass Permissions mode",
 	}
 	last := -1
 	for i, line := range strings.Split(content, "\n") {
+		if isCodexHookTrustBlockerLine(normalizeStartupDialogLine(line)) {
+			last = i
+			continue
+		}
 		for _, marker := range markers {
 			if strings.Contains(line, marker) {
 				last = i

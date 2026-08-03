@@ -212,6 +212,7 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 		{"codex trust prompt", "> You are in /tmp/demo\nDo you trust the contents of this directory?", true},
 		{"codex hook trust prompt", "Hooks need review", true},
 		{"current codex hook trust prompt", "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close", true},
+		{"current codex hook action only", "Press t to trust all; enter to review hooks; esc to close", true},
 		{"bypass dialog", "Bypass Permissions mode\n1. No\n2. Yes, I accept", false},
 		{"shell prompt", "user@host:~$", false},
 	}
@@ -264,6 +265,12 @@ Skip until next version`,
 		{
 			name:        "current codex hook trust modal",
 			content:     "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "current codex hook action-only modal",
+			content:     "Press t to trust all; enter to review hooks; esc to close",
 			wantBlocked: true,
 			wantName:    "workspace trust prompt",
 		},
@@ -364,7 +371,16 @@ func TestCodexHookTrustAcceptanceKey(t *testing.T) {
 			wantOK:  true,
 		},
 		{name: "legacy chooser incomplete", content: "Hooks need review", wantOK: false},
+		{name: "legacy chooser missing review option", content: "Hooks need review\n2. Trust all and continue", wantOK: false},
+		{name: "legacy chooser missing option number", content: "Hooks need review\n› 1. Review hooks\nTrust all and continue", wantOK: false},
+		{name: "legacy chooser reordered", content: "2. Trust all and continue\nHooks need review\n› 1. Review hooks", wantOK: false},
+		{name: "legacy chooser prose", content: "Hooks need review and Trust all and continue", wantOK: false},
 		{name: "current chooser incomplete", content: "hooks need review before they can run", wantOK: false},
+		{name: "current chooser missing header", content: "⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close", wantOK: false},
+		{name: "current chooser missing warning", content: "Hooks\nPress t to trust all; enter to review hooks; esc to close", wantOK: false},
+		{name: "current chooser missing action", content: "Hooks\n⚠ 3 hooks need review before they can run.", wantOK: false},
+		{name: "current chooser reordered", content: "Press t to trust all; enter to review hooks; esc to close\nHooks\n⚠ 3 hooks need review before they can run.", wantOK: false},
+		{name: "current chooser prose", content: "Hooks says 3 hooks need review before they can run and Press t to trust all", wantOK: false},
 		{name: "ordinary prompt", content: "› ", wantOK: false},
 	}
 
