@@ -278,7 +278,8 @@ func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
 }
 
 func TestResolveProcessNames(t *testing.T) {
-	t.Parallel()
+	// This test temporarily replaces process-global agent presets. Running it
+	// in parallel lets readers observe wrapper fixtures such as opencode=nohup.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
