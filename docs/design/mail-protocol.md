@@ -382,6 +382,10 @@ history. This is a critical pollution source.
 - Creates a bead (wisp) in the Dolt database
 - Generates at least one Dolt commit (the write)
 - Persists across session restarts -- survives agent death
+- Stores the message before attempting a runtime wake; storage success does not
+  by itself prove that the recipient was notified
+- Leaves an unverified notification queued for receipt-confirmed retry, while
+  the stored message remains available in the recipient's inbox
 - Suitable for: HANDOFF context, MERGE_READY/MERGED protocol, escalations, HELP
   requests, anything that MUST survive session death
 

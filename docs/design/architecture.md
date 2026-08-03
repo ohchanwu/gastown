@@ -210,6 +210,13 @@ only a matching submitted receipt permits acknowledgement and deletion.
 Notification results preserve queued and failed identities so callers cannot
 mistake partial delivery for success.
 
+Durable mail storage and runtime wake delivery are separate guarantees. A mail
+write can succeed while its notification remains queued. The router therefore
+keeps unverified notifications retryable and uses the configured agent provider
+for submission instead of inferring behavior from a session name. In
+particular, text left in an interactive prompt composer is not a successful
+Codex submission without the matching runtime receipt.
+
 `gt nudge-canary --confirm-live` verifies this path with 20 receipt-confirmed
 turns in a temporary town, isolated Mayor identity, and dedicated tmux socket.
 The canary requires zero attached clients and sole lock ownership, waits for a
@@ -217,6 +224,16 @@ steady idle state between turns, and removes only artifacts it owns. Its hook
 trust bypass is scoped to the isolated canary launch. The latest sanitized
 result is written atomically to `.runtime/canary/control-plane.json` with mode
 0600 and contributes to `gt health` and Doctor's control-plane verdict.
+
+The background nudge poller publishes a structured ownership record that binds
+the PID, process-start identity, command, session, and a random per-launch
+generation. Start and stop transitions share one lifecycle lock. Shutdown is a
+generation-bound cooperative request: the poller observes a byte-exact request,
+exits, and its owner removes custody only after revalidating the unchanged
+record. `StopPoller` never turns a previously validated PID into a later numeric
+signal, so process exit and PID reuse cannot redirect termination to an
+unrelated process. Live legacy PID-only records fail closed and require an
+explicit, identity-checked migration.
 
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
