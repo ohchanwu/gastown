@@ -119,6 +119,27 @@ func (c *ClaimedNudge) Nack(errorCode string, nextAttempt time.Time) error {
 	return os.Rename(c.claimPath, c.queuePath)
 }
 
+// HasRecoverableState proves the delivery still exists either in its in-flight
+// claim or restored FIFO slot. Callers use this before releasing external
+// delivery custody after a filesystem error.
+func (c *ClaimedNudge) HasRecoverableState() bool {
+	for _, path := range []string{c.claimPath, c.queuePath} {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+			continue
+		}
+		data, err := readQueueRecord(path)
+		if err != nil {
+			continue
+		}
+		var queued QueuedNudge
+		if err := json.Unmarshal(data, &queued); err == nil && queued.DeliveryID == c.Nudge.DeliveryID && (queued.Session == "" || queued.Session == c.Nudge.Session) {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeErrorCode(value string) string {
 	value = strings.ToLower(value)
 	var b strings.Builder
@@ -456,6 +477,27 @@ func Pending(townRoot, session string) (int, error) {
 	}
 
 	return count, nil
+}
+
+// HasQueuedOrClaimed reports whether a poll cycle has FIFO work or in-flight
+// state that may need orphan recovery. Unlike Pending, it deliberately includes
+// unique .json.claimed.* records.
+func HasQueuedOrClaimed(townRoot, session string) (bool, error) {
+	dir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading nudge queue: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() && (strings.HasSuffix(name, ".json") || strings.Contains(name, ".json.claimed.")) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ListQueued returns a read-only snapshot of queued and in-flight deliveries.

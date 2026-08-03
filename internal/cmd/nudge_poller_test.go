@@ -197,7 +197,6 @@ func TestPollerCancellationWhileLeaseIsBusyDoesNotClaimQueue(t *testing.T) {
 func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
 	socket := fmt.Sprintf("gt-test-busy-poller-stop-%d", time.Now().UnixNano())
 	transport := tmux.NewTmuxWithSocket(socket)
-	t.Cleanup(func() { _ = transport.KillServer() })
 
 	townRoot := t.TempDir()
 	const sessionName = "gt-test-busy-poller"
@@ -207,6 +206,21 @@ func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create busy session: %v", err)
 	}
+	socketPath, err := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
+	if err != nil {
+		t.Fatalf("resolve busy poller socket: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := transport.KillServer(); err != nil && !errors.Is(err, tmux.ErrNoServer) {
+			t.Errorf("KillServer: %v", err)
+			return
+		}
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove owned socket %s: %v", path, err)
+			}
+		}
+	})
 	queued := nudge.QueuedNudge{
 		DeliveryID:      "ndg-busy-stop",
 		Sender:          "mayor",
@@ -229,18 +243,23 @@ func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
+	enteredIdle := make(chan struct{})
 	go func() {
-		done <- runNudgePollerLoop(context.Background(), townRoot, sessionName, transport, 10*time.Millisecond, 10*time.Second)
+		done <- runNudgePollerLoopWithWait(context.Background(), townRoot, sessionName, transport, 10*time.Millisecond, 10*time.Second, func(ctx context.Context, session string, timeout time.Duration) error {
+			close(enteredIdle)
+			return transport.WaitForIdleContext(ctx, session, timeout)
+		})
 	}()
-	time.Sleep(100 * time.Millisecond)
 	select {
+	case <-enteredIdle:
 	case err := <-done:
-		t.Fatalf("busy poller exited before stop: %v", err)
-	default:
+		t.Fatalf("busy poller exited before idle wait: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("busy poller never entered WaitForIdleContext")
 	}
 
 	kills := 0
-	err := polecat.StopPollerBeforeReplacement(func() error {
+	err = polecat.StopPollerBeforeReplacement(func() error {
 		if err := os.WriteFile(pidPath+".stop", generation, 0600); err != nil {
 			return err
 		}
@@ -262,5 +281,40 @@ func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
 	}
 	if pending, err := nudge.Pending(townRoot, sessionName); err != nil || pending != 1 {
 		t.Fatalf("pending after busy stop = %d, %v; want one untouched record", pending, err)
+	}
+}
+
+func TestSettlePollerClaimRequiresRecoverableStateAfterAckAndNackFailures(t *testing.T) {
+	receipt := tmux.SubmissionReceipt{Submitted: true}
+	ackErr := errors.New("injected ack failure")
+	nackErr := errors.New("injected nack failure")
+	ackCalls, nackCalls := 0, 0
+
+	safe, err := settlePollerClaim(receipt, nil, time.Now(),
+		func(tmux.SubmissionReceipt) error { ackCalls++; return ackErr },
+		func(string, time.Time) error { nackCalls++; return nackErr },
+		func() bool { return false },
+	)
+	if safe || !errors.Is(err, ackErr) || !errors.Is(err, nackErr) || ackCalls != 1 || nackCalls != 1 {
+		t.Fatalf("unrecoverable settlement = safe %v err %v ack %d nack %d", safe, err, ackCalls, nackCalls)
+	}
+
+	safe, err = settlePollerClaim(receipt, nil, time.Now(),
+		func(tmux.SubmissionReceipt) error { return ackErr },
+		func(string, time.Time) error { return nackErr },
+		func() bool { return true },
+	)
+	if !safe || !errors.Is(err, ackErr) || !errors.Is(err, nackErr) {
+		t.Fatalf("recoverable settlement = safe %v err %v", safe, err)
+	}
+
+	retries, pauses := 0, 0
+	waitForRecoverablePollerClaim(
+		func() bool { return retries >= 2 },
+		func() error { retries++; return nackErr },
+		func() { pauses++ },
+	)
+	if retries != 2 || pauses != 1 {
+		t.Fatalf("recovery wait = retries %d pauses %d", retries, pauses)
 	}
 }

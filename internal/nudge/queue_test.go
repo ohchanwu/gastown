@@ -102,6 +102,37 @@ func TestEnqueueTightensLegacyQueuePermissions(t *testing.T) {
 	}
 }
 
+func TestHasQueuedOrClaimedKeepsOrphanRecoveryVisible(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-claimed-recovery"
+	if err := Enqueue(townRoot, session, QueuedNudge{DeliveryID: "ndg-claimed", Sender: "mayor", Message: "recover me"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claim, err := ClaimDue(townRoot, session)
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimDue = %#v, %v", claim, err)
+	}
+	if !claim.HasRecoverableState() {
+		t.Fatal("private valid claim was not recoverable")
+	}
+	if err := os.Chmod(claim.claimPath, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if claim.HasRecoverableState() {
+		t.Fatal("public claim mode was accepted as recoverable custody")
+	}
+	if err := os.Chmod(claim.claimPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := Pending(townRoot, session); err != nil || pending != 0 {
+		t.Fatalf("Pending claimed record = %d, %v", pending, err)
+	}
+	visible, err := HasQueuedOrClaimed(townRoot, session)
+	if err != nil || !visible {
+		t.Fatalf("HasQueuedOrClaimed = %v, %v; want claimed recovery visible", visible, err)
+	}
+}
+
 func TestListQueuedReadsWithoutConsuming(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "hq-mayor"

@@ -72,6 +72,16 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 }
 
 func runNudgePollerLoop(ctx context.Context, townRoot, sessionName string, t *tmux.Tmux, pollInterval, idleTimeout time.Duration) error {
+	return runNudgePollerLoopWithWait(ctx, townRoot, sessionName, t, pollInterval, idleTimeout, t.WaitForIdleContext)
+}
+
+func runNudgePollerLoopWithWait(
+	ctx context.Context,
+	townRoot, sessionName string,
+	t *tmux.Tmux,
+	pollInterval, idleTimeout time.Duration,
+	waitForIdle func(context.Context, string, time.Duration) error,
+) error {
 
 	// Verify session exists before starting the loop.
 	if exists, err := pollerHasSession(t, sessionName); err != nil {
@@ -123,8 +133,14 @@ func runNudgePollerLoop(ctx context.Context, townRoot, sessionName string, t *tm
 				return nil // session gone, exit
 			}
 
-			// Check if there are queued nudges.
-			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
+			// Claimed-only state must keep polling so ClaimDue can perform its
+			// orphan recovery even when no ordinary .json record remains.
+			hasWork, workErr := nudge.HasQueuedOrClaimed(townRoot, sessionName)
+			if workErr != nil {
+				fmt.Fprintf(os.Stderr, "nudge-poller: queue check error for %s: %v\n", sessionName, workErr)
+				continue
+			}
+			if !hasWork {
 				continue
 			}
 
@@ -134,7 +150,7 @@ func runNudgePollerLoop(ctx context.Context, townRoot, sessionName string, t *tm
 			claim, releaseLease, err := claimPollerNudgeWhenIdleContext(
 				pollerContext,
 				hasPromptDetection,
-				func(ctx context.Context) error { return t.WaitForIdleContext(ctx, sessionName, idleTimeout) },
+				func(ctx context.Context) error { return waitForIdle(ctx, sessionName, idleTimeout) },
 				func(ctx context.Context) (func(), error) {
 					return t.AcquireNudgeLeaseContext(ctx, townRoot, sessionName)
 				},
@@ -155,24 +171,62 @@ func runNudgePollerLoop(ctx context.Context, townRoot, sessionName string, t *tm
 			}
 
 			func() {
-				defer releaseLease()
 				formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
 				nudgeOpts.TownRoot = townRoot
 				nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
 				receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
-				if err != nil || !receipt.Submitted {
-					fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
-					if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-						fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
-					}
-				} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
-					fmt.Fprintf(os.Stderr, "nudge-poller: ack error for %s: %v\n", sessionName, ackErr)
-					if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-						fmt.Fprintf(os.Stderr, "nudge-poller: nack error for %s: %v\n", sessionName, nackErr)
-					}
+				nextAttempt := nudge.NextRetry(claim.Nudge.Attempts)
+				safe, settleErr := settlePollerClaim(receipt, err, nextAttempt, claim.AckSubmitted, claim.Nack, claim.HasRecoverableState)
+				if settleErr != nil {
+					fmt.Fprintf(os.Stderr, "nudge-poller: settlement error for %s: %v\n", sessionName, settleErr)
 				}
+				if !safe {
+					// Keep the delivery lease until the in-memory claim has once
+					// again reached a provably durable path. Stop/replacement stays
+					// fail-closed while filesystem recovery is impossible.
+					waitForRecoverablePollerClaim(
+						claim.HasRecoverableState,
+						func() error { return claim.Nack("settlement-recovery", nextAttempt) },
+						func() { time.Sleep(nudgePollerStopInterval) },
+					)
+				}
+				releaseLease()
 			}()
 		}
+	}
+}
+
+func settlePollerClaim(
+	receipt tmux.SubmissionReceipt,
+	deliveryErr error,
+	nextAttempt time.Time,
+	ack func(tmux.SubmissionReceipt) error,
+	nack func(string, time.Time) error,
+	recoverable func() bool,
+) (bool, error) {
+	if deliveryErr == nil && receipt.Submitted {
+		if ackErr := ack(receipt); ackErr == nil {
+			return true, nil
+		} else if nackErr := nack("receipt-mismatch", nextAttempt); nackErr == nil {
+			return true, ackErr
+		} else {
+			return recoverable(), errors.Join(ackErr, nackErr)
+		}
+	}
+	nackErr := nack("submit-unverified", nextAttempt)
+	if nackErr == nil {
+		return true, deliveryErr
+	}
+	return recoverable(), errors.Join(deliveryErr, nackErr)
+}
+
+func waitForRecoverablePollerClaim(recoverable func() bool, retry func() error, pause func()) {
+	for !recoverable() {
+		_ = retry()
+		if recoverable() {
+			return
+		}
+		pause()
 	}
 }
 

@@ -119,6 +119,64 @@ func TestStartPollerLiveLegacyFailsClosedForTransportCustody(t *testing.T) {
 	}
 }
 
+func TestStartPollerDeadPreTransportRecordRecoversAndLaunches(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	identity := testPollerIdentity(session)
+	identity.Transport = ""
+	if err := os.MkdirAll(pollerPidDir(root), 0755); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := pollerPidFile(root, session)
+	if err := os.WriteFile(pidPath, []byte(formatPollerRecord(7, identity, session)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	launched := 0
+	pid, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=new"}, func(string, string, []string) (pollerLaunch, error) {
+		launched++
+		return pollerLaunch{pid: 9, identity: testPollerIdentity(session)}, nil
+	}, os.WriteFile, func(root, name string) (int, bool, error) {
+		return pollerStatusWithOps(root, name, os.ReadFile, func(int) bool { return false }, func(int) (pollerIdentity, error) {
+			t.Fatal("dead record requested process identity")
+			return pollerIdentity{}, nil
+		}, func(string, []byte) error {
+			t.Fatal("dead record was quarantined")
+			return nil
+		}, os.Remove)
+	})
+	if err != nil || pid != 9 || launched != 1 {
+		t.Fatalf("dead pre-transport recovery = pid %d err %v launches %d", pid, err, launched)
+	}
+}
+
+func TestStartPollerDeadMismatchedTransportRecoversAndLaunches(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	identity := testPollerIdentity(session)
+	identity.Transport = "old\x00old"
+	if err := os.MkdirAll(pollerPidDir(root), 0755); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := pollerPidFile(root, session)
+	if err := os.WriteFile(pidPath, []byte(formatPollerRecord(7, identity, session)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	launched := 0
+	pid, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=new"}, func(string, string, []string) (pollerLaunch, error) {
+		launched++
+		return pollerLaunch{pid: 9, identity: testPollerIdentity(session)}, nil
+	}, os.WriteFile, func(root, name string) (int, bool, error) {
+		return pollerStatusWithOps(root, name, os.ReadFile, func(int) bool { return false }, func(int) (pollerIdentity, error) {
+			t.Fatal("dead record requested process identity")
+			return pollerIdentity{}, nil
+		}, func(string, []byte) error {
+			t.Fatal("dead record was quarantined")
+			return nil
+		}, os.Remove)
+	})
+	if err != nil || pid != 9 || launched != 1 {
+		t.Fatalf("dead mismatched recovery = pid %d err %v launches %d", pid, err, launched)
+	}
+}
+
 func TestStartPollerSameTransportReusesLivePID(t *testing.T) {
 	root, session := t.TempDir(), "s"
 	identity := testPollerIdentity(session)

@@ -133,18 +133,24 @@ func startPollerWithLauncherStatus(
 	}
 	defer func() { _ = startLock.Unlock() }()
 	effectiveTransport := normalizePollerTransport(effectivePollerEnv(env))
-	if data, readErr := os.ReadFile(pollerPidFile(townRoot, session)); readErr == nil {
-		if record, parseErr := parsePollerRecord(string(data)); parseErr == nil {
-			if record.Identity.Transport == "" || record.Identity.Transport != effectiveTransport {
-				return 0, errors.New("poller transport mismatch; preserving ownership")
-			}
-		}
-	}
 
-	// Check if a poller is already running for this session.
+	// Reconcile liveness before enforcing transport custody. A positively dead
+	// pre-transport or mismatched record is safe for status to remove; only a
+	// live owner may block reuse on an unprovable transport.
 	if pid, alive, statusErr := status(townRoot, session); statusErr != nil {
 		return 0, statusErr
 	} else if alive {
+		data, readErr := os.ReadFile(pollerPidFile(townRoot, session))
+		if readErr != nil {
+			return 0, fmt.Errorf("reading live poller ownership: %w", readErr)
+		}
+		record, parseErr := parsePollerRecord(string(data))
+		if parseErr != nil {
+			return 0, fmt.Errorf("parsing live poller ownership: %w", parseErr)
+		}
+		if record.Identity.Transport == "" || record.Identity.Transport != effectiveTransport {
+			return 0, errors.New("poller transport mismatch; preserving ownership")
+		}
 		return pid, nil // already running
 	}
 	_ = os.Remove(pollerStopFile(townRoot, session))
