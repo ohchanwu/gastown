@@ -83,6 +83,37 @@ func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
 	}
 }
 
+func TestNormalizePollerTransportAliases(t *testing.T) {
+	if normalizePollerTransport([]string{"GT_TOWN_SOCKET=a", "GT_TMUX_SOCKET=a"}) != "a\x00a" {
+		t.Fatal("alias normalization mismatch")
+	}
+	if normalizePollerTransport([]string{"GT_TOWN_SOCKET=a"}) != "a\x00a" {
+		t.Fatal("single town alias mismatch")
+	}
+	if normalizePollerTransport([]string{"GT_TMUX_SOCKET=a"}) != "a\x00a" {
+		t.Fatal("single tmux alias mismatch")
+	}
+}
+
+func TestStartPollerDifferentTransportFailsClosedWithoutLaunch(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	identity := testPollerIdentity(session)
+	identity.Transport = "old\x00old"
+	_ = os.MkdirAll(pollerPidDir(root), 0755)
+	_ = os.WriteFile(pollerPidFile(root, session), []byte(formatPollerRecord(1, identity, session)), 0644)
+	launched := false
+	_, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=new"}, func(string, string, []string) (pollerLaunch, error) { launched = true; return pollerLaunch{}, nil }, os.WriteFile, func(string, string) (int, bool, error) { return 1, true, nil })
+	if err == nil || launched {
+		t.Fatalf("transport mismatch err=%v launched=%v", err, launched)
+	}
+}
+
+func TestStartPollerNilEnvUsesInheritedTransport(t *testing.T) {
+	if normalizePollerTransport(effectivePollerEnv(nil)) != normalizePollerTransport(os.Environ()) {
+		t.Fatal("nil env did not inherit")
+	}
+}
+
 func TestStartPollerPIDWriteFailureTerminatesLaunchedProcess(t *testing.T) {
 	townRoot := t.TempDir()
 	writeErr := errors.New("injected PID write failure")
