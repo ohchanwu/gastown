@@ -308,20 +308,6 @@ const (
 	pollerExitInterval = 50 * time.Millisecond
 )
 
-func stopPollerWithOwnershipOps(
-	townRoot, sessionName string,
-	readPID func(string) ([]byte, error),
-	alive func(int) bool,
-	identity func(int) (pollerIdentity, error),
-	signal func(int) error,
-	waitExit func(int, pollerRecord) error,
-	quarantine func(string, []byte) error,
-	remove func(string) error,
-) error {
-	return stopPollerWithGenerationOps(townRoot, sessionName, readPID, alive, identity,
-		func(_ []byte) error { return signal(0) }, waitExit, quarantine, remove)
-}
-
 func stopPollerWithGenerationOps(
 	townRoot, sessionName string,
 	readPID func(string) ([]byte, error),
@@ -379,7 +365,7 @@ func stopPollerWithGenerationOps(
 		return errors.New("poller identity mismatch; ownership quarantined")
 	}
 	if err := stop(data); err != nil {
-		return fmt.Errorf("sending SIGTERM to poller (pid %d): %w", record.PID, err)
+		return fmt.Errorf("publishing cooperative stop request for poller (pid %d): %w", record.PID, err)
 	}
 	if err := waitExit(record.PID, record); err != nil {
 		return fmt.Errorf("waiting for poller (pid %d) to exit: %w", record.PID, err)
@@ -417,61 +403,26 @@ func lookupPollerIdentity(pid int) (pollerIdentity, error) {
 }
 
 func waitPollerExit(pid int, record pollerRecord) error {
+	return waitPollerExitWithOps(pid, record, pollerProcessAlive, lookupPollerIdentity)
+}
+
+func waitPollerExitWithOps(
+	pid int,
+	record pollerRecord,
+	alive func(int) bool,
+	identity func(int) (pollerIdentity, error),
+) error {
 	deadline := time.Now().Add(pollerExitTimeout)
 	for time.Now().Before(deadline) {
-		if !pollerProcessAlive(pid) {
+		if !alive(pid) {
 			return nil
 		}
-		if current, err := lookupPollerIdentity(pid); err == nil && !pollerIdentityMatches(current, record, record.Session) {
+		if current, err := identity(pid); err == nil && !pollerIdentityMatches(current, record, record.Session) {
 			return nil
 		}
 		time.Sleep(pollerExitInterval)
 	}
 	return errors.New("exit confirmation timeout")
-}
-
-func stopPollerWithOps(
-	townRoot, session string,
-	readPID func(string) ([]byte, error),
-	processAlive func(int) bool,
-	signal func(int) error,
-	remove func(string) error,
-) error {
-	stopLock, err := lockPoller(townRoot, session)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = stopLock.Unlock() }()
-
-	pidPath := pollerPidFile(townRoot, session)
-
-	data, err := readPID(pidPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // no poller to stop
-		}
-		return fmt.Errorf("reading poller PID file: %w", err)
-	}
-
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		_ = os.Remove(pidPath)
-		return nil // corrupt PID file, clean up
-	}
-
-	if !processAlive(pid) {
-		// Process already dead.
-		_ = remove(pidPath)
-		return nil
-	}
-
-	// Send SIGTERM for graceful shutdown. Preserve custody if signaling fails.
-	if err := signal(pid); err != nil {
-		return fmt.Errorf("sending SIGTERM to poller (pid %d): %w", pid, err)
-	}
-
-	_ = remove(pidPath)
-	return nil
 }
 
 // pollerAlive checks if a poller is running for the given session.

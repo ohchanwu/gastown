@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -112,60 +113,94 @@ func TestStartPollerPIDWriteFailureTerminatesLaunchedProcess(t *testing.T) {
 	}
 }
 
-func TestStopPollerSignalFailurePreservesPIDCustody(t *testing.T) {
+func TestStartPollerEmptyGenerationTerminatesWithoutWriting(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	var terminated, wrote atomic.Bool
+
+	pid, err := startPollerWithLauncher(townRoot, session, nil,
+		func(string, string, []string) (pollerLaunch, error) {
+			return pollerLaunch{
+				pid: 123,
+				identity: pollerIdentity{
+					StartTime: "test-start",
+					Command:   "gt nudge-poller " + session,
+				},
+				terminate: func() error { terminated.Store(true); return nil },
+			}, nil
+		},
+		func(string, []byte, os.FileMode) error { wrote.Store(true); return nil },
+	)
+	if err == nil || pid != 0 || !terminated.Load() || wrote.Load() {
+		t.Fatalf("empty generation start = pid %d err %v terminated %v wrote %v", pid, err, terminated.Load(), wrote.Load())
+	}
+}
+
+func TestStopPollerRequestFailurePreservesCustody(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
 	pidPath := pollerPidFile(townRoot, session)
 	if err := os.MkdirAll(filepath.Dir(pidPath), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(pidPath, []byte("123"), 0644); err != nil {
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0644); err != nil {
 		t.Fatal(err)
 	}
-	signalErr := errors.New("injected SIGTERM failure")
+	requestErr := errors.New("injected stop request failure")
 	removed := false
 
-	err := stopPollerWithOps(townRoot, session,
+	err := stopPollerWithGenerationOps(townRoot, session,
 		os.ReadFile,
 		func(int) bool { return true },
-		func(int) error { return signalErr },
+		func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+		func([]byte) error { return requestErr },
+		func(int, pollerRecord) error { t.Fatal("failed stop request waited for exit"); return nil },
+		func(string, []byte) error { t.Fatal("matching ownership quarantined"); return nil },
 		func(string) error { removed = true; return nil },
 	)
-	if !errors.Is(err, signalErr) {
-		t.Fatalf("error = %v, want SIGTERM failure", err)
+	if !errors.Is(err, requestErr) {
+		t.Fatalf("error = %v, want stop request failure", err)
 	}
 	if removed {
-		t.Fatal("StopPoller removed PID custody after SIGTERM failure")
+		t.Fatal("StopPoller removed custody after stop request failure")
 	}
 	if _, err := os.Stat(pidPath); err != nil {
-		t.Fatalf("PID file stat = %v, want custody preserved", err)
+		t.Fatalf("ownership stat = %v, want custody preserved", err)
 	}
 }
 
 func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
-	signalStarted := make(chan struct{})
-	releaseSignal := make(chan struct{})
+	stopStarted := make(chan struct{})
+	releaseStop := make(chan struct{})
 	launchStarted := make(chan struct{})
 	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pollerPidFile(townRoot, session), record, 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	stopDone := make(chan error, 1)
 	go func() {
-		stopDone <- stopPollerWithOps(townRoot, session,
-			func(string) ([]byte, error) { return []byte("123"), nil },
+		stopDone <- stopPollerWithGenerationOps(townRoot, session,
+			os.ReadFile,
 			func(int) bool { return true },
-			func(int) error {
-				close(signalStarted)
-				<-releaseSignal
-				return nil
+			func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			func(data []byte) error {
+				close(stopStarted)
+				<-releaseStop
+				return os.WriteFile(pollerStopFile(townRoot, session), data, 0600)
 			},
+			func(int, pollerRecord) error { return nil },
+			func(string, []byte) error { return nil },
 			os.Remove,
 		)
 	}()
-	<-signalStarted
+	<-stopStarted
 
 	launcher := func(string, string, []string) (pollerLaunch, error) {
 		close(launchStarted)
@@ -187,9 +222,9 @@ func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
 	select {
 	case <-launchStarted:
 		t.Fatal("StartPoller entered launch while StopPoller held custody lock")
-	case <-time.After(3 * time.Second):
+	case <-time.After(500 * time.Millisecond):
 	}
-	close(releaseSignal)
+	close(releaseStop)
 	if err := <-stopDone; err != nil {
 		t.Fatal(err)
 	}
@@ -211,15 +246,15 @@ func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
 	if err := os.WriteFile(pollerPidFile(townRoot, session), []byte(record), 0644); err != nil {
 		t.Fatal(err)
 	}
-	signaled := false
+	stopRequested := false
 	quarantined := ""
-	err := stopPollerWithOwnershipOps(townRoot, session,
+	err := stopPollerWithGenerationOps(townRoot, session,
 		os.ReadFile,
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
 			return pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, nil
 		},
-		func(int) error { signaled = true; return nil },
+		func([]byte) error { stopRequested = true; return nil },
 		func(int, pollerRecord) error { return nil },
 		func(path string, _ []byte) error { quarantined = path + ".stale-test"; return nil },
 		os.Remove,
@@ -227,8 +262,8 @@ func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
 	if err == nil {
 		t.Fatal("identity mismatch returned nil error")
 	}
-	if signaled {
-		t.Fatal("identity mismatch signaled unrelated process")
+	if stopRequested {
+		t.Fatal("identity mismatch published a cooperative stop request")
 	}
 	if quarantined == pollerPidFile(townRoot, session) || quarantined == "" {
 		t.Fatalf("quarantine path = %q, want deterministic non-colliding stale path", quarantined)
@@ -239,22 +274,65 @@ func TestStopPollerRemovesRecordOnlyAfterConfirmedExit(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
 	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
-	removed := ""
+	data := []byte(formatPollerRecordValue(record))
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	removed := make([]string, 0, 2)
 	waited := false
-	err := stopPollerWithOwnershipOps(townRoot, session,
-		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
+	err := stopPollerWithGenerationOps(townRoot, session,
+		os.ReadFile,
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) { return record.Identity, nil },
-		func(int) error { return nil },
+		func(stopData []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), stopData, 0600) },
 		func(int, pollerRecord) error { waited = true; return nil },
 		func(string, []byte) error { return nil },
-		func(path string) error { removed = path; return nil },
+		func(path string) error { removed = append(removed, path); return os.Remove(path) },
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !waited || removed != pollerPidFile(townRoot, session) {
+	if !waited || len(removed) != 2 || removed[0] != pollerStopFile(townRoot, session) || removed[1] != pollerPidFile(townRoot, session) {
 		t.Fatalf("confirmed exit custody = waited %v, removed %q", waited, removed)
+	}
+}
+
+func TestStopPollerPreservesMismatchedStopRequest(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	oldRecord := pollerRecord{PID: 123, Identity: testPollerIdentity(session), Session: session}
+	oldData := []byte(formatPollerRecordValue(oldRecord))
+	replacement := oldRecord
+	replacement.Identity.Generation = "replacement-generation"
+	replacementData := []byte(formatPollerRecordValue(replacement))
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), oldData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := stopPollerWithGenerationOps(townRoot, session,
+		os.ReadFile,
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) { return oldRecord.Identity, nil },
+		func([]byte) error { return os.WriteFile(pollerStopFile(townRoot, session), replacementData, 0600) },
+		func(int, pollerRecord) error { return nil },
+		func(string, []byte) error { t.Fatal("matching ownership quarantined"); return nil },
+		os.Remove,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(pollerStopFile(townRoot, session))
+	if err != nil || !bytes.Equal(got, replacementData) {
+		t.Fatalf("replacement stop request = %q, err %v", got, err)
+	}
+	if _, err := os.Stat(pollerPidFile(townRoot, session)); !os.IsNotExist(err) {
+		t.Fatalf("old ownership still present after confirmed exit: %v", err)
 	}
 }
 
@@ -262,21 +340,53 @@ func TestStopPollerTimeoutPreservesRecord(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
 	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
+	data := []byte(formatPollerRecordValue(record))
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), data, 0644); err != nil {
+		t.Fatal(err)
+	}
 	removed := false
-	err := stopPollerWithOwnershipOps(townRoot, session,
-		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
+	err := stopPollerWithGenerationOps(townRoot, session,
+		os.ReadFile,
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) { return record.Identity, nil },
-		func(int) error { return nil },
+		func(stopData []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), stopData, 0600) },
 		func(int, pollerRecord) error { return errors.New("exit confirmation timeout") },
-		func(string, []byte) error { removed = true; return nil },
-		os.Remove,
+		func(string, []byte) error { t.Fatal("matching ownership quarantined"); return nil },
+		func(string) error { removed = true; return nil },
 	)
 	if err == nil {
 		t.Fatal("timeout returned nil error")
 	}
 	if removed {
 		t.Fatal("timeout removed live process ownership record")
+	}
+	for _, path := range []string{pollerPidFile(townRoot, session), pollerStopFile(townRoot, session)} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("timeout custody %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestWaitPollerExitTreatsReusedPIDAsOriginalExit(t *testing.T) {
+	session := "gt-gastown-polecat-test"
+	record := pollerRecord{PID: 123, Identity: testPollerIdentity(session), Session: session}
+	identityChecks := 0
+	err := waitPollerExitWithOps(record.PID, record,
+		func(int) bool { return true },
+		func(int) (pollerIdentity, error) {
+			identityChecks++
+			return pollerIdentity{
+				StartTime:  "reused-start",
+				Command:    "unrelated-process",
+				Generation: "unrelated-generation",
+			}, nil
+		},
+	)
+	if err != nil || identityChecks != 1 {
+		t.Fatalf("PID reuse exit = err %v identityChecks %d", err, identityChecks)
 	}
 }
 
@@ -287,7 +397,7 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 	newRecord := []byte(formatPollerRecord(456, pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, session))
 	reads := 0
 	removed := false
-	err := stopPollerWithOwnershipOps(townRoot, session,
+	err := stopPollerWithGenerationOps(townRoot, session,
 		func(string) ([]byte, error) {
 			reads++
 			if reads == 1 {
@@ -299,7 +409,12 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 		func(int) (pollerIdentity, error) {
 			return pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, nil
 		},
-		func(int) error { return nil },
+		func(stopData []byte) error {
+			if !bytes.Equal(stopData, oldRecord) {
+				t.Fatalf("stop request = %q, want exact old ownership", stopData)
+			}
+			return nil
+		},
 		func(int, pollerRecord) error { return nil },
 		func(string, []byte) error { return nil },
 		func(string) error { removed = true; return nil },
@@ -312,20 +427,20 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 func TestStopPollerRejectsSameStartDifferentCommand(t *testing.T) {
 	session := "gt-gastown-polecat-test"
 	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
-	signaled := false
-	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+	stopRequested := false
+	err := stopPollerWithGenerationOps(t.TempDir(), session,
 		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
 			return pollerIdentity{StartTime: "same", Command: "gt other-command " + session, Generation: "fixture-generation"}, nil
 		},
-		func(int) error { signaled = true; return nil },
+		func([]byte) error { stopRequested = true; return nil },
 		func(int, pollerRecord) error { return nil },
 		func(string, []byte) error { return nil },
 		func(string) error { return nil },
 	)
-	if err == nil || signaled {
-		t.Fatalf("same-start command mismatch = err %v signaled %v", err, signaled)
+	if err == nil || stopRequested {
+		t.Fatalf("same-start command mismatch = err %v stopRequested %v", err, stopRequested)
 	}
 }
 
@@ -420,14 +535,14 @@ func TestStopPollerRemovesDeadStructuredRecord(t *testing.T) {
 	removed := false
 	session := "gt-gastown-polecat-test"
 	data := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
-	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+	err := stopPollerWithGenerationOps(t.TempDir(), session,
 		func(string) ([]byte, error) { return data, nil },
 		func(int) bool { return false },
 		func(int) (pollerIdentity, error) {
 			t.Fatal("dead structured identity was queried")
 			return pollerIdentity{}, nil
 		},
-		func(int) error { t.Fatal("dead structured poller was signaled"); return nil },
+		func([]byte) error { t.Fatal("dead structured poller received a stop request"); return nil },
 		func(int, pollerRecord) error { t.Fatal("dead structured poller was waited on"); return nil },
 		func(string, []byte) error { t.Fatal("dead structured record quarantined"); return nil },
 		func(string) error { removed = true; return nil },
@@ -442,11 +557,11 @@ func TestStopPollerRemovesRecordWhenIdentityLookupSeesExit(t *testing.T) {
 	livenessChecks := 0
 	session := "gt-gastown-polecat-test"
 	data := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
-	err := stopPollerWithOwnershipOps(t.TempDir(), session,
+	err := stopPollerWithGenerationOps(t.TempDir(), session,
 		func(string) ([]byte, error) { return data, nil },
 		func(int) bool { livenessChecks++; return livenessChecks == 1 },
 		func(int) (pollerIdentity, error) { return pollerIdentity{}, errors.New("identity unavailable") },
-		func(int) error { t.Fatal("exited poller was signaled"); return nil },
+		func([]byte) error { t.Fatal("exited poller received a stop request"); return nil },
 		func(int, pollerRecord) error { t.Fatal("exited poller was waited on"); return nil },
 		func(string, []byte) error { t.Fatal("exited record quarantined"); return nil },
 		func(string) error { removed = true; return nil },

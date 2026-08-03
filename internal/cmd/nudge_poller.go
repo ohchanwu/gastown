@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -19,6 +20,8 @@ var (
 	nudgePollerIdleFlag     string
 )
 
+const nudgePollerStopInterval = 100 * time.Millisecond
+
 func init() {
 	rootCmd.AddCommand(nudgePollerCmd)
 	nudgePollerCmd.Flags().StringVar(&nudgePollerIntervalFlag, "interval", nudge.DefaultPollInterval, "Poll interval (e.g., 10s, 30s)")
@@ -36,7 +39,8 @@ turn-boundary hooks (Gemini, Codex, Cursor, etc.).
 
 This command runs as a long-lived background process. It exits when:
   - The target tmux session dies
-  - It receives SIGTERM (from StopPoller or session teardown)
+  - Its generation-bound cooperative stop request is published
+  - It receives SIGTERM or SIGINT from external process teardown
   - The poll loop encounters an unrecoverable error
 
 Normally launched automatically by 'gt crew start' for non-Claude agents.
@@ -81,22 +85,22 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-	stopTicker := time.NewTicker(100 * time.Millisecond)
-	defer stopTicker.Stop()
+	stopContext, cancelStopWatcher := context.WithCancel(cmd.Context())
+	defer cancelStopWatcher()
+	cooperativeStop := watchCooperativePollerStop(stopContext, nudgePollerStopInterval, func() bool {
+		return nudge.StopRequested(townRoot, sessionName)
+	})
 
 	for {
 		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
 		case <-sigCh:
 			return nil // graceful shutdown
-		case <-stopTicker.C:
-			if nudge.StopRequested(townRoot, sessionName) {
-				return nil
-			}
+		case <-cooperativeStop:
+			return nil
 
 		case <-ticker.C:
-			if nudge.StopRequested(townRoot, sessionName) {
-				return nil
-			}
 			// Check if session still exists.
 			if exists, _ := t.HasSession(sessionName); !exists {
 				return nil // session gone, exit
@@ -140,6 +144,26 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func watchCooperativePollerStop(ctx context.Context, interval time.Duration, stopRequested func() bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if stopRequested() {
+					close(stopped)
+					return
+				}
+			}
+		}
+	}()
+	return stopped
 }
 
 func claimPollerNudgeWhenIdle(

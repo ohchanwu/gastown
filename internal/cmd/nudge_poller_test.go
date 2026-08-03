@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,5 +83,23 @@ func TestShouldSkipDrainUntilIdle(t *testing.T) {
 				t.Errorf("shouldSkipDrainUntilIdle(%v, %v) = %v, want %v", tt.hasPromptDetection, tt.waitErr, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCooperativeStopWatcherBeatsShutdownDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requested atomic.Bool
+	started := time.Now()
+	stopped := watchCooperativePollerStop(ctx, 10*time.Millisecond, requested.Load)
+	time.AfterFunc(30*time.Millisecond, func() { requested.Store(true) })
+
+	select {
+	case <-stopped:
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("cooperative stop observed after %s", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("cooperative stop watcher missed the bounded stop request")
 	}
 }
