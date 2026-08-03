@@ -64,7 +64,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 				}
 			}
 		}
-		startupDialogObserved = startupDialogObserved || strings.Contains(plain, "Do you trust the contents of this directory?") || strings.Contains(plain, "Hooks need review")
+		startupDialogObserved = startupDialogObserved || strings.Contains(plain, "Do you trust the contents of this directory?") || strings.Contains(plain, "Hooks need review") || strings.Contains(strings.ToLower(plain), "hooks need review before they can run")
 		modelTurnStarted = modelTurnStarted || strings.Contains(plain, "esc to interrupt")
 		exactReplyObserved = exactReplyObserved || idlePaneProbeHasExactReply(styled, probeToken)
 	}
@@ -103,7 +103,7 @@ func TestProbeIsolatedCodexIdlePane(t *testing.T) {
 			}
 		}
 		plainVisible := idlePaneProbeANSI.ReplaceAllString(string(visible), "")
-		startupDialogActive := strings.Contains(plainVisible, "Do you trust the contents of this directory?") || strings.Contains(plainVisible, "Hooks need review")
+		startupDialogActive := strings.Contains(plainVisible, "Do you trust the contents of this directory?") || strings.Contains(plainVisible, "Hooks need review") || strings.Contains(strings.ToLower(plainVisible), "hooks need review before they can run")
 		metadata := fmt.Sprintf("cursor_query_ok=%t\ncursor_parse_ok=%t\nvisible_query_ok=%t\nagent_query_ok=%t\nagent_is_codex=%t\ninstruction_observed=%t\ninstruction_stranded=%t\nruntime_receipt_observed=%t\nstartup_dialog_observed=%t\nstartup_dialog_active=%t\nmodel_turn_started=%t\nexact_reply_observed=%t\nvisible_lines=%d\nprompt_rows=%d\nprompt_row=%d\nprompt_on_cursor_row=%t\ncursor_x=%d\ncursor_y=%d\n", cursorErr == nil, cursorParseErr == nil, visibleErr == nil, agentErr == nil, agent == "codex", instructionObserved, instructionStranded, modelTurnStarted || exactReplyObserved, startupDialogObserved, startupDialogActive, modelTurnStarted, exactReplyObserved, len(visibleLines), promptRows, promptRow, promptRow == cursorY, cursorX, cursorY)
 		if err := os.WriteFile(evidencePath+".meta", []byte(metadata), 0600); err != nil {
 			t.Fatal(err)

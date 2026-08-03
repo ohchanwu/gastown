@@ -211,6 +211,7 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 		{"claude trust prompt", "Quick safety check\nDo you trust this folder?", true},
 		{"codex trust prompt", "> You are in /tmp/demo\nDo you trust the contents of this directory?", true},
 		{"codex hook trust prompt", "Hooks need review", true},
+		{"current codex hook trust prompt", "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close", true},
 		{"bypass dialog", "Bypass Permissions mode\n1. No\n2. Yes, I accept", false},
 		{"shell prompt", "user@host:~$", false},
 	}
@@ -259,6 +260,17 @@ Skip until next version`,
 			content:     "Hooks need review\n› 1. Review hooks\n  2. Trust all and continue",
 			wantBlocked: true,
 			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "current codex hook trust modal",
+			content:     "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "accepted current hook trust before codex turn",
+			content:     "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close\n• Working (esc to interrupt)",
+			wantBlocked: false,
 		},
 		{
 			name:        "accepted hook trust before codex turn",
@@ -326,6 +338,41 @@ Bypass Permissions mode
 			}
 			if gotName != tt.wantName {
 				t.Fatalf("name = %q, want %q", gotName, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestCodexHookTrustAcceptanceKey(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		wantKey string
+		wantOK  bool
+	}{
+		{
+			name:    "legacy numbered chooser",
+			content: "Hooks need review\n› 1. Review hooks\n  2. Trust all and continue",
+			wantKey: "2",
+			wantOK:  true,
+		},
+		{
+			name:    "current trust shortcut",
+			content: "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close",
+			wantKey: "t",
+			wantOK:  true,
+		},
+		{name: "legacy chooser incomplete", content: "Hooks need review", wantOK: false},
+		{name: "current chooser incomplete", content: "hooks need review before they can run", wantOK: false},
+		{name: "ordinary prompt", content: "› ", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotKey, gotOK := codexHookTrustAcceptanceKey(tt.content)
+			if gotKey != tt.wantKey || gotOK != tt.wantOK {
+				t.Fatalf("codexHookTrustAcceptanceKey() = (%q, %v), want (%q, %v)", gotKey, gotOK, tt.wantKey, tt.wantOK)
 			}
 		})
 	}

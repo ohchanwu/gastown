@@ -56,17 +56,23 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		Dialog         bool   `json:"dialog"`
 		ReviewSelected bool   `json:"review_selected"`
 		TrustSelected  bool   `json:"trust_selected"`
+		TrustShortcut  bool   `json:"trust_shortcut"`
 		Trusting       bool   `json:"trusting"`
 		Busy           bool   `json:"busy"`
+	}
+	hookReviewDialog := func(text string) bool {
+		return strings.Contains(text, "Hooks need review") ||
+			strings.Contains(strings.ToLower(text), "hooks need review before they can run")
 	}
 	state := func(content []byte) chooserState {
 		sum := sha256.Sum256(content)
 		text := string(content)
 		return chooserState{
 			SHA256:         hex.EncodeToString(sum[:]),
-			Dialog:         strings.Contains(text, "Hooks need review"),
+			Dialog:         hookReviewDialog(text),
 			ReviewSelected: strings.Contains(text, "› 1. Review hooks"),
 			TrustSelected:  strings.Contains(text, "› 2. Trust all and continue"),
+			TrustShortcut:  strings.Contains(strings.ToLower(text), "press t to trust all"),
 			Trusting:       strings.Contains(text, "Trusting hooks"),
 			Busy:           strings.Contains(text, "esc to interrupt"),
 		}
@@ -83,7 +89,7 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 				}
 				break
 			}
-			if strings.Contains(text, "Hooks need review") {
+			if hookReviewDialog(text) {
 				break
 			}
 		}
@@ -95,8 +101,11 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 	for time.Now().Before(deadline) {
 		before, err = capture()
 		text := string(before)
-		if err == nil && strings.Contains(text, "Hooks need review") &&
-			strings.Contains(text, "Review hooks") && strings.Contains(text, "Trust all and continue") {
+		legacyReady := strings.Contains(text, "Hooks need review") &&
+			strings.Contains(text, "Review hooks") && strings.Contains(text, "Trust all and continue")
+		currentReady := strings.Contains(strings.ToLower(text), "hooks need review before they can run") &&
+			strings.Contains(strings.ToLower(text), "press t to trust all")
+		if err == nil && (legacyReady || currentReady) {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -185,6 +194,9 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		t.Fatalf("tmux chooser target changed; private metadata: %s", evidencePath)
 	}
 	afterState := state(afterOneSecond)
+	if beforeState.SHA256 == afterState.SHA256 {
+		t.Fatalf("tmux accepted the chooser command but Codex hook review did not change; private metadata: %s", evidencePath)
+	}
 	if afterState.ReviewSelected && !afterState.TrustSelected && !afterState.Trusting && !afterState.Busy {
 		t.Fatalf("tmux accepted the chooser command but Codex remained on option 1; private metadata: %s", evidencePath)
 	}

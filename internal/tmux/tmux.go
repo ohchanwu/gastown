@@ -2417,6 +2417,12 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 	if err := t.AcceptBypassPermissionsWarning(session); err != nil {
 		return fmt.Errorf("bypass permissions warning: %w", err)
 	}
+	// Current Codex can defer hook review until an initial model turn or hook
+	// event completes. That can race behind the bypass poll, so make one final
+	// trust pass before the caller's fail-closed startup check.
+	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
+		return fmt.Errorf("deferred hook trust dialog: %w", err)
+	}
 	return nil
 }
 
@@ -2467,16 +2473,17 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Codex hook review pre-selects "Review hooks"; choose
-			// "Trust all and continue" before accepting.
-			if strings.Contains(content, "Hooks need review") {
-				if !strings.Contains(content, "Trust all and continue") {
+			// Codex hook review must choose the explicit trust-all action. The
+			// legacy chooser uses option 2; current Codex exposes the t shortcut.
+			// Wait for the complete, version-specific signature before sending a
+			// key so a partially rendered modal cannot receive blind input.
+			if containsCodexHookTrustDialog(content) {
+				key, ready := codexHookTrustAcceptanceKey(content)
+				if !ready {
 					time.Sleep(constants.DialogPollInterval)
 					continue
 				}
-				// Codex list pickers accept a numbered option directly. Re-capture
-				// afterward so a dropped startup keystroke is retried safely.
-				if _, err := t.run("send-keys", "-t", session, "2"); err != nil {
+				if _, err := t.run("send-keys", "-t", session, key); err != nil {
 					return err
 				}
 				time.Sleep(500 * time.Millisecond)
@@ -2508,7 +2515,25 @@ func containsWorkspaceTrustDialog(content string) bool {
 	return strings.Contains(content, "trust this folder") ||
 		strings.Contains(content, "Quick safety check") ||
 		strings.Contains(content, "Do you trust the contents of this directory?") ||
-		strings.Contains(content, "Hooks need review")
+		containsCodexHookTrustDialog(content)
+}
+
+func containsCodexHookTrustDialog(content string) bool {
+	return strings.Contains(content, "Hooks need review") ||
+		strings.Contains(strings.ToLower(content), "hooks need review before they can run")
+}
+
+func codexHookTrustAcceptanceKey(content string) (string, bool) {
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "hooks need review before they can run") &&
+		strings.Contains(lower, "press t to trust all") {
+		return "t", true
+	}
+	if strings.Contains(content, "Hooks need review") &&
+		strings.Contains(content, "Trust all and continue") {
+		return "2", true
+	}
+	return "", false
 }
 
 func containsBlockingStartupDialog(content string) (string, bool) {
@@ -2547,6 +2572,8 @@ func lastStartupBlockerLine(content string) int {
 		"Quick safety check",
 		"Do you trust the contents of this directory?",
 		"Hooks need review",
+		"hooks need review before they can run",
+		"Press t to trust all",
 		"Bypass Permissions mode",
 	}
 	last := -1
