@@ -96,6 +96,7 @@ type pollerIdentity struct {
 	StartTime  string
 	Command    string
 	Generation string
+	Transport  string
 }
 
 type pollerRecord struct {
@@ -150,6 +151,7 @@ func startPollerWithLauncherStatus(
 	if launched.identity.StartTime == "" || launched.identity.Command == "" || launched.identity.Generation == "" || session == "" {
 		return 0, cleanupLaunchedPoller(launched, errors.New("nudge-poller identity unavailable"))
 	}
+	launched.identity.Transport = normalizePollerTransport(env)
 	record := formatPollerRecord(launched.pid, launched.identity, session)
 	if err := writePID(pidPath, []byte(record), 0644); err != nil {
 		persistErr := fmt.Errorf("persisting nudge-poller PID: %w", err)
@@ -166,6 +168,25 @@ func startPollerWithLauncherStatus(
 	}
 
 	return launched.pid, nil
+}
+
+func normalizePollerTransport(env []string) string {
+	var town, tmux string
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "GT_TOWN_SOCKET=") {
+			town = strings.TrimPrefix(entry, "GT_TOWN_SOCKET=")
+		}
+		if strings.HasPrefix(entry, "GT_TMUX_SOCKET=") {
+			tmux = strings.TrimPrefix(entry, "GT_TMUX_SOCKET=")
+		}
+	}
+	if town == "" {
+		town = tmux
+	}
+	if tmux == "" {
+		tmux = town
+	}
+	return town + "\x00" + tmux
 }
 
 func lockPoller(townRoot, session string) (*flock.Flock, error) {
@@ -455,6 +476,9 @@ func pollerStatusWithOps(
 	record, err := parsePollerRecord(string(data))
 	if err != nil {
 		return 0, false, fmt.Errorf("parsing poller ownership: %w", err)
+	}
+	if record.Identity.Transport != "" && record.Identity.Transport != normalizePollerTransport(os.Environ()) {
+		return 0, false, errors.New("poller transport mismatch; preserving ownership")
 	}
 
 	if !alive(record.PID) {
