@@ -140,7 +140,7 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
 			nudgeOpts.TownRoot = townRoot
 			nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
-			receipt, err := deliverPollerNudgeContext(stopContext, cooperativeStop, t, sessionName, formatted, nudgeOpts)
+			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
 			if err != nil || !receipt.Submitted {
 				fmt.Fprintf(os.Stderr, "nudge-poller: injection error for %s: %v\n", sessionName, err)
 				if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
@@ -153,26 +153,6 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
-	}
-}
-
-func deliverPollerNudgeContext(ctx context.Context, stop <-chan struct{}, t *tmux.Tmux, session, message string, opts tmux.NudgeOpts) (tmux.SubmissionReceipt, error) {
-	type result struct {
-		receipt tmux.SubmissionReceipt
-		err     error
-	}
-	done := make(chan result, 1)
-	go func() {
-		receipt, err := t.NudgeSessionWithReceipt(session, message, opts)
-		done <- result{receipt, err}
-	}()
-	select {
-	case <-ctx.Done():
-		return tmux.SubmissionReceipt{Session: session, DeliveryID: opts.DeliveryID}, ctx.Err()
-	case <-stop:
-		return tmux.SubmissionReceipt{Session: session, DeliveryID: opts.DeliveryID}, context.Canceled
-	case result := <-done:
-		return result.receipt, result.err
 	}
 }
 
