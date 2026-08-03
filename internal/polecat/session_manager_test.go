@@ -62,8 +62,15 @@ func TestSessionManagerNudgePollerLifecycleUsesTmuxEnvironment(t *testing.T) {
 	if started != sessionID || stopped != sessionID {
 		t.Fatalf("poller lifecycle = start %q, stop %q; want %q", started, stopped, sessionID)
 	}
-	if got := strings.Join(childEnv, "|"); got != "PATH=/usr/bin|GT_TOWN_SOCKET=private-town" {
-		t.Fatalf("poller environment = %q, want isolated tmux environment", got)
+	gotEnv := make(map[string]string, len(childEnv))
+	for _, entry := range childEnv {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			gotEnv[name] = value
+		}
+	}
+	if gotEnv["PATH"] != "/usr/bin" || gotEnv["GT_TOWN_SOCKET"] != "private-town" || gotEnv["GT_TMUX_SOCKET"] != "private-town" {
+		t.Fatalf("poller environment = %q, want both isolated tmux socket bindings", strings.Join(childEnv, "|"))
 	}
 }
 
