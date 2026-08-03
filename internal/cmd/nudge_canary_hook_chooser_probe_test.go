@@ -29,7 +29,7 @@ type hookChooserPaneOrder struct {
 func hookChooserBlockerLine(normalized string) bool {
 	lower := strings.ToLower(normalized)
 	return normalized == "Hooks need review" || normalized == "› 1. Review hooks" ||
-		normalized == "2. Trust all and continue" ||
+		normalized == "2. Trust all and continue" || normalized == "› 2. Trust all and continue" ||
 		strings.Contains(lower, "hooks need review before they can run") ||
 		normalized == "Press t to trust all; enter to review hooks; esc to close"
 }
@@ -339,6 +339,7 @@ func TestHookChooserDialogPresent(t *testing.T) {
 		{name: "legacy header", content: "Hooks need review", want: true},
 		{name: "truncated legacy review option", content: "› 1. Review hooks", want: true},
 		{name: "truncated legacy trust option", content: "2. Trust all and continue", want: true},
+		{name: "truncated selected legacy trust option", content: "› 2. Trust all and continue", want: true},
 		{name: "current action", content: "Press t to trust all; enter to review hooks; esc to close", want: true},
 		{name: "ordinary prompt", content: "› ", want: false},
 	} {
@@ -352,7 +353,7 @@ func TestHookChooserDialogPresent(t *testing.T) {
 
 func TestHookChooserTransitionRejectsTruncatedLegacyModal(t *testing.T) {
 	t.Parallel()
-	for _, content := range []string{"› 1. Review hooks", "2. Trust all and continue"} {
+	for _, content := range []string{"› 1. Review hooks", "2. Trust all and continue", "› 2. Trust all and continue"} {
 		dialog := hookChooserDialogPresent(content)
 		progress := hookChooserProgressAfterDialog(content)
 		if hookChooserTransitionAccepted("before", "changed", dialog, progress) {

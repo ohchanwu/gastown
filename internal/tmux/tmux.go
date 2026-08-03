@@ -2519,11 +2519,12 @@ func containsWorkspaceTrustDialog(content string) bool {
 }
 
 const (
-	legacyCodexHookHeader       = "Hooks need review"
-	legacyCodexHookReviewOption = "› 1. Review hooks"
-	legacyCodexHookTrustOption  = "2. Trust all and continue"
-	currentCodexHookHeader      = "Hooks"
-	currentCodexHookAction      = "Press t to trust all; enter to review hooks; esc to close"
+	legacyCodexHookHeader        = "Hooks need review"
+	legacyCodexHookReviewOption  = "› 1. Review hooks"
+	legacyCodexHookTrustOption   = "2. Trust all and continue"
+	legacyCodexHookTrustSelected = "› 2. Trust all and continue"
+	currentCodexHookHeader       = "Hooks"
+	currentCodexHookAction       = "Press t to trust all; enter to review hooks; esc to close"
 )
 
 var currentCodexHookWarning = regexp.MustCompile(`^(?:⚠ )?[1-9][0-9]* hooks need review before they can run\.$`)
@@ -2564,7 +2565,8 @@ func matchingStartupDialogLineAfter(lines []string, pattern *regexp.Regexp, afte
 
 func isCodexHookTrustBlockerLine(line string) bool {
 	return line == legacyCodexHookHeader || line == legacyCodexHookReviewOption ||
-		line == legacyCodexHookTrustOption || currentCodexHookWarning.MatchString(line) ||
+		line == legacyCodexHookTrustOption || line == legacyCodexHookTrustSelected ||
+		currentCodexHookWarning.MatchString(line) ||
 		line == currentCodexHookAction
 }
 

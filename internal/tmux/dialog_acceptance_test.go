@@ -213,6 +213,7 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 		{"codex hook trust prompt", "Hooks need review", true},
 		{"current codex hook trust prompt", "Hooks\n⚠ 3 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to close", true},
 		{"current codex hook action only", "Press t to trust all; enter to review hooks; esc to close", true},
+		{"selected legacy trust option only", "› 2. Trust all and continue", true},
 		{"bypass dialog", "Bypass Permissions mode\n1. No\n2. Yes, I accept", false},
 		{"shell prompt", "user@host:~$", false},
 	}
@@ -271,6 +272,12 @@ Skip until next version`,
 		{
 			name:        "current codex hook action-only modal",
 			content:     "Press t to trust all; enter to review hooks; esc to close",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "selected legacy trust option-only modal",
+			content:     "› 2. Trust all and continue",
 			wantBlocked: true,
 			wantName:    "workspace trust prompt",
 		},
@@ -373,6 +380,7 @@ func TestCodexHookTrustAcceptanceKey(t *testing.T) {
 		{name: "legacy chooser incomplete", content: "Hooks need review", wantOK: false},
 		{name: "legacy chooser missing review option", content: "Hooks need review\n2. Trust all and continue", wantOK: false},
 		{name: "legacy chooser missing option number", content: "Hooks need review\n› 1. Review hooks\nTrust all and continue", wantOK: false},
+		{name: "legacy chooser selected option 2 remains fail closed", content: "Hooks need review\n1. Review hooks\n› 2. Trust all and continue", wantOK: false},
 		{name: "legacy chooser reordered", content: "2. Trust all and continue\nHooks need review\n› 1. Review hooks", wantOK: false},
 		{name: "legacy chooser prose", content: "Hooks need review and Trust all and continue", wantOK: false},
 		{name: "current chooser incomplete", content: "hooks need review before they can run", wantOK: false},
