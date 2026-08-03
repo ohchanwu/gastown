@@ -14,7 +14,9 @@ package nudge
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -53,6 +54,10 @@ func pollerPidFile(townRoot, session string) string {
 	return filepath.Join(pollerPidDir(townRoot), safe+".pid")
 }
 
+func pollerStopFile(townRoot, session string) string {
+	return pollerPidFile(townRoot, session) + ".stop"
+}
+
 // StartPoller launches a background `gt nudge-poller <session>` process.
 // The process is detached (Setpgid) so it survives the caller's exit.
 // Returns the PID of the launched process, or an error.
@@ -64,6 +69,16 @@ func StartPoller(townRoot, session string) (int, error) {
 // Isolated callers use this to preserve their private tmux/config boundary.
 func StartPollerWithEnv(townRoot, session string, env []string) (int, error) {
 	return startPoller(townRoot, session, env)
+}
+
+// StopRequested reports whether the session's cooperative stop generation is set.
+func StopRequested(townRoot, session string) bool {
+	data, err := os.ReadFile(pollerStopFile(townRoot, session))
+	if err != nil {
+		return false
+	}
+	current, err := os.ReadFile(pollerPidFile(townRoot, session))
+	return err == nil && bytes.Equal(data, current)
 }
 
 func startPoller(townRoot, session string, env []string) (int, error) {
@@ -78,8 +93,9 @@ type pollerLaunch struct {
 }
 
 type pollerIdentity struct {
-	StartTime string
-	Command   string
+	StartTime  string
+	Command    string
+	Generation string
 }
 
 type pollerRecord struct {
@@ -122,6 +138,7 @@ func startPollerWithLauncherStatus(
 	} else if alive {
 		return pid, nil // already running
 	}
+	_ = os.Remove(pollerStopFile(townRoot, session))
 
 	launched, err := launcher(townRoot, session, env)
 	if err != nil {
@@ -130,7 +147,7 @@ func startPollerWithLauncherStatus(
 
 	// Write PID file for later cleanup.
 	pidPath := pollerPidFile(townRoot, session)
-	if launched.identity.StartTime == "" || launched.identity.Command == "" {
+	if launched.identity.StartTime == "" || launched.identity.Command == "" || launched.identity.Generation == "" || session == "" {
 		return 0, cleanupLaunchedPoller(launched, errors.New("nudge-poller identity unavailable"))
 	}
 	record := formatPollerRecord(launched.pid, launched.identity, session)
@@ -171,14 +188,20 @@ func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) 
 	}
 
 	cmd := buildPollerCommand(gtBin, townRoot, session, env)
+	var generation [16]byte
+	if _, err := rand.Read(generation[:]); err != nil {
+		return pollerLaunch{}, fmt.Errorf("creating poller generation: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return pollerLaunch{}, fmt.Errorf("starting nudge-poller: %w", err)
 	}
+	identity := pollerIdentityForProcess(cmd.Process.Pid)
+	identity.Generation = fmt.Sprintf("%x", generation[:])
 
 	return pollerLaunch{
 		pid:      cmd.Process.Pid,
-		identity: pollerIdentityForProcess(cmd.Process.Pid),
+		identity: identity,
 		release:  cmd.Process.Release,
 		terminate: func() error {
 			killErr := cmd.Process.Kill()
@@ -196,7 +219,11 @@ func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) 
 }
 
 func formatPollerRecord(pid int, identity pollerIdentity, sessionName string) string {
-	return fmt.Sprintf("%d|%s|%s|%s\n", pid, identity.StartTime, identity.Command, sessionName)
+	if identity.Generation == "" {
+		return ""
+	}
+	b, _ := json.Marshal(pollerRecord{PID: pid, Identity: identity, Session: sessionName})
+	return string(b) + "\n"
 }
 
 func formatPollerRecordValue(record pollerRecord) string {
@@ -205,22 +232,18 @@ func formatPollerRecordValue(record pollerRecord) string {
 
 func parsePollerRecord(value string) (pollerRecord, error) {
 	trimmed := strings.TrimSpace(value)
-	if !strings.Contains(trimmed, "|") {
+	if !strings.HasPrefix(trimmed, "{") {
 		pid, err := strconv.Atoi(trimmed)
 		if err != nil || pid <= 0 {
 			return pollerRecord{}, errors.New("invalid nudge-poller ownership record")
 		}
 		return pollerRecord{PID: pid, Legacy: true}, nil
 	}
-	parts := strings.SplitN(trimmed, "|", 4)
-	if len(parts) != 4 {
+	var record pollerRecord
+	if err := json.Unmarshal([]byte(trimmed), &record); err != nil || record.PID <= 0 || record.Identity.StartTime == "" || record.Identity.Command == "" || record.Identity.Generation == "" || record.Session == "" {
 		return pollerRecord{}, errors.New("invalid nudge-poller ownership record")
 	}
-	pid, err := strconv.Atoi(parts[0])
-	if err != nil || pid <= 0 || parts[1] == "" || parts[2] == "" || parts[3] == "" {
-		return pollerRecord{}, errors.New("invalid nudge-poller ownership record")
-	}
-	return pollerRecord{PID: pid, Identity: pollerIdentity{StartTime: parts[1], Command: parts[2]}, Session: parts[3]}, nil
+	return record, nil
 }
 
 func pollerIdentityForProcess(pid int) pollerIdentity {
@@ -273,7 +296,8 @@ func buildPollerCommand(gtBin, townRoot, session string, env []string) *exec.Cmd
 
 // StopPoller terminates the nudge-poller for a session, if running.
 func StopPoller(townRoot, session string) error {
-	return stopPollerWithOwnershipOps(townRoot, session, os.ReadFile, pollerProcessAlive, lookupPollerIdentity, signalPoller, waitPollerExit,
+	return stopPollerWithGenerationOps(townRoot, session, os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
+		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) }, waitPollerExit,
 		func(path string, data []byte) error {
 			return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
 		}, os.Remove)
@@ -290,6 +314,20 @@ func stopPollerWithOwnershipOps(
 	alive func(int) bool,
 	identity func(int) (pollerIdentity, error),
 	signal func(int) error,
+	waitExit func(int, pollerRecord) error,
+	quarantine func(string, []byte) error,
+	remove func(string) error,
+) error {
+	return stopPollerWithGenerationOps(townRoot, sessionName, readPID, alive, identity,
+		func(_ []byte) error { return signal(0) }, waitExit, quarantine, remove)
+}
+
+func stopPollerWithGenerationOps(
+	townRoot, sessionName string,
+	readPID func(string) ([]byte, error),
+	alive func(int) bool,
+	identity func(int) (pollerIdentity, error),
+	stop func([]byte) error,
 	waitExit func(int, pollerRecord) error,
 	quarantine func(string, []byte) error,
 	remove func(string) error,
@@ -340,7 +378,7 @@ func stopPollerWithOwnershipOps(
 		}
 		return errors.New("poller identity mismatch; ownership quarantined")
 	}
-	if err := signal(record.PID); err != nil {
+	if err := stop(data); err != nil {
 		return fmt.Errorf("sending SIGTERM to poller (pid %d): %w", record.PID, err)
 	}
 	if err := waitExit(record.PID, record); err != nil {
@@ -352,6 +390,12 @@ func stopPollerWithOwnershipOps(
 	}
 	if !bytes.Equal(latest, data) {
 		return errors.New("poller ownership changed before removal; preserving replacement record")
+	}
+	stopPath := pollerStopFile(townRoot, sessionName)
+	if stopData, readErr := os.ReadFile(stopPath); readErr == nil && bytes.Equal(stopData, data) {
+		if removeErr := remove(stopPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("removing poller stop request: %w", removeErr)
+		}
 	}
 	if err := remove(pidPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing poller ownership: %w", err)
@@ -372,10 +416,13 @@ func lookupPollerIdentity(pid int) (pollerIdentity, error) {
 	return identity, nil
 }
 
-func waitPollerExit(pid int, _ pollerRecord) error {
+func waitPollerExit(pid int, record pollerRecord) error {
 	deadline := time.Now().Add(pollerExitTimeout)
 	for time.Now().Before(deadline) {
 		if !pollerProcessAlive(pid) {
+			return nil
+		}
+		if current, err := lookupPollerIdentity(pid); err == nil && !pollerIdentityMatches(current, record, record.Session) {
 			return nil
 		}
 		time.Sleep(pollerExitInterval)
@@ -425,14 +472,6 @@ func stopPollerWithOps(
 
 	_ = remove(pidPath)
 	return nil
-}
-
-func signalPoller(pid int) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return proc.Signal(syscall.SIGTERM)
 }
 
 // pollerAlive checks if a poller is running for the given session.

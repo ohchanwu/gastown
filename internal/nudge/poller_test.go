@@ -16,7 +16,7 @@ import (
 )
 
 func testPollerIdentity(session string) pollerIdentity {
-	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session}
+	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session, Generation: "test-generation"}
 }
 
 func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
@@ -204,7 +204,7 @@ func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
 func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
-	record := formatPollerRecord(123, pollerIdentity{StartTime: "old", Command: "gt nudge-poller " + session}, session)
+	record := formatPollerRecord(123, pollerIdentity{StartTime: "old", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, session)
 	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
 		os.ReadFile,
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
-			return pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session}, nil
+			return pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, nil
 		},
 		func(int) error { signaled = true; return nil },
 		func(int, pollerRecord) error { return nil },
@@ -238,7 +238,7 @@ func TestStopPollerIdentityMismatchQuarantinesWithoutSignal(t *testing.T) {
 func TestStopPollerRemovesRecordOnlyAfterConfirmedExit(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
-	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
 	removed := ""
 	waited := false
 	err := stopPollerWithOwnershipOps(townRoot, session,
@@ -261,7 +261,7 @@ func TestStopPollerRemovesRecordOnlyAfterConfirmedExit(t *testing.T) {
 func TestStopPollerTimeoutPreservesRecord(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
-	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
 	removed := false
 	err := stopPollerWithOwnershipOps(townRoot, session,
 		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
@@ -283,8 +283,8 @@ func TestStopPollerTimeoutPreservesRecord(t *testing.T) {
 func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
-	oldRecord := []byte(formatPollerRecord(123, pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, session))
-	newRecord := []byte(formatPollerRecord(456, pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session}, session))
+	oldRecord := []byte(formatPollerRecord(123, pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, session))
+	newRecord := []byte(formatPollerRecord(456, pollerIdentity{StartTime: "new", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, session))
 	reads := 0
 	removed := false
 	err := stopPollerWithOwnershipOps(townRoot, session,
@@ -297,7 +297,7 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 		},
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
-			return pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, nil
+			return pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, nil
 		},
 		func(int) error { return nil },
 		func(int, pollerRecord) error { return nil },
@@ -311,13 +311,13 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 
 func TestStopPollerRejectsSameStartDifferentCommand(t *testing.T) {
 	session := "gt-gastown-polecat-test"
-	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session}, Session: session}
+	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}
 	signaled := false
 	err := stopPollerWithOwnershipOps(t.TempDir(), session,
 		func(string) ([]byte, error) { return []byte(formatPollerRecordValue(record)), nil },
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
-			return pollerIdentity{StartTime: "same", Command: "gt other-command " + session}, nil
+			return pollerIdentity{StartTime: "same", Command: "gt other-command " + session, Generation: "fixture-generation"}, nil
 		},
 		func(int) error { signaled = true; return nil },
 		func(int, pollerRecord) error { return nil },
@@ -360,13 +360,59 @@ func TestPollerStatusLiveLegacyRequiresVerifiedMigration(t *testing.T) {
 		func(string) ([]byte, error) { return []byte("123"), nil },
 		func(int) bool { return true },
 		func(int) (pollerIdentity, error) {
-			return pollerIdentity{StartTime: "current", Command: "gt nudge-poller " + session}, nil
+			return pollerIdentity{StartTime: "current", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, nil
 		},
 		func(string, []byte) error { t.Fatal("live legacy record quarantined"); return nil },
 		func(string) error { t.Fatal("live legacy record removed"); return nil },
 	)
 	if err == nil || pid != 123 || !alive {
 		t.Fatalf("live legacy status = pid %d alive %v err %v; want preserved migration error", pid, alive, err)
+	}
+}
+
+func TestStopRequestedIsSessionBound(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pollerStopFile(townRoot, session), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !StopRequested(townRoot, session) || StopRequested(townRoot, session+"-other") {
+		t.Fatal("cooperative stop generation was not session-bound")
+	}
+}
+
+func TestStopRequestedRejectsStaleGeneration(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	current := []byte(formatPollerRecord(123, pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session, Generation: "new-generation"}, session))
+	if err := os.WriteFile(pollerStopFile(townRoot, session), old, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pollerPidFile(townRoot, session), current, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if StopRequested(townRoot, session) {
+		t.Fatal("stale stop request matched replacement ownership")
+	}
+}
+
+func TestPollerRecordRoundTripsDelimitersAndGeneration(t *testing.T) {
+	session := "session|with|pipes"
+	identity := pollerIdentity{StartTime: "start", Command: "gt|nudge-poller|" + session, Generation: "generation-b"}
+	record, err := parsePollerRecord(formatPollerRecord(123, identity, session))
+	if err != nil || record.Identity != identity || record.Session != session {
+		t.Fatalf("record round trip = %#v, err %v", record, err)
 	}
 }
 

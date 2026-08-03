@@ -81,13 +81,22 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	stopTicker := time.NewTicker(100 * time.Millisecond)
+	defer stopTicker.Stop()
 
 	for {
 		select {
 		case <-sigCh:
 			return nil // graceful shutdown
+		case <-stopTicker.C:
+			if nudge.StopRequested(townRoot, sessionName) {
+				return nil
+			}
 
 		case <-ticker.C:
+			if nudge.StopRequested(townRoot, sessionName) {
+				return nil
+			}
 			// Check if session still exists.
 			if exists, _ := t.HasSession(sessionName); !exists {
 				return nil // session gone, exit
