@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/testutil"
@@ -42,9 +44,6 @@ func TestTestMainWithoutTmuxDoesNotFail(t *testing.T) {
 func TestTestMainPreservesSocketRootOnKillError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("tmux not supported on Windows")
-	}
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed")
 	}
 
 	evidence := filepath.Join(t.TempDir(), "kill-error-root.txt")
@@ -104,8 +103,12 @@ func TestTestMainCleansTmuxResources(t *testing.T) {
 		if err := tm.NewSessionWithCommand("gt-testmain-cleanup-child", t.TempDir(), "sleep 300"); err != nil {
 			t.Fatalf("create child tmux session: %v", err)
 		}
+		serverPID := tm.ServerPID()
+		if serverPID <= 0 {
+			t.Fatal("read child tmux server PID")
+		}
 		evidence := os.Getenv(testMainCleanupEvidenceEnv)
-		data := os.Getenv("TMUX_TMPDIR") + "\n" + tmux.GetDefaultSocket() + "\n"
+		data := fmt.Sprintf("%s\n%d\n", os.Getenv("TMUX_TMPDIR"), serverPID)
 		if err := os.WriteFile(evidence, []byte(data), 0o600); err != nil {
 			t.Fatalf("write child cleanup evidence: %v", err)
 		}
@@ -130,21 +133,18 @@ func TestTestMainCleansTmuxResources(t *testing.T) {
 	if len(fields) != 2 {
 		t.Fatalf("child cleanup evidence fields = %d, want 2", len(fields))
 	}
-	childSocketDir, childSocket := fields[0], fields[1]
-
-	oldSocketDir, hadSocketDir := os.LookupEnv("TMUX_TMPDIR")
-	if err := os.Setenv("TMUX_TMPDIR", childSocketDir); err != nil {
-		t.Fatalf("set child TMUX_TMPDIR: %v", err)
+	childSocketDir := fields[0]
+	childServerPID, err := strconv.Atoi(fields[1])
+	if err != nil {
+		t.Fatalf("parse child tmux server PID: %v", err)
 	}
-	childTmux := tmux.NewTmuxWithSocket(childSocket)
-	serverLeaked := childTmux.ServerPID() != 0
+	childProcess, err := os.FindProcess(childServerPID)
+	if err != nil {
+		t.Fatalf("find child tmux server PID %d: %v", childServerPID, err)
+	}
+	serverLeaked := childProcess.Signal(syscall.Signal(0)) == nil
 	if serverLeaked {
-		_ = childTmux.KillServer()
-	}
-	if hadSocketDir {
-		_ = os.Setenv("TMUX_TMPDIR", oldSocketDir)
-	} else {
-		_ = os.Unsetenv("TMUX_TMPDIR")
+		_ = childProcess.Kill()
 	}
 
 	_, statErr := os.Stat(childSocketDir)
