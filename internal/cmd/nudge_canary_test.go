@@ -32,6 +32,15 @@ type wakeCanaryTurnWaiterStub struct {
 	idleErr         error
 }
 
+type wakeCanaryIdleObserverStub struct {
+	observation tmux.IdleObservation
+	err         error
+}
+
+func (s wakeCanaryIdleObserverStub) ObserveIdle(string) (tmux.IdleObservation, error) {
+	return s.observation, s.err
+}
+
 func (s *wakeCanaryTurnWaiterStub) WaitForResponse(_, _, _ string, timeout time.Duration) error {
 	s.events = append(s.events, "response")
 	s.responseTimeout = timeout
@@ -99,6 +108,25 @@ func TestConfirmWakeCanaryTurnWaitsForSteadyIdleBeforeNextDelivery(t *testing.T)
 	}
 	if waiter.responseTimeout != 30*time.Second || waiter.idleTimeout != constants.ClaudeStartTimeout {
 		t.Fatalf("turn bounds = response %s idle %s", waiter.responseTimeout, waiter.idleTimeout)
+	}
+}
+
+func TestAnnotateWakeCanaryIdleFailureAddsOnlyStructuralObservation(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("steady idle timeout")
+	observer := wakeCanaryIdleObserverStub{observation: tmux.IdleObservation{
+		Idle: true, PromptRows: 1, PromptOnCursor: true, CursorX: 1, CursorY: 7,
+	}}
+	err := annotateWakeCanaryIdleFailure(observer, session.MayorSessionName(), cause)
+
+	if !errors.Is(err, cause) {
+		t.Fatalf("annotated error = %v, want wrapped cause %v", err, cause)
+	}
+	for _, want := range []string{"idle=true", "prompt_rows=1", "prompt_on_cursor=true", "cursor_x=1", "cursor_y=7"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("annotated error missing %q: %v", want, err)
+		}
 	}
 }
 

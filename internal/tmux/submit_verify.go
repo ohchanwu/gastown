@@ -254,22 +254,61 @@ func analyzeSubmission(escContent, needle, promptPrefix string) submitProbe {
 	return probeUnknown
 }
 
-func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) bool {
+// IdleObservation is a content-free structural description of a captured
+// agent pane. It is safe to include in private operational diagnostics because
+// it never retains transcript, prompt, nonce, or model-response text.
+type IdleObservation struct {
+	Idle                  bool
+	Busy                  bool
+	CodexPrompt           bool
+	PromptRows            int
+	PromptRow             int
+	PromptOnCursor        bool
+	CursorX               int
+	CursorY               int
+	CursorRowBlank        bool
+	NonEmptyAfterCursor   bool
+	BlankCursorWithFooter bool
+}
+
+func (o IdleObservation) String() string {
+	return fmt.Sprintf("idle=%t busy=%t codex_prompt=%t prompt_rows=%d prompt_row=%d prompt_on_cursor=%t cursor_x=%d cursor_y=%d cursor_row_blank=%t nonempty_after_cursor=%t blank_cursor_with_footer=%t",
+		o.Idle, o.Busy, o.CodexPrompt, o.PromptRows, o.PromptRow, o.PromptOnCursor,
+		o.CursorX, o.CursorY, o.CursorRowBlank, o.NonEmptyAfterCursor, o.BlankCursorWithFooter)
+}
+
+func observeIdlePane(escContent, promptPrefix string, cursorX, cursorY int) IdleObservation {
+	observation := IdleObservation{PromptRow: -1, CursorX: cursorX, CursorY: cursorY}
 	if promptPrefix == "" {
-		return false
+		return observation
 	}
 	plain, dim := stripAnsiTrackDim(escContent)
 	lines, lineDims := splitRunesAndDim(plain, dim)
 
 	for _, line := range lines {
 		if hasBusyIndicator(string(line)) {
-			return false
+			observation.Busy = true
+			return observation
 		}
 	}
-	codexPrompt := strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")) == "›"
-	if codexPrompt && cursorX == 1 && cursorY >= 0 && cursorY+1 < len(lines) &&
-		strings.TrimSpace(string(lines[cursorY])) == "" && strings.TrimSpace(string(lines[cursorY+1])) != "" {
-		return true
+	observation.CodexPrompt = strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")) == "›"
+	if cursorY >= 0 && cursorY < len(lines) {
+		observation.CursorRowBlank = strings.TrimSpace(string(lines[cursorY])) == ""
+	}
+	if cursorY >= 0 && cursorY+1 < len(lines) {
+		observation.NonEmptyAfterCursor = strings.TrimSpace(string(lines[cursorY+1])) != ""
+	}
+	for row := range lines {
+		if matchesPromptPrefix(string(lines[row]), promptPrefix) {
+			observation.PromptRows++
+			observation.PromptRow = row
+			observation.PromptOnCursor = observation.PromptOnCursor || row == cursorY
+		}
+	}
+	if observation.CodexPrompt && cursorX == 1 && observation.CursorRowBlank && observation.NonEmptyAfterCursor {
+		observation.BlankCursorWithFooter = true
+		observation.Idle = true
+		return observation
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		if !matchesPromptPrefix(string(lines[i]), promptPrefix) {
@@ -278,17 +317,23 @@ func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) boo
 		content, contentDim := composerContent(lines[i], lineDims[i], promptPrefix)
 		prefix := []rune(strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")))
 		promptX := runeIndex(lines[i], prefix)
-		if codexPrompt {
+		if observation.CodexPrompt {
 			inputX := promptX + len(prefix)
-			return promptX >= 0 && cursorY == i &&
+			observation.Idle = promptX >= 0 && cursorY == i &&
 				(cursorX == inputX || cursorX == inputX+1 && len(content) > 0 && allDim(contentDim))
+			return observation
 		}
 		if len(content) == 0 || allDim(contentDim) {
-			return true
+			observation.Idle = true
+			return observation
 		}
-		return false
+		return observation
 	}
-	return false
+	return observation
+}
+
+func paneAtIdlePrompt(escContent, promptPrefix string, cursorX, cursorY int) bool {
+	return observeIdlePane(escContent, promptPrefix, cursorX, cursorY).Idle
 }
 
 func (t *Tmux) probeSubmission(target, needle, promptPrefix string) submitProbe {

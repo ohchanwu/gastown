@@ -98,6 +98,10 @@ type wakeCanaryIdleWaiter interface {
 	WaitForIdle(session string, timeout time.Duration) error
 }
 
+type wakeCanaryIdleObserver interface {
+	ObserveIdle(session string) (tmux.IdleObservation, error)
+}
+
 type wakeCanaryTurnWaiter interface {
 	wakeCanaryIdleWaiter
 	WaitForResponse(sessionName, baseline, response string, timeout time.Duration) error
@@ -127,6 +131,14 @@ func confirmWakeCanaryTurn(waiter wakeCanaryTurnWaiter, sessionName, baseline, r
 		return "model-turn-not-idle", fmt.Errorf("waiting for completed model turn steady-state idle: %w", err)
 	}
 	return "", nil
+}
+
+func annotateWakeCanaryIdleFailure(observer wakeCanaryIdleObserver, sessionName string, cause error) error {
+	observation, err := observer.ObserveIdle(sessionName)
+	if err != nil {
+		return fmt.Errorf("%w; idle_observation=unavailable", cause)
+	}
+	return fmt.Errorf("%w; idle_observation={%s}", cause, observation.String())
 }
 
 func confirmWakeCanaryDelivery(outcome witness.MayorNotificationOutcome, confirm func() (string, error)) (string, error) {
@@ -390,6 +402,9 @@ func runWakeCanary(t *tmux.Tmux, runtimeTownRoot, evidenceRoot, sessionName stri
 			return confirmWakeCanaryTurn(tmuxWakeCanaryTurnWaiter{tmux: t}, sessionName, before, response)
 		})
 		if confirmErr != nil {
+			if failureCode == "model-turn-not-idle" {
+				confirmErr = annotateWakeCanaryIdleFailure(t, sessionName, confirmErr)
+			}
 			if outcome == witness.MayorNotificationQueued {
 				result.Queued++
 			}

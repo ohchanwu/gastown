@@ -4054,6 +4054,33 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	return t.WaitForIdleContext(context.Background(), session, timeout)
 }
 
+// ObserveIdle returns one content-free structural snapshot using the same
+// prompt and cursor rules as WaitForIdle.
+func (t *Tmux) ObserveIdle(session string) (IdleObservation, error) {
+	return t.ObserveIdleContext(context.Background(), session)
+}
+
+// ObserveIdleContext is ObserveIdle with caller cancellation.
+func (t *Tmux) ObserveIdleContext(ctx context.Context, session string) (IdleObservation, error) {
+	promptPrefix, _, err := submissionPromptForSessionContext(ctx, t, session)
+	if err != nil {
+		return IdleObservation{}, err
+	}
+	content, err := t.runContext(ctx, "capture-pane", "-p", "-e", "-t", session)
+	if err != nil {
+		return IdleObservation{}, err
+	}
+	cursor, err := t.runContext(ctx, "display-message", "-p", "-t", session, "#{cursor_x}|#{cursor_y}")
+	if err != nil {
+		return IdleObservation{}, err
+	}
+	var cursorX, cursorY int
+	if _, err := fmt.Sscanf(strings.TrimSpace(cursor), "%d|%d", &cursorX, &cursorY); err != nil {
+		return IdleObservation{}, err
+	}
+	return observeIdlePane(content, promptPrefix, cursorX, cursorY), nil
+}
+
 // WaitForIdleContext is WaitForIdle with caller cancellation. A caller
 // cancellation is returned verbatim; expiry of timeout remains ErrIdleTimeout.
 func (t *Tmux) WaitForIdleContext(ctx context.Context, session string, timeout time.Duration) error {

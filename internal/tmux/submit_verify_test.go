@@ -175,6 +175,22 @@ func TestPaneAtIdlePromptRejectsStaleCodexPrompt(t *testing.T) {
 	}
 }
 
+func TestIdleObservationIsValueBlind(t *testing.T) {
+	t.Parallel()
+
+	const privatePaneText = "PRIVATE-NONCE-DO-NOT-REPORT"
+	observation := observeIdlePane("completed "+privatePaneText+"\n› Ask anything\n", "› ", 1, 1)
+	summary := observation.String()
+
+	if strings.Contains(summary, privatePaneText) {
+		t.Fatalf("idle observation leaked pane content: %q", summary)
+	}
+	if !strings.Contains(summary, "idle=true") || !strings.Contains(summary, "prompt_rows=1") ||
+		!strings.Contains(summary, "prompt_on_cursor=true") {
+		t.Fatalf("idle observation omitted structural facts: %q", summary)
+	}
+}
+
 func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("nudge to session: %w", fmt.Errorf("submit: %w", ErrSubmitNotVerified))
