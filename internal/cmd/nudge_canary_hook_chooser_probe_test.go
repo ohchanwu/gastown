@@ -21,24 +21,56 @@ func hookChooserTransitionAccepted(before, after string, dialog, progressAfterDi
 	return !dialog || progressAfterDialog
 }
 
-func hookChooserProgressAfterDialog(content string) bool {
+type hookChooserPaneOrder struct {
+	Dialog              bool
+	ProgressAfterDialog bool
+}
+
+func hookChooserBlockerLine(normalized string) bool {
+	lower := strings.ToLower(normalized)
+	return normalized == "Hooks need review" || normalized == "› 1. Review hooks" ||
+		normalized == "2. Trust all and continue" ||
+		strings.Contains(lower, "hooks need review before they can run") ||
+		normalized == "Press t to trust all; enter to review hooks; esc to close"
+}
+
+func hookChooserPromptLine(normalized string) bool {
+	if normalized == "›" {
+		return true
+	}
+	if !strings.HasPrefix(normalized, "› ") {
+		return false
+	}
+	rest := strings.TrimPrefix(normalized, "› ")
+	dot := strings.IndexByte(rest, '.')
+	return dot <= 0 || strings.Trim(rest[:dot], "0123456789") != ""
+}
+
+func analyzeHookChooserPane(content string) hookChooserPaneOrder {
 	plain := idlePaneProbeANSI.ReplaceAllString(content, "")
 	lastBlocker := -1
 	lastProgress := -1
 	for i, line := range strings.Split(plain, "\n") {
 		normalized := strings.Join(strings.Fields(strings.ReplaceAll(line, "\u00a0", " ")), " ")
-		lower := strings.ToLower(normalized)
-		if normalized == "Hooks need review" || normalized == "› 1. Review hooks" ||
-			normalized == "2. Trust all and continue" ||
-			strings.Contains(lower, "hooks need review before they can run") ||
-			normalized == "Press t to trust all; enter to review hooks; esc to close" {
+		if hookChooserBlockerLine(normalized) {
 			lastBlocker = i
 		}
-		if strings.Contains(normalized, "Trusting hooks") || strings.Contains(normalized, "esc to interrupt") {
+		if strings.Contains(normalized, "Trusting hooks") || strings.Contains(normalized, "esc to interrupt") || hookChooserPromptLine(normalized) {
 			lastProgress = i
 		}
 	}
-	return lastBlocker >= 0 && lastProgress > lastBlocker
+	return hookChooserPaneOrder{
+		Dialog:              lastBlocker >= 0,
+		ProgressAfterDialog: lastBlocker >= 0 && lastProgress > lastBlocker,
+	}
+}
+
+func hookChooserDialogPresent(content string) bool {
+	return analyzeHookChooserPane(content).Dialog
+}
+
+func hookChooserProgressAfterDialog(content string) bool {
+	return analyzeHookChooserPane(content).ProgressAfterDialog
 }
 
 func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
@@ -89,22 +121,21 @@ func TestProbeIsolatedCodexHookChooserTarget(t *testing.T) {
 		ProgressAfterDialog bool   `json:"progress_after_dialog"`
 	}
 	hookReviewDialog := func(text string) bool {
-		return strings.Contains(text, "Hooks need review") ||
-			strings.Contains(strings.ToLower(text), "hooks need review before they can run") ||
-			strings.Contains(strings.ToLower(text), "press t to trust all; enter to review hooks; esc to close")
+		return hookChooserDialogPresent(text)
 	}
 	state := func(content []byte) chooserState {
 		sum := sha256.Sum256(content)
 		text := string(content)
+		order := analyzeHookChooserPane(text)
 		return chooserState{
 			SHA256:              hex.EncodeToString(sum[:]),
-			Dialog:              hookReviewDialog(text),
+			Dialog:              order.Dialog,
 			ReviewSelected:      strings.Contains(text, "› 1. Review hooks"),
 			TrustSelected:       strings.Contains(text, "› 2. Trust all and continue"),
 			TrustShortcut:       strings.Contains(strings.ToLower(text), "press t to trust all"),
 			Trusting:            strings.Contains(text, "Trusting hooks"),
 			Busy:                strings.Contains(text, "esc to interrupt"),
-			ProgressAfterDialog: hookChooserProgressAfterDialog(text),
+			ProgressAfterDialog: order.ProgressAfterDialog,
 		}
 	}
 
@@ -277,6 +308,16 @@ func TestHookChooserProgressAfterDialog(t *testing.T) {
 			content: "Hooks need review\n› 1. Review hooks\n2. Trust all and continue\n• Working (esc to interrupt)",
 			want:    true,
 		},
+		{
+			name:    "idle prompt after current modal",
+			content: currentModal + "\n› ",
+			want:    true,
+		},
+		{
+			name:    "numbered chooser option is not idle prompt",
+			content: "Hooks need review\n› 1. Review hooks\n2. Trust all and continue",
+			want:    false,
+		},
 		{name: "activity without modal", content: "• Working (esc to interrupt)", want: false},
 	}
 	for _, tt := range tests {
@@ -285,5 +326,37 @@ func TestHookChooserProgressAfterDialog(t *testing.T) {
 				t.Fatalf("hookChooserProgressAfterDialog() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHookChooserDialogPresent(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "legacy header", content: "Hooks need review", want: true},
+		{name: "truncated legacy review option", content: "› 1. Review hooks", want: true},
+		{name: "truncated legacy trust option", content: "2. Trust all and continue", want: true},
+		{name: "current action", content: "Press t to trust all; enter to review hooks; esc to close", want: true},
+		{name: "ordinary prompt", content: "› ", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hookChooserDialogPresent(tt.content); got != tt.want {
+				t.Fatalf("hookChooserDialogPresent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHookChooserTransitionRejectsTruncatedLegacyModal(t *testing.T) {
+	t.Parallel()
+	for _, content := range []string{"› 1. Review hooks", "2. Trust all and continue"} {
+		dialog := hookChooserDialogPresent(content)
+		progress := hookChooserProgressAfterDialog(content)
+		if hookChooserTransitionAccepted("before", "changed", dialog, progress) {
+			t.Fatalf("changed SHA accepted active truncated modal %q", content)
+		}
 	}
 }
