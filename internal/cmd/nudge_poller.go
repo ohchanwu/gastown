@@ -176,8 +176,12 @@ func claimPollerNudgeWhenIdleContext(ctx context.Context, stop <-chan struct{}, 
 }
 
 func pollerHasSession(t *tmux.Tmux, session string) (bool, error) {
+	return pollerHasSessionWith(func() (bool, error) { return t.HasSession(session) })
+}
+
+func pollerHasSessionWith(check func() (bool, error)) (bool, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		exists, err := t.HasSession(session)
+		exists, err := check()
 		if err == nil || exists {
 			return exists, err
 		}
