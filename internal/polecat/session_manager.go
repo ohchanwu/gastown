@@ -80,6 +80,13 @@ func (m *SessionManager) stopNudgePoller(townRoot, sessionID string) error {
 	return m.stopPoller(townRoot, sessionID)
 }
 
+func stopPollerBeforeReplacement(stop func() error, kill func() error) error {
+	if err := stop(); err != nil {
+		return err
+	}
+	return kill()
+}
+
 // SessionStartOptions configures polecat session startup.
 type SessionStartOptions struct {
 	// WorkDir overrides the default working directory (polecat clone dir).
@@ -390,10 +397,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 			m.startNudgePoller(townRoot, sessionID)
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 		}
-		if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
-			return fmt.Errorf("stopping nudge poller: %w", err)
-		}
-		if err := m.tmux.KillSessionWithProcessesContext(ctx, sessionID); err != nil {
+		if err := stopPollerBeforeReplacement(func() error { return m.stopNudgePoller(townRoot, sessionID) }, func() error { return m.tmux.KillSessionWithProcessesContext(ctx, sessionID) }); err != nil {
 			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
 	}
