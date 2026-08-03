@@ -70,7 +70,9 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
 	// Verify session exists before starting the loop.
-	if exists, _ := t.HasSession(sessionName); !exists {
+	if exists, err := pollerHasSession(t, sessionName); err != nil {
+		return err
+	} else if !exists {
 		return fmt.Errorf("session %q not found", sessionName)
 	}
 
@@ -102,7 +104,10 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 
 		case <-ticker.C:
 			// Check if session still exists.
-			if exists, _ := t.HasSession(sessionName); !exists {
+			if exists, err := pollerHasSession(t, sessionName); err != nil {
+				fmt.Fprintf(os.Stderr, "nudge-poller: session check error for %s: %v\n", sessionName, err)
+				continue
+			} else if !exists {
 				return nil // session gone, exit
 			}
 
@@ -144,6 +149,17 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+}
+
+func pollerHasSession(t *tmux.Tmux, session string) (bool, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		exists, err := t.HasSession(session)
+		if err == nil || exists {
+			return exists, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+	}
+	return false, fmt.Errorf("session check failed")
 }
 
 func watchCooperativePollerStop(ctx context.Context, interval time.Duration, stopRequested func() bool) <-chan struct{} {
