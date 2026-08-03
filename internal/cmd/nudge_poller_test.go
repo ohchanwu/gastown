@@ -318,3 +318,144 @@ func TestSettlePollerClaimRequiresRecoverableStateAfterAckAndNackFailures(t *tes
 		t.Fatalf("recovery wait = retries %d pauses %d", retries, pauses)
 	}
 }
+
+func TestSettlePollerClaimUnderLeaseRetainsActualTmuxCustody(t *testing.T) {
+	assertBlocked := func(t *testing.T, contender *tmux.Tmux, townRoot, session string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		release, err := contender.AcquireNudgeLeaseContext(ctx, townRoot, session)
+		if release != nil {
+			release()
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("contender lease error = %v, want deadline exceeded", err)
+		}
+	}
+	assertReleased := func(t *testing.T, contender *tmux.Tmux, townRoot, session string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		release, err := contender.AcquireNudgeLeaseContext(ctx, townRoot, session)
+		if err != nil {
+			t.Fatalf("contender did not acquire released lease: %v", err)
+		}
+		release()
+	}
+
+	t.Run("submitted ack", func(t *testing.T) {
+		townRoot := t.TempDir()
+		session := fmt.Sprintf("gt-test-settle-ack-%d", time.Now().UnixNano())
+		owner, contender := tmux.NewTmuxWithSocket("settle-ack-owner"), tmux.NewTmuxWithSocket("settle-ack-contender")
+		releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(releaseOwner)
+		entered, proceed := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- settlePollerClaimUnderLease(
+				releaseOwner,
+				tmux.SubmissionReceipt{Submitted: true}, nil, time.Now(),
+				func(tmux.SubmissionReceipt) error { close(entered); <-proceed; return nil },
+				func(string, time.Time) error { return errors.New("unexpected nack") },
+				func() bool { return false },
+				func() error { return errors.New("unexpected recovery") },
+				func() {},
+			)
+		}()
+		<-entered
+		assertBlocked(t, contender, townRoot, session)
+		close(proceed)
+		if err := <-done; err != nil {
+			t.Fatalf("submitted settlement: %v", err)
+		}
+		assertReleased(t, contender, townRoot, session)
+	})
+
+	t.Run("unverified nack", func(t *testing.T) {
+		townRoot := t.TempDir()
+		session := fmt.Sprintf("gt-test-settle-nack-%d", time.Now().UnixNano())
+		owner, contender := tmux.NewTmuxWithSocket("settle-nack-owner"), tmux.NewTmuxWithSocket("settle-nack-contender")
+		releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(releaseOwner)
+		entered, proceed := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		deliveryErr := errors.New("injected delivery failure")
+		go func() {
+			done <- settlePollerClaimUnderLease(
+				releaseOwner,
+				tmux.SubmissionReceipt{}, deliveryErr, time.Now(),
+				func(tmux.SubmissionReceipt) error { return errors.New("unexpected ack") },
+				func(string, time.Time) error { close(entered); <-proceed; return nil },
+				func() bool { return false },
+				func() error { return errors.New("unexpected recovery") },
+				func() {},
+			)
+		}()
+		<-entered
+		assertBlocked(t, contender, townRoot, session)
+		close(proceed)
+		if err := <-done; !errors.Is(err, deliveryErr) {
+			t.Fatalf("unverified settlement: %v", err)
+		}
+		assertReleased(t, contender, townRoot, session)
+	})
+
+	t.Run("failed ack and nack recover private claim", func(t *testing.T) {
+		townRoot := t.TempDir()
+		session := fmt.Sprintf("gt-test-settle-recovery-%d", time.Now().UnixNano())
+		owner, contender := tmux.NewTmuxWithSocket("settle-recovery-owner"), tmux.NewTmuxWithSocket("settle-recovery-contender")
+		releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(releaseOwner)
+		if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{DeliveryID: "ndg-settle-recovery", Session: session, Sender: "mayor", Message: "recover"}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := nudge.ClaimDue(townRoot, session)
+		if err != nil || claim == nil {
+			t.Fatalf("ClaimDue = %#v, %v", claim, err)
+		}
+		claimPaths, err := filepath.Glob(filepath.Join(townRoot, ".runtime", "nudge_queue", session, "*.json.claimed.*"))
+		if err != nil || len(claimPaths) != 1 {
+			t.Fatalf("claim paths = %q, %v", claimPaths, err)
+		}
+		if err := os.Chmod(claimPaths[0], 0644); err != nil {
+			t.Fatal(err)
+		}
+		ackErr, nackErr := errors.New("injected ack failure"), errors.New("injected nack failure")
+		recoveryEntered, allowRecovery := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- settlePollerClaimUnderLease(
+				releaseOwner,
+				tmux.SubmissionReceipt{Submitted: true}, nil, time.Now(),
+				func(tmux.SubmissionReceipt) error { return ackErr },
+				func(string, time.Time) error { return nackErr },
+				claim.HasRecoverableState,
+				func() error {
+					close(recoveryEntered)
+					<-allowRecovery
+					return claim.Nack("settlement-recovery", time.Now())
+				},
+				func() {},
+			)
+		}()
+		<-recoveryEntered
+		assertBlocked(t, contender, townRoot, session)
+		close(allowRecovery)
+		if err := <-done; !errors.Is(err, ackErr) || !errors.Is(err, nackErr) {
+			t.Fatalf("recovery settlement: %v", err)
+		}
+		if !claim.HasRecoverableState() {
+			t.Fatal("claim did not reach private recoverable state before release")
+		}
+		assertReleased(t, contender, townRoot, session)
+	})
+}

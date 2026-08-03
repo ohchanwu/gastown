@@ -176,24 +176,45 @@ func runNudgePollerLoopWithWait(
 				nudgeOpts.DeliveryID = claim.Nudge.DeliveryID
 				receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, nudgeOpts)
 				nextAttempt := nudge.NextRetry(claim.Nudge.Attempts)
-				safe, settleErr := settlePollerClaim(receipt, err, nextAttempt, claim.AckSubmitted, claim.Nack, claim.HasRecoverableState)
+				settleErr := settlePollerClaimUnderLease(
+					releaseLease,
+					receipt,
+					err,
+					nextAttempt,
+					claim.AckSubmitted,
+					claim.Nack,
+					claim.HasRecoverableState,
+					func() error { return claim.Nack("settlement-recovery", nextAttempt) },
+					func() { time.Sleep(nudgePollerStopInterval) },
+				)
 				if settleErr != nil {
 					fmt.Fprintf(os.Stderr, "nudge-poller: settlement error for %s: %v\n", sessionName, settleErr)
 				}
-				if !safe {
-					// Keep the delivery lease until the in-memory claim has once
-					// again reached a provably durable path. Stop/replacement stays
-					// fail-closed while filesystem recovery is impossible.
-					waitForRecoverablePollerClaim(
-						claim.HasRecoverableState,
-						func() error { return claim.Nack("settlement-recovery", nextAttempt) },
-						func() { time.Sleep(nudgePollerStopInterval) },
-					)
-				}
-				releaseLease()
 			}()
 		}
 	}
+}
+
+func settlePollerClaimUnderLease(
+	releaseLease func(),
+	receipt tmux.SubmissionReceipt,
+	deliveryErr error,
+	nextAttempt time.Time,
+	ack func(tmux.SubmissionReceipt) error,
+	nack func(string, time.Time) error,
+	recoverable func() bool,
+	retry func() error,
+	pause func(),
+) error {
+	safe, settleErr := settlePollerClaim(receipt, deliveryErr, nextAttempt, ack, nack, recoverable)
+	if !safe {
+		// Keep the delivery lease until the in-memory claim has once again
+		// reached a provably durable path. Stop/replacement stays fail-closed
+		// while filesystem recovery is impossible.
+		waitForRecoverablePollerClaim(recoverable, retry, pause)
+	}
+	releaseLease()
+	return settleErr
 }
 
 func settlePollerClaim(
