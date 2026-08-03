@@ -1736,6 +1736,116 @@ func createNotifyTestSession(t *testing.T, socket, sessionName, command string) 
 	t.Fatalf("session %q never appeared on socket %q", sessionName, socket)
 }
 
+// TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff reproduces the
+// canary's startup-to-first-notification seam. A transient prompt must not let
+// the canary's idle gate return just before the router observes a busy pane and
+// falls back to its timeout queue.
+func TestNotifyRecipient_StartupIdleProofSurvivesRouterHandoff(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "gt-crew-startup-idle-handoff"
+	signals := t.TempDir()
+	beginIdleGap := filepath.Join(signals, "begin-idle-gap")
+	idlePromptObserved := filepath.Join(signals, "idle-prompt-observed")
+	firstIdleReturned := filepath.Join(signals, "first-idle-returned")
+	busyStarted := filepath.Join(signals, "busy-started")
+	releaseBusy := filepath.Join(signals, "release-busy")
+	command := fmt.Sprintf(`sh -c '
+		while [ ! -e %q ]; do sleep 0.01; done
+		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
+		while [ ! -e %q ]; do sleep 0.01; done
+		early=0
+		# A 500ms transient still catches the former two-poll (200ms) proof,
+		# while leaving ample scheduling margin below the six-poll (1s) proof.
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			if [ -e %q ]; then early=1; break; fi
+			sleep 0.05
+		done
+		touch %q
+		printf "\033[2J\033[H• Working (esc to interrupt)\n"
+		if [ "$early" -eq 1 ]; then
+			while [ ! -e %q ]; do sleep 0.01; done
+		else
+			sleep 2
+		fi
+		printf "\033[2J\033[H\033[1;2m›\033[0m Ask anything\r\033[1C"
+		cat
+	'`, beginIdleGap, idlePromptObserved, firstIdleReturned, busyStarted, releaseBusy)
+	createNotifyTestSession(t, socket, sessionName, command)
+
+	transport := tmux.NewTmuxWithSocket(socket)
+	if err := transport.SetEnvironment(sessionName, "GT_AGENT", "codex"); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	if err := transport.SetEnvironment(sessionName, "GT_READY_PROMPT_PREFIX", "› "); err != nil {
+		t.Fatalf("SetEnvironment GT_READY_PROMPT_PREFIX: %v", err)
+	}
+	if err := os.WriteFile(beginIdleGap, nil, 0600); err != nil {
+		t.Fatalf("begin transient idle gap: %v", err)
+	}
+	promptDeadline := time.Now().Add(time.Second)
+	for !transport.IsIdle(sessionName) {
+		if time.Now().After(promptDeadline) {
+			t.Fatal("transient idle prompt did not become observable")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(idlePromptObserved, nil, 0600); err != nil {
+		t.Fatalf("release transient idle countdown: %v", err)
+	}
+	if err := transport.WaitForIdle(sessionName, 5*time.Second); err != nil {
+		t.Fatalf("startup steady-idle gate: %v", err)
+	}
+	if err := os.WriteFile(firstIdleReturned, nil, 0600); err != nil {
+		t.Fatalf("signal first idle return: %v", err)
+	}
+	busyDeadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(busyStarted); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("observe busy transition: %v", err)
+		}
+		if time.Now().After(busyDeadline) {
+			t.Fatal("busy transition did not start before notification")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              transport,
+		IdleNotifyTimeout: 3 * time.Second,
+	}
+	err := r.notifyRecipient(&Message{
+		From:    "gastown/crew/sender",
+		To:      "gastown/crew/startup-idle-handoff",
+		Subject: "first notification after startup",
+	})
+	if signalErr := os.WriteFile(releaseBusy, nil, 0600); signalErr != nil {
+		t.Fatalf("release busy pane: %v", signalErr)
+	}
+	if !errors.Is(err, ErrNotificationQueued) {
+		t.Fatalf("notifyRecipient returned %v, want durable queued fallback", err)
+	}
+
+	nudges, err := nudge.Drain(townRoot, sessionName)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("Drain returned %d immediately deliverable nudges, want 1", len(nudges))
+	}
+	pane, err := transport.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(pane, "first notification after startup") {
+		t.Fatal("first notification exhausted the router idle wait instead of attempting direct delivery")
+	}
+}
+
 // TestNotifyRecipient_IdleUnsupportedRuntimeQueues verifies that an idle
 // runtime without a submit verifier retains a durable queued wake.
 func TestNotifyRecipient_IdleUnsupportedRuntimeQueues(t *testing.T) {

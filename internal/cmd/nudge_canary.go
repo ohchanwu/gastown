@@ -223,16 +223,25 @@ func (s *wakeCanarySandbox) linkCodexAuth() error {
 }
 
 func (s *wakeCanarySandbox) Cleanup() error {
-	pollerErr := nudge.StopPoller(s.TownRoot, s.Session)
+	cleanupErr := nudge.StopPoller(s.TownRoot, s.Session)
 	if s.tmux != nil {
-		_ = s.tmux.KillSessionWithProcesses(s.Session)
-		_ = s.tmux.KillServer()
+		cleanupErr = errors.Join(cleanupErr, s.tmux.KillSessionWithProcesses(s.Session))
+		cleanupErr = errors.Join(cleanupErr, s.tmux.KillServer())
 	}
-	var socketErr error
 	if s.Socket != "" {
-		socketErr = removeWakeCanarySocketPath(s.Socket)
+		cleanupErr = errors.Join(cleanupErr, removeWakeCanarySocketPath(s.Socket))
 	}
-	return errors.Join(pollerErr, socketErr, os.RemoveAll(s.TownRoot))
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	return os.RemoveAll(s.TownRoot)
+}
+
+func runWakeCanaryWithCleanup(sandbox *wakeCanarySandbox, run func() error) (err error) {
+	defer func() {
+		err = errors.Join(err, sandbox.Cleanup())
+	}()
+	return run()
 }
 
 func init() {
@@ -262,28 +271,29 @@ var nudgeCanaryCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		defer sandbox.Cleanup()
-		roles, err := configureWakeCanarySandboxRoles(sandbox, evidenceRoot, "")
-		if err != nil {
+		return runWakeCanaryWithCleanup(sandbox, func() error {
+			roles, err := configureWakeCanarySandboxRoles(sandbox, evidenceRoot, "")
+			if err != nil {
+				return err
+			}
+			if err := sandbox.linkCodexAuth(); err != nil {
+				return err
+			}
+			startupInstruction, startupResponse := wakeCanaryStartupChallenge(strings.TrimPrefix(nudge.NewDeliveryID(), "ndg-"))
+			sessionConfig, err := wakeCanarySessionConfig(sandbox, startupInstruction)
+			if err != nil {
+				return err
+			}
+			if _, err := session.StartSession(sandbox.tmux, sessionConfig); err != nil {
+				return fmt.Errorf("starting isolated Codex Mayor: %w", err)
+			}
+			if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
+				return fmt.Errorf("confirming isolated Mayor startup turn: %w", err)
+			}
+			result, statePath, err := runWakeCanary(sandbox.tmux, sandbox.TownRoot, evidenceRoot, sandbox.Session, wakeCanaryTurns, roles)
+			fmt.Printf("Mayor wake canary: %d/%d submitted, %d queued, %d failed\nState: %s\n", result.Submitted, result.Turns, result.Queued, result.Failed, statePath)
 			return err
-		}
-		if err := sandbox.linkCodexAuth(); err != nil {
-			return err
-		}
-		startupInstruction, startupResponse := wakeCanaryStartupChallenge(strings.TrimPrefix(nudge.NewDeliveryID(), "ndg-"))
-		sessionConfig, err := wakeCanarySessionConfig(sandbox, startupInstruction)
-		if err != nil {
-			return err
-		}
-		if _, err := session.StartSession(sandbox.tmux, sessionConfig); err != nil {
-			return fmt.Errorf("starting isolated Codex Mayor: %w", err)
-		}
-		if err := waitForCanaryResponse(sandbox.tmux, sandbox.Session, "", startupResponse, constants.ClaudeStartTimeout); err != nil {
-			return fmt.Errorf("confirming isolated Mayor startup turn: %w", err)
-		}
-		result, statePath, err := runWakeCanary(sandbox.tmux, sandbox.TownRoot, evidenceRoot, sandbox.Session, wakeCanaryTurns, roles)
-		fmt.Printf("Mayor wake canary: %d/%d submitted, %d queued, %d failed\nState: %s\n", result.Submitted, result.Turns, result.Queued, result.Failed, statePath)
-		return err
+		})
 	},
 }
 

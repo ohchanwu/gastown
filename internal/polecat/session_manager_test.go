@@ -34,7 +34,11 @@ func setupTestRegistryForSession(t *testing.T) {
 
 func TestSessionManagerNudgePollerLifecycleUsesTmuxEnvironment(t *testing.T) {
 	townRoot := t.TempDir()
-	tmuxClient := tmux.NewTmuxWithSocketAndEnv("private-town", []string{"PATH=/usr/bin", "GT_TOWN_SOCKET=wrong"})
+	tmuxClient := tmux.NewTmuxWithSocketAndEnv("private-town", []string{
+		"PATH=/usr/bin",
+		"GT_TOWN_SOCKET=wrong-town-socket",
+		"GT_TMUX_SOCKET=wrong-registry-socket",
+	})
 	m := &SessionManager{tmux: tmuxClient}
 	sessionID := "gt-gastown-polecat-test"
 
@@ -62,8 +66,20 @@ func TestSessionManagerNudgePollerLifecycleUsesTmuxEnvironment(t *testing.T) {
 	if started != sessionID || stopped != sessionID {
 		t.Fatalf("poller lifecycle = start %q, stop %q; want %q", started, stopped, sessionID)
 	}
-	if got := strings.Join(childEnv, "|"); got != "PATH=/usr/bin|GT_TOWN_SOCKET=private-town" {
-		t.Fatalf("poller environment = %q, want isolated tmux environment", got)
+	gotEnv := make(map[string]string, len(childEnv))
+	aliasCount := make(map[string]int, 2)
+	for _, entry := range childEnv {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			gotEnv[name] = value
+			if name == "GT_TOWN_SOCKET" || name == "GT_TMUX_SOCKET" {
+				aliasCount[name]++
+			}
+		}
+	}
+	if gotEnv["PATH"] != "/usr/bin" || aliasCount["GT_TOWN_SOCKET"] != 1 || aliasCount["GT_TMUX_SOCKET"] != 1 ||
+		gotEnv["GT_TOWN_SOCKET"] != "private-town" || gotEnv["GT_TMUX_SOCKET"] != "private-town" {
+		t.Fatalf("poller environment = %q, want both isolated tmux socket bindings", strings.Join(childEnv, "|"))
 	}
 }
 

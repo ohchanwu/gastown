@@ -247,14 +247,15 @@ func (t *Tmux) PollerEnvironment() []string {
 	if t.commandEnv != nil {
 		env = t.commandEnv
 	}
-	result := make([]string, 0, len(env)+1)
+	result := make([]string, 0, len(env)+2)
 	for _, entry := range env {
-		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") {
+		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") && !strings.HasPrefix(entry, "GT_TMUX_SOCKET=") {
 			result = append(result, entry)
 		}
 	}
 	if t.socketName != "" {
 		result = append(result, "GT_TOWN_SOCKET="+t.socketName)
+		result = append(result, "GT_TMUX_SOCKET="+t.socketName)
 	}
 	return result
 }
@@ -262,7 +263,11 @@ func (t *Tmux) PollerEnvironment() []string {
 // NudgeLockAvailable proves no other process or goroutine currently owns the
 // target's nudge lock without retaining the lock after the check.
 func NudgeLockAvailable(townRoot, session string) bool {
-	unlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), 0)
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return false
+	}
+	unlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), 0)
 	if err != nil {
 		return false
 	}
@@ -282,7 +287,11 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 	if t.nudgeLease != nil {
 		return nil, fmt.Errorf("nudge lease already held for session %q", t.nudgeLease.session)
 	}
-	unlockFlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), nudgeLockTimeout)
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolving nudge lease town root: %w", err)
+	}
+	unlockFlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), nudgeLockTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +299,7 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 		unlockFlock()
 		return nil, fmt.Errorf("nudge lock timeout for session %q", session)
 	}
-	lease := &nudgeLease{townRoot: townRoot, session: session}
+	lease := &nudgeLease{townRoot: canonicalTownRoot, session: session}
 	t.nudgeLease = lease
 	var once sync.Once
 	return func() {
@@ -307,9 +316,24 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 }
 
 func (t *Tmux) ownsNudgeLease(townRoot, session string) bool {
+	owns, _, err := t.nudgeLeaseOwnership(townRoot, session)
+	return err == nil && owns
+}
+
+func (t *Tmux) nudgeLeaseOwnership(townRoot, session string) (bool, string, error) {
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return false, "", err
+	}
 	t.leaseMu.Lock()
 	defer t.leaseMu.Unlock()
-	return t.nudgeLease != nil && t.nudgeLease.townRoot == townRoot && t.nudgeLease.session == session
+	if t.nudgeLease == nil {
+		return false, canonicalTownRoot, nil
+	}
+	if t.nudgeLease.townRoot != canonicalTownRoot || t.nudgeLease.session != session {
+		return false, "", errors.New("active nudge lease has a different canonical scope")
+	}
+	return true, canonicalTownRoot, nil
 }
 
 // run executes a tmux command and returns stdout.
@@ -417,6 +441,17 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	return t.createNewSession(name, workDir, nil)
 }
 
+// commandInWorkDir makes the child shell, rather than tmux's -c handling, the
+// authoritative working-directory boundary. A long-lived tmux server can keep
+// an unlinked cwd after its launching worktree is removed; tmux then accepts -c
+// but starts new panes in that dead directory.
+func commandInWorkDir(command, workDir string) string {
+	if workDir == "" {
+		return command
+	}
+	return "cd " + config.ShellQuote(workDir) + " && " + command
+}
+
 // NewSessionWithCommand creates a new detached tmux session that immediately runs a command.
 // Unlike NewSession + SendKeys, this avoids race conditions where the shell isn't ready
 // or the command arrives before the shell prompt. The command runs directly as the
@@ -484,7 +519,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.run(respawnArgs...); err != nil {
 			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
@@ -553,7 +588,7 @@ func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, wor
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
-		respawnArgs = append(respawnArgs, command)
+		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.runContext(ctx, respawnArgs...); err != nil {
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
 		}
@@ -1501,6 +1536,28 @@ func nudgeFlockPath(townRoot, session string) string {
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
+func canonicalNudgeTownRoot(townRoot string) (string, error) {
+	if townRoot == "" {
+		return "", errors.New("town root is required")
+	}
+	absolute, err := filepath.Abs(townRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving absolute town root: %w", err)
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolving physical town root: %w", err)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("checking physical town root: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("town root is not a directory")
+	}
+	return canonical, nil
+}
+
 const clientAttachmentLatch = "@gt-canary-client-attached"
 
 func (t *Tmux) sessionAttached(target string) (bool, error) {
@@ -1965,9 +2022,17 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// channel semaphore below provides no cross-process protection. Without
 	// this, concurrent nudges interleave send-keys/Enter and produce garbled
 	// or empty input. (GH#gt-ukl8)
-	ownsLease := t.ownsNudgeLease(opts.TownRoot, session)
+	ownsLease := false
+	canonicalTownRoot := ""
+	if opts.TownRoot != "" {
+		var leaseErr error
+		ownsLease, canonicalTownRoot, leaseErr = t.nudgeLeaseOwnership(opts.TownRoot, session)
+		if leaseErr != nil {
+			return fmt.Errorf("resolving nudge lease ownership: %w", leaseErr)
+		}
+	}
 	if opts.TownRoot != "" && !ownsLease {
-		lockPath := nudgeFlockPath(opts.TownRoot, session)
+		lockPath := nudgeFlockPath(canonicalTownRoot, session)
 		unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
 		if err != nil {
 			return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)
@@ -3858,12 +3923,12 @@ const DefaultReadyPromptPrefix = "❯ "
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 	promptPrefix := readyPromptPrefixForSession(t, session)
 
-	// Require 2 consecutive idle polls to filter out transient states.
+	// Require 6 consecutive idle polls to filter out transient states.
 	// During inter-tool-call gaps (~500ms), the prompt may briefly appear
 	// in the pane buffer while Claude Code is still actively working.
-	// Two polls 200ms apart (400ms window) confirms genuine idle state.
+	// Six polls 200ms apart span a full second and confirm genuine idle state.
 	consecutiveIdle := 0
-	const requiredConsecutive = 2
+	const requiredConsecutive = 6
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -13,7 +15,6 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
-	"github.com/steveyegge/gastown/internal/nudge"
 )
 
 // writeFakeTmuxWithSession creates a fake tmux binary that reports the Deacon
@@ -73,6 +74,7 @@ exit 0
 func assertNoNudgePollerLeak(t *testing.T, townRoot, sessionName string) {
 	t.Helper()
 	pidPath := filepath.Join(townRoot, ".runtime", "nudge_poller", sessionName+".pid")
+	stopPath := filepath.Join(townRoot, ".runtime", "nudge_poller", sessionName+".pid.stop")
 	t.Cleanup(func() {
 		data, err := os.ReadFile(pidPath)
 		if os.IsNotExist(err) {
@@ -82,7 +84,7 @@ func assertNoNudgePollerLeak(t *testing.T, townRoot, sessionName string) {
 			t.Errorf("read nudge poller pid: %v", err)
 			return
 		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		pid, err := testNudgePollerPID(data)
 		if err != nil {
 			t.Errorf("parse nudge poller pid: %v", err)
 			return
@@ -95,47 +97,64 @@ func assertNoNudgePollerLeak(t *testing.T, townRoot, sessionName string) {
 			t.Errorf("refusing to stop pid %d: process identity does not match test nudge poller", pid)
 			return
 		}
-		if err := nudge.StopPoller(townRoot, sessionName); err != nil {
-			t.Errorf("stop nudge poller %d: %v", pid, err)
-			return
-		}
-
-		process, findErr := os.FindProcess(pid)
-		if findErr != nil {
+		// The test binary is intentionally named daemon.test rather than gt, so
+		// production StopPoller must reject it. Publish the same byte-exact,
+		// generation-bound cooperative request directly for test-owned cleanup.
+		if err := os.WriteFile(stopPath, data, 0o600); err != nil {
+			t.Errorf("publish test nudge poller stop request %d: %v", pid, err)
 			return
 		}
 		deadline := time.Now().Add(2 * time.Second)
-		for {
+		for time.Now().Before(deadline) {
 			running, matches = testNudgePollerIdentity(pid, sessionName)
 			if !running || !matches {
-				return
-			}
-			if time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		running, matches = testNudgePollerIdentity(pid, sessionName)
-		if !running || !matches {
+		if running && matches {
+			t.Errorf("nudge poller %d still running after cooperative cleanup", pid)
 			return
 		}
-		if err := process.Kill(); err != nil {
-			t.Errorf("kill nudge poller %d: %v", pid, err)
-			return
-		}
-		deadline = time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			running, matches = testNudgePollerIdentity(pid, sessionName)
-			if !running || !matches {
+		latest, err := os.ReadFile(pidPath)
+		if err == nil {
+			if !bytes.Equal(latest, data) {
+				t.Errorf("nudge poller ownership changed during cleanup; preserving replacement")
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove stopped nudge poller ownership: %v", err)
+			}
+		} else if !os.IsNotExist(err) {
+			t.Errorf("reread stopped nudge poller ownership: %v", err)
 		}
-		running, matches = testNudgePollerIdentity(pid, sessionName)
-		if running && matches {
-			t.Errorf("nudge poller %d still running after forced cleanup", pid)
+		stopData, err := os.ReadFile(stopPath)
+		if err == nil && bytes.Equal(stopData, data) {
+			if err := os.Remove(stopPath); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove test nudge poller stop request: %v", err)
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			t.Errorf("reread test nudge poller stop request: %v", err)
 		}
 	})
+}
+
+func testNudgePollerPID(data []byte) (int, error) {
+	trimmed := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(trimmed, "{") {
+		return strconv.Atoi(trimmed)
+	}
+	var record struct {
+		PID int
+	}
+	if err := json.Unmarshal(data, &record); err != nil {
+		return 0, err
+	}
+	if record.PID <= 0 {
+		return 0, fmt.Errorf("invalid structured poller PID %d", record.PID)
+	}
+	return record.PID, nil
 }
 
 func testNudgePollerIdentity(pid int, sessionName string) (running, matches bool) {
@@ -225,6 +244,8 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			townRoot := t.TempDir()
+			t.Setenv("GT_TOWN_ROOT", townRoot)
+			t.Setenv("GT_ROOT", townRoot)
 			assertNoNudgePollerLeak(t, townRoot, "hq-deacon")
 			fakeBinDir := t.TempDir()
 			tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
