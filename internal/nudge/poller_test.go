@@ -100,6 +100,88 @@ func TestStartPollerPIDWriteFailureTerminatesLaunchedProcess(t *testing.T) {
 	}
 }
 
+func TestStopPollerSignalFailurePreservesPIDCustody(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidPath, []byte("123"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	signalErr := errors.New("injected SIGTERM failure")
+	removed := false
+
+	err := stopPollerWithOps(townRoot, session,
+		os.ReadFile,
+		func(int) bool { return true },
+		func(int) error { return signalErr },
+		func(string) error { removed = true; return nil },
+	)
+	if !errors.Is(err, signalErr) {
+		t.Fatalf("error = %v, want SIGTERM failure", err)
+	}
+	if removed {
+		t.Fatal("StopPoller removed PID custody after SIGTERM failure")
+	}
+	if _, err := os.Stat(pidPath); err != nil {
+		t.Fatalf("PID file stat = %v, want custody preserved", err)
+	}
+}
+
+func TestStopPollerSerializesStartCustodyTransition(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	signalStarted := make(chan struct{})
+	releaseSignal := make(chan struct{})
+	launchStarted := make(chan struct{})
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- stopPollerWithOps(townRoot, session,
+			func(string) ([]byte, error) { return []byte("123"), nil },
+			func(int) bool { return true },
+			func(int) error {
+				close(signalStarted)
+				<-releaseSignal
+				return nil
+			},
+			os.Remove,
+		)
+	}()
+	<-signalStarted
+
+	launcher := func(string, string, []string) (pollerLaunch, error) {
+		close(launchStarted)
+		return pollerLaunch{pid: os.Getpid()}, nil
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := startPollerWithLauncher(townRoot, session, nil, launcher, os.WriteFile)
+		startDone <- err
+	}()
+
+	select {
+	case <-launchStarted:
+		t.Fatal("StartPoller entered launch while StopPoller held custody lock")
+	case <-time.After(3 * time.Second):
+	}
+	close(releaseSignal)
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pollerPidFile(townRoot, session)); err != nil {
+		t.Fatalf("final PID custody missing after serialized transition: %v", err)
+	}
+}
+
 func TestPollerPidFile(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-crew-bear"

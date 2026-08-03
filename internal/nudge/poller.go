@@ -84,9 +84,9 @@ func startPollerWithLauncher(
 		return 0, fmt.Errorf("creating poller pid dir: %w", err)
 	}
 
-	startLock := flock.New(pollerPidFile(townRoot, session) + ".lock")
-	if err := startLock.Lock(); err != nil {
-		return 0, fmt.Errorf("acquiring nudge-poller start lock: %w", err)
+	startLock, err := lockPoller(townRoot, session)
+	if err != nil {
+		return 0, err
 	}
 	defer func() { _ = startLock.Unlock() }()
 
@@ -117,6 +117,18 @@ func startPollerWithLauncher(
 	}
 
 	return launched.pid, nil
+}
+
+func lockPoller(townRoot, session string) (*flock.Flock, error) {
+	lockPath := pollerPidFile(townRoot, session) + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating nudge-poller lock dir: %w", err)
+	}
+	startLock := flock.New(lockPath)
+	if err := startLock.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring nudge-poller start lock: %w", err)
+	}
+	return startLock, nil
 }
 
 func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) {
@@ -164,9 +176,25 @@ func buildPollerCommand(gtBin, townRoot, session string, env []string) *exec.Cmd
 
 // StopPoller terminates the nudge-poller for a session, if running.
 func StopPoller(townRoot, session string) error {
+	return stopPollerWithOps(townRoot, session, os.ReadFile, pollerProcessAlive, signalPoller, os.Remove)
+}
+
+func stopPollerWithOps(
+	townRoot, session string,
+	readPID func(string) ([]byte, error),
+	processAlive func(int) bool,
+	signal func(int) error,
+	remove func(string) error,
+) error {
+	stopLock, err := lockPoller(townRoot, session)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stopLock.Unlock() }()
+
 	pidPath := pollerPidFile(townRoot, session)
 
-	data, err := os.ReadFile(pidPath)
+	data, err := readPID(pidPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // no poller to stop
@@ -180,26 +208,27 @@ func StopPoller(townRoot, session string) error {
 		return nil // corrupt PID file, clean up
 	}
 
-	if !pollerProcessAlive(pid) {
+	if !processAlive(pid) {
 		// Process already dead.
-		_ = os.Remove(pidPath)
+		_ = remove(pidPath)
 		return nil
 	}
 
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		_ = os.Remove(pidPath)
-		return nil
-	}
-
-	// Send SIGTERM for graceful shutdown.
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		_ = os.Remove(pidPath)
+	// Send SIGTERM for graceful shutdown. Preserve custody if signaling fails.
+	if err := signal(pid); err != nil {
 		return fmt.Errorf("sending SIGTERM to poller (pid %d): %w", pid, err)
 	}
 
-	_ = os.Remove(pidPath)
+	_ = remove(pidPath)
 	return nil
+}
+
+func signalPoller(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGTERM)
 }
 
 // pollerAlive checks if a poller is running for the given session.
