@@ -83,6 +83,15 @@ func TestSessionManagerNudgePollerLifecycleUsesTmuxEnvironment(t *testing.T) {
 	}
 }
 
+func TestStopNudgePollerFailurePropagatesWithoutReplacement(t *testing.T) {
+	townRoot, sessionID := t.TempDir(), "gt-gastown-polecat-existing"
+	stopErr := errors.New("poller still owns previous generation")
+	m := &SessionManager{stopPoller: func(string, string) error { return stopErr }}
+	if err := m.stopNudgePoller(townRoot, sessionID); !errors.Is(err, stopErr) {
+		t.Fatalf("stop error = %v, want %v", err, stopErr)
+	}
+}
+
 // testSessionCounter provides unique session names across -count=N runs
 // to prevent "duplicate session" races with tmux's async cleanup.
 var testSessionCounter atomic.Int64
