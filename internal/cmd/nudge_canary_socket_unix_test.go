@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -14,6 +15,36 @@ import (
 
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestRunWakeCanaryWithCleanupReturnsJoinedCleanupFailure(t *testing.T) {
+	runErr := errors.New("canary run failed")
+	for _, tt := range []struct {
+		name   string
+		runErr error
+	}{
+		{name: "successful body"},
+		{name: "failed body", runErr: runErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxRoot := t.TempDir()
+			sandbox := &wakeCanarySandbox{
+				TownRoot: sandboxRoot,
+				Socket:   filepath.Join("..", "ambiguous-canary-socket"),
+			}
+
+			err := runWakeCanaryWithCleanup(sandbox, func() error { return tt.runErr })
+			if err == nil || !strings.Contains(err.Error(), "ambiguous wake canary socket ownership") {
+				t.Fatalf("canary cleanup error = %v, want cleanup failure", err)
+			}
+			if tt.runErr != nil && !errors.Is(err, tt.runErr) {
+				t.Fatalf("joined canary error = %v, want run failure", err)
+			}
+			if _, err := os.Stat(sandboxRoot); err != nil {
+				t.Fatalf("sandbox evidence root not preserved after cleanup failure: %v", err)
+			}
+		})
+	}
+}
 
 func TestWakeCanaryCleanupRemovesOnlyOwnedSocket(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -79,12 +110,33 @@ func TestWakeCanaryCleanupRefusesAmbiguousSocketOwnership(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(target) })
 
-	sandbox := &wakeCanarySandbox{TownRoot: t.TempDir(), Socket: filepath.Join("..", name)}
+	sandboxRoot := t.TempDir()
+	sandbox := &wakeCanarySandbox{TownRoot: sandboxRoot, Socket: filepath.Join("..", name)}
 	if err := sandbox.Cleanup(); err == nil {
 		t.Fatal("Cleanup with ambiguous socket ownership = nil, want error")
 	}
+	if _, err := os.Stat(sandboxRoot); err != nil {
+		t.Fatalf("sandbox evidence root not preserved after cleanup failure: %v", err)
+	}
 	if data, err := os.ReadFile(target); err != nil || string(data) != "unrelated" {
 		t.Fatalf("ambiguous target changed: preserved=%t err=%v", string(data) == "unrelated", err)
+	}
+}
+
+func TestWakeCanaryCleanupPreservesRootWhenTmuxTeardownFails(t *testing.T) {
+	sandboxRoot := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	sandbox := &wakeCanarySandbox{
+		TownRoot: sandboxRoot,
+		Session:  "gt-canary-missing-tmux",
+		tmux:     tmux.NewTmuxWithSocket("gt-wake-canary-missing-tmux"),
+	}
+
+	if err := sandbox.Cleanup(); err == nil {
+		t.Fatal("Cleanup with unavailable tmux = nil, want teardown error")
+	}
+	if _, err := os.Stat(sandboxRoot); err != nil {
+		t.Fatalf("sandbox evidence root not preserved after tmux teardown failure: %v", err)
 	}
 }
 
