@@ -108,6 +108,17 @@ func TestStartPollerDifferentTransportFailsClosedWithoutLaunch(t *testing.T) {
 	}
 }
 
+func TestStartPollerLiveLegacyFailsClosedForTransportCustody(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	_ = os.MkdirAll(pollerPidDir(root), 0755)
+	_ = os.WriteFile(pollerPidFile(root, session), []byte("7"), 0644)
+	launched := false
+	_, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=a"}, func(string, string, []string) (pollerLaunch, error) { launched = true; return pollerLaunch{}, nil }, os.WriteFile, func(string, string) (int, bool, error) { return 7, true, nil })
+	if err == nil || launched {
+		t.Fatalf("legacy transport err=%v launched=%v", err, launched)
+	}
+}
+
 func TestStartPollerSameTransportReusesLivePID(t *testing.T) {
 	root, session := t.TempDir(), "s"
 	identity := testPollerIdentity(session)

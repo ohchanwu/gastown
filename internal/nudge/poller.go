@@ -134,7 +134,7 @@ func startPollerWithLauncherStatus(
 	defer func() { _ = startLock.Unlock() }()
 	effectiveTransport := normalizePollerTransport(effectivePollerEnv(env))
 	if data, readErr := os.ReadFile(pollerPidFile(townRoot, session)); readErr == nil {
-		if record, parseErr := parsePollerRecord(string(data)); parseErr == nil && !record.Legacy {
+		if record, parseErr := parsePollerRecord(string(data)); parseErr == nil {
 			if record.Identity.Transport == "" || record.Identity.Transport != effectiveTransport {
 				return 0, errors.New("poller transport mismatch; preserving ownership")
 			}
