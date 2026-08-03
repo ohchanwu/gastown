@@ -213,7 +213,9 @@ mistake partial delivery for success.
 Nudge leases canonicalize the town root before constructing their lock path or
 comparing ownership. A caller that acquires a lease through a symlinked path
 therefore reuses that lease when receipt verification resolves the same town to
-its physical path; it cannot wait on its own cross-process lock.
+its physical path; it cannot wait on its own cross-process lock. Missing roots,
+failed canonicalization, and a symlink retargeted while a lease is active fail
+closed instead of falling back to a path identity that can change later.
 
 Durable mail storage and runtime wake delivery are separate guarantees. A mail
 write can succeed while its notification remains queued. The router therefore

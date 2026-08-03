@@ -263,7 +263,11 @@ func (t *Tmux) PollerEnvironment() []string {
 // NudgeLockAvailable proves no other process or goroutine currently owns the
 // target's nudge lock without retaining the lock after the check.
 func NudgeLockAvailable(townRoot, session string) bool {
-	unlock, err := acquireFlockLock(nudgeFlockPath(townRoot, session), 0)
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return false
+	}
+	unlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), 0)
 	if err != nil {
 		return false
 	}
@@ -283,7 +287,10 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 	if t.nudgeLease != nil {
 		return nil, fmt.Errorf("nudge lease already held for session %q", t.nudgeLease.session)
 	}
-	canonicalTownRoot := canonicalNudgeTownRoot(townRoot)
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolving nudge lease town root: %w", err)
+	}
 	unlockFlock, err := acquireFlockLock(nudgeFlockPath(canonicalTownRoot, session), nudgeLockTimeout)
 	if err != nil {
 		return nil, err
@@ -309,9 +316,24 @@ func (t *Tmux) AcquireNudgeLease(townRoot, session string) (func(), error) {
 }
 
 func (t *Tmux) ownsNudgeLease(townRoot, session string) bool {
+	owns, _, err := t.nudgeLeaseOwnership(townRoot, session)
+	return err == nil && owns
+}
+
+func (t *Tmux) nudgeLeaseOwnership(townRoot, session string) (bool, string, error) {
+	canonicalTownRoot, err := canonicalNudgeTownRoot(townRoot)
+	if err != nil {
+		return false, "", err
+	}
 	t.leaseMu.Lock()
 	defer t.leaseMu.Unlock()
-	return t.nudgeLease != nil && t.nudgeLease.townRoot == canonicalNudgeTownRoot(townRoot) && t.nudgeLease.session == session
+	if t.nudgeLease == nil {
+		return false, canonicalTownRoot, nil
+	}
+	if t.nudgeLease.townRoot != canonicalTownRoot || t.nudgeLease.session != session {
+		return false, "", errors.New("active nudge lease has a different canonical scope")
+	}
+	return true, canonicalTownRoot, nil
 }
 
 // run executes a tmux command and returns stdout.
@@ -1511,22 +1533,29 @@ func releaseNudgeLock(session string) {
 // Lock files live alongside the nudge queue directory for self-documentation and cleanup.
 func nudgeFlockPath(townRoot, session string) string {
 	safe := strings.ReplaceAll(session, "/", "_")
-	return filepath.Join(canonicalNudgeTownRoot(townRoot), constants.DirRuntime, "nudge_queue", safe, ".lock")
+	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
-func canonicalNudgeTownRoot(townRoot string) string {
+func canonicalNudgeTownRoot(townRoot string) (string, error) {
 	if townRoot == "" {
-		return ""
+		return "", errors.New("town root is required")
 	}
 	absolute, err := filepath.Abs(townRoot)
 	if err != nil {
-		return townRoot
+		return "", fmt.Errorf("resolving absolute town root: %w", err)
 	}
 	canonical, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
-		return absolute
+		return "", fmt.Errorf("resolving physical town root: %w", err)
 	}
-	return canonical
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("checking physical town root: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("town root is not a directory")
+	}
+	return canonical, nil
 }
 
 const clientAttachmentLatch = "@gt-canary-client-attached"
@@ -1993,9 +2022,17 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// channel semaphore below provides no cross-process protection. Without
 	// this, concurrent nudges interleave send-keys/Enter and produce garbled
 	// or empty input. (GH#gt-ukl8)
-	ownsLease := t.ownsNudgeLease(opts.TownRoot, session)
+	ownsLease := false
+	canonicalTownRoot := ""
+	if opts.TownRoot != "" {
+		var leaseErr error
+		ownsLease, canonicalTownRoot, leaseErr = t.nudgeLeaseOwnership(opts.TownRoot, session)
+		if leaseErr != nil {
+			return fmt.Errorf("resolving nudge lease ownership: %w", leaseErr)
+		}
+	}
 	if opts.TownRoot != "" && !ownsLease {
-		lockPath := nudgeFlockPath(opts.TownRoot, session)
+		lockPath := nudgeFlockPath(canonicalTownRoot, session)
 		unlock, err := acquireFlockLock(lockPath, nudgeLockTimeout)
 		if err != nil {
 			return fmt.Errorf("cross-process nudge lock for session %q: %w", session, err)

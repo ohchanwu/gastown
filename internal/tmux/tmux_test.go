@@ -1733,6 +1733,60 @@ func TestNudgeLeaseRecognizesCanonicalTownRoot(t *testing.T) {
 	}
 }
 
+func TestNudgeLeaseRejectsMissingTownRootBelowSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior requires Unix")
+	}
+	realParent := t.TempDir()
+	linkedParent := filepath.Join(t.TempDir(), "town-parent-link")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	missingRoot := filepath.Join(linkedParent, "missing-town")
+
+	tm := NewTmuxWithSocket("isolated")
+	release, err := tm.AcquireNudgeLease(missingRoot, "hq-mayor")
+	if release != nil {
+		release()
+	}
+	if err == nil {
+		t.Fatal("AcquireNudgeLease accepted a missing town root")
+	}
+	if _, statErr := os.Stat(filepath.Join(realParent, "missing-town")); !os.IsNotExist(statErr) {
+		t.Fatalf("missing town root was created: %v", statErr)
+	}
+}
+
+func TestNudgeLeaseRejectsRetargetedTownSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior requires Unix")
+	}
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	linkedRoot := filepath.Join(t.TempDir(), "town-link")
+	if err := os.Symlink(firstRoot, linkedRoot); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	tm := NewTmuxWithSocket("isolated")
+	release, err := tm.AcquireNudgeLease(linkedRoot, "hq-mayor")
+	if err != nil {
+		t.Fatalf("AcquireNudgeLease: %v", err)
+	}
+	defer release()
+	if err := os.Remove(linkedRoot); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+	if err := os.Symlink(secondRoot, linkedRoot); err != nil {
+		t.Fatalf("Retarget symlink: %v", err)
+	}
+
+	owned, _, err := tm.nudgeLeaseOwnership(linkedRoot, "hq-mayor")
+	if err == nil || owned {
+		t.Fatalf("retargeted town root ownership = %v, %v; want fail-closed mismatch", owned, err)
+	}
+}
+
 func TestClientAttachmentLatchRecordsTransientAttachment(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-client-latch"
