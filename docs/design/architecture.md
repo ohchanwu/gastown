@@ -235,6 +235,13 @@ signal, so process exit and PID reuse cannot redirect termination to an
 unrelated process. Live legacy PID-only records fail closed and require an
 explicit, identity-checked migration.
 
+An external poller inherits the target transport under both
+`GT_TOWN_SOCKET` and `GT_TMUX_SOCKET`. The first supports direct tmux-client
+fallbacks, while the second survives the standard CLI registry initialization
+that runs before the poller command. Keeping them identical prevents an
+isolated poller from silently deriving a different town socket and exiting
+without draining its queue.
+
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
 deadline. Lookup uncertainty is isolated per convoy and fails closed: a convoy

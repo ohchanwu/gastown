@@ -13,8 +13,50 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestPollerEnvironmentSurvivesCLIRegistryInitialization(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	socket := fmt.Sprintf("gt-test-poller-registry-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocketAndEnv(socket, []string{"PATH=" + os.Getenv("PATH")})
+	sessionName := "hq-mayor"
+	if err := transport.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
+		t.Fatalf("create isolated poller target: %v", err)
+	}
+	socketPath, err := exec.Command("tmux", "-L", socket, "display-message", "-p", "#{socket_path}").Output()
+	if err != nil {
+		t.Fatalf("resolve isolated poller socket: %v", err)
+	}
+	oldSocket := tmux.GetDefaultSocket()
+	t.Cleanup(func() {
+		tmux.SetDefaultSocket(oldSocket)
+		_ = transport.KillServer()
+		if path := strings.TrimSpace(string(socketPath)); filepath.IsAbs(path) {
+			_ = os.Remove(path)
+		}
+	})
+
+	t.Setenv("GT_TOWN_SOCKET", "")
+	t.Setenv("GT_TMUX_SOCKET", "")
+	for _, entry := range transport.PollerEnvironment() {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && (name == "GT_TOWN_SOCKET" || name == "GT_TMUX_SOCKET") {
+			t.Setenv(name, value)
+		}
+	}
+	if err := session.InitRegistry(t.TempDir()); err != nil {
+		t.Fatalf("initialize CLI registry from poller environment: %v", err)
+	}
+
+	exists, err := tmux.NewTmux().HasSession(sessionName)
+	if err != nil || !exists {
+		t.Fatalf("poller target after CLI registry initialization: exists=%t err=%v", exists, err)
+	}
+}
 
 func TestPollerCustomPromptBusyDoesNotClaimQueue(t *testing.T) {
 	socket := fmt.Sprintf("gt-test-poller-prompt-%d", time.Now().UnixNano())

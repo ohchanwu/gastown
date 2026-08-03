@@ -247,14 +247,15 @@ func (t *Tmux) PollerEnvironment() []string {
 	if t.commandEnv != nil {
 		env = t.commandEnv
 	}
-	result := make([]string, 0, len(env)+1)
+	result := make([]string, 0, len(env)+2)
 	for _, entry := range env {
-		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") {
+		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") && !strings.HasPrefix(entry, "GT_TMUX_SOCKET=") {
 			result = append(result, entry)
 		}
 	}
 	if t.socketName != "" {
 		result = append(result, "GT_TOWN_SOCKET="+t.socketName)
+		result = append(result, "GT_TMUX_SOCKET="+t.socketName)
 	}
 	return result
 }
