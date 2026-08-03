@@ -492,9 +492,6 @@ func pollerStatusWithOps(
 	if err != nil {
 		return 0, false, fmt.Errorf("parsing poller ownership: %w", err)
 	}
-	if record.Identity.Transport != "" && record.Identity.Transport != normalizePollerTransport(os.Environ()) {
-		return 0, false, errors.New("poller transport mismatch; preserving ownership")
-	}
 
 	if !alive(record.PID) {
 		_ = remove(pidPath)

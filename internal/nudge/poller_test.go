@@ -108,6 +108,32 @@ func TestStartPollerDifferentTransportFailsClosedWithoutLaunch(t *testing.T) {
 	}
 }
 
+func TestStartPollerSameTransportReusesLivePID(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	identity := testPollerIdentity(session)
+	identity.Transport = "a\x00a"
+	_ = os.MkdirAll(pollerPidDir(root), 0755)
+	_ = os.WriteFile(pollerPidFile(root, session), []byte(formatPollerRecord(7, identity, session)), 0644)
+	launched := false
+	pid, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=a"}, func(string, string, []string) (pollerLaunch, error) { launched = true; return pollerLaunch{}, nil }, os.WriteFile, func(string, string) (int, bool, error) { return 7, true, nil })
+	if err != nil || pid != 7 || launched {
+		t.Fatalf("reuse err=%v pid=%d launched=%v", err, pid, launched)
+	}
+}
+
+func TestStartPollerMissingTransportFailsClosed(t *testing.T) {
+	root, session := t.TempDir(), "s"
+	identity := testPollerIdentity(session)
+	identity.Transport = ""
+	_ = os.MkdirAll(pollerPidDir(root), 0755)
+	_ = os.WriteFile(pollerPidFile(root, session), []byte(`{"PID":7,"Identity":{"StartTime":"test-start","Command":"gt nudge-poller s","Generation":"g"},"Session":"s"}`), 0644)
+	launched := false
+	_, err := startPollerWithLauncherStatus(root, session, []string{"GT_TOWN_SOCKET=a"}, func(string, string, []string) (pollerLaunch, error) { launched = true; return pollerLaunch{}, nil }, os.WriteFile, func(string, string) (int, bool, error) { return 7, true, nil })
+	if err == nil || launched {
+		t.Fatalf("missing transport err=%v launched=%v", err, launched)
+	}
+}
+
 func TestStartPollerNilEnvUsesInheritedTransport(t *testing.T) {
 	if normalizePollerTransport(effectivePollerEnv(nil)) != normalizePollerTransport(os.Environ()) {
 		t.Fatal("nil env did not inherit")
