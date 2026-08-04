@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -31,6 +32,27 @@ func envWithPath(path string) []string {
 		}
 	}
 	return env
+}
+
+func processStartMatches(pid int, want string) bool {
+	got, err := session.ProcessStartTime(pid)
+	return err == nil && got == want
+}
+
+func TestProcessStartMatches(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process start identity not supported on Windows")
+	}
+	start, err := session.ProcessStartTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processStartMatches(os.Getpid(), start) {
+		t.Fatal("matching process identity rejected")
+	}
+	if processStartMatches(os.Getpid(), start+" changed") || processStartMatches(-1, start) {
+		t.Fatal("mismatched or unavailable process identity accepted")
+	}
 }
 
 func TestTestMainWithoutTmuxDoesNotFail(t *testing.T) {
@@ -107,8 +129,12 @@ func TestTestMainCleansTmuxResources(t *testing.T) {
 		if serverPID <= 0 {
 			t.Fatal("read child tmux server PID")
 		}
+		serverStart, err := session.ProcessStartTime(serverPID)
+		if err != nil || serverStart == "" {
+			t.Fatalf("read child tmux server identity: %v", err)
+		}
 		evidence := os.Getenv(testMainCleanupEvidenceEnv)
-		data := fmt.Sprintf("%s\n%d\n", os.Getenv("TMUX_TMPDIR"), serverPID)
+		data := fmt.Sprintf("%s\n%d\n%s\n", os.Getenv("TMUX_TMPDIR"), serverPID, serverStart)
 		if err := os.WriteFile(evidence, []byte(data), 0o600); err != nil {
 			t.Fatalf("write child cleanup evidence: %v", err)
 		}
@@ -129,22 +155,27 @@ func TestTestMainCleansTmuxResources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read child cleanup evidence: %v", err)
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) != 2 {
-		t.Fatalf("child cleanup evidence fields = %d, want 2", len(fields))
+	fields := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(fields) != 3 {
+		t.Fatalf("child cleanup evidence fields = %d, want 3", len(fields))
 	}
 	childSocketDir := fields[0]
 	childServerPID, err := strconv.Atoi(fields[1])
 	if err != nil {
 		t.Fatalf("parse child tmux server PID: %v", err)
 	}
+	childServerStart := fields[2]
 	childProcess, err := os.FindProcess(childServerPID)
 	if err != nil {
 		t.Fatalf("find child tmux server PID %d: %v", childServerPID, err)
 	}
 	serverLeaked := childProcess.Signal(syscall.Signal(0)) == nil
 	if serverLeaked {
-		_ = childProcess.Kill()
+		if !processStartMatches(childServerPID, childServerStart) {
+			t.Errorf("refusing to signal tmux server PID %d without matching process identity", childServerPID)
+		} else if killErr := childProcess.Kill(); killErr != nil {
+			t.Errorf("kill leaked child tmux server PID %d: %v", childServerPID, killErr)
+		}
 	}
 
 	_, statErr := os.Stat(childSocketDir)
