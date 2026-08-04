@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -92,6 +93,41 @@ func TestNormalizePollerTransportAliases(t *testing.T) {
 	}
 	if normalizePollerTransport([]string{"GT_TMUX_SOCKET=a"}) != "a\x00a" {
 		t.Fatal("single tmux alias mismatch")
+	}
+}
+
+func TestStartPollerUsesDefaultTmuxTransport(t *testing.T) {
+	originalSocket := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket("test-poller-socket")
+	t.Cleanup(func() { tmux.SetDefaultSocket(originalSocket) })
+	t.Setenv("GT_TOWN_SOCKET", "")
+	t.Setenv("GT_TMUX_SOCKET", "")
+
+	root, session := t.TempDir(), "s"
+	var launchedEnv []string
+	pid, err := startPollerWithLauncherStatus(root, session, nil, func(_ string, _ string, env []string) (pollerLaunch, error) {
+		launchedEnv = append([]string(nil), env...)
+		return pollerLaunch{pid: 7, identity: testPollerIdentity(session)}, nil
+	}, os.WriteFile, func(string, string) (int, bool, error) {
+		return 0, false, nil
+	})
+	if err != nil || pid != 7 {
+		t.Fatalf("StartPoller = pid %d, err %v", pid, err)
+	}
+	want := "test-poller-socket\x00test-poller-socket"
+	if got := normalizePollerTransport(launchedEnv); got != want {
+		t.Fatalf("launched transport = %q, want %q", got, want)
+	}
+	data, err := os.ReadFile(pollerPidFile(root, session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parsePollerRecord(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Identity.Transport != want {
+		t.Fatalf("record transport = %q, want %q", record.Identity.Transport, want)
 	}
 }
 

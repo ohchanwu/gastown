@@ -31,6 +31,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -132,7 +133,8 @@ func startPollerWithLauncherStatus(
 		return 0, err
 	}
 	defer func() { _ = startLock.Unlock() }()
-	effectiveTransport := normalizePollerTransport(effectivePollerEnv(env))
+	env = effectivePollerEnv(env)
+	effectiveTransport := normalizePollerTransport(env)
 
 	// Reconcile liveness before enforcing transport custody. A positively dead
 	// pre-transport or mismatched record is safe for status to remove; only a
@@ -186,7 +188,7 @@ func startPollerWithLauncherStatus(
 
 func effectivePollerEnv(env []string) []string {
 	if env == nil {
-		return os.Environ()
+		return tmux.NewTmux().PollerEnvironment()
 	}
 	return env
 }
