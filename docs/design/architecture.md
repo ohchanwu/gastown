@@ -210,6 +210,11 @@ only a matching submitted receipt permits acknowledgement and deletion.
 Notification results preserve queued and failed identities so callers cannot
 mistake partial delivery for success.
 
+If pane or composer verification becomes ambiguous after text was typed, the
+receipt verifier still performs its bounded lookup. A matching post-baseline
+runtime receipt proves acceptance; without one, the original delivery error is
+preserved. This prevents retrying a turn that the runtime already accepted.
+
 Nudge leases canonicalize the town root before constructing their lock path or
 comparing ownership. A caller that acquires a lease through a symlinked path
 therefore reuses that lease when receipt verification resolves the same town to
