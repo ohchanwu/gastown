@@ -2480,6 +2480,48 @@ func TestNudgeSessionReceipt_MatchingRuntimeReceipt(t *testing.T) {
 	}
 }
 
+func TestNudgeSessionReceipt_AcceptsMatchingReceiptAfterAmbiguousComposerError(t *testing.T) {
+	tm := newTestTmux(t)
+	townRoot := t.TempDir()
+	captured := townRoot + "/submitted.txt"
+	sessionName := "gt-test-nudge-ambiguous-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	command := fmt.Sprintf(`sh -c 'printf "› "; IFS= read -r line || exit; printf "%%s\n" "$line" >> %s; printf "\033[2K\r› stuck"; sleep 30'`, captured)
+	if _, err := tm.run("respawn-pane", "-k", "-t", sessionName+":0.0", command); err != nil {
+		t.Fatalf("respawn runtime fixture: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_AGENT", string(config.AgentCodex)); err != nil {
+		t.Fatalf("SetEnvironment GT_AGENT: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	const deliveryID = "ndg-ambiguous-submitted"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, _ := os.ReadFile(captured)
+			if strings.Contains(string(data), delivery.ControlMessage(deliveryID, "receipt wins")) {
+				_, _ = delivery.RecordPromptSubmitted(townRoot, sessionName, "codex", string(data), time.Now())
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	receipt, err := tm.NudgeSessionWithReceipt(sessionName, "receipt wins", NudgeOpts{TownRoot: townRoot, DeliveryID: deliveryID})
+	<-done
+	if err != nil {
+		t.Fatalf("matching runtime receipt lost to ambiguous composer error: %v", err)
+	}
+	if !receipt.Typed || !receipt.Submitted || receipt.Session != sessionName || receipt.DeliveryID != deliveryID {
+		t.Fatalf("receipt = %#v, want matching submitted receipt", receipt)
+	}
+}
+
 func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-nudge-paneid-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)

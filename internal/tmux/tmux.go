@@ -2310,8 +2310,9 @@ func (t *Tmux) NudgeSessionWithReceipt(session, message string, opts NudgeOpts) 
 	baseline := time.Now()
 	opts.receipt = &receipt
 	opts.TownRoot = canonicalTownRoot
-	if err := t.NudgeSessionWithOpts(session, delivery.ControlMessage(opts.DeliveryID, message), opts); err != nil {
-		return receipt, err
+	deliveryErr := t.NudgeSessionWithOpts(session, delivery.ControlMessage(opts.DeliveryID, message), opts)
+	if deliveryErr != nil && !receipt.Typed {
+		return receipt, deliveryErr
 	}
 
 	deadline := time.Now().Add(submissionReceiptTimeout)
@@ -2326,6 +2327,9 @@ func (t *Tmux) NudgeSessionWithReceipt(session, message string, opts NudgeOpts) 
 			return matched, nil
 		}
 		if !time.Now().Before(deadline) {
+			if deliveryErr != nil {
+				return receipt, deliveryErr
+			}
 			return receipt, fmt.Errorf("%w (no matching post-baseline runtime receipt)", ErrSubmitNotVerified)
 		}
 		time.Sleep(submissionReceiptPollInterval)
