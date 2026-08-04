@@ -176,6 +176,9 @@ func (d *Daemon) executeLifecycleAction(request *LifecycleRequest) error {
 			d.logger.Printf("Agent bead %s reports state: %s", agentBeadID, beadState)
 		}
 	}
+	if parsed, parseErr := parseIdentity(request.From); parseErr == nil && parsed.RoleType == constants.RoleRefinery {
+		return d.executeRefineryLifecycleAction(request.Action, parsed.RigName)
+	}
 
 	// Check if session exists (tmux detection still needed for lifecycle actions)
 	running, err := d.tmux.HasSession(sessionName)
@@ -217,6 +220,35 @@ func (d *Daemon) executeLifecycleAction(request *LifecycleRequest) error {
 	default:
 		return fmt.Errorf("unknown action: %s", request.Action)
 	}
+}
+
+type refineryLifecycleManager interface {
+	Stop() error
+	Start(bool, string) error
+}
+
+func executeRefineryManagerLifecycle(action LifecycleAction, mgr refineryLifecycleManager) error {
+	if action != ActionShutdown && action != ActionCycle && action != ActionRestart {
+		return fmt.Errorf("unknown action: %s", action)
+	}
+	if err := mgr.Stop(); err != nil && !errors.Is(err, refinery.ErrNotRunning) {
+		return fmt.Errorf("stopping refinery: %w", err)
+	}
+	if action == ActionShutdown {
+		return nil
+	}
+	if err := mgr.Start(false, ""); err != nil {
+		return fmt.Errorf("starting refinery: %w", err)
+	}
+	return nil
+}
+
+func (d *Daemon) executeRefineryLifecycleAction(action LifecycleAction, rigName string) error {
+	mgr := refinery.NewManagerWithTmux(&rig.Rig{
+		Name: rigName,
+		Path: filepath.Join(d.config.TownRoot, rigName),
+	}, d.tmux)
+	return executeRefineryManagerLifecycle(action, mgr)
 }
 
 // ParsedIdentity holds the components extracted from an agent identity string.

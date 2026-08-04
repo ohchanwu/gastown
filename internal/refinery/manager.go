@@ -66,6 +66,7 @@ type Manager struct {
 	rig     *rig.Rig
 	workDir string
 	output  io.Writer // Output destination for user-facing messages
+	tmux    *tmux.Tmux
 }
 
 type scoredIssue struct {
@@ -75,10 +76,16 @@ type scoredIssue struct {
 
 // NewManager creates a new refinery manager for a rig.
 func NewManager(r *rig.Rig) *Manager {
+	return NewManagerWithTmux(r, tmux.NewTmux())
+}
+
+// NewManagerWithTmux creates a refinery manager on the caller's tmux transport.
+func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	return &Manager{
 		rig:     r,
 		workDir: r.Path,
 		output:  os.Stdout,
+		tmux:    t,
 	}
 }
 
@@ -99,9 +106,8 @@ func (m *Manager) SessionName() string {
 // ZFC: tmux session existence is the source of truth for session state,
 // but agent liveness determines if the session is actually functional.
 func (m *Manager) IsRunning() (bool, error) {
-	t := tmux.NewTmux()
 	sessionName := m.SessionName()
-	status := t.CheckSessionHealth(sessionName, 0)
+	status := m.tmux.CheckSessionHealth(sessionName, 0)
 	return status == tmux.SessionHealthy, nil
 }
 
@@ -111,17 +117,15 @@ func (m *Manager) IsRunning() (bool, error) {
 // Returns the detailed ZombieStatus for callers that need to distinguish
 // between different failure modes.
 func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
-	t := tmux.NewTmux()
-	return t.CheckSessionHealth(m.SessionName(), maxInactivity)
+	return m.tmux.CheckSessionHealth(m.SessionName(), maxInactivity)
 }
 
 // Status returns information about the refinery session.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Status() (*tmux.SessionInfo, error) {
-	t := tmux.NewTmux()
 	sessionID := m.SessionName()
 
-	running, err := t.HasSession(sessionID)
+	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("checking session: %w", err)
 	}
@@ -129,7 +133,7 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 		return nil, ErrNotRunning
 	}
 
-	return t.GetSessionInfo(sessionID)
+	return m.tmux.GetSessionInfo(sessionID)
 }
 
 // Start starts the refinery.
@@ -148,7 +152,7 @@ func (m *Manager) StartAllowingForkRig(foreground bool, agentOverride string) er
 }
 
 func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool) error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
 
 	if foreground {
@@ -347,7 +351,7 @@ func (m *Manager) ForkRigStartError() error {
 // BlockForkRigStart applies the fork-rig startup guard and kills any leftover
 // refinery session that would otherwise keep processing a fork-backed rig.
 func (m *Manager) BlockForkRigStart() error {
-	return m.blockForkRigStart(tmux.NewTmux())
+	return m.blockForkRigStart(m.tmux)
 }
 
 func (m *Manager) blockForkRigStart(t *tmux.Tmux) error {
@@ -406,7 +410,7 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
 // Stop stops the refinery.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Stop() error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
 	townRoot := filepath.Dir(m.rig.Path)
 
