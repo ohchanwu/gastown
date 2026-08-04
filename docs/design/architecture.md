@@ -215,6 +215,12 @@ receipt verifier still performs its bounded lookup. A matching post-baseline
 runtime receipt proves acceptance; without one, the original delivery error is
 preserved. This prevents retrying a turn that the runtime already accepted.
 
+Codex startup nudges use the same receipt proof before the legacy idle-prompt
+check. A matching submitted receipt ends startup verification immediately, so
+a fast turn that has already completed and returned to the prompt is not
+mistaken for a lost nudge and sent again. Providers without receipt support
+retain the bounded idle-prompt fallback.
+
 Nudge leases canonicalize the town root before constructing their lock path or
 comparing ownership. A caller that acquires a lease through a symlinked path
 therefore reuses that lease when receipt verification resolves the same town to

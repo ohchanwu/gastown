@@ -332,7 +332,7 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	m.deliverStartupPrompt = func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error {
 		return nil
 	}
-	m.verifyStartupNudge = func(ctx context.Context, _ string, _ *config.RuntimeConfig, _ string) error {
+	m.verifyStartupNudge = func(ctx context.Context, _ string, _ *config.RuntimeConfig, _ string, _ bool) error {
 		close(verificationEntered)
 		<-ctx.Done()
 		return ctx.Err()
@@ -876,7 +876,7 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	// plus overhead = ~60s. Use 90s for safety.
 	done := make(chan struct{})
 	go func() {
-		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "check your hook")
+		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "check your hook", false)
 		close(done)
 	}()
 
@@ -897,7 +897,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	// Should return immediately without error for nil config
-	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", nil, "")
+	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", nil, "", false)
 
 	// And for config without prompt prefix
 	rc := &config.RuntimeConfig{
@@ -906,7 +906,15 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 			ReadyDelayMs:      1000,
 		},
 	}
-	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", rc, "")
+	_ = m.verifyStartupNudgeDelivery(context.Background(), "nonexistent-session", rc, "", false)
+}
+
+func TestVerifyStartupNudgeDelivery_SubmittedReceiptSkipsIdleRetry(t *testing.T) {
+	m := &SessionManager{}
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "› "}}
+	if err := m.verifyStartupNudgeDelivery(context.Background(), "missing-session", rc, "already submitted", true); err != nil {
+		t.Fatalf("submitted startup receipt should bypass idle retry: %v", err)
+	}
 }
 
 func TestVerifyStartupNudgeDelivery_CancellationInterruptsPolling(t *testing.T) {
@@ -931,7 +939,7 @@ func TestVerifyStartupNudgeDelivery_CancellationInterruptsPolling(t *testing.T) 
 	go func() {
 		done <- m.verifyStartupNudgeDelivery(ctx, "nonexistent-session", &config.RuntimeConfig{
 			Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "READY"},
-		}, "check your hook")
+		}, "check your hook", false)
 	}()
 
 	select {
@@ -1078,7 +1086,7 @@ func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
 
 	launchStart := time.Now()
 	go func() {
-		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		_ = m.verifyStartupNudgeDelivery(context.Background(), sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`", false)
 		close(goroutineDone)
 	}()
 	callerReturned <- time.Since(launchStart)

@@ -46,7 +46,7 @@ type SessionManager struct {
 	tmux                 *tmux.Tmux
 	rig                  *rig.Rig
 	deliverStartupPrompt func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
-	verifyStartupNudge   func(context.Context, string, *config.RuntimeConfig, string) error
+	verifyStartupNudge   func(context.Context, string, *config.RuntimeConfig, string, bool) error
 	startPoller          func(string, string, []string) (int, error)
 	stopPoller           func(string, string) error
 }
@@ -586,6 +586,8 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 		return fmt.Errorf("startup blocked: %w", err)
 	}
 
+	startupNudgeSubmitted := false
+
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
 	if fallbackInfo.SendBeaconNudge {
@@ -608,8 +610,20 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 		}
 
 		if fallbackInfo.SendStartupNudge {
-			// Send work instructions via nudge
-			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+			// Codex receipts distinguish a completed fast turn from a lost nudge.
+			if runtimeConfig.Provider == string(config.AgentCodex) {
+				receipt, deliveryErr := m.tmux.NudgeSessionWithReceipt(sessionID, startupNudgeContent, tmux.NudgeOpts{
+					TownRoot:   townRoot,
+					DeliveryID: nudge.NewDeliveryID(),
+				})
+				startupNudgeSubmitted = deliveryErr == nil && receipt.Submitted
+				debugSession("SendStartupNudgeWithReceipt", deliveryErr)
+				if deliveryErr != nil && !receipt.Typed {
+					debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+				}
+			} else {
+				debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+			}
 		}
 	}
 
@@ -621,7 +635,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 		if fallbackInfo.SendBeaconNudge {
 			verifyContent = startupPromptFallback
 		}
-		if err := m.verifyStartupNudge(ctx, sessionID, runtimeConfig, verifyContent); err != nil {
+		if err := m.verifyStartupNudge(ctx, sessionID, runtimeConfig, verifyContent, startupNudgeSubmitted); err != nil {
 			return fmt.Errorf("verifying startup nudge delivery: %w", err)
 		}
 	}
@@ -635,7 +649,7 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	// common gt sling path. Non-fatal: the witness zombie patrol handles unrecovered stalls.
 	if !fallbackInfo.SendBeaconNudge && !fallbackInfo.SendStartupNudge {
 		go func() {
-			_ = m.verifyStartupNudge(context.Background(), sessionID, runtimeConfig, startupNudgeContent)
+			_ = m.verifyStartupNudge(context.Background(), sessionID, runtimeConfig, startupNudgeContent, false)
 		}()
 	}
 
@@ -994,7 +1008,10 @@ func (m *SessionManager) deliverStartupPromptFallback(
 //
 // Non-fatal: if verification fails or times out, the session is left running.
 // The witness zombie patrol will eventually detect and handle truly idle polecats.
-func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, sessionID string, rc *config.RuntimeConfig, retryContent string) error {
+func (m *SessionManager) verifyStartupNudgeDelivery(ctx context.Context, sessionID string, rc *config.RuntimeConfig, retryContent string, submitted bool) error {
+	if submitted {
+		return nil
+	}
 	// Only verify for agents with prompt detection. Without ReadyPromptPrefix,
 	// we can't distinguish "idle at prompt" from "busy processing".
 	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
