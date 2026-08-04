@@ -21,6 +21,17 @@ func testPollerIdentity(session string) pollerIdentity {
 	return pollerIdentity{StartTime: "test-start", Command: "gt nudge-poller " + session, Generation: "test-generation", Transport: "fixture\x00fixture"}
 }
 
+func TestStopPollerBeforeReplacementOrdering(t *testing.T) {
+	stopErr := errors.New("stop failed")
+	replacements := 0
+	if err := StopPollerBeforeReplacement(func() error { return stopErr }, func() error { replacements++; return nil }); !errors.Is(err, stopErr) || replacements != 0 {
+		t.Fatalf("failed stop err=%v replacements=%d", err, replacements)
+	}
+	if err := StopPollerBeforeReplacement(func() error { return nil }, func() error { replacements++; return nil }); err != nil || replacements != 1 {
+		t.Fatalf("successful stop err=%v replacements=%d", err, replacements)
+	}
+}
+
 func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"

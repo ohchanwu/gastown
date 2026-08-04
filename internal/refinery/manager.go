@@ -170,7 +170,7 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 	if stop != nil {
 		if running, _ := t.HasSession(sessionID); running {
 			_, _ = fmt.Fprintf(m.output, "Refinery %s is safety-stopped; killing leftover session %s.\n", m.rig.Name, sessionID)
-			if err := t.KillSessionWithProcesses(sessionID); err != nil {
+			if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSessionWithProcesses(sessionID) }); err != nil {
 				return fmt.Errorf("%w: killing leftover refinery session: %v", NewSafetyStoppedError(stop), err)
 			}
 		}
@@ -186,7 +186,7 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 		}
 		// Zombie - tmux alive but agent dead. Kill and recreate.
 		_, _ = fmt.Fprintln(m.output, "⚠ Detected zombie session (tmux alive, agent dead). Recreating...")
-		if err := t.KillSession(sessionID); err != nil {
+		if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSession(sessionID) }); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}
@@ -358,7 +358,8 @@ func (m *Manager) blockForkRigStart(t *tmux.Tmux) error {
 	sessionID := m.SessionName()
 	if running, _ := t.HasSession(sessionID); running {
 		_, _ = fmt.Fprintf(m.output, "Refinery %s is disabled for fork-backed rig; killing leftover session %s.\n", m.rig.Name, sessionID)
-		if killErr := t.KillSessionWithProcesses(sessionID); killErr != nil {
+		townRoot := filepath.Dir(m.rig.Path)
+		if killErr := m.stopSession(townRoot, sessionID, func() error { return t.KillSessionWithProcesses(sessionID) }); killErr != nil {
 			return fmt.Errorf("%w: killing leftover refinery session: %v", err, killErr)
 		}
 	}
@@ -407,6 +408,7 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
 func (m *Manager) Stop() error {
 	t := tmux.NewTmux()
 	sessionID := m.SessionName()
+	townRoot := filepath.Dir(m.rig.Path)
 
 	// Check if tmux session exists
 	running, _ := t.HasSession(sessionID)
@@ -414,8 +416,14 @@ func (m *Manager) Stop() error {
 		return ErrNotRunning
 	}
 
-	// Kill the tmux session
-	return t.KillSession(sessionID)
+	return m.stopSession(townRoot, sessionID, func() error { return t.KillSession(sessionID) })
+}
+
+func (m *Manager) stopSession(townRoot, sessionID string, stopSession func() error) error {
+	return nudge.StopPollerBeforeReplacement(
+		func() error { return nudge.StopPoller(townRoot, sessionID) },
+		stopSession,
+	)
 }
 
 // Queue returns the current merge queue.

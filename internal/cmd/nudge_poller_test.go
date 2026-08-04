@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/nudge"
-	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -259,7 +258,7 @@ func TestBusyPollerStopsBeforeReplacementWithoutClaimingQueue(t *testing.T) {
 	}
 
 	kills := 0
-	err = polecat.StopPollerBeforeReplacement(func() error {
+	err = nudge.StopPollerBeforeReplacement(func() error {
 		if err := os.WriteFile(pidPath+".stop", generation, 0600); err != nil {
 			return err
 		}

@@ -69,6 +69,24 @@ func TestManager_SessionName(t *testing.T) {
 	}
 }
 
+func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testing.T) {
+	mgr, rigPath := setupTestManager(t)
+	townRoot := filepath.Dir(rigPath)
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pollerDir, mgr.SessionName()+".pid"), []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced := false
+	err := mgr.stopSession(townRoot, mgr.SessionName(), func() error { replaced = true; return nil })
+	if err == nil || replaced {
+		t.Fatalf("stopSession err=%v replaced=%v, want ownership error without replacement", err, replaced)
+	}
+}
+
 func TestSafetyStopFromIssue(t *testing.T) {
 	stop := safetyStopFromIssue("", &beads.Issue{
 		ID:     "gt-testrig-refinery",

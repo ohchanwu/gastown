@@ -347,6 +347,15 @@ func StopPoller(townRoot, session string) error {
 		}, os.Remove)
 }
 
+// StopPollerBeforeReplacement prevents session replacement until the old
+// poller generation has relinquished custody.
+func StopPollerBeforeReplacement(stop func() error, replace func() error) error {
+	if err := stop(); err != nil {
+		return err
+	}
+	return replace()
+}
+
 const (
 	pollerExitTimeout  = 2 * time.Second
 	pollerExitInterval = 50 * time.Millisecond
