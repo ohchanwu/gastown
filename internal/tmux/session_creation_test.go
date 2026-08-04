@@ -185,6 +185,28 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 	t.Cleanup(func() { _ = tm.KillSessionWithProcesses(unrelated) })
 
 	session := "gt-test-create-cancel-detached"
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := filepath.Join(t.TempDir(), "final-check")
+	wrapperDir := t.TempDir()
+	wrapper := fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" -t %s remain-on-exit off "*)
+    if [ ! -e %q ]; then
+      : > %q
+      exec /bin/sleep 30
+    fi
+    ;;
+esac
+exec %q "$@"
+`, session, barrier, barrier, realTmux)
+	if err := os.WriteFile(filepath.Join(wrapperDir, "tmux"), []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write tmux barrier wrapper: %v", err)
+	}
+	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	script := fmt.Sprintf(`import subprocess; p = subprocess.Popen(["sleep", "30"], start_new_session=True); open(%q, "w").write(str(p.pid)); p.wait()`, pidFile)
 	command := fmt.Sprintf("%q -c %q", python, script)
@@ -211,7 +233,16 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 	if childPID == "" {
 		t.Fatal("runtime command did not record detached child PID")
 	}
-	t.Cleanup(func() { _ = exec.Command("kill", "-KILL", childPID).Run() })
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(barrier); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(barrier); err != nil {
+		t.Fatalf("session creation did not reach final context boundary: %v", err)
+	}
 
 	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {

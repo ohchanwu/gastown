@@ -659,7 +659,7 @@ func (t *Tmux) checkSessionAfterCreateContext(ctx context.Context, name, command
 
 	// Pane is alive — restore default (no need to keep dead sessions around)
 	_, _ = t.runContext(ctx, "set-option", "-t", name, "remain-on-exit", "off")
-	return nil
+	return ctx.Err()
 }
 
 // EnsureSessionFresh ensures a session is available and healthy.
