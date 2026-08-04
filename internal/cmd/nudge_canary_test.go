@@ -106,7 +106,7 @@ func TestConfirmWakeCanaryTurnWaitsForSteadyIdleBeforeNextDelivery(t *testing.T)
 	if got, want := strings.Join(waiter.events, ","), "response,idle,next-delivery"; got != want {
 		t.Fatalf("turn ordering = %q, want %q", got, want)
 	}
-	if waiter.responseTimeout != 30*time.Second || waiter.idleTimeout != constants.ClaudeStartTimeout {
+	if waiter.responseTimeout != constants.ClaudeStartTimeout || waiter.idleTimeout != constants.ClaudeStartTimeout {
 		t.Fatalf("turn bounds = response %s idle %s", waiter.responseTimeout, waiter.idleTimeout)
 	}
 }

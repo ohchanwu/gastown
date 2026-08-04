@@ -232,7 +232,10 @@ Codex submission without the matching runtime receipt.
 `gt nudge-canary --confirm-live` verifies this path with 20 receipt-confirmed
 turns in a temporary town, isolated Mayor identity, and dedicated tmux socket.
 The canary requires zero attached clients and sole lock ownership, waits for a
-steady idle state between turns, and removes only artifacts it owns. Its hook
+steady idle state between turns, and removes only artifacts it owns. A matching
+runtime receipt proves prompt wake within the delivery bound; the exact nonce
+response uses the existing full-turn startup bound so provider inference time
+is not misclassified as a missed wake. Its hook
 trust bypass is scoped to the isolated canary launch. The latest sanitized
 result is written atomically to `.runtime/canary/control-plane.json` with mode
 0600 and contributes to `gt health` and Doctor's control-plane verdict.
