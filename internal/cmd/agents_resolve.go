@@ -51,6 +51,7 @@ type agentBeadCandidate struct {
 	ID       string
 	Source   agentBeadSource
 	BeadsDir string
+	Database string
 	Status   string
 	Issue    *beads.Issue
 }
@@ -59,6 +60,7 @@ type agentsResolveResult struct {
 	ID       string `json:"id"`
 	Source   string `json:"source"`
 	BeadsDir string `json:"beads_dir"`
+	Database string `json:"database"`
 	Status   string `json:"status"`
 }
 
@@ -117,6 +119,7 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 			ID:       match.ID,
 			Source:   string(match.Source),
 			BeadsDir: match.BeadsDir,
+			Database: match.Database,
 			Status:   match.Status,
 		})
 	}
@@ -153,6 +156,7 @@ func findAgentBeadCandidates(cwd, currentBeadsDir string) ([]agentBeadCandidate,
 
 func loadAgentBeadsFromDir(beadsDir string, issueSource, wispSource agentBeadSource) ([]agentBeadCandidate, error) {
 	db := beads.NewWithBeadsDir(filepath.Dir(beadsDir), beadsDir)
+	database := beads.DatabaseNameFromMetadata(beadsDir)
 	var candidates []agentBeadCandidate
 
 	issues, err := listAgentIssues(db)
@@ -164,6 +168,7 @@ func loadAgentBeadsFromDir(beadsDir string, issueSource, wispSource agentBeadSou
 			ID:       issue.ID,
 			Source:   issueSource,
 			BeadsDir: beadsDir,
+			Database: database,
 			Status:   issue.Status,
 			Issue:    issue,
 		})
@@ -175,6 +180,7 @@ func loadAgentBeadsFromDir(beadsDir string, issueSource, wispSource agentBeadSou
 				ID:       wisp.ID,
 				Source:   wispSource,
 				BeadsDir: beadsDir,
+				Database: database,
 				Status:   wisp.Status,
 				Issue:    wisp,
 			})
