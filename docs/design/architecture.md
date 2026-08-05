@@ -221,6 +221,11 @@ a fast turn that has already completed and returned to the prompt is not
 mistaken for a lost nudge and sent again. Providers without receipt support
 retain the bounded idle-prompt fallback.
 
+Codex idle verification also recognizes the runtime's blank spacer cursor row
+immediately above a populated footer at either of the observed one- or
+two-column cursor positions. The footer and blank-row constraints keep stale
+composer text and active turns fail-closed.
+
 The effective preset name is session identity, not provider capability. Gas
 Town resolves the preset once, derives receipt and prompt behavior from its
 provider, and stores the resolved ready prompt with the tmux session. A custom
