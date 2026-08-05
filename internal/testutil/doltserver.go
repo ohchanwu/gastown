@@ -124,6 +124,18 @@ func setSharedDoltEnv(port string) {
 	os.Setenv("BEADS_DOLT_PORT", port)               //nolint:tenv // intentional process-wide env
 	os.Setenv("BEADS_DOLT_AUTO_START", "0")          //nolint:tenv // intentional process-wide env
 	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1")          //nolint:tenv // integration tests reuse this container
+	os.Unsetenv("GT_TEST_DOLT_UNAVAILABLE")          //nolint:tenv // successful setup clears fail-closed marker
+}
+
+func setUnavailableDoltEnv() {
+	os.Setenv("GT_DOLT_HOST", "127.0.0.1")           //nolint:tenv // fail closed on loopback
+	os.Setenv("GT_DOLT_PORT", "1")                   //nolint:tenv // discard port cannot reach production
+	os.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1") //nolint:tenv // override inherited production host
+	os.Setenv("BEADS_DOLT_SERVER_PORT", "1")         //nolint:tenv // preferred beads route
+	os.Setenv("BEADS_DOLT_PORT", "1")                //nolint:tenv // legacy beads route
+	os.Setenv("BEADS_DOLT_AUTO_START", "0")          //nolint:tenv // never create a fallback server
+	os.Setenv("GT_TEST_DOLT_UNAVAILABLE", "1")       //nolint:tenv // definitive skip/failure marker
+	os.Unsetenv("GT_TEST_EXTERNAL_DOLT")             //nolint:tenv // no external test server exists
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the
@@ -163,11 +175,19 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 // TestMain functions. Call TerminateDoltContainer() after m.Run() to clean up.
 // Sets both GT_DOLT_PORT and BEADS_DOLT_PORT process-wide.
 func EnsureDoltContainerForTestMain() error {
-	if !isDockerAvailable() {
+	return ensureDoltContainerForTestMain(isDockerAvailable)
+}
+
+func ensureDoltContainerForTestMain(dockerAvailable func() bool) error {
+	if !dockerAvailable() {
+		setUnavailableDoltEnv()
 		return fmt.Errorf("Docker not available")
 	}
 
 	doltCtrOnce.Do(startSharedDoltContainer)
+	if doltCtrErr != nil {
+		setUnavailableDoltEnv()
+	}
 	return doltCtrErr
 }
 

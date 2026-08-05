@@ -58,3 +58,33 @@ func TestSetSharedDoltEnvOverridesInheritedServerRoute(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureDoltContainerForTestMainPoisonsRouteWhenDockerUnavailable(t *testing.T) {
+	for _, key := range []string{
+		"GT_DOLT_HOST",
+		"GT_DOLT_PORT",
+		"BEADS_DOLT_SERVER_HOST",
+		"BEADS_DOLT_SERVER_PORT",
+		"BEADS_DOLT_PORT",
+		"BEADS_DOLT_AUTO_START",
+		"GT_TEST_EXTERNAL_DOLT",
+	} {
+		t.Setenv(key, "production")
+	}
+
+	err := ensureDoltContainerForTestMain(func() bool { return false })
+	if err == nil {
+		t.Fatal("EnsureDoltContainerForTestMain error = nil, want Docker unavailable")
+	}
+	for _, key := range []string{"GT_DOLT_PORT", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+		if got := os.Getenv(key); got != "1" {
+			t.Errorf("%s = %q, want poisoned port 1", key, got)
+		}
+	}
+	if got := os.Getenv("GT_TEST_DOLT_UNAVAILABLE"); got != "1" {
+		t.Errorf("GT_TEST_DOLT_UNAVAILABLE = %q, want 1", got)
+	}
+	if got := os.Getenv("GT_TEST_EXTERNAL_DOLT"); got != "" {
+		t.Errorf("GT_TEST_EXTERNAL_DOLT = %q, want unset", got)
+	}
+}
