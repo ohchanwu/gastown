@@ -191,7 +191,7 @@ func TestParseLifecycleRequest_AlwaysUsesFromField(t *testing.T) {
 	}
 }
 
-func TestExecuteLifecycleActionRefineryPollerStopFailurePreservesSession(t *testing.T) {
+func TestExecuteLifecycleActionRefineryPollerStopFailurePreventsReplacement(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("isolated tmux lifecycle test")
 	}
@@ -202,39 +202,46 @@ func TestExecuteLifecycleActionRefineryPollerStopFailurePreservesSession(t *test
 	session.SetDefaultRegistry(registry)
 	t.Cleanup(func() { session.SetDefaultRegistry(previousRegistry) })
 
-	townRoot := t.TempDir()
-	rigPath := filepath.Join(townRoot, "testrig")
-	if err := os.MkdirAll(rigPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	tmx := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dlr-%d", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = tmx.KillServer() })
-	sessionName := "xut-refinery"
-	if err := tmx.NewSessionWithCommand(sessionName, rigPath, "sleep 60"); err != nil {
-		t.Fatal(err)
-	}
+	for _, sessionExists := range []bool{true, false} {
+		t.Run(fmt.Sprintf("session_exists_%t", sessionExists), func(t *testing.T) {
+			townRoot := t.TempDir()
+			rigPath := filepath.Join(townRoot, "testrig")
+			if err := os.MkdirAll(rigPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tmx := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dlr-%d", time.Now().UnixNano()))
+			t.Cleanup(func() { _ = tmx.KillServer() })
+			sessionName := "xut-refinery"
+			if sessionExists {
+				if err := tmx.NewSessionWithCommand(sessionName, rigPath, "sleep 60"); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
-	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pollerDir, sessionName+".pid"), []byte("invalid ownership\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+			pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+			if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pollerDir, sessionName+".pid"), []byte("invalid ownership\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		tmux:   tmx,
-		logger: log.New(io.Discard, "", 0),
-		gtPath: "/usr/bin/false",
-		bdPath: "/usr/bin/false",
-	}
-	err := d.executeLifecycleAction(&LifecycleRequest{From: "testrig-refinery", Action: ActionRestart})
-	if err == nil || !strings.Contains(err.Error(), "poller") {
-		t.Fatalf("restart error = %v, want poller ownership failure", err)
-	}
-	if running, checkErr := tmx.HasSession(sessionName); checkErr != nil || !running {
-		t.Fatalf("refinery session after failed poller stop: running=%v err=%v, want preserved", running, checkErr)
+			d := &Daemon{
+				config: &Config{TownRoot: townRoot},
+				tmux:   tmx,
+				logger: log.New(io.Discard, "", 0),
+				gtPath: "/usr/bin/false",
+				bdPath: "/usr/bin/false",
+			}
+			err := d.executeLifecycleAction(&LifecycleRequest{From: "testrig-refinery", Action: ActionRestart})
+			if err == nil || !strings.Contains(err.Error(), "poller") {
+				t.Fatalf("restart error = %v, want poller ownership failure", err)
+			}
+			running, checkErr := tmx.HasSession(sessionName)
+			if checkErr != nil || running != sessionExists {
+				t.Fatalf("refinery session after failed poller stop: running=%v err=%v, want running=%v", running, checkErr, sessionExists)
+			}
+		})
 	}
 }
 

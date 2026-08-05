@@ -414,13 +414,13 @@ func (m *Manager) Stop() error {
 	sessionID := m.SessionName()
 	townRoot := filepath.Dir(m.rig.Path)
 
-	// Check if tmux session exists
-	running, _ := t.HasSession(sessionID)
-	if !running {
-		return ErrNotRunning
-	}
-
-	return m.stopSession(townRoot, sessionID, func() error { return t.KillSession(sessionID) })
+	return m.stopSession(townRoot, sessionID, func() error {
+		running, _ := t.HasSession(sessionID)
+		if !running {
+			return ErrNotRunning
+		}
+		return t.KillSession(sessionID)
+	})
 }
 
 func (m *Manager) stopSession(townRoot, sessionID string, stopSession func() error) error {

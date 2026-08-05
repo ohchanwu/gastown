@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func setupTestRegistry(t *testing.T) {
@@ -84,6 +85,30 @@ func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testi
 	err := mgr.stopSession(townRoot, mgr.SessionName(), func() error { replaced = true; return nil })
 	if err == nil || replaced {
 		t.Fatalf("stopSession err=%v replaced=%v, want ownership error without replacement", err, replaced)
+	}
+}
+
+func TestManagerStopChecksPollerOwnershipWhenSessionIsAbsent(t *testing.T) {
+	setupTestRegistry(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tmx := tmux.NewTmuxWithSocket("gt-rsa-" + strconv.FormatInt(time.Now().UnixNano(), 10))
+	mgr := NewManagerWithTmux(&rig.Rig{Name: "testrig", Path: rigPath}, tmx)
+
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pollerDir, mgr.SessionName()+".pid"), []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := mgr.Stop()
+	if err == nil || errors.Is(err, ErrNotRunning) {
+		t.Fatalf("Stop() error = %v, want poller ownership failure before session-absent result", err)
 	}
 }
 
