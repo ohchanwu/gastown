@@ -112,6 +112,32 @@ func TestManagerStopChecksPollerOwnershipWhenSessionIsAbsent(t *testing.T) {
 	}
 }
 
+func TestManagerStopChecksSessionStateBeforePollerCustody(t *testing.T) {
+	setupTestRegistry(t)
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: rigPath},
+		tmux.NewTmuxWithSocket("gt-rse-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+	)
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pollerDir, mgr.SessionName()+".pid"), []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	err := mgr.Stop()
+	if err == nil || !strings.Contains(err.Error(), "checking refinery session") {
+		t.Fatalf("Stop() error = %v, want tmux state error before poller custody", err)
+	}
+}
+
 func TestSafetyStopFromIssue(t *testing.T) {
 	stop := safetyStopFromIssue("", &beads.Issue{
 		ID:     "gt-testrig-refinery",

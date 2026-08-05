@@ -413,9 +413,12 @@ func (m *Manager) Stop() error {
 	t := m.tmux
 	sessionID := m.SessionName()
 	townRoot := filepath.Dir(m.rig.Path)
+	running, err := t.HasSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("checking refinery session: %w", err)
+	}
 
 	return m.stopSession(townRoot, sessionID, func() error {
-		running, _ := t.HasSession(sessionID)
 		if !running {
 			return ErrNotRunning
 		}
