@@ -2,13 +2,13 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -193,27 +193,12 @@ func runWitnessStop(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Kill tmux session if it exists.
-	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-	t := tmux.NewTmux()
-	sessionName := witnessSessionName(rigName)
-	running, _ := t.HasSession(sessionName)
-	if running {
-		if err := t.KillSessionWithProcesses(sessionName); err != nil {
-			style.PrintWarning("failed to kill session: %v", err)
-		}
-	}
-
-	// Update state file
 	if err := mgr.Stop(); err != nil {
-		if err == witness.ErrNotRunning && !running {
+		if errors.Is(err, witness.ErrNotRunning) {
 			fmt.Printf("%s Witness is not running\n", style.Dim.Render("⚠"))
 			return nil
 		}
-		// Even if manager.Stop fails, if we killed the session it's stopped
-		if !running {
-			return fmt.Errorf("stopping witness: %w", err)
-		}
+		return fmt.Errorf("stopping witness: %w", err)
 	}
 
 	fmt.Printf("%s Witness stopped for %s\n", style.Bold.Render("✓"), rigName)
@@ -342,8 +327,9 @@ func runWitnessRestart(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Restarting witness for %s...\n", rigName)
 
-	// Stop existing session (non-fatal: may not be running)
-	_ = mgr.Stop()
+	if err := mgr.Stop(); err != nil && !errors.Is(err, witness.ErrNotRunning) {
+		return fmt.Errorf("stopping witness: %w", err)
+	}
 
 	// Start fresh
 	if err := mgr.Start(false, witnessAgentOverride, witnessEnvOverrides); err != nil {

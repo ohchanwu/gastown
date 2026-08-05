@@ -1,13 +1,17 @@
 package witness
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestManagerStartForegroundDeprecated(t *testing.T) {
@@ -18,6 +22,117 @@ func TestManagerStartForegroundDeprecated(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "foreground mode is deprecated") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager(&rig.Rig{Name: "testrig", Path: rigPath})
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pollerDir, mgr.SessionName()+".pid"), []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced := false
+	err := mgr.stopSession(townRoot, mgr.SessionName(), func() error { replaced = true; return nil })
+	if err == nil || replaced {
+		t.Fatalf("stopSession err=%v replaced=%v, want ownership error without replacement", err, replaced)
+	}
+}
+
+func TestManagerStopChecksPollerOwnershipWhenSessionIsAbsent(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: rigPath},
+		tmux.NewTmuxWithSocket("gt-wsa-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+	)
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pollerDir, mgr.SessionName()+".pid"), []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := mgr.Stop()
+	if err == nil || errors.Is(err, ErrNotRunning) {
+		t.Fatalf("Stop() error = %v, want poller ownership failure before session-absent result", err)
+	}
+}
+
+func TestManagerStopChecksSessionStateBeforePollerCustody(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: rigPath},
+		tmux.NewTmuxWithSocket("gt-wse-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+	)
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pollerPath := filepath.Join(pollerDir, mgr.SessionName()+".pid")
+	if err := os.WriteFile(pollerPath, []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	err := mgr.Stop()
+	if err == nil || !strings.Contains(err.Error(), "checking witness session") {
+		t.Fatalf("Stop() error = %v, want tmux state error before poller custody", err)
+	}
+	if data, readErr := os.ReadFile(pollerPath); readErr != nil || string(data) != "invalid ownership" {
+		t.Fatalf("poller custody changed after unknown session state: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestManagerStartFailsClosedWhenSessionStateIsUnknown(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: rigPath},
+		tmux.NewTmuxWithSocket("gt-wss-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+	)
+	t.Setenv("PATH", t.TempDir())
+
+	err := mgr.Start(false, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "checking witness session") {
+		t.Fatalf("Start() error = %v, want unknown tmux state failure", err)
 	}
 }
 

@@ -32,13 +32,20 @@ var (
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
-	rig *rig.Rig
+	rig  *rig.Rig
+	tmux *tmux.Tmux
 }
 
 // NewManager creates a new witness manager for a rig.
 func NewManager(r *rig.Rig) *Manager {
+	return NewManagerWithTmux(r, tmux.NewTmux())
+}
+
+// NewManagerWithTmux creates a witness manager on the caller's tmux transport.
+func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	return &Manager{
-		rig: r,
+		rig:  r,
+		tmux: t,
 	}
 }
 
@@ -114,8 +121,9 @@ func (m *Manager) prepareWitnessDir(townRoot string) (string, error) {
 // envOverrides are KEY=VALUE pairs that override all other env var sources.
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []string) error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
+	townRoot := m.townRoot()
 
 	if foreground {
 		// Foreground mode is deprecated - patrol logic moved to mol-witness-patrol
@@ -123,7 +131,10 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	}
 
 	// Check if session already exists
-	running, _ := t.HasSession(sessionID)
+	running, err := t.HasSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("checking witness session: %w", err)
+	}
 	if running {
 		// Session exists - check if Claude is actually running (healthy vs zombie)
 		if t.IsAgentAlive(sessionID) {
@@ -148,7 +159,7 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 			return ErrAlreadyRunning
 		}
 
-		if err := t.KillSession(sessionID); err != nil {
+		if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSession(sessionID) }); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}
@@ -161,7 +172,6 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// package config) to prevent concurrent rig starts from corrupting the
 	// global agent registry.
 	// Working directory
-	townRoot := m.townRoot()
 	witnessDir, err := m.prepareWitnessDir(townRoot)
 	if err != nil {
 		return err
@@ -389,15 +399,26 @@ func isBuiltinClaudeStartCommand(cmd string) bool {
 // Stop stops the witness.
 // ZFC-compliant: tmux session is the source of truth.
 func (m *Manager) Stop() error {
-	t := tmux.NewTmux()
+	t := m.tmux
 	sessionID := m.SessionName()
+	townRoot := m.townRoot()
 
-	// Check if tmux session exists
-	running, _ := t.HasSession(sessionID)
-	if !running {
-		return ErrNotRunning
+	running, err := t.HasSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("checking witness session: %w", err)
 	}
 
-	// Kill the tmux session
-	return t.KillSession(sessionID)
+	return m.stopSession(townRoot, sessionID, func() error {
+		if !running {
+			return ErrNotRunning
+		}
+		return t.KillSessionWithProcesses(sessionID)
+	})
+}
+
+func (m *Manager) stopSession(townRoot, sessionID string, stopSession func() error) error {
+	return nudge.StopPollerBeforeReplacement(
+		func() error { return nudge.StopPoller(townRoot, sessionID) },
+		stopSession,
+	)
 }
