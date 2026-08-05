@@ -124,7 +124,7 @@ func waitForWakeCanaryIdle(waiter wakeCanaryIdleWaiter, sessionName string) erro
 }
 
 func confirmWakeCanaryTurn(waiter wakeCanaryTurnWaiter, sessionName, baseline, response string) (string, error) {
-	if err := waiter.WaitForResponse(sessionName, baseline, response, constants.ClaudeStartTimeout); err != nil {
+	if err := waiter.WaitForResponse(sessionName, baseline, response, 2*constants.ClaudeStartTimeout); err != nil {
 		return "model-turn-unconfirmed", err
 	}
 	if err := waitForWakeCanaryIdle(waiter, sessionName); err != nil {
