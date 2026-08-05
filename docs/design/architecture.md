@@ -287,6 +287,11 @@ poller before killing or replacing a present session. An unknown tmux state
 fails before custody changes; a proven-absent session still retires its poller
 before returning not-running.
 
+Witness stop, restart, and zombie replacement follow the same custody order.
+They fail closed when tmux state or poller ownership is unknown, retire the
+poller for both present and proven-absent sessions, and use process-aware session
+cleanup before replacing a live session.
+
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
 deadline. Lookup uncertainty is isolated per convoy and fails closed: a convoy
