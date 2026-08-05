@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/nudge"
@@ -391,6 +392,25 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 	}
 	if strings.Contains(string(hooksData), "cmd.test") {
 		t.Fatal("temporary Codex hooks resolve to the Go test binary")
+	}
+	configData, err := os.ReadFile(filepath.Join(sandbox.RuntimeConfigDir, "config.toml"))
+	if err != nil {
+		t.Fatalf("temporary Codex config missing: %v", err)
+	}
+	var codexConfig struct {
+		HideRateLimitModelNudge bool `toml:"hide_rate_limit_model_nudge"`
+		Features                struct {
+			Hooks bool `toml:"hooks"`
+		} `toml:"features"`
+	}
+	if _, err := toml.Decode(string(configData), &codexConfig); err != nil {
+		t.Fatalf("parse temporary Codex config: %v", err)
+	}
+	if !codexConfig.HideRateLimitModelNudge {
+		t.Fatal("temporary Codex config permits a model-switch reminder to block idle detection")
+	}
+	if !codexConfig.Features.Hooks {
+		t.Fatal("temporary Codex config disables hooks")
 	}
 	if sandbox.Socket == "" || sandbox.Socket == "gastown" {
 		t.Fatalf("canary socket is not isolated: %q", sandbox.Socket)

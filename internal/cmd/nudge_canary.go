@@ -185,7 +185,7 @@ func newWakeCanarySandbox(parent, gtBin string) (*wakeCanarySandbox, error) {
 		cleanup()
 		return nil, fmt.Errorf("installing temporary Codex hooks: %w", err)
 	}
-	if err := atomicfile.WriteFile(filepath.Join(runtimeConfigDir, "config.toml"), []byte("[features]\nhooks = true\n"), 0600); err != nil {
+	if err := atomicfile.WriteFile(filepath.Join(runtimeConfigDir, "config.toml"), []byte("hide_rate_limit_model_nudge = true\n\n[features]\nhooks = true\n"), 0600); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("writing temporary Codex settings: %w", err)
 	}
