@@ -55,6 +55,14 @@ func TestProcessStartMatches(t *testing.T) {
 	}
 }
 
+func TestTestMainIsolatesHostGitConfig(t *testing.T) {
+	global := os.Getenv("GIT_CONFIG_GLOBAL")
+	system := os.Getenv("GIT_CONFIG_SYSTEM")
+	if global == "" || system == "" || global != system {
+		t.Fatalf("git config isolation missing: global=%q system=%q", global, system)
+	}
+}
+
 func TestTestMainWithoutTmuxDoesNotFail(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^$", "-test.count=1")
 	cmd.Env = envWithPath(t.TempDir())
@@ -219,6 +227,21 @@ func TestMain(m *testing.M) {
 	}
 	oldSocketDir, hadSocketDir := os.LookupEnv("TMUX_TMPDIR")
 	_ = os.Setenv("TMUX_TMPDIR", socketDir)
+	gitConfig := filepath.Join(socketDir, "empty-gitconfig")
+	if err := os.WriteFile(gitConfig, nil, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "create isolated git config: %v\n", err)
+		os.Exit(1)
+	}
+	oldGitGlobal, hadGitGlobal := os.LookupEnv("GIT_CONFIG_GLOBAL")
+	oldGitSystem, hadGitSystem := os.LookupEnv("GIT_CONFIG_SYSTEM")
+	if err := os.Setenv("GIT_CONFIG_GLOBAL", gitConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "set GIT_CONFIG_GLOBAL: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("GIT_CONFIG_SYSTEM", gitConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "set GIT_CONFIG_SYSTEM: %v\n", err)
+		os.Exit(1)
+	}
 	socket := fmt.Sprintf("gt-polecat-test-%d", os.Getpid())
 	tmux.SetDefaultSocket(socket)
 
@@ -237,6 +260,24 @@ func TestMain(m *testing.M) {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "restore TMUX_TMPDIR: %v\n", err)
+		code = 1
+	}
+	if hadGitGlobal {
+		err = os.Setenv("GIT_CONFIG_GLOBAL", oldGitGlobal)
+	} else {
+		err = os.Unsetenv("GIT_CONFIG_GLOBAL")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "restore GIT_CONFIG_GLOBAL: %v\n", err)
+		code = 1
+	}
+	if hadGitSystem {
+		err = os.Setenv("GIT_CONFIG_SYSTEM", oldGitSystem)
+	} else {
+		err = os.Unsetenv("GIT_CONFIG_SYSTEM")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "restore GIT_CONFIG_SYSTEM: %v\n", err)
 		code = 1
 	}
 	if stopErr != nil {
