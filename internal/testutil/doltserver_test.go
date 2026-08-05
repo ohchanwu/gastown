@@ -4,6 +4,7 @@ package testutil
 
 import (
 	"errors"
+	"os"
 	"testing"
 )
 
@@ -25,5 +26,35 @@ func TestIsDockerUnavailableErr(t *testing.T) {
 				t.Fatalf("isDockerUnavailableErr(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSetSharedDoltEnvOverridesInheritedServerRoute(t *testing.T) {
+	for _, key := range []string{
+		"GT_DOLT_HOST",
+		"GT_DOLT_PORT",
+		"BEADS_DOLT_SERVER_HOST",
+		"BEADS_DOLT_SERVER_PORT",
+		"BEADS_DOLT_PORT",
+		"BEADS_DOLT_AUTO_START",
+	} {
+		t.Setenv(key, "production")
+	}
+
+	setSharedDoltEnv("4407")
+
+	want := map[string]string{
+		"GT_DOLT_HOST":           "127.0.0.1",
+		"GT_DOLT_PORT":           "4407",
+		"BEADS_DOLT_SERVER_HOST": "127.0.0.1",
+		"BEADS_DOLT_SERVER_PORT": "4407",
+		"BEADS_DOLT_PORT":        "4407",
+		"BEADS_DOLT_AUTO_START":  "0",
+		"GT_TEST_EXTERNAL_DOLT":  "1",
+	}
+	for key, value := range want {
+		if got := os.Getenv(key); got != value {
+			t.Errorf("%s = %q, want %q", key, got, value)
+		}
 	}
 }
