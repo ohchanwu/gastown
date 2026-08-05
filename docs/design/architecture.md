@@ -221,6 +221,12 @@ a fast turn that has already completed and returned to the prompt is not
 mistaken for a lost nudge and sent again. Providers without receipt support
 retain the bounded idle-prompt fallback.
 
+The effective preset name is session identity, not provider capability. Gas
+Town resolves the preset once, derives receipt and prompt behavior from its
+provider, and stores the resolved ready prompt with the tmux session. A custom
+alias backed by Codex therefore retains Codex delivery semantics; an unknown or
+unsupported provider fails closed instead of being guessed from the alias.
+
 Nudge leases canonicalize the town root before constructing their lock path or
 comparing ownership. A caller that acquires a lease through a symlinked path
 therefore reuses that lease when receipt verification resolves the same town to
@@ -246,6 +252,13 @@ trust bypass is scoped to the isolated canary launch. The latest sanitized
 result is written atomically to `.runtime/canary/control-plane.json` with mode
 0600 and contributes to `gt health` and Doctor's control-plane verdict.
 
+Changes to provider, session, or wake delivery behavior are accepted only after
+the isolated normal/race gates, a clean 20-turn source canary, exact-candidate
+installation, and three consecutive fresh end-to-end mail round trips. Each
+round trip requires one original mail, one acknowledgment, matching submitted
+receipts in both directions, and no duplicate accepted turn. A causal repair
+restarts the consecutive count from run one.
+
 The background nudge poller publishes a structured ownership record that binds
 the PID, process-start identity, command, session, and a random per-launch
 generation. Start and stop transitions share one lifecycle lock. Shutdown is a
@@ -262,6 +275,12 @@ fallbacks, while the second survives the standard CLI registry initialization
 that runs before the poller command. Keeping them identical prevents an
 isolated poller from silently deriving a different town socket and exiting
 without draining its queue.
+
+Refinery stop and restart actions use the same manager as ordinary lifecycle
+commands. The manager first proves whether the session exists, then retires the
+poller before killing or replacing a present session. An unknown tmux state
+fails before custody changes; a proven-absent session still retires its poller
+before returning not-running.
 
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command

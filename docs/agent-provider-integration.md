@@ -263,6 +263,29 @@ At each step, the agent name is looked up in:
 
 This means your JSON preset is found automatically — no code change needed.
 
+### Preset identity and provider capability
+
+The resolved preset name identifies the configured session; it does not define
+runtime capability. Gas Town uses the preset's `provider` for receipt support,
+prompt readiness, and delivery behavior. For example, a custom `night-mayor`
+preset with provider `codex` keeps Codex receipt semantics without being named
+`codex`. Missing or unsupported provider capabilities fail closed.
+
+### Acceptance checks for provider and session changes
+
+Before installing a build that changes provider, session, or wake behavior:
+
+1. Run the full normal suite and focused race tests in isolated tmux and Dolt
+   fixtures.
+2. Run `gt nudge-canary --confirm-live` and require 20 submitted turns with no
+   queued, failed, duplicate, or leaked work.
+3. Install the exact tested commit with a preserved rollback binary.
+4. Complete three fresh end-to-end mail round trips. Each must contain one
+   original mail, one acknowledgment, and matching submitted receipts in both
+   directions, with no duplicate accepted turn.
+
+After a causal repair, restart the three-run sequence from run one.
+
 ---
 
 ## Tier 2: Hooks Integration
