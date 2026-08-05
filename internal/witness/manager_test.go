@@ -25,6 +25,150 @@ func TestManagerStartForegroundDeprecated(t *testing.T) {
 	}
 }
 
+func newFakeTmuxManager(t *testing.T, behavior string) (*Manager, string, string) {
+	t.Helper()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "tmux.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_TMUX_LOG\"\n" + behavior
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: rigPath},
+		tmux.NewTmuxWithSocket("gt-wsf-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
+	)
+	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
+	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pollerPath := filepath.Join(pollerDir, mgr.SessionName()+".pid")
+	if err := os.WriteFile(pollerPath, []byte("invalid ownership"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return mgr, pollerPath, logPath
+}
+
+func assertFakePollerPreserved(t *testing.T, pollerPath, logPath string) {
+	t.Helper()
+	data, err := os.ReadFile(pollerPath)
+	if err != nil || string(data) != "invalid ownership" {
+		t.Fatalf("poller custody changed: data=%q err=%v", data, err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logData), "kill-session") {
+		t.Fatalf("session kill attempted after unknown state:\n%s", logData)
+	}
+}
+
+func TestManagerStartPreservesZombieWhenLivenessIsUnknown(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "transport failure" >&2; exit 2 ;;
+esac
+exit 2
+`)
+
+	err := mgr.Start(false, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "checking witness liveness") {
+		t.Fatalf("Start() error = %v, want checked liveness failure", err)
+	}
+	assertFakePollerPreserved(t, pollerPath, logPath)
+}
+
+func TestManagerStartPreservesZombieWhenCreationTimeIsUnknown(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"session_created"*) echo "transport failure" >&2; exit 2 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+
+	err := mgr.Start(false, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "reading witness session creation time") {
+		t.Fatalf("Start() error = %v, want checked creation-time failure", err)
+	}
+	assertFakePollerPreserved(t, pollerPath, logPath)
+}
+
+func TestManagerStartPreservesZombieWhenCreationTimeIsInvalid(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"session_created"*) echo "0"; exit 0 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+
+	err := mgr.Start(false, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid timestamp 0") {
+		t.Fatalf("Start() error = %v, want invalid creation-time failure", err)
+	}
+	assertFakePollerPreserved(t, pollerPath, logPath)
+}
+
+func TestManagerStartZombieUsesProcessAwareCleanup(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"session_created"*) echo "123"; exit 0 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+  *"set-option"*|*"set-hook"*) exit 0 ;;
+  *"kill-session"*) echo "expected kill failure" >&2; exit 2 ;;
+esac
+exit 0
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+
+	err := mgr.Start(false, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "killing zombie session") {
+		t.Fatalf("Start() error = %v, want replacement kill failure", err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "set-hook") || !strings.Contains(logText, "kill-session") {
+		t.Fatalf("zombie replacement skipped process-aware cleanup:\n%s", logText)
+	}
+}
+
 func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testing.T) {
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")

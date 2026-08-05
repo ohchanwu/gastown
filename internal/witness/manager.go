@@ -137,7 +137,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	}
 	if running {
 		// Session exists - check if Claude is actually running (healthy vs zombie)
-		if t.IsAgentAlive(sessionID) {
+		alive, err := t.IsAgentAliveChecked(sessionID)
+		if err != nil {
+			return fmt.Errorf("checking witness liveness: %w", err)
+		}
+		if alive {
 			// Healthy - Claude is running
 			return ErrAlreadyRunning
 		}
@@ -146,20 +150,37 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		// dead during initialization. Record session creation time, wait
 		// briefly, then re-verify before killing to avoid destroying a
 		// session that just became healthy.
-		createdAt, _ := t.GetSessionCreatedUnix(sessionID)
+		createdAt, err := t.GetSessionCreatedUnix(sessionID)
+		if err != nil {
+			return fmt.Errorf("reading witness session creation time: %w", err)
+		}
+		if createdAt <= 0 {
+			return fmt.Errorf("reading witness session creation time: invalid timestamp %d", createdAt)
+		}
 		time.Sleep(constants.ZombieKillGracePeriod)
 
 		// Re-check: abort kill if agent started or session was replaced
-		if t.IsAgentAlive(sessionID) {
+		alive, err = t.IsAgentAliveChecked(sessionID)
+		if err != nil {
+			return fmt.Errorf("rechecking witness liveness: %w", err)
+		}
+		if alive {
 			return ErrAlreadyRunning
 		}
-		if createdNow, _ := t.GetSessionCreatedUnix(sessionID); createdAt > 0 && createdNow != createdAt {
+		createdNow, err := t.GetSessionCreatedUnix(sessionID)
+		if err != nil {
+			return fmt.Errorf("rechecking witness session creation time: %w", err)
+		}
+		if createdNow <= 0 {
+			return fmt.Errorf("rechecking witness session creation time: invalid timestamp %d", createdNow)
+		}
+		if createdNow != createdAt {
 			// Session was replaced between checks — another process already
 			// handled the zombie. Treat as already running; caller can retry.
 			return ErrAlreadyRunning
 		}
 
-		if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSession(sessionID) }); err != nil {
+		if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSessionWithProcesses(sessionID) }); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}
