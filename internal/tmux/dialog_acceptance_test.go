@@ -276,6 +276,12 @@ Skip until next version`,
 			wantName:    "workspace trust prompt",
 		},
 		{
+			name:        "accepted current codex hook overview",
+			content:     "Hooks\nLifecycle hooks from config and enabled plugins.\nPress enter to view hooks; esc to close",
+			wantBlocked: true,
+			wantName:    "codex hook overview",
+		},
+		{
 			name:        "selected legacy trust option-only modal",
 			content:     "› 2. Trust all and continue",
 			wantBlocked: true,
@@ -352,6 +358,28 @@ Bypass Permissions mode
 			}
 			if gotName != tt.wantName {
 				t.Fatalf("name = %q, want %q", gotName, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestContainsCodexHookOverview(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "complete", content: "Hooks\nLifecycle hooks from config and enabled plugins.\nPress enter to view hooks; esc to close", want: true},
+		{name: "missing description", content: "Hooks\nPress enter to view hooks; esc to close"},
+		{name: "missing action", content: "Hooks\nLifecycle hooks from config and enabled plugins."},
+		{name: "reordered", content: "Press enter to view hooks; esc to close\nHooks\nLifecycle hooks from config and enabled plugins."},
+		{name: "prose", content: "Hooks use lifecycle hooks from config and enabled plugins; press enter to view hooks"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsCodexHookOverview(tt.content); got != tt.want {
+				t.Fatalf("containsCodexHookOverview() = %t, want %t", got, tt.want)
 			}
 		})
 	}

@@ -2491,6 +2491,18 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 					return err
 				}
 				time.Sleep(500 * time.Millisecond)
+				if key == "t" {
+					content, err := t.CapturePane(session, 30)
+					if err != nil {
+						return err
+					}
+					if containsCodexHookOverview(content) {
+						if _, err := t.run("send-keys", "-t", session, "Escape"); err != nil {
+							return err
+						}
+						time.Sleep(200 * time.Millisecond)
+					}
+				}
 				return nil
 			}
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
@@ -2529,6 +2541,8 @@ const (
 	legacyCodexHookTrustSelected = "› 2. Trust all and continue"
 	currentCodexHookHeader       = "Hooks"
 	currentCodexHookAction       = "Press t to trust all; enter to review hooks; esc to close"
+	currentCodexHookOverview     = "Lifecycle hooks from config and enabled plugins."
+	currentCodexHookOverviewExit = "Press enter to view hooks; esc to close"
 )
 
 var currentCodexHookWarning = regexp.MustCompile(`^(?:⚠ )?[1-9][0-9]* hooks need review before they can run\.$`)
@@ -2600,9 +2614,20 @@ func codexHookTrustAcceptanceKey(content string) (string, bool) {
 	return "", false
 }
 
+func containsCodexHookOverview(content string) bool {
+	lines := normalizedStartupDialogLines(content)
+	header := exactStartupDialogLineAfter(lines, currentCodexHookHeader, -1)
+	overview := exactStartupDialogLineAfter(lines, currentCodexHookOverview, header)
+	exit := exactStartupDialogLineAfter(lines, currentCodexHookOverviewExit, overview)
+	return header >= 0 && overview > header && exit > overview
+}
+
 func containsBlockingStartupDialog(content string) (string, bool) {
 	if agentActivityAppearsAfterStartupBlocker(content) {
 		return "", false
+	}
+	if containsCodexHookOverview(content) {
+		return "codex hook overview", true
 	}
 	if containsCodexUpdateDialog(content) {
 		return "codex update prompt", true

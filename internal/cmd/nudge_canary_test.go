@@ -398,15 +398,17 @@ func TestNewWakeCanarySandboxIsPrivateAndIsolated(t *testing.T) {
 		t.Fatalf("temporary Codex config missing: %v", err)
 	}
 	var codexConfig struct {
-		HideRateLimitModelNudge bool `toml:"hide_rate_limit_model_nudge"`
-		Features                struct {
+		Notice struct {
+			HideRateLimitModelNudge bool `toml:"hide_rate_limit_model_nudge"`
+		} `toml:"notice"`
+		Features struct {
 			Hooks bool `toml:"hooks"`
 		} `toml:"features"`
 	}
 	if _, err := toml.Decode(string(configData), &codexConfig); err != nil {
 		t.Fatalf("parse temporary Codex config: %v", err)
 	}
-	if !codexConfig.HideRateLimitModelNudge {
+	if !codexConfig.Notice.HideRateLimitModelNudge {
 		t.Fatal("temporary Codex config permits a model-switch reminder to block idle detection")
 	}
 	if !codexConfig.Features.Hooks {
