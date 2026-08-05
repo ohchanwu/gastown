@@ -305,7 +305,7 @@ func observeIdlePane(escContent, promptPrefix string, cursorX, cursorY int) Idle
 			observation.PromptOnCursor = observation.PromptOnCursor || row == cursorY
 		}
 	}
-	if observation.CodexPrompt && cursorX == 1 && observation.CursorRowBlank && observation.NonEmptyAfterCursor {
+	if observation.CodexPrompt && (cursorX == 1 || cursorX == 2) && observation.CursorRowBlank && observation.NonEmptyAfterCursor {
 		observation.BlankCursorWithFooter = true
 		observation.Idle = true
 		return observation
