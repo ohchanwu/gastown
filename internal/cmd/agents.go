@@ -87,7 +87,11 @@ Use 'gt agents menu' for an interactive tmux popup menu.`,
 }
 
 var agentsListCmd = &cobra.Command{
-	Use:   "list",
+	Use: "list",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+	},
 	Short: "List agent sessions (no popup)",
 	Long:  `List all agent sessions to stdout without the popup menu.`,
 	RunE:  runAgentsList,

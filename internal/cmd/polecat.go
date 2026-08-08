@@ -60,7 +60,11 @@ Cats build features. Dogs clean up messes.`,
 }
 
 var polecatListCmd = &cobra.Command{
-	Use:   "list [rig]",
+	Use: "list [rig]",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsMaximumOne,
+	},
 	Short: "List polecats in a rig",
 	Long: `List polecats in a rig or all rigs.
 
@@ -114,7 +118,11 @@ Examples:
 }
 
 var polecatStatusCmd = &cobra.Command{
-	Use:   "status <rig>/<polecat>",
+	Use: "status <rig>/<polecat>",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsExactOne,
+	},
 	Short: "Show detailed status for a polecat",
 	Long: `Show detailed status for a polecat.
 

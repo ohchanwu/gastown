@@ -100,6 +100,53 @@ func TestCheckHelpFlag(t *testing.T) {
 	}
 }
 
+func TestExecuteRoutesBrokerBeforeCobra(t *testing.T) {
+	originalBroker := runSessionBrokerClient
+	originalArgs := os.Args
+	t.Cleanup(func() {
+		runSessionBrokerClient = originalBroker
+		os.Args = originalArgs
+	})
+
+	os.Args = []string{"gt", "doctor", "--fix"}
+	called := false
+	runSessionBrokerClient = func(args []string) (bool, int, error) {
+		called = true
+		if len(args) != 2 || args[0] != "doctor" || args[1] != "--fix" {
+			t.Fatalf("broker args = %q, want [doctor --fix]", args)
+		}
+		return true, 73, nil
+	}
+	if code := Execute(); code != 73 {
+		t.Fatalf("Execute() = %d, want broker exit code 73", code)
+	}
+	if !called {
+		t.Fatal("Execute() did not call broker")
+	}
+}
+
+func TestExecuteDoesNotBrokerTrustedInitInvocation(t *testing.T) {
+	originalBroker := runSessionBrokerClient
+	originalArgs := os.Args
+	t.Cleanup(func() {
+		runSessionBrokerClient = originalBroker
+		os.Args = originalArgs
+	})
+
+	os.Args = []string{"gt", "session-custody-init"}
+	called := false
+	runSessionBrokerClient = func([]string) (bool, int, error) {
+		called = true
+		return true, 73, nil
+	}
+	if code := Execute(); code != 1 {
+		t.Fatalf("Execute() = %d, want trusted-init rejection code 1", code)
+	}
+	if called {
+		t.Fatal("Execute() routed trusted init through the not-yet-running broker")
+	}
+}
+
 func TestCheckHelpFlag_EdgeCases(t *testing.T) {
 	testCmd := &cobra.Command{
 		Use:   "test",

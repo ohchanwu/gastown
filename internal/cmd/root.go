@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/ui"
 	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -320,7 +321,20 @@ func checkStaleBinaryWarning() {
 
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
+var runSessionBrokerClient = tmux.RunSessionBrokerClient
+
 func Execute() int {
+	if !isSessionCustodyInitInvocation(os.Args[1:]) {
+		if handled, exitCode, err := runSessionBrokerClient(os.Args[1:]); handled {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gt session broker: %v\n", err)
+				if exitCode == 0 {
+					return 1
+				}
+			}
+			return exitCode
+		}
+	}
 	if !isDoneInvocation(os.Args[1:]) && !isSessionCustodyInitInvocation(os.Args[1:]) {
 		ctx := context.Background()
 		provider, err := telemetry.Init(ctx, "gastown", Version)

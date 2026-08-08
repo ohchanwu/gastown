@@ -13,6 +13,12 @@ import (
 
 func TestMain(m *testing.M) {
 	BuiltProperly = "1"
+	if runSessionBrokerReexecHelper() {
+		os.Exit(Execute())
+	}
+	if os.Getenv("GT_TEST_CMD_EXECUTE_HELPER") == "1" {
+		os.Exit(Execute())
+	}
 	baseline := doltserver.FindAllDoltListeners()
 	code := m.Run()
 	if leaked := newListenerPIDs(baseline, doltserver.FindAllDoltListeners()); len(leaked) > 0 {

@@ -16,9 +16,9 @@ var (
 	mailType          string
 	mailReplyTo       string
 	mailNotify        bool
-	mailNoNotify      bool // Suppress auto-nudge notification to recipient
-	mailTo            string   // --to flag (alternative to positional arg)
-	mailFrom          string   // --from flag (override sender, for relay/bridge use)
+	mailNoNotify      bool   // Suppress auto-nudge notification to recipient
+	mailTo            string // --to flag (alternative to positional arg)
+	mailFrom          string // --from flag (override sender, for relay/bridge use)
 	mailSendSelf      bool
 	mailCC            []string // CC recipients
 	mailInboxJSON     bool
@@ -96,7 +96,11 @@ COMMANDS:
 }
 
 var mailSendCmd = &cobra.Command{
-	Use:   "send <address>",
+	Use: "send <address>",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+	},
 	Short: "Send a message",
 	Long: `Send a message to an agent.
 
@@ -146,7 +150,11 @@ Examples:
 }
 
 var mailInboxCmd = &cobra.Command{
-	Use:   "inbox [address]",
+	Use: "inbox [address]",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+	},
 	Short: "Check inbox",
 	Long: `Check messages in an inbox.
 
@@ -168,7 +176,11 @@ Examples:
 }
 
 var mailReadCmd = &cobra.Command{
-	Use:   "read <message-id|index>",
+	Use: "read <message-id|index>",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsExactOne,
+	},
 	Short: "Read a message",
 	Long: `Read a specific message (does not mark as read).
 

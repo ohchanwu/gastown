@@ -64,10 +64,14 @@ const (
 )
 
 var primeCmd = &cobra.Command{
-	Use:         "prime",
-	GroupID:     GroupDiag,
-	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
-	Short:       "Output role context for current directory",
+	Use:     "prime",
+	GroupID: GroupDiag,
+	Annotations: map[string]string{
+		AnnotationPolecatSafe:    "true",
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+	},
+	Short: "Output role context for current directory",
 	Long: `Detect the agent role from the current directory and output context.
 
 Role detection:

@@ -74,6 +74,7 @@ type linuxCustodyLaunch struct {
 	ready  *os.File
 	permit *os.File
 	life   *os.File
+	broker *os.File
 }
 
 func startLinuxCustodyWait(child *exec.Cmd) <-chan error {
@@ -145,6 +146,22 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 			_ = lifeWriter.Close()
 		}
 	}()
+	brokerPair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("creating session custody broker socket: %w", err)
+	}
+	brokerServer := os.NewFile(uintptr(brokerPair[0]), "session-custody-broker-server")
+	brokerClient := os.NewFile(uintptr(brokerPair[1]), "session-custody-broker-client")
+	defer func() {
+		if retErr != nil {
+			if brokerServer != nil {
+				_ = brokerServer.Close()
+			}
+			if brokerClient != nil {
+				_ = brokerClient.Close()
+			}
+		}
+	}()
 	executable, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -153,7 +170,7 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.ExtraFiles = []*os.File{readyWriter, permitReader, lifeReader}
+	child.ExtraFiles = []*os.File{readyWriter, permitReader, lifeReader, brokerClient}
 	child.Env = append(
 		withoutEnvironmentKeys(os.Environ(), envLinuxSessionCustodyInit, envLinuxSessionCustodyCommand, envLinuxSessionCustodyNamespaced),
 		envLinuxSessionCustodyInit+"=1",
@@ -177,11 +194,14 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	}
 	launch := &linuxCustodyLaunch{
 		child: child, wait: startLinuxCustodyWait(child), pidfd: pidfd,
-		ready: readyReader, permit: permitWriter, life: lifeWriter,
+		ready: readyReader, permit: permitWriter, life: lifeWriter, broker: brokerServer,
 	}
+	brokerServer = nil
 	_ = readyWriter.Close()
 	_ = permitReader.Close()
 	_ = lifeReader.Close()
+	_ = brokerClient.Close()
+	brokerClient = nil
 	if pidfd < 0 {
 		return nil, errors.Join(errors.New("kernel did not return a pidfd for session custody"), closeLinuxCustodyLaunch(launch, true))
 	}
@@ -233,6 +253,10 @@ func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
 	if terminate && launch.life != nil {
 		errs = append(errs, launch.life.Close())
 		launch.life = nil
+	}
+	if terminate && launch.broker != nil {
+		errs = append(errs, launch.broker.Close())
+		launch.broker = nil
 	}
 	if terminate && reaped && launch.pidfd >= 0 {
 		errs = append(errs, unix.Close(launch.pidfd))
@@ -365,6 +389,9 @@ func runSessionCustodyInit() (bool, error) {
 	if ready == nil || permit == nil || life == nil {
 		return true, errors.New("session custody init protocol descriptors are unavailable")
 	}
+	if err := validateLinuxSessionBrokerEndpoint(linuxSessionBrokerFD); err != nil {
+		return true, err
+	}
 	unix.CloseOnExec(int(life.Fd()))
 	go func() {
 		var value [1]byte
@@ -433,7 +460,7 @@ func runLinuxCustodyWorkload(command string) error {
 	_, err := syscall.ForkExec(
 		"/bin/sh",
 		[]string{"/bin/sh", "-lc", command},
-		&syscall.ProcAttr{Env: env, Files: []uintptr{0, 1, 2}},
+		&syscall.ProcAttr{Env: env, Files: []uintptr{0, 1, 2, ^uintptr(0), ^uintptr(0), ^uintptr(0), uintptr(linuxSessionBrokerFD)}},
 	)
 	if err != nil {
 		return err
@@ -456,10 +483,38 @@ func runLinuxCustodyWorkload(command string) error {
 	}
 }
 
-func runSessionWithCustody(_ string, command string) error {
+func runSessionWithCustody(_ string, command string, validate SessionBrokerValidator) error {
 	launch, contained, err := launchLinuxCustodyCommand(command, startLinuxCustodyCommand)
 	if err != nil {
 		return err
+	}
+	var brokerDone <-chan error
+	if contained {
+		if launch.broker == nil {
+			return errors.Join(errors.New("contained session has no broker endpoint"), closeLinuxCustodyLaunch(launch, true))
+		}
+		brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
+		if dupErr != nil {
+			return errors.Join(fmt.Errorf("retaining session broker endpoint: %w", dupErr), closeLinuxCustodyLaunch(launch, true))
+		}
+		if closeErr := launch.broker.Close(); closeErr != nil {
+			_ = unix.Close(brokerFD)
+			launch.broker = nil
+			return errors.Join(fmt.Errorf("closing original session broker endpoint: %w", closeErr), closeLinuxCustodyLaunch(launch, true))
+		}
+		launch.broker = nil
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			_ = unix.Close(brokerFD)
+			return errors.Join(executableErr, closeLinuxCustodyLaunch(launch, true))
+		}
+		brokerContext, cancelBroker := context.WithCancel(context.Background())
+		defer cancelBroker()
+		result := make(chan error, 1)
+		go func() {
+			result <- ServeSessionBroker(brokerContext, executable, brokerFD, validate)
+		}()
+		brokerDone = result
 	}
 	// Retain the namespace init pidfd and the supervisor-liveness writer until
 	// exact teardown. The trusted init remains alive after reaping the workload,
@@ -467,9 +522,37 @@ func runSessionWithCustody(_ string, command string) error {
 	// PID-1 process or a signal-disposition-dependent zombie.
 	timer := time.NewTimer(sessionCustodyReadyProbe)
 	defer timer.Stop()
-	<-timer.C
+	if brokerDone != nil {
+		select {
+		case brokerErr := <-brokerDone:
+			if brokerErr == nil {
+				brokerErr = errors.New("session broker stopped without an error")
+			}
+			return errors.Join(
+				fmt.Errorf("session broker stopped before readiness: %w", brokerErr),
+				closeLinuxCustodyLaunch(launch, true),
+			)
+		case <-timer.C:
+		}
+	} else {
+		<-timer.C
+	}
 	for {
-		time.Sleep(time.Hour)
+		if brokerDone != nil {
+			select {
+			case brokerErr := <-brokerDone:
+				if brokerErr == nil {
+					brokerErr = errors.New("session broker stopped without an error")
+				}
+				return errors.Join(
+					fmt.Errorf("session broker stopped: %w", brokerErr),
+					closeLinuxCustodyLaunch(launch, true),
+				)
+			case <-time.After(time.Hour):
+			}
+		} else {
+			time.Sleep(time.Hour)
+		}
 		if contained && launch.life == nil {
 			return errors.New("session custody lost its supervisor liveness handle")
 		}

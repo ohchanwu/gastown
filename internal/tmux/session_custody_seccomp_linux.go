@@ -66,12 +66,15 @@ func buildLinuxCustodySeccompFilter(goarch string) ([]unix.SockFilter, error) {
 		)
 	}
 	filter = append(filter,
-		// fcntl(fd, F_SETFD): the endpoint must remain inherited across exec.
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 5, K: uint32(unix.SYS_FCNTL)},
+		// fcntl(fd, F_SETFD, flags): prevent setting FD_CLOEXEC while
+		// permitting the exec runtime to clear it on the inherited endpoint.
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 7, K: uint32(unix.SYS_FCNTL)},
 		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 3, K: linuxCustodyBrokerFD},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 5, K: linuxCustodyBrokerFD},
 		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 24},
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.F_SETFD)},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 3, K: uint32(unix.F_SETFD)},
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 32},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.FD_CLOEXEC)},
 		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: deny},
 	)
 	for _, syscallNumber := range []uint32{

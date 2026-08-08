@@ -53,6 +53,14 @@ func CanWrapCurrentExecutable(path string) bool {
 
 // RunSessionCustodyCommand is the implementation of the hidden launcher.
 func RunSessionCustodyCommand(custody, command string) error {
+	return RunSessionCustodyCommandWithBroker(custody, command, func([]string) error {
+		return errors.New("session broker command policy is unavailable")
+	})
+}
+
+// RunSessionCustodyCommandWithBroker launches the contained workload and
+// serves only commands approved by validate through the trusted outer broker.
+func RunSessionCustodyCommandWithBroker(custody, command string, validate SessionBrokerValidator) error {
 	if !validSessionGenerationRe.MatchString(custody) {
 		return errors.New("invalid session custody token")
 	}
@@ -62,7 +70,10 @@ func RunSessionCustodyCommand(custody, command string) error {
 	if strings.TrimSpace(command) == "" {
 		return errors.New("session custody command is empty")
 	}
-	return runSessionWithCustody(custody, command)
+	if validate == nil {
+		return errors.New("session broker validator is unavailable")
+	}
+	return runSessionWithCustody(custody, command, validate)
 }
 
 // RunSessionCustodyInit enters the trusted namespace-init path selected by the

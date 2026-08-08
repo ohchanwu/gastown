@@ -19,11 +19,15 @@ import (
 )
 
 var hookCmd = &cobra.Command{
-	Use:         "hook [bead-id] [target]",
-	Aliases:     []string{"work"},
-	GroupID:     GroupWork,
-	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
-	Short:       "Show or attach work on a hook",
+	Use:     "hook [bead-id] [target]",
+	Aliases: []string{"work"},
+	GroupID: GroupWork,
+	Annotations: map[string]string{
+		AnnotationPolecatSafe:    "true",
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+	},
+	Short: "Show or attach work on a hook",
 	Long: `Show what's on your hook, or attach new work.
 
 With no arguments, shows your current hook status (alias for 'gt mol status').
@@ -52,7 +56,11 @@ Related commands:
 
 // hookStatusCmd shows hook status (alias for mol status)
 var hookStatusCmd = &cobra.Command{
-	Use:   "status [target]",
+	Use: "status [target]",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+	},
 	Short: "Show what's on your hook",
 	Long: `Show what's slung on your hook.
 
@@ -68,7 +76,11 @@ Examples:
 
 // hookShowCmd shows hook status in compact one-line format
 var hookShowCmd = &cobra.Command{
-	Use:   "show [agent]",
+	Use: "show [agent]",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+	},
 	Short: "Show what's on an agent's hook (compact)",
 	Long: `Show what's on any agent's hook in compact one-line format.
 

@@ -38,11 +38,15 @@ var statusInterval int
 var statusVerbose bool
 
 var statusCmd = &cobra.Command{
-	Use:         "status",
-	Aliases:     []string{"stat"},
-	GroupID:     GroupDiag,
-	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
-	Short:       "Show overall town status",
+	Use:     "status",
+	Aliases: []string{"stat"},
+	GroupID: GroupDiag,
+	Annotations: map[string]string{
+		AnnotationPolecatSafe:    "true",
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+	},
+	Short: "Show overall town status",
 	Long: `Display the current status of the Gas Town workspace.
 
 Shows town name, registered rigs, polecats, and witness status.

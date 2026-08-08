@@ -89,7 +89,11 @@ type OrphanDB struct {
 }
 
 var healthCmd = &cobra.Command{
-	Use:   "health",
+	Use: "health",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:     "true",
+		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+	},
 	Short: "Show comprehensive system health",
 	Long: `Display a comprehensive health report for the Gas Town data plane.
 

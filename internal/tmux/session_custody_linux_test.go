@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -103,6 +104,23 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	} else {
 		socketResult += ";broker_close=allowed"
 	}
+	_, _, closeRangeErr := unix.RawSyscall(unix.SYS_CLOSE_RANGE, uintptr(linuxCustodyBrokerFD), uintptr(linuxCustodyBrokerFD), 0)
+	socketResult += ";broker_close_range=" + closeRangeErr.Error()
+	if dupErr := unix.Dup3(0, int(linuxCustodyBrokerFD), 0); dupErr != nil {
+		socketResult += ";broker_dup_over=" + dupErr.Error()
+	} else {
+		socketResult += ";broker_dup_over=allowed"
+	}
+	if _, fcntlErr := unix.FcntlInt(uintptr(linuxCustodyBrokerFD), unix.F_SETFD, unix.FD_CLOEXEC); fcntlErr != nil {
+		socketResult += ";broker_cloexec=" + fcntlErr.Error()
+	} else {
+		socketResult += ";broker_cloexec=allowed"
+	}
+	if socketType, endpointErr := unix.GetsockoptInt(int(linuxCustodyBrokerFD), unix.SOL_SOCKET, unix.SO_TYPE); endpointErr != nil {
+		socketResult += ";broker_endpoint=" + endpointErr.Error()
+	} else {
+		socketResult += ";broker_endpoint=" + strconv.Itoa(socketType)
+	}
 	if inetFD, inetErr := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0); inetErr != nil {
 		socketResult += ";inet=" + inetErr.Error()
 	} else {
@@ -122,13 +140,61 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_NETWORK"), []byte(networkResult), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("GT_TEST_SESSION_CUSTODY_BROKER_PROOF") != "" {
+		socketType, err := unix.GetsockoptInt(linuxSessionBrokerFD, unix.SOL_SOCKET, unix.SO_TYPE)
+		if err != nil {
+			t.Fatalf("checking inherited broker endpoint: %v", err)
+		}
+		if socketType != unix.SOCK_SEQPACKET {
+			t.Fatalf("inherited broker socket type = %d, want SOCK_SEQPACKET", socketType)
+		}
+		exitCode, err := runSessionBrokerClientAtFD(
+			linuxSessionBrokerFD,
+			[]string{"-test.run=^TestLinuxSessionBrokerOutsideWorkerHelper$"},
+			os.Stdin,
+			os.Stdout,
+			os.Stderr,
+			10*time.Second,
+		)
+		if err != nil || exitCode != 0 {
+			t.Fatalf("brokered worker exit code = %d, error = %v", exitCode, err)
+		}
+	}
 	grandchildPath := os.Getenv("GT_TEST_SESSION_CUSTODY_GRANDCHILD")
-	script := fmt.Sprintf("(setsid sh -c 'grep ^NSpid: /proc/$$/status > %s; while :; do sleep 60; done' </dev/null >/dev/null 2>&1 &) &", config.ShellQuote(grandchildPath))
+	grandchildTempPath := grandchildPath + ".tmp"
+	script := fmt.Sprintf(
+		"(setsid sh -c 'grep ^NSpid: /proc/$$/status > %s && mv %s %s; while :; do sleep 60; done' </dev/null >/dev/null 2>&1 &) &",
+		config.ShellQuote(grandchildTempPath),
+		config.ShellQuote(grandchildTempPath),
+		config.ShellQuote(grandchildPath),
+	)
 	if output, err := exec.Command("sh", "-c", script).CombinedOutput(); err != nil {
 		t.Fatalf("starting detached grandchild: %v\n%s", err, output)
 	}
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+func TestLinuxSessionBrokerOutsideWorkerHelper(t *testing.T) {
+	proofPath := os.Getenv("GT_TEST_SESSION_CUSTODY_BROKER_PROOF")
+	if proofPath == "" {
+		return
+	}
+	pidNamespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := fmt.Sprintf(
+		"pidns=%s;custody=%q;init=%q;command=%q;namespaced=%q",
+		pidNamespace,
+		os.Getenv(EnvSessionCustody),
+		os.Getenv(envLinuxSessionCustodyInit),
+		os.Getenv(envLinuxSessionCustodyCommand),
+		os.Getenv(envLinuxSessionCustodyNamespaced),
+	)
+	if err := os.WriteFile(proofPath, []byte(proof), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -143,7 +209,18 @@ func TestLinuxSessionCustodySupervisorHelper(t *testing.T) {
 	if command == "" {
 		command = config.ShellQuote(os.Args[0]) + " -test.run=^TestLinuxSessionCustodyWorkloadHelper$"
 	}
-	if err := RunSessionCustodyCommand(custody, command); err != nil {
+	validator := SessionBrokerValidator(func([]string) error {
+		return errors.New("test session broker command denied")
+	})
+	if os.Getenv("GT_TEST_SESSION_CUSTODY_BROKER_PROOF") != "" {
+		validator = func(args []string) error {
+			if len(args) == 1 && args[0] == "-test.run=^TestLinuxSessionBrokerOutsideWorkerHelper$" {
+				return nil
+			}
+			return fmt.Errorf("unexpected test broker command %q", args)
+		}
+	}
+	if err := RunSessionCustodyCommandWithBroker(custody, command, validator); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -405,6 +482,11 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 	socketPath := testDir + "/socket"
 	hardeningPath := testDir + "/hardening"
 	networkPath := testDir + "/network"
+	brokerProofPath := testDir + "/broker-proof"
+	wantBrokerPIDNamespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCustodySupervisorHelper$")
 	cmd.Env = append(os.Environ(),
 		"GT_TEST_SESSION_CUSTODY_HELPER="+custody,
@@ -416,8 +498,9 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		"GT_TEST_SESSION_CUSTODY_HARDENING="+hardeningPath,
 		"GT_TEST_SESSION_CUSTODY_NETWORK="+networkPath,
 		"GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK="+hostListener.Addr().String(),
+		"GT_TEST_SESSION_CUSTODY_BROKER_PROOF="+brokerProofPath,
 	)
-	var output strings.Builder
+	var output synchronizedStringBuilder
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
@@ -437,7 +520,7 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		}
 	})
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		escape, escapeErr := os.ReadFile(escapePath)
 		grandchild, grandchildErr := os.ReadFile(grandchildPath)
@@ -445,7 +528,8 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		socketResult, socketErr := os.ReadFile(socketPath)
 		hardeningResult, hardeningErr := os.ReadFile(hardeningPath)
 		networkResult, networkErr := os.ReadFile(networkPath)
-		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil && hardeningErr == nil && networkErr == nil {
+		brokerProof, brokerProofErr := os.ReadFile(brokerProofPath)
+		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil && hardeningErr == nil && networkErr == nil && brokerProofErr == nil {
 			if strings.Contains(strings.TrimSpace(string(escape)), "escaped") {
 				t.Fatal("contained workload joined the supervisor PID namespace")
 			}
@@ -468,6 +552,10 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 				"kcmp=operation not permitted",
 				"pidfd_getfd=operation not permitted",
 				"broker_close=operation not permitted",
+				"broker_close_range=operation not permitted",
+				"broker_dup_over=operation not permitted",
+				"broker_cloexec=operation not permitted",
+				"broker_endpoint=" + strconv.Itoa(unix.SOCK_SEQPACKET),
 			} {
 				if !strings.Contains(socketEvidence, field) {
 					t.Fatalf("contained workload bypassed socket broker containment: %q", socketResult)
@@ -488,6 +576,18 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 			}
 			if strings.TrimSpace(string(networkResult)) == "connected" {
 				t.Fatal("contained workload reached the supervisor host loopback")
+			}
+			brokerEvidence := string(brokerProof)
+			for _, field := range []string{
+				"pidns=" + wantBrokerPIDNamespace,
+				`custody=""`,
+				`init=""`,
+				`command=""`,
+				`namespaced=""`,
+			} {
+				if !strings.Contains(brokerEvidence, field) {
+					t.Fatalf("brokered worker did not run outside with sanitized custody environment %q: %q", field, brokerProof)
+				}
 			}
 			grandchildNamespacePID, parseErr := strconv.Atoi(fields[len(fields)-1])
 			if parseErr != nil {
@@ -544,6 +644,23 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+type synchronizedStringBuilder struct {
+	mu      sync.Mutex
+	builder strings.Builder
+}
+
+func (builder *synchronizedStringBuilder) Write(payload []byte) (int, error) {
+	builder.mu.Lock()
+	defer builder.mu.Unlock()
+	return builder.builder.Write(payload)
+}
+
+func (builder *synchronizedStringBuilder) String() string {
+	builder.mu.Lock()
+	defer builder.mu.Unlock()
+	return builder.builder.String()
 }
 
 func TestLinuxSessionGenerationCleanupStopsSupervisorOnFirstRun(t *testing.T) {
