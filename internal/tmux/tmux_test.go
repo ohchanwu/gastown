@@ -1631,6 +1631,85 @@ func TestSessionGenerationCleanupRefreshesTmuxBudgetAfterCommittedKill(t *testin
 	}
 }
 
+func TestReconcileSessionGenerationRetriesPaneRaceUntilAbsent(t *testing.T) {
+	original := SessionGeneration{Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server"}
+	captures := 0
+	kills := 0
+	err := reconcileSessionGenerationContext(
+		context.Background(),
+		original,
+		123,
+		sessionGenerationReconcileOps{
+			capture: func(context.Context, string) (SessionGeneration, error) {
+				captures++
+				if captures >= 3 {
+					return SessionGeneration{}, ErrSessionNotFound
+				}
+				return original, nil
+			},
+			kill: func(context.Context, SessionGeneration, int) error {
+				kills++
+				if kills == 1 {
+					return ErrSessionGenerationChanged
+				}
+				return nil
+			},
+			wait: func(context.Context, time.Duration) error { return nil },
+		},
+	)
+	if err != nil || captures != 3 || kills != 2 {
+		t.Fatalf("reconcile = error %v, captures %d, kills %d; want absent after retry", err, captures, kills)
+	}
+}
+
+func TestReconcileSessionGenerationPreservesSameNameReplacement(t *testing.T) {
+	original := SessionGeneration{Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server"}
+	replacement := original
+	replacement.SessionID = "$2"
+	replacement.Nonce = "replacement-generation"
+	kills := 0
+	err := reconcileSessionGenerationContext(
+		context.Background(),
+		original,
+		123,
+		sessionGenerationReconcileOps{
+			capture: func(context.Context, string) (SessionGeneration, error) { return replacement, nil },
+			kill: func(context.Context, SessionGeneration, int) error {
+				kills++
+				return nil
+			},
+			wait: func(context.Context, time.Duration) error { return nil },
+		},
+	)
+	if !errors.Is(err, ErrSessionGenerationChanged) || kills != 0 {
+		t.Fatalf("replacement reconciliation = error %v, kills %d; want preserved replacement evidence", err, kills)
+	}
+}
+
+func TestReconcileSessionGenerationTimeoutReportsUnreconciledCommit(t *testing.T) {
+	ambiguousErr := errors.New("ambiguous tmux receipt")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := reconcileSessionGenerationContext(
+		ctx,
+		SessionGeneration{Name: "witness"},
+		123,
+		sessionGenerationReconcileOps{
+			capture: func(context.Context, string) (SessionGeneration, error) {
+				return SessionGeneration{}, ambiguousErr
+			},
+			kill: func(context.Context, SessionGeneration, int) error {
+				t.Fatal("ambiguous capture must not issue a tmux mutation")
+				return nil
+			},
+			wait: waitForContext,
+		},
+	)
+	if !errors.Is(err, ErrSessionCleanupUnreconciled) || !errors.Is(err, ambiguousErr) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("reconcile error = %v, want committed unresolved evidence", err)
+	}
+}
+
 func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-success-%d", time.Now().UnixNano()))
 	session := "gt-cleanup-success"

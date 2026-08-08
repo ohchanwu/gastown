@@ -518,6 +518,98 @@ func TestWaitLinuxCustodyProcessBoundsUnreapedChild(t *testing.T) {
 	}
 }
 
+func TestCloseLinuxCustodyLaunchClosesPidfdAfterReapTimeout(t *testing.T) {
+	fd, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := &linuxCustodyLaunch{
+		child: &exec.Cmd{},
+		wait:  make(chan error),
+		pidfd: fd,
+	}
+	err = closeLinuxCustodyLaunchWithTimeout(launch, true, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close error = %v, want bounded reap evidence", err)
+	}
+	if launch.pidfd != -1 {
+		t.Fatalf("launch pidfd = %d, want released ownership", launch.pidfd)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("released pidfd F_GETFD error = %v, want EBADF", err)
+	}
+}
+
+func TestLinuxSessionCustodyKillRefreshesEveryPostCommitBudget(t *testing.T) {
+	custody := &linuxSessionCustody{
+		supervisorPID: 101, supervisorIdentity: "supervisor", supervisorFD: 11,
+		initPID: 202, initIdentity: "init", initFD: 22, prepared: true,
+	}
+	var signals []string
+	var waits []string
+	budget := 20 * time.Millisecond
+	ops := linuxCustodyKillOps{
+		revalidate: func() (linuxProcessStat, error) {
+			return linuxProcessStat{startTime: "init", state: 'S'}, nil
+		},
+		signal: func(fd int, signal unix.Signal) error {
+			signals = append(signals, fmt.Sprintf("%d:%d", fd, signal))
+			return nil
+		},
+		wait: func(ctx context.Context, pid int, identity string) error {
+			if ctx.Err() != nil {
+				t.Fatalf("phase %s started with exhausted context: %v", identity, ctx.Err())
+			}
+			if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < budget/2 {
+				t.Fatalf("phase %s did not receive a fresh budget: deadline %v", identity, deadline)
+			}
+			waits = append(waits, identity)
+			if len(waits) < 3 {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+	committed, err := custody.killWithBudgets(
+		context.Background(),
+		linuxCustodyKillBudgets{Init: budget, Broker: budget, Supervisor: budget},
+		ops,
+	)
+	if !committed || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("killWithBudgets() = committed %v, error %v; want committed timeout evidence", committed, err)
+	}
+	wantSignals := []string{
+		fmt.Sprintf("22:%d", unix.SIGKILL),
+		fmt.Sprintf("11:%d", unix.SIGTERM),
+		fmt.Sprintf("11:%d", unix.SIGKILL),
+	}
+	if strings.Join(signals, ",") != strings.Join(wantSignals, ",") {
+		t.Fatalf("signals = %v, want %v", signals, wantSignals)
+	}
+	if strings.Join(waits, ",") != "init,supervisor,supervisor" {
+		t.Fatalf("wait phases = %v", waits)
+	}
+}
+
+func TestLinuxCustodyServiceShutdownBoundsIgnoredBrokerWorker(t *testing.T) {
+	serviceContext, cancelServices := context.WithCancel(context.Background())
+	results := make(chan linuxCustodyServiceResult, 3)
+	results <- linuxCustodyServiceResult{name: "HTTPS proxy"}
+	results <- linuxCustodyServiceResult{name: "Dolt proxy"}
+	started := time.Now()
+	err := shutdownLinuxCustodyServices(cancelServices, results, 3, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want broker timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("ignored broker worker blocked shutdown for %v", elapsed)
+	}
+	if serviceContext.Err() == nil {
+		t.Fatal("service cancellation was not issued")
+	}
+}
+
 func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testing.T) {
 	custody := uuid.NewString()
 	testDir := t.TempDir()

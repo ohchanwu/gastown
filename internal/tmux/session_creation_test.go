@@ -181,6 +181,10 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 	if err != nil {
 		t.Skip("python3 is required to launch a detached child")
 	}
+	mkfifo, err := exec.LookPath("mkfifo")
+	if err != nil {
+		t.Skip("mkfifo is required for the detached-child readiness handshake")
+	}
 
 	unrelated := "gt-test-create-cancel-unrelated"
 	_ = tm.KillSession(unrelated)
@@ -194,26 +198,46 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	barrier := filepath.Join(t.TempDir(), "final-check")
+	barrier := filepath.Join(t.TempDir(), "final-check.fifo")
+	barrierOnce := filepath.Join(t.TempDir(), "final-check-once")
+	pidFIFO := filepath.Join(t.TempDir(), "child-pid.fifo")
+	for _, fifo := range []string{barrier, pidFIFO} {
+		if output, err := exec.Command(mkfifo, fifo).CombinedOutput(); err != nil {
+			t.Fatalf("create readiness FIFO %s: %v: %s", fifo, err, output)
+		}
+	}
+	type fifoResult struct {
+		payload []byte
+		err     error
+	}
+	readFIFO := func(path string) <-chan fifoResult {
+		result := make(chan fifoResult, 1)
+		go func() {
+			payload, err := os.ReadFile(path)
+			result <- fifoResult{payload: payload, err: err}
+		}()
+		return result
+	}
+	childReady := readFIFO(pidFIFO)
+	finalBoundary := readFIFO(barrier)
 	wrapperDir := t.TempDir()
 	wrapper := fmt.Sprintf(`#!/bin/sh
 case " $* " in
   *" -t %s remain-on-exit off "*)
-    if [ ! -e %q ]; then
-      : > %q
+    if mkdir %q 2>/dev/null; then
+      printf 'ready\n' > %q
       exec /bin/sleep 30
     fi
     ;;
 esac
 exec %q "$@"
-`, session, barrier, barrier, realTmux)
+`, session, barrierOnce, barrier, realTmux)
 	if err := os.WriteFile(filepath.Join(wrapperDir, "tmux"), []byte(wrapper), 0o755); err != nil {
 		t.Fatalf("write tmux barrier wrapper: %v", err)
 	}
 	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	script := fmt.Sprintf(`import subprocess; p = subprocess.Popen(["sleep", "30"], start_new_session=True); open(%q, "w").write(str(p.pid)); p.wait()`, pidFile)
+	script := fmt.Sprintf(`import subprocess; p = subprocess.Popen(["sleep", "30"], start_new_session=True); ready = open(%q, "w"); ready.write(str(p.pid)); ready.close(); p.wait()`, pidFIFO)
 	command := fmt.Sprintf("%q -c %q", python, script)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -225,41 +249,43 @@ exec %q "$@"
 	}()
 
 	var childPID string
-	deadline := time.Now().Add(3 * time.Second)
-	for childPID == "" && time.Now().Before(deadline) {
-		payload, readErr := os.ReadFile(pidFile)
-		if readErr == nil {
-			childPID = strings.TrimSpace(string(payload))
+	select {
+	case ready := <-childReady:
+		childPID = strings.TrimSpace(string(ready.payload))
+		if ready.err != nil || childPID == "" {
+			t.Fatalf("detached-child readiness handshake = %q, err %v", ready.payload, ready.err)
 		}
-		if childPID == "" {
-			time.Sleep(10 * time.Millisecond)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for detached-child readiness handshake")
+	}
+	select {
+	case ready := <-finalBoundary:
+		if ready.err != nil || strings.TrimSpace(string(ready.payload)) != "ready" {
+			t.Fatalf("final creation boundary handshake = %q, err %v", ready.payload, ready.err)
 		}
-	}
-	if childPID == "" {
-		t.Fatal("runtime command did not record detached child PID")
-	}
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(barrier); err == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if _, err := os.Stat(barrier); err != nil {
-		t.Fatalf("session creation did not reach final context boundary: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final creation boundary handshake")
 	}
 
 	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("creation error = %v, want context canceled", err)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("creation error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bounded failed-creation cleanup")
 	}
 
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for exec.Command("kill", "-0", childPID).Run() == nil && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if err := exec.Command("kill", "-0", childPID).Run(); err == nil {
 		t.Fatalf("attempt-owned detached child process %s survived cancelled creation", childPID)
+	}
+	if running, err := tm.HasSession(session); err != nil || running {
+		t.Fatalf("attempt-owned tmux session survived cancelled creation: running=%v err=%v", running, err)
 	}
 	if running, err := tm.HasSession(unrelated); err != nil || !running {
 		t.Fatalf("unrelated session removed by cancelled creation: running=%v err=%v", running, err)

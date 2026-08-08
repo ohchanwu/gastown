@@ -412,6 +412,18 @@ type pollerTransitionOps struct {
 // and must preserve the old poller generation.
 type PollerReplacementCommit func(context.Context) (bool, error)
 
+// PollerReplacementOutcome separates the irreversible commit fact from proof
+// that the old session reached a terminal state. A committed but non-terminal
+// cleanup must preserve the exact poller generation for later reconciliation.
+type PollerReplacementOutcome struct {
+	Committed bool
+	Terminal  bool
+}
+
+type PollerReplacementOutcomeCommit func(context.Context) (PollerReplacementOutcome, error)
+
+var ErrPollerPreservedAfterCommittedCleanup = errors.New("poller preserved after committed cleanup without terminal session reconciliation")
+
 // ReplaceBeforeStoppingPollerGenerationContext keeps the exact poller alive
 // through nondestructive replacement preparation. Once the returned commit
 // function issues its first destructive signal, exact-poller reconciliation is
@@ -446,6 +458,40 @@ func ReplaceBeforeStoppingPollerGenerationContext(
 	)
 }
 
+// ReplaceBeforeStoppingPollerGenerationOutcomeContext gives committed session
+// work and exact-poller reconciliation independent budgets. The poller stops
+// only after the commit reports terminal old-session reconciliation.
+func ReplaceBeforeStoppingPollerGenerationOutcomeContext(
+	ctx context.Context,
+	townRoot, session string,
+	generation PollerGeneration,
+	commitTimeout, pollerTimeout time.Duration,
+	prepare func(context.Context) (PollerReplacementOutcomeCommit, error),
+) error {
+	return replaceBeforeStoppingPollerGenerationOutcomeContext(
+		ctx,
+		townRoot,
+		session,
+		generation,
+		commitTimeout,
+		pollerTimeout,
+		pollerTransitionOps{
+			read:     os.ReadFile,
+			alive:    pollerProcessAlive,
+			identity: lookupPollerIdentity,
+			stop: func(data []byte) error {
+				return os.WriteFile(pollerStopFile(townRoot, session), data, 0600)
+			},
+			wait: waitPollerExitContext,
+			quarantine: func(path string, data []byte) error {
+				return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
+			},
+			remove: os.Remove,
+		},
+		prepare,
+	)
+}
+
 func replaceBeforeStoppingPollerGenerationContext(
 	ctx context.Context,
 	townRoot, session string,
@@ -453,6 +499,35 @@ func replaceBeforeStoppingPollerGenerationContext(
 	postCommitTimeout time.Duration,
 	ops pollerTransitionOps,
 	prepare func(context.Context) (PollerReplacementCommit, error),
+) error {
+	return replaceBeforeStoppingPollerGenerationOutcomeContext(
+		ctx,
+		townRoot,
+		session,
+		generation,
+		postCommitTimeout,
+		postCommitTimeout,
+		ops,
+		func(ctx context.Context) (PollerReplacementOutcomeCommit, error) {
+			commit, err := prepare(ctx)
+			if err != nil || commit == nil {
+				return nil, err
+			}
+			return func(commitCtx context.Context) (PollerReplacementOutcome, error) {
+				committed, commitErr := commit(commitCtx)
+				return PollerReplacementOutcome{Committed: committed, Terminal: committed}, commitErr
+			}, nil
+		},
+	)
+}
+
+func replaceBeforeStoppingPollerGenerationOutcomeContext(
+	ctx context.Context,
+	townRoot, session string,
+	generation PollerGeneration,
+	commitTimeout, pollerTimeout time.Duration,
+	ops pollerTransitionOps,
+	prepare func(context.Context) (PollerReplacementOutcomeCommit, error),
 ) error {
 	lock, err := lockPollerContext(ctx, townRoot, session)
 	if err != nil {
@@ -475,19 +550,25 @@ func replaceBeforeStoppingPollerGenerationContext(
 	// Commit and exact-poller reconciliation each get a fresh post-commit
 	// budget. Caller cancellation cannot strand a killed session under a stale
 	// poller, and a slow committed cleanup cannot consume the stop budget.
-	if postCommitTimeout <= 0 {
-		postCommitTimeout = pollerReconcileTimeout
+	if commitTimeout <= 0 {
+		commitTimeout = pollerReconcileTimeout
 	}
-	commitCtx, cancelCommit := context.WithTimeout(context.Background(), postCommitTimeout)
-	committed, replacementErr := commit(commitCtx)
+	if pollerTimeout <= 0 {
+		pollerTimeout = pollerReconcileTimeout
+	}
+	commitCtx, cancelCommit := context.WithTimeout(context.Background(), commitTimeout)
+	outcome, replacementErr := commit(commitCtx)
 	cancelCommit()
-	if !committed {
+	if !outcome.Committed {
 		if replacementErr == nil {
 			return errors.New("replacement commit returned without issuing a destructive signal")
 		}
 		return replacementErr
 	}
-	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), postCommitTimeout)
+	if !outcome.Terminal {
+		return errors.Join(replacementErr, ErrPollerPreservedAfterCommittedCleanup)
+	}
+	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), pollerTimeout)
 	defer cancelReconcile()
 	stopErr := stopPollerWithExpectedGenerationOpsLocked(
 		townRoot,

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"sort"
 	"strconv"
@@ -21,18 +22,21 @@ import (
 )
 
 const (
-	linuxProcRoot                         = "/proc"
-	sessionCustodyReadyProbe              = 300 * time.Millisecond
-	linuxCustodyHandshakeTimeout          = 3 * time.Second
-	linuxCustodyReapTimeout               = 3 * time.Second
-	linuxCustodyReadyFD                   = 3
-	linuxCustodyPermitFD                  = 4
-	linuxCustodySupervisorLifeFD          = 5
-	envLinuxSessionCustodyInit            = "GT_INTERNAL_SESSION_CUSTODY_INIT"
-	envLinuxSessionCustodyCommand         = "GT_INTERNAL_SESSION_CUSTODY_COMMAND"
-	envLinuxSessionCustodyNamespaced      = "GT_INTERNAL_SESSION_CUSTODY_NAMESPACED"
-	linuxSessionCustodyReadyByte     byte = 'R'
-	linuxSessionCustodyHardenedByte  byte = 'H'
+	linuxProcRoot                          = "/proc"
+	sessionCustodyReadyProbe               = 300 * time.Millisecond
+	linuxCustodyHandshakeTimeout           = 3 * time.Second
+	linuxCustodyReapTimeout                = 3 * time.Second
+	linuxCustodyInitExitTimeout            = 3 * time.Second
+	linuxCustodyBrokerShutdownTimeout      = 2 * time.Second
+	linuxCustodySupervisorExitTimeout      = 3 * time.Second
+	linuxCustodyReadyFD                    = 3
+	linuxCustodyPermitFD                   = 4
+	linuxCustodySupervisorLifeFD           = 5
+	envLinuxSessionCustodyInit             = "GT_INTERNAL_SESSION_CUSTODY_INIT"
+	envLinuxSessionCustodyCommand          = "GT_INTERNAL_SESSION_CUSTODY_COMMAND"
+	envLinuxSessionCustodyNamespaced       = "GT_INTERNAL_SESSION_CUSTODY_NAMESPACED"
+	linuxSessionCustodyReadyByte      byte = 'R'
+	linuxSessionCustodyHardenedByte   byte = 'H'
 )
 
 type linuxSessionCustody struct {
@@ -45,6 +49,23 @@ type linuxSessionCustody struct {
 	initFD             int
 	prepared           bool
 	committed          bool
+}
+
+type linuxCustodyKillBudgets struct {
+	Init       time.Duration
+	Broker     time.Duration
+	Supervisor time.Duration
+}
+
+type linuxCustodyKillOps struct {
+	revalidate func() (linuxProcessStat, error)
+	signal     func(int, unix.Signal) error
+	wait       func(context.Context, int, string) error
+}
+
+type linuxCustodyServiceResult struct {
+	name string
+	err  error
 }
 
 func sessionCustodyLaunchSupported() bool {
@@ -231,20 +252,22 @@ type linuxCustodyStarter func(string, bool) (*linuxCustodyLaunch, error)
 type linuxNamespaceValidator func(string, int, int) (string, uint64, error)
 
 func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
+	return closeLinuxCustodyLaunchWithTimeout(launch, terminate, linuxCustodyReapTimeout)
+}
+
+func closeLinuxCustodyLaunchWithTimeout(launch *linuxCustodyLaunch, terminate bool, reapTimeout time.Duration) error {
 	if launch == nil {
 		return nil
 	}
 	var errs []error
-	reaped := false
 	if terminate && launch.child != nil {
 		if launch.pidfd >= 0 {
 			errs = append(errs, unix.PidfdSendSignal(launch.pidfd, unix.SIGKILL, nil, 0))
 		} else {
 			errs = append(errs, launch.child.Process.Kill())
 		}
-		waitErr := waitLinuxCustodyProcess(launch, linuxCustodyReapTimeout)
+		waitErr := waitLinuxCustodyProcess(launch, reapTimeout)
 		errs = append(errs, waitErr)
-		reaped = !errors.Is(waitErr, context.DeadlineExceeded)
 	}
 	if launch.ready != nil {
 		errs = append(errs, launch.ready.Close())
@@ -265,7 +288,7 @@ func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
 	if terminate {
 		errs = append(errs, launch.proxies.Close())
 	}
-	if terminate && reaped && launch.pidfd >= 0 {
+	if terminate && launch.pidfd >= 0 {
 		errs = append(errs, unix.Close(launch.pidfd))
 		launch.pidfd = -1
 	}
@@ -550,23 +573,22 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 		_ = unix.Close(brokerFD)
 		return errors.Join(executableErr, closeLinuxCustodyLaunch(launch, true))
 	}
-	type serviceResult struct {
-		name string
-		err  error
-	}
 	serviceContext, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
-	serviceDone := make(chan serviceResult, 3)
+	serviceDone := make(chan linuxCustodyServiceResult, 3)
 	go func() {
-		serviceDone <- serviceResult{name: "command broker", err: ServeSessionBroker(serviceContext, executable, brokerFD, validate)}
+		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: ServeSessionBroker(serviceContext, executable, brokerFD, validate)}
 	}()
 	go func() {
-		serviceDone <- serviceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
+		serviceDone <- linuxCustodyServiceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
 	}()
 	go func() {
 		upstream := net.JoinHostPort(doltHost, strconv.Itoa(int(doltPort)))
-		serviceDone <- serviceResult{name: "Dolt proxy", err: serveDoltProxy(serviceContext, launch.proxies.Dolt, upstream)}
+		serviceDone <- linuxCustodyServiceResult{name: "Dolt proxy", err: serveDoltProxy(serviceContext, launch.proxies.Dolt, upstream)}
 	}()
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignals)
 	// Retain the namespace init pidfd and the supervisor-liveness writer until
 	// exact teardown. The trusted init remains alive after reaping the workload,
 	// so it is a stable direct-child custody boundary rather than an untrusted
@@ -580,8 +602,11 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 		}
 		return errors.Join(
 			fmt.Errorf("session %s stopped before readiness: %w", stopped.name, stopped.err),
+			shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout),
 			closeLinuxCustodyLaunch(launch, true),
 		)
+	case <-shutdownSignals:
+		return shutdownLinuxCustodyServices(cancelServices, serviceDone, 3, linuxCustodyBrokerShutdownTimeout)
 	case <-timer.C:
 	}
 	for {
@@ -592,8 +617,11 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 			}
 			return errors.Join(
 				fmt.Errorf("session %s stopped: %w", stopped.name, stopped.err),
+				shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout),
 				closeLinuxCustodyLaunch(launch, true),
 			)
+		case <-shutdownSignals:
+			return shutdownLinuxCustodyServices(cancelServices, serviceDone, 3, linuxCustodyBrokerShutdownTimeout)
 		case <-time.After(time.Hour):
 		}
 		if launch.life == nil {
@@ -601,6 +629,33 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 		}
 		runtime.KeepAlive(launch)
 	}
+}
+
+func shutdownLinuxCustodyServices(
+	cancel context.CancelFunc,
+	results <-chan linuxCustodyServiceResult,
+	remaining int,
+	timeout time.Duration,
+) error {
+	if cancel == nil || results == nil || remaining < 0 || timeout <= 0 {
+		return errors.New("invalid session service shutdown request")
+	}
+	cancel()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var errs []error
+	for range remaining {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				errs = append(errs, fmt.Errorf("stopping session %s: %w", result.name, result.err))
+			}
+		case <-timer.C:
+			errs = append(errs, fmt.Errorf("session services did not stop within %s: %w", timeout, context.DeadlineExceeded))
+			return errors.Join(errs...)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func linuxDirectChildren(procRoot string, pid int) ([]int, error) {
@@ -833,35 +888,85 @@ func waitLinuxProcessTerminal(ctx context.Context, pid int, identity string) err
 }
 
 func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
+	return custody.killWithBudgets(
+		ctx,
+		linuxCustodyKillBudgets{
+			Init:       linuxCustodyInitExitTimeout,
+			Broker:     linuxCustodyBrokerShutdownTimeout,
+			Supervisor: linuxCustodySupervisorExitTimeout,
+		},
+		linuxCustodyKillOps{
+			revalidate: custody.revalidate,
+			signal: func(fd int, signal unix.Signal) error {
+				return unix.PidfdSendSignal(fd, signal, nil, 0)
+			},
+			wait: waitLinuxProcessTerminal,
+		},
+	)
+}
+
+func (custody *linuxSessionCustody) killWithBudgets(
+	ctx context.Context,
+	budgets linuxCustodyKillBudgets,
+	ops linuxCustodyKillOps,
+) (bool, error) {
 	if custody == nil || !custody.prepared {
 		return false, errors.New("session PID namespace custody is not prepared")
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	initStat, err := custody.revalidate()
+	if budgets.Init <= 0 || budgets.Broker <= 0 || budgets.Supervisor <= 0 {
+		return false, errors.New("session custody teardown budgets must be positive")
+	}
+	if ops.revalidate == nil || ops.signal == nil || ops.wait == nil {
+		return false, errors.New("session custody teardown operations are unavailable")
+	}
+	initStat, err := ops.revalidate()
 	if err != nil {
 		return false, err
 	}
 	var errs []error
+	waitPhase := func(timeout time.Duration, pid int, identity, phase string) error {
+		phaseCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := ops.wait(phaseCtx, pid, identity); err != nil {
+			return fmt.Errorf("%s: %w", phase, err)
+		}
+		return nil
+	}
 	if !linuxProcessStateTerminal(initStat.state) {
-		if err := unix.PidfdSendSignal(custody.initFD, unix.SIGKILL, nil, 0); err != nil {
+		if err := ops.signal(custody.initFD, unix.SIGKILL); err != nil {
 			if !errors.Is(err, unix.ESRCH) {
-				return false, err
+				errs = append(errs, fmt.Errorf("signaling trusted namespace init: %w", err))
 			}
 		} else {
 			custody.committed = true
-			errs = append(errs, waitLinuxProcessTerminal(ctx, custody.initPID, custody.initIdentity))
+			errs = append(errs, waitPhase(budgets.Init, custody.initPID, custody.initIdentity, "verifying trusted namespace init exit"))
 		}
 	}
-	if err := unix.PidfdSendSignal(custody.supervisorFD, unix.SIGKILL, nil, 0); err != nil {
+	forceSupervisor := false
+	if err := ops.signal(custody.supervisorFD, unix.SIGTERM); err != nil {
 		if !errors.Is(err, unix.ESRCH) {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("requesting session broker shutdown: %w", err))
+			forceSupervisor = true
 		}
 	} else {
 		custody.committed = true
-		errs = append(errs, waitLinuxProcessTerminal(ctx, custody.supervisorPID, custody.supervisorIdentity))
+		brokerErr := waitPhase(budgets.Broker, custody.supervisorPID, custody.supervisorIdentity, "waiting for session broker shutdown")
+		errs = append(errs, brokerErr)
+		forceSupervisor = brokerErr != nil
 	}
+	if forceSupervisor {
+		if err := ops.signal(custody.supervisorFD, unix.SIGKILL); err != nil {
+			if !errors.Is(err, unix.ESRCH) {
+				errs = append(errs, fmt.Errorf("forcing session supervisor exit: %w", err))
+			}
+		} else {
+			custody.committed = true
+		}
+	}
+	errs = append(errs, waitPhase(budgets.Supervisor, custody.supervisorPID, custody.supervisorIdentity, "verifying session supervisor exit"))
 	if !custody.committed {
 		errs = append(errs, ErrSessionGenerationChanged)
 	}

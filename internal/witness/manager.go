@@ -31,6 +31,26 @@ var (
 
 const witnessCleanupTimeout = 10 * time.Second
 
+type teardownBudgets struct {
+	Init       time.Duration
+	Broker     time.Duration
+	Supervisor time.Duration
+	Tmux       time.Duration
+	Poller     time.Duration
+}
+
+func (budgets teardownBudgets) commitTimeout() time.Duration {
+	return budgets.Init + budgets.Broker + budgets.Supervisor + budgets.Tmux
+}
+
+var witnessTeardownBudgets = teardownBudgets{
+	Init:       3 * time.Second,
+	Broker:     2 * time.Second,
+	Supervisor: 3 * time.Second,
+	Tmux:       2 * time.Second,
+	Poller:     3 * time.Second,
+}
+
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
@@ -40,6 +60,7 @@ type Manager struct {
 	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
 	wrapSessionCommand    func(string) (string, string, error)
 	cleanupTimeout        time.Duration
+	teardownBudgets       teardownBudgets
 	zombieKillGrace       time.Duration
 }
 
@@ -60,6 +81,7 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 		tmux:                  t,
 		capturePaneGeneration: t.CapturePaneProcessGeneration,
 		cleanupTimeout:        witnessCleanupTimeout,
+		teardownBudgets:       witnessTeardownBudgets,
 		zombieKillGrace:       constants.ZombieKillGracePeriod,
 		prepareSessionCleanup: func(
 			generation tmux.SessionGeneration,
@@ -130,13 +152,14 @@ func (m *Manager) teardownSessionGeneration(
 		cleanup = nil
 		return err
 	}
-	replaceErr := nudge.ReplaceBeforeStoppingPollerGenerationContext(
+	replaceErr := nudge.ReplaceBeforeStoppingPollerGenerationOutcomeContext(
 		cleanupCtx,
 		townRoot,
 		sessionID,
 		pollerGeneration,
-		m.cleanupTimeout,
-		func(ctx context.Context) (nudge.PollerReplacementCommit, error) {
+		m.teardownBudgets.commitTimeout(),
+		m.teardownBudgets.Poller,
+		func(ctx context.Context) (nudge.PollerReplacementOutcomeCommit, error) {
 			if err := m.revalidateSessionGenerationUnderLease(generation, paneGeneration, requireDead); err != nil {
 				return nil, err
 			}
@@ -152,9 +175,12 @@ func (m *Manager) teardownSessionGeneration(
 			if commit == nil {
 				return nil, errors.Join(errors.New("session cleanup preparation returned no commit operation"), closeCleanup())
 			}
-			return func(commitCtx context.Context) (bool, error) {
+			return func(commitCtx context.Context) (nudge.PollerReplacementOutcome, error) {
 				committed, commitErr := commit(commitCtx)
-				return committed, errors.Join(commitErr, closeCleanup())
+				return nudge.PollerReplacementOutcome{
+					Committed: committed,
+					Terminal:  committed && !errors.Is(commitErr, tmux.ErrSessionCleanupUnreconciled),
+				}, errors.Join(commitErr, closeCleanup())
 			}, nil
 		},
 	)
@@ -168,7 +194,7 @@ func (m *Manager) stopPollerForAbsentSession(
 	townRoot, sessionID string,
 	pollerGeneration nudge.PollerGeneration,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), m.cleanupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), m.teardownBudgets.Poller)
 	defer cancel()
 	releaseDeliveryLease, err := m.tmux.AcquireNudgeLeaseContext(ctx, townRoot, sessionID)
 	if err != nil {

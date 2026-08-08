@@ -265,6 +265,49 @@ func TestReplaceBeforeStoppingPollerGenerationReconcilesAfterCommittedError(t *t
 	}
 }
 
+func TestReplaceBeforeStoppingPollerGenerationPreservesPollerAfterUnreconciledCommit(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("committed tmux reconciliation remained ambiguous")
+	stopCalled := false
+	err = replaceBeforeStoppingPollerGenerationOutcomeContext(
+		context.Background(), townRoot, session, generation,
+		20*time.Millisecond, 20*time.Millisecond,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { stopCalled = true; return nil },
+			wait:       func(context.Context, int, pollerRecord) error { return nil },
+			quarantine: func(string, []byte) error { return nil },
+			remove:     os.Remove,
+		},
+		func(context.Context) (PollerReplacementOutcomeCommit, error) {
+			return func(context.Context) (PollerReplacementOutcome, error) {
+				return PollerReplacementOutcome{Committed: true, Terminal: false}, commitErr
+			}, nil
+		},
+	)
+	if !errors.Is(err, commitErr) || !errors.Is(err, ErrPollerPreservedAfterCommittedCleanup) || stopCalled {
+		t.Fatalf("replacement error=%v stopCalled=%v, want committed evidence with preserved poller", err, stopCalled)
+	}
+	if got, readErr := os.ReadFile(pidPath); readErr != nil || !bytes.Equal(got, record) {
+		t.Fatalf("poller record after ambiguous committed cleanup = %q, err %v", got, readErr)
+	}
+}
+
 func TestReplaceBeforeStoppingPollerGenerationRefreshesBudgetAfterCommit(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"

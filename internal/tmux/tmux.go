@@ -50,13 +50,14 @@ var validSessionGenerationRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,128}$`)
 
 // Common errors
 var (
-	ErrNoServer                 = errors.New("no tmux server running")
-	ErrSessionExists            = errors.New("session already exists")
-	ErrSessionNotFound          = errors.New("session not found")
-	ErrSessionRunning           = errors.New("session already running with healthy agent")
-	ErrInvalidSessionName       = errors.New("invalid session name")
-	ErrIdleTimeout              = errors.New("agent not idle before timeout")
-	ErrSessionGenerationChanged = errors.New("tmux session generation changed")
+	ErrNoServer                   = errors.New("no tmux server running")
+	ErrSessionExists              = errors.New("session already exists")
+	ErrSessionNotFound            = errors.New("session not found")
+	ErrSessionRunning             = errors.New("session already running with healthy agent")
+	ErrInvalidSessionName         = errors.New("invalid session name")
+	ErrIdleTimeout                = errors.New("agent not idle before timeout")
+	ErrSessionGenerationChanged   = errors.New("tmux session generation changed")
+	ErrSessionCleanupUnreconciled = errors.New("committed session cleanup did not reach a terminal tmux state")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -585,6 +586,8 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	return t.NewSessionWithCommandAndEnvContext(context.Background(), name, workDir, command, env)
 }
 
+const failedSessionCreationCleanupTimeout = 500 * time.Millisecond
+
 // NewSessionWithCommandAndEnvContext is NewSessionWithCommandAndEnv bounded by ctx.
 func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, workDir, command string, env map[string]string) (retErr error) {
 	if err := validateSessionName(name); err != nil {
@@ -611,7 +614,10 @@ func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, wor
 	}
 	defer func() {
 		if retErr != nil {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			// Creation may fail because the caller's budget is already exhausted.
+			// Give attempt-owned cleanup an independent bounded context so a
+			// detached child cannot inherit the failed caller's deadline.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
 			defer cleanupCancel()
 			_ = t.KillSessionWithProcessesContext(cleanupCtx, name)
 		}
@@ -862,11 +868,15 @@ func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 // session ID, and session-lifetime nonce in one tmux format expansion, then
 // binds that observation to the server process start identity.
 func (t *Tmux) CaptureSessionGeneration(name string) (SessionGeneration, error) {
+	return t.captureSessionGenerationContext(context.Background(), name)
+}
+
+func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string) (SessionGeneration, error) {
 	if err := validateSessionName(name); err != nil {
 		return SessionGeneration{}, err
 	}
 	format := "#{pid}\t#{session_id}\t#{E:" + EnvSessionGeneration + "}\t#{E:" + EnvSessionCustody + "}"
-	out, err := t.run("display-message", "-t", name, "-p", format)
+	out, err := t.runContext(ctx, "display-message", "-t", name, "-p", format)
 	if err != nil {
 		return SessionGeneration{}, err
 	}
@@ -880,7 +890,7 @@ func (t *Tmux) CaptureSessionGeneration(name string) (SessionGeneration, error) 
 	}
 	generation.ServerIdentity = serverIdentity
 
-	confirmOut, err := t.run("display-message", "-t", name, "-p", format)
+	confirmOut, err := t.runContext(ctx, "display-message", "-t", name, "-p", format)
 	if err != nil {
 		return SessionGeneration{}, err
 	}
@@ -1236,6 +1246,67 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 	return errors.Join(errs...)
 }
 
+type sessionGenerationReconcileOps struct {
+	capture  func(context.Context, string) (SessionGeneration, error)
+	readPane func(context.Context, SessionGeneration) (int, bool, error)
+	kill     func(context.Context, SessionGeneration, int) error
+	wait     func(context.Context, time.Duration) error
+}
+
+func reconcileSessionGenerationContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	panePID int,
+	ops sessionGenerationReconcileOps,
+) error {
+	if ops.capture == nil || ops.kill == nil || ops.wait == nil {
+		return errors.New("session generation reconciliation operations are unavailable")
+	}
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(ErrSessionCleanupUnreconciled, lastErr, err)
+		}
+		current, err := ops.capture(ctx, generation.Name)
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return nil
+		}
+		if err == nil {
+			if !current.Equal(generation) {
+				// The reusable name now resolves to a different immutable
+				// generation. The old generation is terminal and the replacement
+				// must not be touched.
+				return ErrSessionGenerationChanged
+			}
+			if ops.readPane != nil {
+				currentPane, exists, paneErr := ops.readPane(ctx, current)
+				switch {
+				case paneErr == nil && !exists:
+					return nil
+				case paneErr == nil && currentPane != panePID:
+					// A new pane under the same session generation is also a
+					// replacement. Preserve it without issuing a name-based kill.
+					return ErrSessionGenerationChanged
+				case paneErr != nil:
+					lastErr = paneErr
+				}
+			}
+			if lastErr == nil {
+				killErr := ops.kill(ctx, generation, panePID)
+				if killErr != nil {
+					lastErr = killErr
+				}
+			}
+		} else {
+			lastErr = err
+		}
+		if err := ops.wait(ctx, processExitPollInterval); err != nil {
+			return errors.Join(ErrSessionCleanupUnreconciled, lastErr, err)
+		}
+		lastErr = nil
+	}
+}
+
 // PrepareCommit freezes the launch-time containment boundary and revalidates
 // the exact tmux/pane generation without signaling anything. The returned
 // closure reports whether its first destructive signal was actually issued.
@@ -1299,32 +1370,35 @@ func (cleanup *SessionGenerationCleanup) PrepareCommit(ctx context.Context) (fun
 		if !committed {
 			return false, fmt.Errorf("killing launch-time session containment: %w", killErr)
 		}
-		// The containment kill has committed. Give exact tmux reconciliation
-		// its own bounded budget even if exit verification exhausted the
-		// caller's commit context.
+		// The containment kill has committed. Reconcile the exact tmux
+		// generation under a fresh budget until the old generation is absent,
+		// a replacement is positively identified and preserved, or the phase
+		// expires as ambiguous.
 		tmuxKillCtx, cancelTmuxKill := context.WithTimeout(context.Background(), sessionGenerationTmuxKillTimeout)
 		defer cancelTmuxKill()
-		sessionErr := cleanup.tmux.runGuardedSessionGenerationPaneContext(
+		sessionErr := reconcileSessionGenerationContext(
 			tmuxKillCtx,
 			cleanup.generation,
 			cleanup.panePID,
-			true,
-			"kill-session -t "+cleanup.generation.SessionID,
+			sessionGenerationReconcileOps{
+				capture: cleanup.tmux.captureSessionGenerationContext,
+				readPane: func(ctx context.Context, generation SessionGeneration) (int, bool, error) {
+					return cleanup.tmux.getPanePIDGenerationContext(ctx, generation)
+				},
+				kill: func(ctx context.Context, generation SessionGeneration, panePID int) error {
+					return cleanup.tmux.runGuardedSessionGenerationPaneContext(
+						ctx,
+						generation,
+						panePID,
+						true,
+						"kill-session -t "+generation.SessionID,
+					)
+				},
+				wait: waitForContext,
+			},
 		)
-		if errors.Is(sessionErr, ErrSessionGenerationChanged) {
-			// Killing the exact retained supervisor can make tmux remove the
-			// session before the guarded command is evaluated. Accept only a
-			// confirmed absent name; a same-name replacement remains a generation
-			// change and is preserved.
-			exists, existsErr := cleanup.tmux.HasSessionContext(tmuxKillCtx, cleanup.generation.Name)
-			if existsErr != nil {
-				sessionErr = errors.Join(sessionErr, fmt.Errorf("confirming post-commit session absence: %w", existsErr))
-			} else if !exists {
-				sessionErr = nil
-			}
-		}
 		if sessionErr != nil {
-			sessionErr = fmt.Errorf("killing exact tmux session generation: %w", sessionErr)
+			sessionErr = fmt.Errorf("reconciling exact tmux session generation after committed cleanup: %w", sessionErr)
 		}
 		if killErr != nil {
 			killErr = fmt.Errorf("verifying launch-time session containment exit: %w", killErr)
@@ -1381,7 +1455,11 @@ func (t *Tmux) killSessionGenerationWithProcessesContext(
 // session is already gone or there is no tmux server.
 func (t *Tmux) KillSession(name string) (retErr error) {
 	defer func() { telemetry.RecordSessionStop(context.Background(), name, retErr) }()
-	_, retErr = t.run("kill-session", "-t", name)
+	return t.killSessionContext(context.Background(), name)
+}
+
+func (t *Tmux) killSessionContext(ctx context.Context, name string) (retErr error) {
+	_, retErr = t.runContext(ctx, "kill-session", "-t", name)
 	if retErr == ErrSessionNotFound || retErr == ErrNoServer {
 		retErr = nil
 	}
@@ -1417,21 +1495,21 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {
 // KillSessionWithProcessesContext bounds graceful waits while preserving the
 // same TERM-then-KILL cleanup sequence.
 func (t *Tmux) KillSessionWithProcessesContext(ctx context.Context, name string) error {
-	if ctx.Err() != nil {
-		return t.KillSession(name)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Disarm auto-respawn BEFORE killing anything. The pane-died hook would
 	// otherwise respawn the process 3 seconds after we kill it, creating a
 	// zombie that fights every kill attempt.
-	_ = t.SetRemainOnExit(name, false)
-	_, _ = t.run("set-hook", "-t", name, "-u", "pane-died")
+	_ = t.setRemainOnExitContext(ctx, name, false)
+	_, _ = t.runContext(ctx, "set-hook", "-t", name, "-u", "pane-died")
 
 	// Get the pane PID
-	pid, err := t.GetPanePID(name)
+	pid, err := t.getPanePIDContext(ctx, name)
 	if err != nil {
 		// Session might not exist or server may have already gone away.
-		killErr := t.KillSession(name)
+		killErr := t.killSessionContext(ctx, name)
 		if killErr == nil || killErr == ErrSessionNotFound || killErr == ErrNoServer {
 			return nil
 		}
@@ -1483,7 +1561,7 @@ func (t *Tmux) KillSessionWithProcessesContext(ctx context.Context, name string)
 	// Kill the tmux session
 	// Ignore missing/dead-server errors - killing the pane process may have
 	// already caused tmux to destroy the session automatically.
-	err = t.KillSession(name)
+	err = t.killSessionContext(ctx, name)
 	if err == ErrSessionNotFound || err == ErrNoServer {
 		return nil
 	}
@@ -3541,11 +3619,15 @@ func (t *Tmux) GetPaneWorkDir(session string) (string, error) {
 // returning the active pane's PID when a non-agent window is focused. When target is
 // a pane ID (e.g., "%5"), uses it directly.
 func (t *Tmux) GetPanePID(target string) (string, error) {
+	return t.getPanePIDContext(context.Background(), target)
+}
+
+func (t *Tmux) getPanePIDContext(ctx context.Context, target string) (string, error) {
 	tmuxTarget := target
 	if !strings.HasPrefix(target, "%") {
 		tmuxTarget = target + ":^"
 	}
-	out, err := t.run("display-message", "-t", tmuxTarget, "-p", "#{pane_pid}")
+	out, err := t.runContext(ctx, "display-message", "-t", tmuxTarget, "-p", "#{pane_pid}")
 	if err != nil {
 		return "", err
 	}
@@ -5182,11 +5264,15 @@ func (t *Tmux) ClearHistory(pane string) error {
 // When off (default), the pane is destroyed when its process exits.
 // This is essential for handoff: set on before killing processes, so respawn-pane works.
 func (t *Tmux) SetRemainOnExit(pane string, on bool) error {
+	return t.setRemainOnExitContext(context.Background(), pane, on)
+}
+
+func (t *Tmux) setRemainOnExitContext(ctx context.Context, pane string, on bool) error {
 	value := "on"
 	if !on {
 		value = "off"
 	}
-	_, err := t.run("set-option", "-t", pane, "remain-on-exit", value)
+	_, err := t.runContext(ctx, "set-option", "-t", pane, "remain-on-exit", value)
 	return err
 }
 
