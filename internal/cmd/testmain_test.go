@@ -16,6 +16,9 @@ func TestMain(m *testing.M) {
 	if runSessionBrokerReexecHelper() {
 		os.Exit(Execute())
 	}
+	if code, requested := runSessionBrokerRawClientHelper(); requested {
+		os.Exit(code)
+	}
 	if os.Getenv("GT_TEST_CMD_EXECUTE_HELPER") == "1" {
 		os.Exit(Execute())
 	}

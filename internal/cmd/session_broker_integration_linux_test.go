@@ -3,6 +3,9 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +24,7 @@ import (
 const (
 	envSessionBrokerReexecHelper = "GT_TEST_CMD_REEXEC_HELPER"
 	envSessionBrokerReexecStage  = "GT_TEST_CMD_REEXEC_STAGE"
+	envSessionBrokerRawClient    = "GT_TEST_CMD_BROKER_RAW_CLIENT"
 )
 
 func runSessionBrokerReexecHelper() bool {
@@ -38,6 +42,85 @@ func runSessionBrokerReexecHelper() bool {
 	_ = os.Unsetenv(envSessionBrokerReexecHelper)
 	_ = os.Unsetenv(envSessionBrokerReexecStage)
 	return true
+}
+
+func runSessionBrokerRawClientHelper() (int, bool) {
+	if os.Getenv(envSessionBrokerRawClient) != "1" {
+		return 0, false
+	}
+	handled, code, err := tmux.RunSessionBrokerClient(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "raw broker client: %v\n", err)
+		return 1, true
+	}
+	if !handled {
+		fmt.Fprintln(os.Stderr, "raw broker client: inherited endpoint was not handled")
+		return 1, true
+	}
+	return code, true
+}
+
+func TestSessionBrokerRawUnsafeFramesNeverStartWorker(t *testing.T) {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientEndpoint := os.NewFile(uintptr(pair[1]), "raw-broker-client")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	proofPath := filepath.Join(t.TempDir(), "worker-started")
+	workerPath := filepath.Join(t.TempDir(), "worker")
+	worker := "#!/bin/sh\ntouch " + config.ShellQuote(proofPath) + "\nexit 0\n"
+	if err := os.WriteFile(workerPath, []byte(worker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		serverDone <- tmux.ServeSessionBroker(ctx, workerPath, pair[0], func(args []string) error {
+			return IsBrokerSafeCommand(rootCmd, args)
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = clientEndpoint.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("ServeSessionBroker() cleanup error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeSessionBroker() did not stop")
+		}
+	})
+
+	nullFiles := make([]*os.File, 3)
+	for index := range nullFiles {
+		nullFiles[index], err = os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nullFiles[index].Close()
+	}
+	unsafeRequests := [][]string{
+		{"session-custody-init"},
+		{"session-custody", "--id", "00000000-0000-0000-0000-000000000000", "--", "true"},
+		{"shell", "-c", "touch " + proofPath},
+		{"doctor", "--fix"},
+		{"up", "--restore"},
+		{"tmux", "send-keys", "hq-mayor", "payload"},
+	}
+	for _, args := range unsafeRequests {
+		command := exec.Command(os.Args[0], args...)
+		command.Env = append(os.Environ(), envSessionBrokerRawClient+"=1")
+		command.ExtraFiles = []*os.File{nullFiles[0], nullFiles[1], nullFiles[2], clientEndpoint}
+		output, err := command.CombinedOutput()
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 126 {
+			t.Fatalf("raw unsafe request %q error = %v, output = %q; want exit 126", args, err, output)
+		}
+	}
+	if _, err := os.Stat(proofPath); !os.IsNotExist(err) {
+		t.Fatalf("unsafe raw frame started worker; stat error = %v", err)
+	}
 }
 
 func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
