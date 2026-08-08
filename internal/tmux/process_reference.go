@@ -38,10 +38,14 @@ type retainedProcess interface {
 
 type retainedProcessFactory func(int) (retainedProcess, error)
 
-func closeRetainedProcesses(processes []retainedProcess) {
+func closeRetainedProcesses(processes []retainedProcess) error {
+	var errs []error
 	for i := len(processes) - 1; i >= 0; i-- {
-		_ = processes[i].Close()
+		if err := processes[i].Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // captureRetainedProcessTree accepts a snapshot relation only when the

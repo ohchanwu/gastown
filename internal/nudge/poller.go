@@ -14,6 +14,7 @@ package nudge
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -232,6 +233,25 @@ func lockPoller(townRoot, session string) (*flock.Flock, error) {
 	return startLock, nil
 }
 
+func lockPollerContext(ctx context.Context, townRoot, session string) (*flock.Flock, error) {
+	lockPath := pollerPidFile(townRoot, session) + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating nudge-poller lock dir: %w", err)
+	}
+	startLock := flock.New(lockPath)
+	locked, err := startLock.TryLockContext(ctx, pollerExitInterval)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring nudge-poller start lock: %w", err)
+	}
+	if !locked {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("acquiring nudge-poller start lock: lock unavailable")
+	}
+	return startLock, nil
+}
+
 func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) {
 	// Find the gt binary.
 	gtBin, err := os.Executable()
@@ -377,33 +397,121 @@ func StopPollerGeneration(townRoot, session string, generation PollerGeneration)
 	return stopPoller(townRoot, session, &generation)
 }
 
-// StopPollerGenerationBeforeReplacement holds the same ownership lock used by
-// StartPoller across both the generation-bound stop and the replacement
-// callback. A competing poller therefore cannot advance after validation but
-// before the tmux generation is replaced.
-func StopPollerGenerationBeforeReplacement(
+type pollerTransitionOps struct {
+	read       func(string) ([]byte, error)
+	alive      func(int) bool
+	identity   func(int) (pollerIdentity, error)
+	stop       func([]byte) error
+	wait       func(context.Context, int, pollerRecord) error
+	quarantine func(string, []byte) error
+	remove     func(string) error
+}
+
+// ReplaceBeforeStoppingPollerGenerationContext keeps the exact poller alive
+// and holds its ownership lock until replacement succeeds. A failed or timed
+// out replacement therefore leaves the surviving session under poller custody.
+func ReplaceBeforeStoppingPollerGenerationContext(
+	ctx context.Context,
 	townRoot, session string,
 	generation PollerGeneration,
-	replace func() error,
+	replace func(context.Context) error,
 ) error {
-	lock, err := lockPoller(townRoot, session)
+	return replaceBeforeStoppingPollerGenerationContext(
+		ctx,
+		townRoot,
+		session,
+		generation,
+		pollerTransitionOps{
+			read:     os.ReadFile,
+			alive:    pollerProcessAlive,
+			identity: lookupPollerIdentity,
+			stop: func(data []byte) error {
+				return os.WriteFile(pollerStopFile(townRoot, session), data, 0600)
+			},
+			wait: waitPollerExitContext,
+			quarantine: func(path string, data []byte) error {
+				return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
+			},
+			remove: os.Remove,
+		},
+		replace,
+	)
+}
+
+func replaceBeforeStoppingPollerGenerationContext(
+	ctx context.Context,
+	townRoot, session string,
+	generation PollerGeneration,
+	ops pollerTransitionOps,
+	replace func(context.Context) error,
+) error {
+	lock, err := lockPollerContext(ctx, townRoot, session)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lock.Unlock() }()
-	if err := stopPollerWithExpectedGenerationOpsLocked(
-		townRoot, session, &generation,
-		os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
-		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) },
-		waitPollerExit,
-		func(path string, data []byte) error {
-			return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
-		},
-		os.Remove,
-	); err != nil {
+	if err := validatePollerGenerationLocked(townRoot, session, generation, ops); err != nil {
 		return err
 	}
-	return replace()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := replace(ctx); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return stopPollerWithExpectedGenerationOpsLocked(
+		townRoot,
+		session,
+		&generation,
+		ops.read,
+		ops.alive,
+		ops.identity,
+		ops.stop,
+		func(pid int, record pollerRecord) error { return ops.wait(ctx, pid, record) },
+		ops.quarantine,
+		ops.remove,
+	)
+}
+
+func validatePollerGenerationLocked(
+	townRoot, session string,
+	generation PollerGeneration,
+	ops pollerTransitionOps,
+) error {
+	data, err := ops.read(pollerPidFile(townRoot, session))
+	if err != nil {
+		if os.IsNotExist(err) {
+			if generation.exists {
+				return errors.New("poller ownership advanced before replacement; preserving current generation")
+			}
+			return nil
+		}
+		return fmt.Errorf("reading poller ownership before replacement: %w", err)
+	}
+	if !generation.exists || !bytes.Equal(data, generation.record) {
+		return errors.New("poller ownership advanced before replacement; preserving current generation")
+	}
+	record, err := parsePollerRecord(string(data))
+	if err != nil {
+		return fmt.Errorf("parsing poller ownership before replacement: %w", err)
+	}
+	if !ops.alive(record.PID) {
+		return nil
+	}
+	current, err := ops.identity(record.PID)
+	if err != nil {
+		if !ops.alive(record.PID) {
+			return nil
+		}
+		return fmt.Errorf("validating poller identity before replacement: %w", err)
+	}
+	if record.Legacy || !pollerIdentityMatches(current, record, session) {
+		return errors.New("poller identity changed before replacement; preserving current generation")
+	}
+	return nil
 }
 
 func stopPoller(townRoot, session string, expected *PollerGeneration) error {
@@ -559,7 +667,11 @@ func lookupPollerIdentity(pid int) (pollerIdentity, error) {
 }
 
 func waitPollerExit(pid int, record pollerRecord) error {
-	return waitPollerExitWithOps(pid, record, pollerProcessAlive, lookupPollerIdentity)
+	return waitPollerExitWithOpsContext(context.Background(), pid, record, pollerProcessAlive, lookupPollerIdentity)
+}
+
+func waitPollerExitContext(ctx context.Context, pid int, record pollerRecord) error {
+	return waitPollerExitWithOpsContext(ctx, pid, record, pollerProcessAlive, lookupPollerIdentity)
 }
 
 func waitPollerExitWithOps(
@@ -568,17 +680,35 @@ func waitPollerExitWithOps(
 	alive func(int) bool,
 	identity func(int) (pollerIdentity, error),
 ) error {
-	deadline := time.Now().Add(pollerExitTimeout)
-	for time.Now().Before(deadline) {
+	return waitPollerExitWithOpsContext(context.Background(), pid, record, alive, identity)
+}
+
+func waitPollerExitWithOpsContext(
+	ctx context.Context,
+	pid int,
+	record pollerRecord,
+	alive func(int) bool,
+	identity func(int) (pollerIdentity, error),
+) error {
+	timer := time.NewTimer(pollerExitTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(pollerExitInterval)
+	defer ticker.Stop()
+	for {
 		if !alive(pid) {
 			return nil
 		}
 		if current, err := identity(pid); err == nil && !pollerIdentityMatches(current, record, record.Session) {
 			return nil
 		}
-		time.Sleep(pollerExitInterval)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return errors.New("exit confirmation timeout")
+		case <-ticker.C:
+		}
 	}
-	return errors.New("exit confirmation timeout")
 }
 
 // pollerAlive checks if a poller is running for the given session.

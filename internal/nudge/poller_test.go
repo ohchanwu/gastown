@@ -2,10 +2,12 @@ package nudge
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,41 +34,154 @@ func TestStopPollerBeforeReplacementOrdering(t *testing.T) {
 	}
 }
 
-func TestStopPollerGenerationBeforeReplacementHoldsOwnershipLock(t *testing.T) {
+func TestReplaceBeforeStoppingPollerGenerationContextReleasesLockOnDeadline(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
 	generation, err := CapturePollerGeneration(townRoot, session)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lockResult := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err = ReplaceBeforeStoppingPollerGenerationContext(
+		ctx,
+		townRoot,
+		session,
+		generation,
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("replacement error = %v, want deadline", err)
+	}
+	lock, err := lockPoller(townRoot, session)
+	if err != nil {
+		t.Fatalf("ownership lock remained wedged after deadline: %v", err)
+	}
+	_ = lock.Unlock()
+}
 
-	err = StopPollerGenerationBeforeReplacement(townRoot, session, generation, func() error {
-		go func() {
-			lock, lockErr := lockPoller(townRoot, session)
-			if lockErr == nil {
-				_ = lock.Unlock()
-			}
-			lockResult <- lockErr
-		}()
-		select {
-		case lockErr := <-lockResult:
-			t.Fatalf("competing ownership lock acquired during replacement: %v", lockErr)
-		case <-time.After(100 * time.Millisecond):
+func TestReplaceBeforeStoppingPollerGenerationContextChecksDeadlineAfterValidation(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	ctx, cancel := context.WithCancel(context.Background())
+	replacementCalled := false
+	err := replaceBeforeStoppingPollerGenerationContext(
+		ctx,
+		townRoot,
+		session,
+		PollerGeneration{},
+		pollerTransitionOps{
+			read: func(string) ([]byte, error) {
+				cancel()
+				return nil, os.ErrNotExist
+			},
+		},
+		func(context.Context) error {
+			replacementCalled = true
 			return nil
-		}
-		return nil
-	})
+		},
+	)
+	if !errors.Is(err, context.Canceled) || replacementCalled {
+		t.Fatalf("replacement error=%v called=%v, want cancellation before replacement", err, replacementCalled)
+	}
+}
+
+func TestReplaceBeforeStoppingPollerGenerationPreservesLivePollerOnReplacementFailure(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
 	if err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case lockErr := <-lockResult:
-		if lockErr != nil {
-			t.Fatal(lockErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("competing ownership lock did not acquire after replacement")
+	stopCalled := false
+	replacementErr := errors.New("replacement preserved")
+	err = replaceBeforeStoppingPollerGenerationContext(
+		context.Background(),
+		townRoot,
+		session,
+		generation,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { stopCalled = true; return nil },
+			wait:       func(context.Context, int, pollerRecord) error { return nil },
+			quarantine: func(string, []byte) error { return nil },
+			remove:     os.Remove,
+		},
+		func(context.Context) error { return replacementErr },
+	)
+	if !errors.Is(err, replacementErr) || stopCalled {
+		t.Fatalf("replacement error=%v stopCalled=%v, want preserved live poller", err, stopCalled)
+	}
+	got, err := os.ReadFile(pidPath)
+	if err != nil || !bytes.Equal(got, record) {
+		t.Fatalf("poller record after replacement failure = %q, err %v", got, err)
+	}
+	lock, err := lockPoller(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = lock.Unlock()
+}
+
+func TestReplaceBeforeStoppingPollerGenerationStopsOnlyAfterSuccess(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	err = replaceBeforeStoppingPollerGenerationContext(
+		context.Background(),
+		townRoot,
+		session,
+		generation,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { events = append(events, "stop"); return nil },
+			wait:       func(context.Context, int, pollerRecord) error { events = append(events, "wait"); return nil },
+			quarantine: func(string, []byte) error { return nil },
+			remove: func(path string) error {
+				events = append(events, "remove")
+				return os.Remove(path)
+			},
+		},
+		func(context.Context) error {
+			events = append(events, "replace")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"replace", "stop", "wait", "remove"}) {
+		t.Fatalf("transition events = %v", events)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("poller record survived successful replacement: %v", err)
 	}
 }
 

@@ -29,6 +29,8 @@ var (
 	ErrAlreadyRunning = errors.New("witness already running")
 )
 
+const witnessCleanupTimeout = 10 * time.Second
+
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
@@ -36,6 +38,7 @@ type Manager struct {
 	tmux                  *tmux.Tmux
 	capturePaneGeneration func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error)
 	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
+	cleanupTimeout        time.Duration
 }
 
 type sessionGenerationCleanup interface {
@@ -54,6 +57,7 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 		rig:                   r,
 		tmux:                  t,
 		capturePaneGeneration: t.CapturePaneProcessGeneration,
+		cleanupTimeout:        witnessCleanupTimeout,
 		prepareSessionCleanup: func(
 			generation tmux.SessionGeneration,
 			paneGeneration tmux.PaneProcessGeneration,
@@ -198,12 +202,15 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		if err != nil {
 			return fmt.Errorf("preparing zombie session cleanup: %w", err)
 		}
-		replaceErr := nudge.StopPollerGenerationBeforeReplacement(
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
+		replaceErr := nudge.ReplaceBeforeStoppingPollerGenerationContext(
+			cleanupCtx,
 			townRoot,
 			sessionID,
 			pollerGeneration,
-			func() error { return cleanup.Run(context.Background()) },
+			func(ctx context.Context) error { return cleanup.Run(ctx) },
 		)
+		cancelCleanup()
 		closeErr := cleanup.Close()
 		if err := errors.Join(replaceErr, closeErr); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)

@@ -918,6 +918,16 @@ func (t *Tmux) runGuardedSessionGenerationPane(
 	paneDead bool,
 	command string,
 ) error {
+	return t.runGuardedSessionGenerationPaneContext(context.Background(), generation, panePID, paneDead, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationPaneContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	panePID int,
+	paneDead bool,
+	command string,
+) error {
 	condition, err := sessionGenerationCondition(generation)
 	if err != nil {
 		return err
@@ -935,17 +945,26 @@ func (t *Tmux) runGuardedSessionGenerationPane(
 		panePID,
 		expectedDead,
 	)
-	return t.runGuardedSessionGenerationCondition(generation, condition, command)
+	return t.runGuardedSessionGenerationConditionContext(ctx, generation, condition, command)
 }
 
 func (t *Tmux) runGuardedSessionGenerationCondition(generation SessionGeneration, condition, command string) error {
+	return t.runGuardedSessionGenerationConditionContext(context.Background(), generation, condition, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationConditionContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	condition, command string,
+) error {
 	if err := validateServerGeneration(generation); err != nil {
 		return err
 	}
 	const matchMarker = "GT_SESSION_GENERATION_MATCH"
 	const changedMarker = "GT_SESSION_GENERATION_CHANGED"
 	matchedCommand := "display-message -p " + matchMarker + " ; " + command
-	out, err := t.run(
+	out, err := t.runContext(
+		ctx,
 		"if-shell", "-F", "-t", generation.SessionID,
 		condition,
 		matchedCommand,
@@ -974,6 +993,10 @@ func (t *Tmux) KillSessionGeneration(generation SessionGeneration) error {
 }
 
 func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, error) {
+	return t.getPanePIDGenerationContext(context.Background(), generation)
+}
+
+func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation SessionGeneration) (int, bool, error) {
 	condition, err := sessionGenerationCondition(generation)
 	if err != nil {
 		return 0, false, err
@@ -983,7 +1006,8 @@ func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, er
 	}
 	const paneMarker = "GT_SESSION_GENERATION_PANE:"
 	const changedMarker = "GT_SESSION_GENERATION_CHANGED"
-	out, err := t.run(
+	out, err := t.runContext(
+		ctx,
 		"if-shell", "-F", "-t", generation.SessionID,
 		condition,
 		"display-message -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
@@ -1107,8 +1131,7 @@ func (t *Tmux) prepareSessionGenerationProcessCleanup(
 		return nil, fmt.Errorf("retaining pane process tree before tmux mutation: %w", err)
 	}
 	reject := func(err error) (*SessionGenerationCleanup, error) {
-		closeRetainedProcesses(processes)
-		return nil, err
+		return nil, errors.Join(err, closeRetainedProcesses(processes))
 	}
 	if len(processes) == 0 || processes[0].PID() != panePID {
 		return reject(errors.New("retained pane process custody did not return the captured root"))
@@ -1182,19 +1205,33 @@ func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
 	if identity != cleanup.paneIdentity {
 		return ErrSessionGenerationChanged
 	}
-
-	if err := cleanup.tmux.runGuardedSessionGenerationPane(
-		cleanup.generation,
-		cleanup.panePID,
-		false,
-		"set-option -t "+cleanup.generation.SessionID+" remain-on-exit off ; set-hook -t "+cleanup.generation.SessionID+" -u pane-died",
-	); err != nil {
-		return fmt.Errorf("disarming exact tmux session generation: %w", err)
+	currentPanePID, exists, err := cleanup.tmux.getPanePIDGenerationContext(ctx, cleanup.generation)
+	if err != nil {
+		return fmt.Errorf("revalidating guarded pane before cleanup: %w", err)
 	}
+	if !exists || currentPanePID != cleanup.panePID {
+		return ErrSessionGenerationChanged
+	}
+	rootAlive, err = cleanup.processes[0].Alive()
+	if err != nil {
+		return fmt.Errorf("revalidating retained pane process after guarded read: %w", err)
+	}
+	if !rootAlive {
+		return ErrSessionGenerationChanged
+	}
+	identity, err = cleanup.identity(cleanup.panePID)
+	if err != nil {
+		return fmt.Errorf("re-reading pane process identity after guarded read: %w", err)
+	}
+	if identity != cleanup.paneIdentity {
+		return ErrSessionGenerationChanged
+	}
+
 	if err := cleanupRetainedProcesses(ctx, cleanup.processes, waitForContext); err != nil {
 		return fmt.Errorf("cleaning exact tmux process generation: %w", err)
 	}
-	if err := cleanup.tmux.runGuardedSessionGenerationPane(
+	if err := cleanup.tmux.runGuardedSessionGenerationPaneContext(
+		ctx,
 		cleanup.generation,
 		cleanup.panePID,
 		true,

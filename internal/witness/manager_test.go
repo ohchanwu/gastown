@@ -33,7 +33,11 @@ type fakeSessionCleanup struct {
 	logPath    string
 }
 
-func (cleanup *fakeSessionCleanup) Run(context.Context) error {
+func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
+	if os.Getenv("FAKE_CLEANUP_WAIT_CONTEXT") != "" {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	logFile, err := os.OpenFile(cleanup.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -614,6 +618,33 @@ exit 0
 	logText := string(logData)
 	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
 		t.Fatalf("zombie replacement skipped process-aware cleanup:\n%s", logText)
+	}
+}
+
+func TestManagerStartBoundsCleanupTransaction(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	mgr.cleanupTimeout = 50 * time.Millisecond
+	t.Setenv("FAKE_CLEANUP_WAIT_CONTEXT", "1")
+	started := time.Now()
+	err := mgr.Start(false, "", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start() error = %v, want cleanup deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("bounded cleanup took %v", elapsed)
 	}
 }
 
