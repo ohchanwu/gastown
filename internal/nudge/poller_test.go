@@ -597,6 +597,39 @@ func TestStopPollerReplacementRecordPreserved(t *testing.T) {
 	}
 }
 
+func TestStopPollerGenerationRejectsAdvancedRecord(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRecord := []byte("old-generation")
+	newRecord := []byte("replacement-generation")
+	if err := os.WriteFile(pidPath, oldRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidPath, newRecord, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = StopPollerGeneration(townRoot, session, generation)
+	if err == nil || !strings.Contains(err.Error(), "poller ownership advanced") {
+		t.Fatalf("StopPollerGeneration() error = %v, want advanced-generation refusal", err)
+	}
+	got, readErr := os.ReadFile(pidPath)
+	if readErr != nil || !bytes.Equal(got, newRecord) {
+		t.Fatalf("replacement ownership = %q, err %v", got, readErr)
+	}
+	if _, statErr := os.Stat(pollerStopFile(townRoot, session)); !os.IsNotExist(statErr) {
+		t.Fatalf("replacement generation received stop request: %v", statErr)
+	}
+}
+
 func TestStopPollerRejectsSameStartDifferentCommand(t *testing.T) {
 	session := "gt-gastown-polecat-test"
 	record := pollerRecord{PID: 123, Identity: pollerIdentity{StartTime: "same", Command: "gt nudge-poller " + session, Generation: "fixture-generation"}, Session: session}

@@ -107,6 +107,14 @@ type pollerRecord struct {
 	Legacy   bool
 }
 
+// PollerGeneration identifies the exact ownership record observed by a caller.
+// Its fields are intentionally private so only this package can interpret or
+// mutate poller custody.
+type PollerGeneration struct {
+	record []byte
+	exists bool
+}
+
 func startPollerWithLauncher(
 	townRoot, session string,
 	env []string,
@@ -340,7 +348,37 @@ func buildPollerCommand(gtBin, townRoot, session string, env []string) *exec.Cmd
 
 // StopPoller terminates the nudge-poller for a session, if running.
 func StopPoller(townRoot, session string) error {
-	return stopPollerWithGenerationOps(townRoot, session, os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
+	return stopPoller(townRoot, session, nil)
+}
+
+// CapturePollerGeneration records the exact poller ownership generation for a
+// later generation-bound stop. Absence is also captured so a newly created
+// poller cannot be mistaken for the inspected generation.
+func CapturePollerGeneration(townRoot, session string) (PollerGeneration, error) {
+	lock, err := lockPoller(townRoot, session)
+	if err != nil {
+		return PollerGeneration{}, err
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	data, err := os.ReadFile(pollerPidFile(townRoot, session))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return PollerGeneration{}, nil
+		}
+		return PollerGeneration{}, fmt.Errorf("reading poller ownership generation: %w", err)
+	}
+	return PollerGeneration{record: append([]byte(nil), data...), exists: true}, nil
+}
+
+// StopPollerGeneration stops only the exact ownership generation previously
+// captured by CapturePollerGeneration.
+func StopPollerGeneration(townRoot, session string, generation PollerGeneration) error {
+	return stopPoller(townRoot, session, &generation)
+}
+
+func stopPoller(townRoot, session string, expected *PollerGeneration) error {
+	return stopPollerWithExpectedGenerationOps(townRoot, session, expected, os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
 		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) }, waitPollerExit,
 		func(path string, data []byte) error {
 			return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
@@ -371,6 +409,20 @@ func stopPollerWithGenerationOps(
 	quarantine func(string, []byte) error,
 	remove func(string) error,
 ) error {
+	return stopPollerWithExpectedGenerationOps(townRoot, sessionName, nil, readPID, alive, identity, stop, waitExit, quarantine, remove)
+}
+
+func stopPollerWithExpectedGenerationOps(
+	townRoot, sessionName string,
+	expected *PollerGeneration,
+	readPID func(string) ([]byte, error),
+	alive func(int) bool,
+	identity func(int) (pollerIdentity, error),
+	stop func([]byte) error,
+	waitExit func(int, pollerRecord) error,
+	quarantine func(string, []byte) error,
+	remove func(string) error,
+) error {
 	lock, err := lockPoller(townRoot, sessionName)
 	if err != nil {
 		return err
@@ -381,9 +433,15 @@ func stopPollerWithGenerationOps(
 	data, err := readPID(pidPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if expected != nil && expected.exists {
+				return errors.New("poller ownership advanced before stop; preserving current generation")
+			}
 			return nil
 		}
 		return fmt.Errorf("reading poller ownership: %w", err)
+	}
+	if expected != nil && (!expected.exists || !bytes.Equal(data, expected.record)) {
+		return errors.New("poller ownership advanced before stop; preserving current generation")
 	}
 	record, err := parsePollerRecord(string(data))
 	if err != nil {

@@ -3,11 +3,73 @@
 package tmux
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"syscall"
 	"time"
 )
+
+func processGenerationIdentity(pid int) (string, error) {
+	alive, err := processAliveChecked(pid)
+	if err != nil {
+		return "", err
+	}
+	if !alive {
+		return "", errProcessNotFound
+	}
+	identity, err := readProcessStartIdentity(pid)
+	if err != nil {
+		alive, aliveErr := processAliveChecked(pid)
+		if aliveErr != nil {
+			return "", aliveErr
+		}
+		if !alive {
+			return "", errProcessNotFound
+		}
+		return "", fmt.Errorf("reading process start identity: %w", err)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", errors.New("process start identity is empty")
+	}
+	return identity, nil
+}
+
+func processAliveChecked(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, fmt.Errorf("invalid PID %d", pid)
+	}
+	err := syscall.Kill(pid, 0)
+	switch {
+	case err == nil, errors.Is(err, syscall.EPERM):
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func signalProcessGeneration(pid int, requested processSignal) error {
+	var signal syscall.Signal
+	switch requested {
+	case processSignalTerminate:
+		signal = syscall.SIGTERM
+	case processSignalKill:
+		signal = syscall.SIGKILL
+	default:
+		return fmt.Errorf("unknown process signal %q", requested)
+	}
+	if err := syscall.Kill(pid, signal); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return errProcessNotFound
+		}
+		return err
+	}
+	return nil
+}
 
 func killProcessGroup(pgid int) {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)

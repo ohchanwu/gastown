@@ -788,23 +788,118 @@ func (t *Tmux) KillSession(name string) (retErr error) {
 // and caused Claude processes to become orphans when they couldn't shut down in time.
 const processKillGracePeriod = 2 * time.Second
 
+const processExitPollInterval = 50 * time.Millisecond
+
+var errProcessNotFound = errors.New("process generation no longer exists")
+
+type processSignal string
+
+const (
+	processSignalTerminate processSignal = "TERM"
+	processSignalKill      processSignal = "KILL"
+)
+
+type capturedProcess struct {
+	pid      int
+	identity string
+}
+
+type processCleanupOps struct {
+	identity func(int) (string, error)
+	signal   func(int, processSignal) error
+	wait     func(context.Context, time.Duration) error
+}
+
+func cleanupCapturedProcesses(ctx context.Context, descendants []capturedProcess, pane *capturedProcess, ops processCleanupOps) error {
+	var cleanupErrs []error
+	signal := func(process capturedProcess, requested processSignal) {
+		current, err := ops.identity(process.pid)
+		if errors.Is(err, errProcessNotFound) || (err == nil && current != process.identity) {
+			return
+		}
+		if err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("validating process %d before %s: %w", process.pid, requested, err))
+			return
+		}
+		if err := ops.signal(process.pid, requested); err != nil && !errors.Is(err, errProcessNotFound) {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("signaling process %d with %s: %w", process.pid, requested, err))
+		}
+	}
+
+	for _, process := range descendants {
+		signal(process, processSignalTerminate)
+	}
+	if len(descendants) > 0 {
+		if err := ops.wait(ctx, processKillGracePeriod); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("waiting after descendant TERM: %w", err))
+		}
+	}
+	for _, process := range descendants {
+		signal(process, processSignalKill)
+	}
+	if pane != nil {
+		signal(*pane, processSignalTerminate)
+		if err := ops.wait(ctx, processKillGracePeriod); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("waiting after pane TERM: %w", err))
+		}
+		signal(*pane, processSignalKill)
+	}
+
+	remaining := append([]capturedProcess(nil), descendants...)
+	if pane != nil {
+		remaining = append(remaining, *pane)
+	}
+	verifyRemaining := func(processes []capturedProcess) ([]capturedProcess, error) {
+		stillRunning := make([]capturedProcess, 0, len(processes))
+		var verifyErrs []error
+		for _, process := range processes {
+			current, err := ops.identity(process.pid)
+			if errors.Is(err, errProcessNotFound) || (err == nil && current != process.identity) {
+				continue
+			}
+			if err != nil {
+				verifyErrs = append(verifyErrs, fmt.Errorf("verifying process %d exit: %w", process.pid, err))
+				continue
+			}
+			stillRunning = append(stillRunning, process)
+		}
+		return stillRunning, errors.Join(verifyErrs...)
+	}
+
+	remaining, verifyErr := verifyRemaining(remaining)
+	if verifyErr == nil && len(cleanupErrs) == 0 {
+		for waited := time.Duration(0); len(remaining) > 0 && waited < processKillGracePeriod; waited += processExitPollInterval {
+			if err := ops.wait(ctx, processExitPollInterval); err != nil {
+				verifyErr = fmt.Errorf("waiting for process exit after KILL: %w", err)
+				break
+			}
+			remaining, verifyErr = verifyRemaining(remaining)
+			if verifyErr != nil {
+				break
+			}
+		}
+	}
+	if verifyErr != nil {
+		cleanupErrs = append(cleanupErrs, verifyErr)
+	}
+	for _, process := range remaining {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("process %d generation remained after KILL", process.pid))
+	}
+	return errors.Join(cleanupErrs...)
+}
+
 // KillSessionWithProcesses explicitly kills all processes in a session before terminating it.
 // This prevents orphan processes that survive tmux kill-session due to SIGHUP being ignored.
 //
 // Process:
-// 1. Get the pane's main process PID and its process group ID (PGID)
-// 2. Kill the entire process group (catches reparented processes that stayed in the group)
-// 3. Find all descendant processes from one process snapshot (catches any stragglers)
-// 4. Send SIGTERM/SIGKILL to descendants
-// 5. Kill the pane process itself
-// 6. Kill the tmux session
+// 1. Capture the pane PID and immutable process-start identity
+// 2. Snapshot descendants and eligible reparented process-group members
+// 3. Revalidate each captured identity before TERM and KILL
+// 4. Verify every captured generation exited
+// 5. Kill the immutable tmux session target
 //
-// The process group kill is critical because:
-// - Descendant snapshots only find processes still connected by PPID
-// - Processes that reparent to init (PID 1) are missed by PPID traversal
-// - But they typically stay in the same process group unless they call setsid()
-//
-// This ensures Claude processes and all their children are properly terminated.
+// This avoids raw PID or process-group kills reaching a reused, unrelated
+// generation while still cleaning detached descendants owned by the session.
 func (t *Tmux) KillSessionWithProcesses(name string) error {
 	return t.KillSessionWithProcessesContext(context.Background(), name)
 }
@@ -812,28 +907,54 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {
 // KillSessionWithProcessesContext bounds graceful waits while preserving the
 // same TERM-then-KILL cleanup sequence.
 func (t *Tmux) KillSessionWithProcessesContext(ctx context.Context, name string) error {
+	return t.killSessionWithProcessesContext(ctx, name, processCleanupOps{
+		identity: processGenerationIdentity,
+		signal:   signalProcessGeneration,
+		wait:     waitForContext,
+	})
+}
+
+func (t *Tmux) killSessionWithProcessesContext(ctx context.Context, name string, ops processCleanupOps) error {
 	if ctx.Err() != nil {
-		return t.KillSession(name)
+		return ctx.Err()
 	}
 
 	// Disarm auto-respawn BEFORE killing anything. The pane-died hook would
 	// otherwise respawn the process 3 seconds after we kill it, creating a
 	// zombie that fights every kill attempt.
-	_ = t.SetRemainOnExit(name, false)
-	_, _ = t.run("set-hook", "-t", name, "-u", "pane-died")
+	if err := t.SetRemainOnExit(name, false); err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return nil
+		}
+		return fmt.Errorf("disarming remain-on-exit before process cleanup: %w", err)
+	}
+	if _, err := t.run("set-hook", "-t", name, "-u", "pane-died"); err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return nil
+		}
+		return fmt.Errorf("disarming pane-died before process cleanup: %w", err)
+	}
 
 	// Get the pane PID
 	pid, err := t.GetPanePID(name)
 	if err != nil {
-		// Session might not exist or server may have already gone away.
-		killErr := t.KillSession(name)
-		if killErr == nil || killErr == ErrSessionNotFound || killErr == ErrNoServer {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
 			return nil
 		}
-		return killErr
+		return fmt.Errorf("reading pane PID before process cleanup: %w", err)
 	}
 
 	if pid != "" {
+		panePID, err := strconv.Atoi(pid)
+		if err != nil || panePID <= 0 {
+			return fmt.Errorf("reading pane PID before process cleanup: invalid PID %q", pid)
+		}
+		paneIdentity, err := ops.identity(panePID)
+		if err != nil {
+			return fmt.Errorf("capturing pane process %d generation: %w", panePID, err)
+		}
+		pane := capturedProcess{pid: panePID, identity: paneIdentity}
+
 		// Walk the process tree for all descendants (catches processes that
 		// called setsid() and created their own process groups)
 		descendants := getAllDescendants(pid)
@@ -856,23 +977,24 @@ func (t *Tmux) KillSessionWithProcessesContext(ctx context.Context, name string)
 			descendants = append(descendants, reparented...)
 		}
 
-		// Send SIGTERM to all descendants (deepest first to avoid orphaning)
-		for _, dpid := range descendants {
-			_ = exec.Command("kill", "-TERM", dpid).Run()
+		capturedDescendants := make([]capturedProcess, 0, len(descendants))
+		for _, descendant := range descendants {
+			descendantPID, parseErr := strconv.Atoi(descendant)
+			if parseErr != nil || descendantPID <= 0 {
+				return fmt.Errorf("capturing descendant process generation: invalid PID %q", descendant)
+			}
+			identity, identityErr := ops.identity(descendantPID)
+			if errors.Is(identityErr, errProcessNotFound) {
+				continue
+			}
+			if identityErr != nil {
+				return fmt.Errorf("capturing descendant process %d generation: %w", descendantPID, identityErr)
+			}
+			capturedDescendants = append(capturedDescendants, capturedProcess{pid: descendantPID, identity: identity})
 		}
-
-		// Wait for graceful shutdown (2s gives processes time to clean up)
-		_ = waitForContext(ctx, processKillGracePeriod)
-
-		// Send SIGKILL to any remaining descendants
-		for _, dpid := range descendants {
-			_ = exec.Command("kill", "-KILL", dpid).Run()
+		if err := cleanupCapturedProcesses(ctx, capturedDescendants, &pane, ops); err != nil {
+			return fmt.Errorf("cleaning session process generations: %w", err)
 		}
-
-		// Kill the pane process itself (may have called setsid() and detached)
-		_ = exec.Command("kill", "-TERM", pid).Run()
-		_ = waitForContext(ctx, processKillGracePeriod)
-		_ = exec.Command("kill", "-KILL", pid).Run()
 	}
 
 	// Kill the tmux session

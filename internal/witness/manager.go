@@ -29,6 +29,18 @@ var (
 	ErrAlreadyRunning = errors.New("witness already running")
 )
 
+func validTmuxSessionID(id string) bool {
+	if len(id) < 2 || id[0] != '$' {
+		return false
+	}
+	for _, digit := range id[1:] {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
@@ -136,8 +148,24 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		return fmt.Errorf("checking witness session: %w", err)
 	}
 	if running {
+		sessionIDs, err := t.ListSessionIDs()
+		if err != nil {
+			return fmt.Errorf("reading witness session identity: %w", err)
+		}
+		generation := sessionIDs[sessionID]
+		if generation == "" {
+			return fmt.Errorf("reading witness session identity: session %s has no immutable ID", sessionID)
+		}
+		if !validTmuxSessionID(generation) {
+			return fmt.Errorf("reading witness session identity: session %s has invalid immutable ID %q", sessionID, generation)
+		}
+		pollerGeneration, err := nudge.CapturePollerGeneration(townRoot, sessionID)
+		if err != nil {
+			return fmt.Errorf("reading witness poller generation: %w", err)
+		}
+
 		// Session exists - check if Claude is actually running (healthy vs zombie)
-		alive, err := t.IsAgentAliveChecked(sessionID)
+		alive, err := t.IsAgentAliveChecked(generation)
 		if err != nil {
 			return fmt.Errorf("checking witness liveness: %w", err)
 		}
@@ -145,42 +173,39 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 			// Healthy - Claude is running
 			return ErrAlreadyRunning
 		}
-		// Zombie detected — tmux alive but agent dead.
-		// Mitigate TOCTOU gap: the agent may be slow to start, appearing
-		// dead during initialization. Record session creation time, wait
-		// briefly, then re-verify before killing to avoid destroying a
-		// session that just became healthy.
-		createdAt, err := t.GetSessionCreatedUnix(sessionID)
-		if err != nil {
-			return fmt.Errorf("reading witness session creation time: %w", err)
-		}
-		if createdAt <= 0 {
-			return fmt.Errorf("reading witness session creation time: invalid timestamp %d", createdAt)
-		}
+		// Zombie detected — tmux alive but agent dead. Wait briefly, then
+		// re-verify the immutable tmux generation before destructive cleanup.
 		time.Sleep(constants.ZombieKillGracePeriod)
 
 		// Re-check: abort kill if agent started or session was replaced
-		alive, err = t.IsAgentAliveChecked(sessionID)
+		alive, err = t.IsAgentAliveChecked(generation)
 		if err != nil {
 			return fmt.Errorf("rechecking witness liveness: %w", err)
 		}
 		if alive {
 			return ErrAlreadyRunning
 		}
-		createdNow, err := t.GetSessionCreatedUnix(sessionID)
+		sessionIDs, err = t.ListSessionIDs()
 		if err != nil {
-			return fmt.Errorf("rechecking witness session creation time: %w", err)
+			return fmt.Errorf("rechecking witness session identity: %w", err)
 		}
-		if createdNow <= 0 {
-			return fmt.Errorf("rechecking witness session creation time: invalid timestamp %d", createdNow)
+		currentGeneration := sessionIDs[sessionID]
+		if currentGeneration == "" {
+			return fmt.Errorf("rechecking witness session identity: session %s has no immutable ID", sessionID)
 		}
-		if createdNow != createdAt {
+		if !validTmuxSessionID(currentGeneration) {
+			return fmt.Errorf("rechecking witness session identity: session %s has invalid immutable ID %q", sessionID, currentGeneration)
+		}
+		if currentGeneration != generation {
 			// Session was replaced between checks — another process already
 			// handled the zombie. Treat as already running; caller can retry.
 			return ErrAlreadyRunning
 		}
 
-		if err := m.stopSession(townRoot, sessionID, func() error { return t.KillSessionWithProcesses(sessionID) }); err != nil {
+		if err := nudge.StopPollerBeforeReplacement(
+			func() error { return nudge.StopPollerGeneration(townRoot, sessionID, pollerGeneration) },
+			func() error { return t.KillSessionWithProcesses(generation) },
+		); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}

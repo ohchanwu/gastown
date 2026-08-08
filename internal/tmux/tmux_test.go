@@ -874,6 +874,215 @@ func TestKillSessionWithProcesses(t *testing.T) {
 	}
 }
 
+func TestCleanupCapturedProcessesReturnsSignalFailure(t *testing.T) {
+	signalErr := errors.New("injected TERM failure")
+	refs := []capturedProcess{{pid: 123, identity: "start-123"}}
+	ops := processCleanupOps{
+		identity: func(int) (string, error) { return "start-123", nil },
+		signal: func(int, processSignal) error {
+			return signalErr
+		},
+		wait: func(context.Context, time.Duration) error { return nil },
+	}
+
+	err := cleanupCapturedProcesses(context.Background(), refs, nil, ops)
+	if !errors.Is(err, signalErr) {
+		t.Fatalf("cleanupCapturedProcesses() error = %v, want signal failure", err)
+	}
+}
+
+func TestCleanupCapturedProcessesTreatsExitedGenerationAsSuccess(t *testing.T) {
+	signaled := false
+	ops := processCleanupOps{
+		identity: func(int) (string, error) { return "", errProcessNotFound },
+		signal: func(int, processSignal) error {
+			signaled = true
+			return nil
+		},
+		wait: func(context.Context, time.Duration) error { return nil },
+	}
+	err := cleanupCapturedProcesses(context.Background(), []capturedProcess{{pid: 123, identity: "start-123"}}, nil, ops)
+	if err != nil || signaled {
+		t.Fatalf("exited generation cleanup = err %v, signaled %v", err, signaled)
+	}
+}
+
+func TestCleanupCapturedProcessesRejectsSurvivingGeneration(t *testing.T) {
+	ops := processCleanupOps{
+		identity: func(int) (string, error) { return "start-123", nil },
+		signal:   func(int, processSignal) error { return nil },
+		wait:     func(context.Context, time.Duration) error { return nil },
+	}
+	err := cleanupCapturedProcesses(context.Background(), []capturedProcess{{pid: 123, identity: "start-123"}}, nil, ops)
+	if err == nil || !strings.Contains(err.Error(), "remained after KILL") {
+		t.Fatalf("surviving generation cleanup error = %v", err)
+	}
+}
+
+func TestCleanupCapturedProcessesWaitsForExitAfterKill(t *testing.T) {
+	killed := false
+	postKillChecks := 0
+	waits := 0
+	ops := processCleanupOps{
+		identity: func(int) (string, error) {
+			if killed {
+				postKillChecks++
+				if postKillChecks > 1 {
+					return "", errProcessNotFound
+				}
+			}
+			return "start-123", nil
+		},
+		signal: func(_ int, requested processSignal) error {
+			if requested == processSignalKill {
+				killed = true
+			}
+			return nil
+		},
+		wait: func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
+	}
+
+	err := cleanupCapturedProcesses(context.Background(), []capturedProcess{{pid: 123, identity: "start-123"}}, nil, ops)
+	if err != nil {
+		t.Fatalf("cleanupCapturedProcesses() error = %v, want delayed exit success", err)
+	}
+	if waits < 2 {
+		t.Fatalf("cleanup wait calls = %d, want TERM grace plus post-KILL poll", waits)
+	}
+}
+
+func TestKillSessionWithProcessesStopsBeforeTmuxKillOnSignalFailure(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "tmux.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TMUX_LOG"
+case "$*" in
+  *"set-option"*|*"set-hook"*) exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "123"; exit 0 ;;
+  *"kill-session"*) exit 0 ;;
+esac
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	tm := NewTmuxWithSocket("gt-process-cleanup-test")
+	signalErr := errors.New("injected TERM failure")
+	ops := processCleanupOps{
+		identity: func(int) (string, error) { return "start-123", nil },
+		signal:   func(int, processSignal) error { return signalErr },
+		wait:     func(context.Context, time.Duration) error { return nil },
+	}
+
+	err := tm.killSessionWithProcessesContext(context.Background(), "$1", ops)
+	if !errors.Is(err, signalErr) {
+		t.Fatalf("killSessionWithProcessesContext() error = %v, want signal failure", err)
+	}
+	logData, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "kill-session") {
+		t.Fatalf("tmux session killed after incomplete process cleanup:\n%s", logData)
+	}
+}
+
+func TestKillSessionWithProcessesStopsWhenRespawnCannotBeDisarmed(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "tmux.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TMUX_LOG"
+case "$*" in
+  *"set-option"*) exit 0 ;;
+  *"set-hook"*) echo "injected set-hook failure" >&2; exit 2 ;;
+  *"display-message"*"pane_pid"*) echo "123"; exit 0 ;;
+  *"kill-session"*) exit 0 ;;
+esac
+exit 2
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	tm := NewTmuxWithSocket("gt-process-cleanup-hook-test")
+	alive := true
+	ops := processCleanupOps{
+		identity: func(int) (string, error) {
+			if !alive {
+				return "", errProcessNotFound
+			}
+			return "start-123", nil
+		},
+		signal: func(_ int, requested processSignal) error {
+			if requested == processSignalKill {
+				alive = false
+			}
+			return nil
+		},
+		wait: func(context.Context, time.Duration) error { return nil },
+	}
+
+	err := tm.killSessionWithProcessesContext(context.Background(), "$1", ops)
+	if err == nil || !strings.Contains(err.Error(), "disarming pane-died") {
+		t.Fatalf("killSessionWithProcessesContext() error = %v, want respawn-disarm failure", err)
+	}
+	logData, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "kill-session") {
+		t.Fatalf("tmux session killed after respawn-disarm failure:\n%s", logData)
+	}
+}
+
+func TestKillSessionWithProcessesTreatsMissingGenerationDuringRespawnDisarmAsSuccess(t *testing.T) {
+	for _, stage := range []string{"set-option", "set-hook"} {
+		t.Run(stage, func(t *testing.T) {
+			fakeBin := t.TempDir()
+			logPath := filepath.Join(fakeBin, "tmux.log")
+			script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TMUX_LOG"
+case "$*" in
+  *"set-option"*)
+    [ "$FAKE_MISSING_STAGE" = "set-option" ] && echo "no server running" >&2 && exit 1
+    exit 0
+    ;;
+  *"set-hook"*)
+    [ "$FAKE_MISSING_STAGE" = "set-hook" ] && echo "can't find session: $1" >&2 && exit 1
+    exit 0
+    ;;
+  *"display-message"*|*"kill-session"*) echo "destructive cleanup followed missing generation" >&2; exit 2 ;;
+esac
+exit 2
+`
+			if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_TMUX_LOG", logPath)
+			t.Setenv("FAKE_MISSING_STAGE", stage)
+			t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			tm := NewTmuxWithSocket("gt-process-cleanup-missing-test")
+
+			if err := tm.killSessionWithProcessesContext(context.Background(), "$1", processCleanupOps{}); err != nil {
+				t.Fatalf("killSessionWithProcessesContext() error = %v, want missing generation success", err)
+			}
+			logData, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(logData), "display-message") || strings.Contains(string(logData), "kill-session") {
+				t.Fatalf("destructive cleanup followed missing generation:\n%s", logData)
+			}
+		})
+	}
+}
+
 func TestKillSessionWithProcesses_NonexistentSession(t *testing.T) {
 	tm := newTestTmux(t)
 
