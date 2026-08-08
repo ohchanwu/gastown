@@ -130,6 +130,30 @@ func TestCheckHelpFlag_EdgeCases(t *testing.T) {
 	})
 }
 
+func TestSessionCustodyInitInvocationRequiresExactInternalCommand(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"session-custody-init"}, want: true},
+		{args: nil, want: false},
+		{args: []string{"session-custody-init", "extra"}, want: false},
+		{args: []string{"session-custody"}, want: false},
+	}
+	for _, test := range tests {
+		if got := isSessionCustodyInitInvocation(test.args); got != test.want {
+			t.Errorf("isSessionCustodyInitInvocation(%q) = %v, want %v", test.args, got, test.want)
+		}
+	}
+}
+
+func TestPersistentPreRunBypassesAllSharedSetupForSessionCustodyInit(t *testing.T) {
+	cmd := &cobra.Command{Use: "session-custody-init"}
+	if err := persistentPreRun(cmd, nil); err != nil {
+		t.Fatalf("persistentPreRun(session-custody-init): %v", err)
+	}
+}
+
 func TestPersistentPreRunLoadsAgentRegistry(t *testing.T) {
 	// Regression test: persistentPreRun must load settings/agents.json so that
 	// GetProcessNames (used by IsAgentAlive, daemon heartbeat, cleanup) respects

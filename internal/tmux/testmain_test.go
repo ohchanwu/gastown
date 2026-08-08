@@ -12,6 +12,16 @@ import (
 // down after all tests complete. This prevents test sessions from appearing on
 // the user's interactive tmux and avoids socket conflicts with other packages.
 func TestMain(m *testing.M) {
+	if requested, err := runSessionCustodyInit(); requested {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "session custody init: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("GT_TEST_SESSION_CUSTODY_HELPER") != "" || os.Getenv("GT_TEST_SESSION_CUSTODY_WORKLOAD") != "" {
+		os.Exit(m.Run())
+	}
 	socket := fmt.Sprintf("gt-test-%d", os.Getpid())
 	socketDir, err := os.MkdirTemp("/tmp", "gt-tmux-tests-")
 	if err != nil {

@@ -64,3 +64,13 @@ func RunSessionCustodyCommand(custody, command string) error {
 	}
 	return runSessionWithCustody(custody, command)
 }
+
+// RunSessionCustodyInit enters the trusted namespace-init path selected by the
+// hidden internal command. Ordinary invocations are rejected.
+func RunSessionCustodyInit() error {
+	requested, err := runSessionCustodyInit()
+	if !requested {
+		return errors.New("session custody init was not requested by a trusted launcher")
+	}
+	return err
+}

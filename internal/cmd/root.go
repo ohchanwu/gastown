@@ -97,6 +97,9 @@ var branchCheckExemptCommands = map[string]bool{
 
 // persistentPreRun runs before every command.
 func persistentPreRun(cmd *cobra.Command, args []string) error {
+	if cmd.Name() == "session-custody-init" {
+		return nil
+	}
 	// Check if binary was built properly (via make build, not raw go build).
 	// Raw go build produces unsigned binaries that macOS may kill.
 	// Warning only - doesn't block execution.
@@ -318,7 +321,7 @@ func checkStaleBinaryWarning() {
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
-	if !isDoneInvocation(os.Args[1:]) {
+	if !isDoneInvocation(os.Args[1:]) && !isSessionCustodyInitInvocation(os.Args[1:]) {
 		ctx := context.Background()
 		provider, err := telemetry.Init(ctx, "gastown", Version)
 		if err != nil {
@@ -350,6 +353,10 @@ func Execute() int {
 func isDoneInvocation(args []string) bool {
 	cmd, _, err := rootCmd.Find(args)
 	return err == nil && isDoneCommand(cmd)
+}
+
+func isSessionCustodyInitInvocation(args []string) bool {
+	return len(args) == 1 && args[0] == "session-custody-init"
 }
 
 // Command group IDs - used by subcommands to organize help output

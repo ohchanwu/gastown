@@ -1311,6 +1311,18 @@ func (cleanup *SessionGenerationCleanup) PrepareCommit(ctx context.Context) (fun
 			true,
 			"kill-session -t "+cleanup.generation.SessionID,
 		)
+		if errors.Is(sessionErr, ErrSessionGenerationChanged) {
+			// Killing the exact retained supervisor can make tmux remove the
+			// session before the guarded command is evaluated. Accept only a
+			// confirmed absent name; a same-name replacement remains a generation
+			// change and is preserved.
+			exists, existsErr := cleanup.tmux.HasSessionContext(tmuxKillCtx, cleanup.generation.Name)
+			if existsErr != nil {
+				sessionErr = errors.Join(sessionErr, fmt.Errorf("confirming post-commit session absence: %w", existsErr))
+			} else if !exists {
+				sessionErr = nil
+			}
+		}
 		if sessionErr != nil {
 			sessionErr = fmt.Errorf("killing exact tmux session generation: %w", sessionErr)
 		}

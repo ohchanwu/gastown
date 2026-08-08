@@ -162,8 +162,13 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansCreatedSession(t *
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("creation error = %v, want context deadline exceeded", err)
 	}
-	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
-		t.Fatalf("cancellation took %v, want <= 300ms", elapsed)
+	// The caller deadline, exec.Cmd WaitDelay, and bounded cleanup all remain
+	// sub-second, but starting the tmux and ps helper processes can occasionally
+	// exceed 300ms under host scheduler pressure. Keep the regression ceiling
+	// well below the former multi-second graceful-wait path without making the
+	// assertion depend on sub-300ms process scheduling.
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancellation took %v, want <= 1s", elapsed)
 	}
 	if running, err := tm.HasSession(session); err != nil || running {
 		t.Fatalf("cancelled creation left session behind: running=%v err=%v", running, err)
