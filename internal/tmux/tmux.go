@@ -1074,13 +1074,15 @@ type SessionGenerationCleanup struct {
 	panePID      int
 	paneIdentity string
 	identity     func(int) (string, error)
+	stabilize    func(context.Context, int, []retainedProcess) ([]retainedProcess, error)
 	processes    []retainedProcess
 }
 
 type sessionProcessCustodyOps struct {
-	readPane func(SessionGeneration) (int, bool, error)
-	identity func(int) (string, error)
-	retain   func(int) ([]retainedProcess, error)
+	readPane  func(SessionGeneration) (int, bool, error)
+	identity  func(int) (string, error)
+	retain    func(int) ([]retainedProcess, error)
+	stabilize func(context.Context, int, []retainedProcess) ([]retainedProcess, error)
 }
 
 // PrepareSessionGenerationProcessCleanup captures the exact pane process tree
@@ -1095,9 +1097,10 @@ func (t *Tmux) PrepareSessionGenerationProcessCleanup(
 
 func (t *Tmux) sessionProcessCustodyOps() sessionProcessCustodyOps {
 	return sessionProcessCustodyOps{
-		readPane: t.getPanePIDGeneration,
-		identity: processGenerationIdentity,
-		retain:   retainProcessTree,
+		readPane:  t.getPanePIDGeneration,
+		identity:  processGenerationIdentity,
+		retain:    retainProcessTree,
+		stabilize: stabilizeProcessTree,
 	}
 }
 
@@ -1163,6 +1166,7 @@ func (t *Tmux) prepareSessionGenerationProcessCleanup(
 		panePID:      panePID,
 		paneIdentity: paneIdentity,
 		identity:     ops.identity,
+		stabilize:    ops.stabilize,
 		processes:    processes,
 	}, nil
 }
@@ -1184,8 +1188,8 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 
 // Run performs the destructive cleanup while retaining the captured kernel
 // references. Callers may wrap Run in a broader ownership transaction.
-func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
-	if cleanup == nil || cleanup.tmux == nil || cleanup.identity == nil || cleanup.paneIdentity == "" || len(cleanup.processes) == 0 {
+func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) (retErr error) {
+	if cleanup == nil || cleanup.tmux == nil || cleanup.identity == nil || cleanup.stabilize == nil || cleanup.paneIdentity == "" || len(cleanup.processes) == 0 {
 		return errors.New("tmux session generation cleanup has no retained process custody")
 	}
 	if err := ctx.Err(); err != nil {
@@ -1227,9 +1231,21 @@ func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
 		return ErrSessionGenerationChanged
 	}
 
-	if err := cleanupRetainedProcesses(ctx, cleanup.processes, waitForContext); err != nil {
+	processes, err := cleanup.stabilize(ctx, cleanup.panePID, cleanup.processes)
+	cleanup.processes = processes
+	if err != nil {
+		return fmt.Errorf("establishing stable no-fork process custody: %w", err)
+	}
+	frozen := true
+	defer func() {
+		if frozen {
+			retErr = errors.Join(retErr, thawRetainedProcesses(cleanup.processes))
+		}
+	}()
+	if err := cleanupFrozenRetainedProcesses(ctx, cleanup.processes, waitForContext); err != nil {
 		return fmt.Errorf("cleaning exact tmux process generation: %w", err)
 	}
+	frozen = false
 	if err := cleanup.tmux.runGuardedSessionGenerationPaneContext(
 		ctx,
 		cleanup.generation,

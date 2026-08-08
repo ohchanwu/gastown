@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -31,9 +32,13 @@ type fakeSessionCleanup struct {
 	generation tmux.SessionGeneration
 	pane       tmux.PaneProcessGeneration
 	logPath    string
+	run        func(context.Context) error
 }
 
 func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
+	if cleanup.run != nil {
+		return cleanup.run(ctx)
+	}
 	if os.Getenv("FAKE_CLEANUP_WAIT_CONTEXT") != "" {
 		<-ctx.Done()
 		return ctx.Err()
@@ -645,6 +650,92 @@ exit 2
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("bounded cleanup took %v", elapsed)
+	}
+}
+
+func TestManagerStartHoldsDeliveryLeaseThroughFailedCleanup(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	townRoot := filepath.Dir(mgr.rig.Path)
+	queued := nudge.QueuedNudge{
+		DeliveryID:      "ndg-cleanup-delivery-lease",
+		Sender:          "mayor",
+		Message:         "must remain recoverable",
+		Priority:        nudge.PriorityUrgent,
+		DurableUntilAck: true,
+	}
+	if err := nudge.Enqueue(townRoot, mgr.SessionName(), queued); err != nil {
+		t.Fatal(err)
+	}
+	cleanupEntered := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	cleanupErr := errors.New("preserve zombie")
+	mgr.prepareSessionCleanup = func(
+		generation tmux.SessionGeneration,
+		pane tmux.PaneProcessGeneration,
+	) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{
+			generation: generation,
+			pane:       pane,
+			run: func(context.Context) error {
+				close(cleanupEntered)
+				<-releaseCleanup
+				return cleanupErr
+			},
+		}, nil
+	}
+	startResult := make(chan error, 1)
+	go func() { startResult <- mgr.Start(false, "", nil) }()
+	select {
+	case <-cleanupEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not start")
+	}
+
+	competitor := tmux.NewTmuxWithSocket("gt-witness-delivery-lease-competitor")
+	leaseCtx, cancelLease := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	releaseCompetingLease, leaseErr := competitor.AcquireNudgeLeaseContext(leaseCtx, townRoot, mgr.SessionName())
+	cancelLease()
+	if releaseCompetingLease != nil {
+		releaseCompetingLease()
+	}
+	close(releaseCleanup)
+	startErr := <-startResult
+	if !errors.Is(startErr, cleanupErr) {
+		t.Fatalf("Start() error = %v, want cleanup failure", startErr)
+	}
+	if !errors.Is(leaseErr, context.DeadlineExceeded) {
+		t.Fatalf("competing delivery lease error = %v, want deadline during cleanup", leaseErr)
+	}
+
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), time.Second)
+	releaseRecoveryLease, err := competitor.AcquireNudgeLeaseContext(recoveryCtx, townRoot, mgr.SessionName())
+	cancelRecovery()
+	if err != nil {
+		t.Fatalf("reacquiring delivery lease after cleanup: %v", err)
+	}
+	defer releaseRecoveryLease()
+	claim, err := nudge.ClaimDue(townRoot, mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim == nil || claim.Nudge.DeliveryID != queued.DeliveryID {
+		t.Fatalf("recoverable claim = %#v, want %s", claim, queued.DeliveryID)
+	}
+	if err := claim.Nack("test-recovery", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 }
 

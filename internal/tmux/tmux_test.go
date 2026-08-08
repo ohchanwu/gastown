@@ -964,6 +964,7 @@ func TestSessionGenerationCleanupRejectsReplacementPane(t *testing.T) {
 		panePID:      panePID + 1,
 		paneIdentity: "old-pane-start",
 		identity:     func(int) (string, error) { return "old-pane-start", nil },
+		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{oldProcess},
 	}
 
@@ -994,6 +995,10 @@ type mockRetainedProcess struct {
 	aliveChecks         int
 	aliveSequence       []bool
 	onSignal            func(processSignal) error
+	onFreeze            func()
+	frozen              bool
+	freezeErr           error
+	thawErr             error
 	closeErr            error
 }
 
@@ -1021,7 +1026,33 @@ func (p *mockRetainedProcess) Signal(signal processSignal) error {
 	}
 	return nil
 }
+func (p *mockRetainedProcess) Freeze(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.freezeErr != nil {
+		return p.freezeErr
+	}
+	p.frozen = true
+	if p.onFreeze != nil {
+		p.onFreeze()
+	}
+	return nil
+}
+func (p *mockRetainedProcess) Thaw() error {
+	p.frozen = false
+	return p.thawErr
+}
 func (p *mockRetainedProcess) Close() error { p.closed = true; return p.closeErr }
+
+func stabilizeMockRetainedProcesses(ctx context.Context, _ int, processes []retainedProcess) ([]retainedProcess, error) {
+	for _, process := range processes {
+		if err := process.Freeze(ctx); err != nil {
+			return processes, err
+		}
+	}
+	return processes, nil
+}
 
 func TestCaptureRetainedProcessTreeRejectsReusedAncestry(t *testing.T) {
 	root := &mockRetainedProcess{pid: 100, parent: 1, generation: "root", alive: true}
@@ -1080,6 +1111,143 @@ func TestCaptureRetainedProcessTreeRechecksParentAfterChildAcquire(t *testing.T)
 	}
 	if !root.closed || !child.closed {
 		t.Fatalf("failed ancestry custody was not closed: root=%v child=%v", root.closed, child.closed)
+	}
+}
+
+func TestCaptureRetainedProcessTreeJoinsRollbackCloseErrors(t *testing.T) {
+	t.Run("parent already exited", func(t *testing.T) {
+		closeErr := errors.New("root close failure")
+		root := &mockRetainedProcess{pid: 100, parent: 1, alive: false, closeErr: closeErr}
+		_, err := captureRetainedProcessTree(
+			100,
+			[]processRelation{{PID: 101, ParentPID: 100}},
+			func(int) (retainedProcess, error) { return root, nil },
+		)
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("capture error = %v, want joined root close failure", err)
+		}
+	})
+
+	t.Run("descendant acquisition fails", func(t *testing.T) {
+		closeErr := errors.New("root close failure")
+		acquireErr := errors.New("descendant acquire failure")
+		root := &mockRetainedProcess{pid: 100, parent: 1, alive: true, closeErr: closeErr}
+		_, err := captureRetainedProcessTree(
+			100,
+			[]processRelation{{PID: 101, ParentPID: 100}},
+			func(pid int) (retainedProcess, error) {
+				if pid == 100 {
+					return root, nil
+				}
+				return nil, acquireErr
+			},
+		)
+		if !errors.Is(err, acquireErr) || !errors.Is(err, closeErr) {
+			t.Fatalf("capture error = %v, want acquire and rollback close failures", err)
+		}
+	})
+
+	t.Run("reused child close fails", func(t *testing.T) {
+		rootCloseErr := errors.New("root close failure")
+		childCloseErr := errors.New("reused child close failure")
+		root := &mockRetainedProcess{pid: 100, parent: 1, alive: true, closeErr: rootCloseErr}
+		child := &mockRetainedProcess{pid: 101, parent: 999, alive: true, closeErr: childCloseErr}
+		_, err := captureRetainedProcessTree(
+			100,
+			[]processRelation{{PID: 101, ParentPID: 100}},
+			func(pid int) (retainedProcess, error) {
+				if pid == 100 {
+					return root, nil
+				}
+				return child, nil
+			},
+		)
+		if !errors.Is(err, childCloseErr) || !errors.Is(err, rootCloseErr) {
+			t.Fatalf("capture error = %v, want child and root close failures", err)
+		}
+	})
+
+	t.Run("parent exits after child acquisition", func(t *testing.T) {
+		rootCloseErr := errors.New("root close failure")
+		childCloseErr := errors.New("child close failure")
+		root := &mockRetainedProcess{pid: 100, parent: 1, aliveSequence: []bool{true, false}, closeErr: rootCloseErr}
+		child := &mockRetainedProcess{pid: 101, parent: 100, alive: true, closeErr: childCloseErr}
+		_, err := captureRetainedProcessTree(
+			100,
+			[]processRelation{{PID: 101, ParentPID: 100}},
+			func(pid int) (retainedProcess, error) {
+				if pid == 100 {
+					return root, nil
+				}
+				return child, nil
+			},
+		)
+		if !errors.Is(err, childCloseErr) || !errors.Is(err, rootCloseErr) {
+			t.Fatalf("capture error = %v, want child and root close failures", err)
+		}
+	})
+}
+
+func TestStabilizeRetainedProcessTreeCapturesLateForkBeforeKill(t *testing.T) {
+	spawned := false
+	root := &mockRetainedProcess{pid: 100, parent: 1, generation: "root", alive: true}
+	child := &mockRetainedProcess{pid: 101, parent: 100, generation: "late-child", alive: true}
+	root.onFreeze = func() { spawned = true }
+	processes, err := stabilizeRetainedProcessTree(
+		context.Background(),
+		100,
+		[]retainedProcess{root},
+		func(int) ([]processRelation, error) {
+			if spawned {
+				return []processRelation{{PID: 101, ParentPID: 100}}, nil
+			}
+			return nil, nil
+		},
+		func(pid int) (retainedProcess, error) {
+			if pid == child.pid {
+				return child, nil
+			}
+			return nil, errProcessNotFound
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(processes) != 2 || !root.frozen || !child.frozen {
+		t.Fatalf("stable custody = %d refs, root frozen=%v child frozen=%v", len(processes), root.frozen, child.frozen)
+	}
+	if err := cleanupFrozenRetainedProcesses(context.Background(), processes, func(context.Context, time.Duration) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(root.signals, []processSignal{processSignalKill}) || !reflect.DeepEqual(child.signals, []processSignal{processSignalKill}) {
+		t.Fatalf("stable cleanup signals root=%v child=%v", root.signals, child.signals)
+	}
+}
+
+func TestStabilizeRetainedProcessTreeThawsOwnedProcessesOnLateFreezeFailure(t *testing.T) {
+	freezeErr := errors.New("late child freeze failure")
+	root := &mockRetainedProcess{pid: 100, parent: 1, alive: true}
+	child := &mockRetainedProcess{pid: 101, parent: 100, alive: true, freezeErr: freezeErr}
+	processes, err := stabilizeRetainedProcessTree(
+		context.Background(),
+		100,
+		[]retainedProcess{root},
+		func(int) ([]processRelation, error) {
+			return []processRelation{{PID: 101, ParentPID: 100}}, nil
+		},
+		func(int) (retainedProcess, error) { return child, nil },
+	)
+	if !errors.Is(err, freezeErr) {
+		t.Fatalf("stable capture error = %v, want freeze failure", err)
+	}
+	if root.frozen {
+		t.Fatal("stable capture failure left retained root frozen")
+	}
+	if !child.closed {
+		t.Fatal("late child reference was not closed after freeze failure")
+	}
+	if len(processes) != 1 || processes[0] != root {
+		t.Fatalf("stable capture returned %d owned refs after child failure", len(processes))
 	}
 }
 
@@ -1221,6 +1389,7 @@ func TestSessionGenerationCleanupPreservesPaneReplacementBeforeFinalKill(t *test
 		panePID:      pane.PID,
 		paneIdentity: pane.Identity,
 		identity:     processGenerationIdentity,
+		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{oldProcess},
 	}
 
@@ -1264,6 +1433,7 @@ func TestSessionGenerationCleanupRunRejectsSamePIDIdentityReplacement(t *testing
 		panePID:      123,
 		paneIdentity: "old-process-start",
 		identity:     func(int) (string, error) { return "replacement-process-start", nil },
+		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{process},
 	}
 	err := cleanup.Run(context.Background())
@@ -1304,6 +1474,7 @@ func TestSessionGenerationCleanupRunBoundsHangingGuard(t *testing.T) {
 		panePID:      123,
 		paneIdentity: "owned-process-start",
 		identity:     func(int) (string, error) { return "owned-process-start", nil },
+		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{process},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1352,6 +1523,7 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 				}
 				return []retainedProcess{process}, nil
 			},
+			stabilize: stabilizeMockRetainedProcesses,
 		},
 	)
 	if err != nil {
@@ -1360,8 +1532,8 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 	if err := cleanup.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if !reflect.DeepEqual(process.signals, []processSignal{processSignalTerminate, processSignalKill}) {
-		t.Fatalf("Run() signals = %v, want TERM then KILL", process.signals)
+	if !reflect.DeepEqual(process.signals, []processSignal{processSignalKill}) {
+		t.Fatalf("Run() signals = %v, want KILL after stable freeze", process.signals)
 	}
 	has, err := tm.HasSession(session)
 	if err != nil {
@@ -1415,6 +1587,19 @@ func TestCleanupRetainedProcessesSignalsCapturedHandleAfterPIDReuse(t *testing.T
 	}
 	if !reflect.DeepEqual(old.signaledGenerations, []string{"old", "old"}) {
 		t.Fatalf("signaled generations = %v, want retained old handle", old.signaledGenerations)
+	}
+}
+
+func TestCleanupFrozenRetainedProcessesChecksContextBeforeCommit(t *testing.T) {
+	process := &mockRetainedProcess{pid: 123, parent: 1, generation: "owned", alive: true, frozen: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := cleanupFrozenRetainedProcesses(ctx, []retainedProcess{process}, func(context.Context, time.Duration) error { return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("frozen cleanup error = %v, want cancellation", err)
+	}
+	if len(process.signals) != 0 {
+		t.Fatalf("canceled frozen cleanup signaled process: %v", process.signals)
 	}
 }
 

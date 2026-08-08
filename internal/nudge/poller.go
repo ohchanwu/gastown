@@ -459,9 +459,12 @@ func replaceBeforeStoppingPollerGenerationContext(
 	if err := replace(ctx); err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	// Replacement success is the commit point: the old session may already be
+	// gone, so caller cancellation must not skip poller reconciliation. Give the
+	// exact-generation stop a fresh bounded budget while retaining the lifecycle
+	// lock acquired above.
+	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), pollerReconcileTimeout)
+	defer cancelReconcile()
 	return stopPollerWithExpectedGenerationOpsLocked(
 		townRoot,
 		session,
@@ -470,7 +473,7 @@ func replaceBeforeStoppingPollerGenerationContext(
 		ops.alive,
 		ops.identity,
 		ops.stop,
-		func(pid int, record pollerRecord) error { return ops.wait(ctx, pid, record) },
+		func(pid int, record pollerRecord) error { return ops.wait(reconcileCtx, pid, record) },
 		ops.quarantine,
 		ops.remove,
 	)
@@ -532,8 +535,9 @@ func StopPollerBeforeReplacement(stop func() error, replace func() error) error 
 }
 
 const (
-	pollerExitTimeout  = 2 * time.Second
-	pollerExitInterval = 50 * time.Millisecond
+	pollerExitTimeout      = 2 * time.Second
+	pollerExitInterval     = 50 * time.Millisecond
+	pollerReconcileTimeout = pollerExitTimeout + time.Second
 )
 
 func stopPollerWithGenerationOps(

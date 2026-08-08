@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strconv"
@@ -11,14 +12,72 @@ import (
 )
 
 type linuxRetainedProcess struct {
-	fd        int
-	pid       int
-	parentPID int
+	fd           int
+	pid          int
+	parentPID    int
+	resumeOnThaw bool
 }
 
 func (p *linuxRetainedProcess) PID() int       { return p.pid }
 func (p *linuxRetainedProcess) ParentPID() int { return p.parentPID }
-func (p *linuxRetainedProcess) Close() error   { return unix.Close(p.fd) }
+func (p *linuxRetainedProcess) Close() error   { return errors.Join(p.Thaw(), unix.Close(p.fd)) }
+
+func (p *linuxRetainedProcess) Freeze(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	before, err := readLinuxProcessStat(p.pid)
+	if err != nil {
+		return err
+	}
+	if before.state == 'T' || before.state == 't' {
+		alive, aliveErr := p.Alive()
+		if aliveErr != nil {
+			return aliveErr
+		}
+		if !alive {
+			return errProcessNotFound
+		}
+		return nil
+	}
+	if err := unix.PidfdSendSignal(p.fd, unix.SIGSTOP, nil, 0); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return errProcessNotFound
+		}
+		return err
+	}
+	p.resumeOnThaw = true
+	for {
+		stat, err := readLinuxProcessStat(p.pid)
+		if err != nil {
+			return errors.Join(err, p.Thaw())
+		}
+		if stat.state == 'T' || stat.state == 't' {
+			alive, aliveErr := p.Alive()
+			if aliveErr != nil {
+				return errors.Join(aliveErr, p.Thaw())
+			}
+			if !alive {
+				return errors.Join(errProcessNotFound, p.Thaw())
+			}
+			return nil
+		}
+		if err := waitForContext(ctx, processExitPollInterval); err != nil {
+			return errors.Join(err, p.Thaw())
+		}
+	}
+}
+
+func (p *linuxRetainedProcess) Thaw() error {
+	if !p.resumeOnThaw {
+		return nil
+	}
+	if err := unix.PidfdSendSignal(p.fd, unix.SIGCONT, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	p.resumeOnThaw = false
+	return nil
+}
 
 func (p *linuxRetainedProcess) Alive() (bool, error) {
 	err := unix.PidfdSendSignal(p.fd, 0, nil, 0)
@@ -62,17 +121,15 @@ func acquireLinuxRetainedProcess(pid int) (retainedProcess, error) {
 	process := &linuxRetainedProcess{fd: fd, pid: pid}
 	stat, err := readLinuxProcessStat(pid)
 	if err != nil {
-		_ = process.Close()
-		return nil, err
+		return nil, errors.Join(err, process.Close())
 	}
 	process.parentPID = stat.parentPID
 	alive, err := process.Alive()
 	if err != nil || !alive {
-		_ = process.Close()
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, process.Close())
 		}
-		return nil, errProcessNotFound
+		return nil, errors.Join(errProcessNotFound, process.Close())
 	}
 	return process, nil
 }
@@ -123,4 +180,8 @@ func retainProcessTree(rootPID int) ([]retainedProcess, error) {
 		return nil, err
 	}
 	return captureRetainedProcessTree(rootPID, relations, acquireLinuxRetainedProcess)
+}
+
+func stabilizeProcessTree(ctx context.Context, rootPID int, processes []retainedProcess) ([]retainedProcess, error) {
+	return stabilizeRetainedProcessTree(ctx, rootPID, processes, linuxProcessRelations, acquireLinuxRetainedProcess)
 }

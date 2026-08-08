@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"syscall"
@@ -15,11 +16,56 @@ type windowsRetainedProcess struct {
 	handle    windows.Handle
 	pid       int
 	parentPID int
+	suspended bool
 }
+
+var (
+	ntdll            = windows.NewLazySystemDLL("ntdll.dll")
+	ntSuspendProcess = ntdll.NewProc("NtSuspendProcess")
+	ntResumeProcess  = ntdll.NewProc("NtResumeProcess")
+)
 
 func (p *windowsRetainedProcess) PID() int       { return p.pid }
 func (p *windowsRetainedProcess) ParentPID() int { return p.parentPID }
-func (p *windowsRetainedProcess) Close() error   { return windows.CloseHandle(p.handle) }
+func (p *windowsRetainedProcess) Close() error {
+	return errors.Join(p.Thaw(), windows.CloseHandle(p.handle))
+}
+
+func (p *windowsRetainedProcess) Freeze(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.suspended {
+		return nil
+	}
+	status, _, _ := ntSuspendProcess.Call(uintptr(p.handle))
+	if int32(status) < 0 {
+		alive, aliveErr := p.Alive()
+		if aliveErr == nil && !alive {
+			return errProcessNotFound
+		}
+		return fmt.Errorf("NtSuspendProcess failed with NTSTATUS %#x", uint32(status))
+	}
+	p.suspended = true
+	return nil
+}
+
+func (p *windowsRetainedProcess) Thaw() error {
+	if !p.suspended {
+		return nil
+	}
+	status, _, _ := ntResumeProcess.Call(uintptr(p.handle))
+	if int32(status) < 0 {
+		alive, aliveErr := p.Alive()
+		if aliveErr == nil && !alive {
+			p.suspended = false
+			return nil
+		}
+		return fmt.Errorf("NtResumeProcess failed with NTSTATUS %#x", uint32(status))
+	}
+	p.suspended = false
+	return nil
+}
 
 func (p *windowsRetainedProcess) Alive() (bool, error) {
 	result, err := windows.WaitForSingleObject(p.handle, 0)
@@ -88,7 +134,7 @@ func currentWindowsParentPID(pid int) (int, error) {
 }
 
 func acquireWindowsRetainedProcess(pid int) (retainedProcess, error) {
-	access := uint32(windows.PROCESS_QUERY_LIMITED_INFORMATION | windows.PROCESS_TERMINATE | windows.SYNCHRONIZE)
+	access := uint32(windows.PROCESS_QUERY_LIMITED_INFORMATION | windows.PROCESS_TERMINATE | windows.PROCESS_SUSPEND_RESUME | windows.SYNCHRONIZE)
 	handle, err := windows.OpenProcess(access, false, uint32(pid))
 	if err != nil {
 		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
@@ -99,22 +145,20 @@ func acquireWindowsRetainedProcess(pid int) (retainedProcess, error) {
 	process := &windowsRetainedProcess{handle: handle, pid: pid}
 	parentPID, err := currentWindowsParentPID(pid)
 	if err != nil {
-		_ = process.Close()
-		return nil, err
+		return nil, errors.Join(err, process.Close())
 	}
 	process.parentPID = parentPID
 	alive, err := process.Alive()
 	if err != nil || !alive {
-		_ = process.Close()
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, process.Close())
 		}
-		return nil, errProcessNotFound
+		return nil, errors.Join(errProcessNotFound, process.Close())
 	}
 	return process, nil
 }
 
-func retainProcessTree(rootPID int) ([]retainedProcess, error) {
+func windowsProcessRelations(rootPID int) ([]processRelation, error) {
 	all, err := snapshotWindowsProcessRelations()
 	if err != nil {
 		return nil, err
@@ -142,5 +186,17 @@ func retainProcessTree(rootPID int) ([]retainedProcess, error) {
 			break
 		}
 	}
-	return captureRetainedProcessTree(rootPID, descendants, acquireWindowsRetainedProcess)
+	return descendants, nil
+}
+
+func retainProcessTree(rootPID int) ([]retainedProcess, error) {
+	relations, err := windowsProcessRelations(rootPID)
+	if err != nil {
+		return nil, err
+	}
+	return captureRetainedProcessTree(rootPID, relations, acquireWindowsRetainedProcess)
+}
+
+func stabilizeProcessTree(ctx context.Context, rootPID int, processes []retainedProcess) ([]retainedProcess, error) {
+	return stabilizeRetainedProcessTree(ctx, rootPID, processes, windowsProcessRelations, acquireWindowsRetainedProcess)
 }

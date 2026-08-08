@@ -13,6 +13,7 @@ import (
 type linuxProcessStat struct {
 	parentPID int
 	startTime string
+	state     byte
 }
 
 func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
@@ -36,7 +37,10 @@ func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
 	if err != nil || parentPID < 0 {
 		return linuxProcessStat{}, fmt.Errorf("invalid process parent PID %q", fields[1])
 	}
-	return linuxProcessStat{parentPID: parentPID, startTime: fields[19]}, nil
+	if len(fields[0]) != 1 {
+		return linuxProcessStat{}, fmt.Errorf("invalid process state %q", fields[0])
+	}
+	return linuxProcessStat{parentPID: parentPID, startTime: fields[19], state: fields[0][0]}, nil
 }
 
 func readProcessStartIdentity(pid int) (string, error) {

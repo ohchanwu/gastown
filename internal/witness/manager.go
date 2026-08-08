@@ -203,13 +203,20 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 			return fmt.Errorf("preparing zombie session cleanup: %w", err)
 		}
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
-		replaceErr := nudge.ReplaceBeforeStoppingPollerGenerationContext(
-			cleanupCtx,
-			townRoot,
-			sessionID,
-			pollerGeneration,
-			func(ctx context.Context) error { return cleanup.Run(ctx) },
-		)
+		replaceErr := func() error {
+			releaseDeliveryLease, err := t.AcquireNudgeLeaseContext(cleanupCtx, townRoot, sessionID)
+			if err != nil {
+				return fmt.Errorf("acquiring zombie cleanup delivery lease: %w", err)
+			}
+			defer releaseDeliveryLease()
+			return nudge.ReplaceBeforeStoppingPollerGenerationContext(
+				cleanupCtx,
+				townRoot,
+				sessionID,
+				pollerGeneration,
+				func(ctx context.Context) error { return cleanup.Run(ctx) },
+			)
+		}()
 		cancelCleanup()
 		closeErr := cleanup.Close()
 		if err := errors.Join(replaceErr, closeErr); err != nil {
