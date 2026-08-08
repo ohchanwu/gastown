@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -140,13 +141,26 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 		// Also drain queued nudges (from --mode=queue or --mode=wait-idle fallback).
 		// The nudge queue is per-session; detect our session name.
 		if sessionName != "" {
+			transport := tmux.NewTmux()
 			for {
+				// A receipt-producing delivery may already own this lease while
+				// waiting for the current hook to return. Probe briefly so hook
+				// output never deadlocks the transport whose receipt it enables.
+				leaseCtx, cancelLease := context.WithTimeout(cmd.Context(), 50*time.Millisecond)
+				releaseLease, leaseErr := transport.AcquireNudgeLeaseContext(leaseCtx, workDir, sessionName)
+				cancelLease()
+				if leaseErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: nudge delivery lease error: %v\n", leaseErr)
+					break
+				}
 				claim, claimErr := nudge.ClaimDue(workDir, sessionName)
 				if claimErr != nil {
+					releaseLease()
 					fmt.Fprintf(os.Stderr, "gt mail check: nudge queue claim error: %v\n", claimErr)
 					break
 				}
 				if claim == nil {
+					releaseLease()
 					break
 				}
 				fmt.Print(nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge}))
@@ -155,6 +169,7 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 				if nackErr := claim.Nack("hook-output-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
 					fmt.Fprintf(os.Stderr, "gt mail check: nudge queue nack error: %v\n", nackErr)
 				}
+				releaseLease()
 				break
 			}
 		}

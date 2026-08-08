@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -49,9 +50,10 @@ func TestReplaceBeforeStoppingPollerGenerationContextReleasesLockOnDeadline(t *t
 		townRoot,
 		session,
 		generation,
-		func(ctx context.Context) error {
+		pollerReconcileTimeout,
+		func(ctx context.Context) (PollerReplacementCommit, error) {
 			<-ctx.Done()
-			return ctx.Err()
+			return nil, ctx.Err()
 		},
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -74,15 +76,16 @@ func TestReplaceBeforeStoppingPollerGenerationContextChecksDeadlineAfterValidati
 		townRoot,
 		session,
 		PollerGeneration{},
+		pollerReconcileTimeout,
 		pollerTransitionOps{
 			read: func(string) ([]byte, error) {
 				cancel()
 				return nil, os.ErrNotExist
 			},
 		},
-		func(context.Context) error {
+		func(context.Context) (PollerReplacementCommit, error) {
 			replacementCalled = true
-			return nil
+			return nil, nil
 		},
 	)
 	if !errors.Is(err, context.Canceled) || replacementCalled {
@@ -104,7 +107,8 @@ func TestReplaceBeforeStoppingPollerGenerationContextHoldsLifecycleLockDuringRep
 		townRoot,
 		session,
 		generation,
-		func(context.Context) error {
+		pollerReconcileTimeout,
+		func(context.Context) (PollerReplacementCommit, error) {
 			go func() {
 				lock, lockErr := lockPoller(townRoot, session)
 				if lockErr == nil {
@@ -117,7 +121,7 @@ func TestReplaceBeforeStoppingPollerGenerationContextHoldsLifecycleLockDuringRep
 				t.Fatalf("competing lifecycle lock acquired during replacement: %v", lockErr)
 			case <-time.After(100 * time.Millisecond):
 			}
-			return replacementErr
+			return nil, replacementErr
 		},
 	)
 	if !errors.Is(err, replacementErr) {
@@ -155,6 +159,7 @@ func TestReplaceBeforeStoppingPollerGenerationPreservesLivePollerOnReplacementFa
 		townRoot,
 		session,
 		generation,
+		pollerReconcileTimeout,
 		pollerTransitionOps{
 			read:       os.ReadFile,
 			alive:      func(int) bool { return true },
@@ -164,7 +169,7 @@ func TestReplaceBeforeStoppingPollerGenerationPreservesLivePollerOnReplacementFa
 			quarantine: func(string, []byte) error { return nil },
 			remove:     os.Remove,
 		},
-		func(context.Context) error { return replacementErr },
+		func(context.Context) (PollerReplacementCommit, error) { return nil, replacementErr },
 	)
 	if !errors.Is(err, replacementErr) || stopCalled {
 		t.Fatalf("replacement error=%v stopCalled=%v, want preserved live poller", err, stopCalled)
@@ -178,6 +183,185 @@ func TestReplaceBeforeStoppingPollerGenerationPreservesLivePollerOnReplacementFa
 		t.Fatal(err)
 	}
 	_ = lock.Unlock()
+}
+
+func TestReplaceBeforeStoppingPollerGenerationPreservesPollerWhenCommitSignalFails(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopCalled := false
+	commitErr := errors.New("first destructive signal was not issued")
+	err = replaceBeforeStoppingPollerGenerationContext(
+		context.Background(), townRoot, session, generation, pollerReconcileTimeout,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { stopCalled = true; return nil },
+			wait:       func(context.Context, int, pollerRecord) error { return nil },
+			quarantine: func(string, []byte) error { return nil },
+			remove:     os.Remove,
+		},
+		func(context.Context) (PollerReplacementCommit, error) {
+			return func(context.Context) (bool, error) { return false, commitErr }, nil
+		},
+	)
+	if !errors.Is(err, commitErr) || stopCalled {
+		t.Fatalf("replacement error=%v stopCalled=%v, want pre-commit preservation", err, stopCalled)
+	}
+	if got, readErr := os.ReadFile(pidPath); readErr != nil || !bytes.Equal(got, record) {
+		t.Fatalf("poller record after failed commit = %q, err %v", got, readErr)
+	}
+}
+
+func TestReplaceBeforeStoppingPollerGenerationReconcilesAfterCommittedError(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("post-commit session verification failed")
+	stopCalled := false
+	err = replaceBeforeStoppingPollerGenerationContext(
+		context.Background(), townRoot, session, generation, pollerReconcileTimeout,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { stopCalled = true; return nil },
+			wait:       func(context.Context, int, pollerRecord) error { return nil },
+			quarantine: func(string, []byte) error { return nil },
+			remove:     os.Remove,
+		},
+		func(context.Context) (PollerReplacementCommit, error) {
+			return func(context.Context) (bool, error) { return true, commitErr }, nil
+		},
+	)
+	if !errors.Is(err, commitErr) || !stopCalled {
+		t.Fatalf("replacement error=%v stopCalled=%v, want mandatory post-commit reconciliation", err, stopCalled)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("poller record survived committed replacement error: %v", statErr)
+	}
+}
+
+func TestReplaceBeforeStoppingPollerGenerationRefreshesBudgetAfterCommit(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	pidPath := pollerPidFile(townRoot, session)
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(formatPollerRecord(123, testPollerIdentity(session), session))
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const budget = 20 * time.Millisecond
+	stopCalled := false
+	err = replaceBeforeStoppingPollerGenerationContext(
+		context.Background(), townRoot, session, generation, budget,
+		pollerTransitionOps{
+			read:       os.ReadFile,
+			alive:      func(int) bool { return true },
+			identity:   func(int) (pollerIdentity, error) { return testPollerIdentity(session), nil },
+			stop:       func([]byte) error { stopCalled = true; return nil },
+			wait:       func(ctx context.Context, _ int, _ pollerRecord) error { return ctx.Err() },
+			quarantine: func(string, []byte) error { return nil },
+			remove:     os.Remove,
+		},
+		func(context.Context) (PollerReplacementCommit, error) {
+			return func(ctx context.Context) (bool, error) {
+				<-ctx.Done()
+				return true, ctx.Err()
+			}, nil
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("replacement error = %v, want committed deadline evidence", err)
+	}
+	if !stopCalled {
+		t.Fatal("poller reconciliation did not receive a fresh post-commit budget")
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("poller record survived exhausted commit budget: %v", statErr)
+	}
+}
+
+func TestPollerLifecycleLockHelperProcess(t *testing.T) {
+	if os.Getenv("GT_TEST_POLLER_LOCK_HELPER") == "" {
+		return
+	}
+	lockPath := pollerPidFile(os.Getenv("GT_TEST_POLLER_TOWN"), os.Getenv("GT_TEST_POLLER_SESSION")) + ".lock"
+	probe := flock.New(lockPath)
+	locked, err := probe.TryLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked {
+		_ = probe.Unlock()
+	}
+	fmt.Printf("locked=%v", locked)
+}
+
+func TestReplaceBeforeStoppingPollerGenerationHoldsLifecycleLockCrossProcess(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := func() string {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestPollerLifecycleLockHelperProcess$")
+		cmd.Env = append(os.Environ(),
+			"GT_TEST_POLLER_LOCK_HELPER=1",
+			"GT_TEST_POLLER_TOWN="+townRoot,
+			"GT_TEST_POLLER_SESSION="+session,
+		)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("cross-process lifecycle lock probe: %v\n%s", err, output)
+		}
+		return string(output)
+	}
+	err = ReplaceBeforeStoppingPollerGenerationContext(
+		context.Background(), townRoot, session, generation, pollerReconcileTimeout,
+		func(context.Context) (PollerReplacementCommit, error) {
+			if got := probe(); !strings.Contains(got, "locked=false") {
+				t.Fatalf("competing process acquired lifecycle lock during preparation: %q", got)
+			}
+			return nil, errors.New("stop before commit")
+		},
+	)
+	if err == nil {
+		t.Fatal("replacement unexpectedly committed")
+	}
+	if got := probe(); !strings.Contains(got, "locked=true") {
+		t.Fatalf("lifecycle lock remained held after transaction: %q", got)
+	}
 }
 
 func TestReplaceBeforeStoppingPollerGenerationStopsOnlyAfterSuccess(t *testing.T) {
@@ -201,6 +385,7 @@ func TestReplaceBeforeStoppingPollerGenerationStopsOnlyAfterSuccess(t *testing.T
 		townRoot,
 		session,
 		generation,
+		pollerReconcileTimeout,
 		pollerTransitionOps{
 			read:       os.ReadFile,
 			alive:      func(int) bool { return true },
@@ -213,9 +398,11 @@ func TestReplaceBeforeStoppingPollerGenerationStopsOnlyAfterSuccess(t *testing.T
 				return os.Remove(path)
 			},
 		},
-		func(context.Context) error {
-			events = append(events, "replace")
-			return nil
+		func(context.Context) (PollerReplacementCommit, error) {
+			return func(context.Context) (bool, error) {
+				events = append(events, "replace")
+				return true, nil
+			}, nil
 		},
 	)
 	if err != nil {
@@ -251,6 +438,7 @@ func TestReplaceBeforeStoppingPollerGenerationReconcilesAfterReplacementCancelsC
 		townRoot,
 		session,
 		generation,
+		pollerReconcileTimeout,
 		pollerTransitionOps{
 			read:     os.ReadFile,
 			alive:    func(int) bool { return true },
@@ -269,10 +457,12 @@ func TestReplaceBeforeStoppingPollerGenerationReconcilesAfterReplacementCancelsC
 				return os.Remove(path)
 			},
 		},
-		func(context.Context) error {
-			events = append(events, "replace")
-			cancel()
-			return nil
+		func(context.Context) (PollerReplacementCommit, error) {
+			return func(context.Context) (bool, error) {
+				events = append(events, "replace")
+				cancel()
+				return true, nil
+			}, nil
 		},
 	)
 	if err != nil {

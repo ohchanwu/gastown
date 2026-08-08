@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/townlog"
 )
 
@@ -195,6 +196,18 @@ func (p *Propeller) eventLoop() {
 
 // deliverNudges claims queued nudges and acknowledges them after ACP accepts the update.
 func (p *Propeller) deliverNudges() {
+	transport := tmux.NewTmux()
+	leaseCtx := p.ctx
+	if leaseCtx == nil {
+		leaseCtx = context.Background()
+	}
+	releaseLease, err := transport.AcquireNudgeLeaseContext(leaseCtx, p.townRoot, p.session)
+	if err != nil {
+		debugLog(p.townRoot, "[Propeller] deliverNudges: lease error: %v", err)
+		return
+	}
+	defer releaseLease()
+
 	claim, err := nudge.ClaimDue(p.townRoot, p.session)
 	if err != nil {
 		debugLog(p.townRoot, "[Propeller] deliverNudges: Claim error: %v", err)
@@ -241,6 +254,7 @@ func (p *Propeller) deliverNudges() {
 	receipt := nudge.SubmissionReceipt{Session: p.session, DeliveryID: claim.Nudge.DeliveryID, Runtime: "acp", Submitted: true, SubmittedAt: time.Now()}
 	if err := claim.AckSubmitted(receipt); err != nil {
 		style.PrintWarning("ACP Propeller delivered nudge but failed to acknowledge claim: %v", err)
+		nack("receipt-mismatch")
 	}
 }
 

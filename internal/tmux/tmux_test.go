@@ -964,8 +964,8 @@ func TestSessionGenerationCleanupRejectsReplacementPane(t *testing.T) {
 		panePID:      panePID + 1,
 		paneIdentity: "old-pane-start",
 		identity:     func(int) (string, error) { return "old-pane-start", nil },
-		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{oldProcess},
+		custody:      &mockSessionCustody{},
 	}
 
 	err = cleanup.Run(context.Background())
@@ -1052,6 +1052,62 @@ func stabilizeMockRetainedProcesses(ctx context.Context, _ int, processes []reta
 		}
 	}
 	return processes, nil
+}
+
+type mockSessionCustody struct {
+	frozen        bool
+	committed     bool
+	closed        bool
+	freezeErr     error
+	thawErr       error
+	killErr       error
+	closeErr      error
+	onKill        func() error
+	onKillContext func(context.Context) (bool, error)
+}
+
+func (custody *mockSessionCustody) Freeze(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if custody.freezeErr != nil {
+		return custody.freezeErr
+	}
+	custody.frozen = true
+	return nil
+}
+
+func (custody *mockSessionCustody) Kill(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !custody.frozen {
+		return false, errors.New("mock custody was not frozen")
+	}
+	if custody.onKillContext != nil {
+		committed, err := custody.onKillContext(ctx)
+		custody.committed = committed
+		return committed, err
+	}
+	if custody.onKill != nil {
+		if err := custody.onKill(); err != nil {
+			return false, err
+		}
+	}
+	custody.committed = true
+	return true, custody.killErr
+}
+
+func (custody *mockSessionCustody) Thaw() error {
+	if !custody.committed {
+		custody.frozen = false
+	}
+	return custody.thawErr
+}
+
+func (custody *mockSessionCustody) Close() error {
+	custody.closed = true
+	return errors.Join(custody.Thaw(), custody.closeErr)
 }
 
 func TestCaptureRetainedProcessTreeRejectsReusedAncestry(t *testing.T) {
@@ -1376,21 +1432,18 @@ func TestSessionGenerationCleanupPreservesPaneReplacementBeforeFinalKill(t *test
 		t.Fatal(err)
 	}
 	oldProcess := &mockRetainedProcess{pid: pane.PID, parent: 1, generation: "old-pane", alive: true}
-	oldProcess.onSignal = func(signal processSignal) error {
-		if signal != processSignalKill {
-			return nil
-		}
+	processCustody := &mockSessionCustody{onKill: func() error {
 		_, err := tm.run("respawn-pane", "-k", "-t", generation.SessionID, "sleep 60")
 		return err
-	}
+	}}
 	cleanup := &SessionGenerationCleanup{
 		tmux:         tm,
 		generation:   generation,
 		panePID:      pane.PID,
 		paneIdentity: pane.Identity,
 		identity:     processGenerationIdentity,
-		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{oldProcess},
+		custody:      processCustody,
 	}
 
 	err = cleanup.Run(context.Background())
@@ -1433,8 +1486,8 @@ func TestSessionGenerationCleanupRunRejectsSamePIDIdentityReplacement(t *testing
 		panePID:      123,
 		paneIdentity: "old-process-start",
 		identity:     func(int) (string, error) { return "replacement-process-start", nil },
-		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{process},
+		custody:      &mockSessionCustody{},
 	}
 	err := cleanup.Run(context.Background())
 	if !errors.Is(err, ErrSessionGenerationChanged) {
@@ -1447,6 +1500,48 @@ func TestSessionGenerationCleanupRunRejectsSamePIDIdentityReplacement(t *testing
 		t.Fatalf("tmux mutation followed Run identity mismatch:\n%s", logData)
 	} else if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatal(readErr)
+	}
+}
+
+func TestSessionGenerationCleanupPrepareJoinsContainmentThawError(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-thaw-%d", time.Now().UnixNano()))
+	session := "gt-cleanup-thaw"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityCalls := 0
+	thawErr := errors.New("injected containment thaw failure")
+	cleanup := &SessionGenerationCleanup{
+		tmux:         tm,
+		generation:   generation,
+		panePID:      pane.PID,
+		paneIdentity: pane.Identity,
+		identity: func(int) (string, error) {
+			identityCalls++
+			if identityCalls == 1 {
+				return pane.Identity, nil
+			}
+			return "replacement-process-start", nil
+		},
+		processes: []retainedProcess{&mockRetainedProcess{pid: pane.PID, alive: true}},
+		custody:   &mockSessionCustody{thawErr: thawErr},
+	}
+	commit, err := cleanup.PrepareCommit(context.Background())
+	if commit != nil || !errors.Is(err, ErrSessionGenerationChanged) || !errors.Is(err, thawErr) {
+		t.Fatalf("PrepareCommit() commit=%v error=%v, want generation and thaw errors", commit != nil, err)
+	}
+	has, err := tm.HasSession(session)
+	if err != nil || !has {
+		t.Fatalf("pre-commit thaw failure changed session: has=%v err=%v", has, err)
 	}
 }
 
@@ -1474,8 +1569,8 @@ func TestSessionGenerationCleanupRunBoundsHangingGuard(t *testing.T) {
 		panePID:      123,
 		paneIdentity: "owned-process-start",
 		identity:     func(int) (string, error) { return "owned-process-start", nil },
-		stabilize:    stabilizeMockRetainedProcesses,
 		processes:    []retainedProcess{process},
+		custody:      &mockSessionCustody{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1483,6 +1578,56 @@ func TestSessionGenerationCleanupRunBoundsHangingGuard(t *testing.T) {
 	err = cleanup.Run(ctx)
 	if err == nil || time.Since(started) > 5*time.Second {
 		t.Fatalf("Run() error=%v elapsed=%v, want bounded hanging guard", err, time.Since(started))
+	}
+}
+
+func TestSessionGenerationCleanupRefreshesTmuxBudgetAfterCommittedKill(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-budget-%d", time.Now().UnixNano()))
+	session := "gt-cleanup-budget"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processCustody := &mockSessionCustody{onKillContext: func(ctx context.Context) (bool, error) {
+		if err := exec.Command("kill", "-KILL", fmt.Sprint(pane.PID)).Run(); err != nil {
+			return false, err
+		}
+		<-ctx.Done()
+		return true, ctx.Err()
+	}}
+	cleanup := &SessionGenerationCleanup{
+		tmux:         tm,
+		generation:   generation,
+		panePID:      pane.PID,
+		paneIdentity: pane.Identity,
+		identity:     processGenerationIdentity,
+		processes:    []retainedProcess{&mockRetainedProcess{pid: pane.PID, alive: true}},
+		custody:      processCustody,
+	}
+	commit, err := cleanup.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	committed, err := commit(commitCtx)
+	if !committed || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("commit = %v, %v; want committed deadline evidence", committed, err)
+	}
+	has, err := tm.HasSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("exact tmux session survived exhausted committed-kill budget")
 	}
 }
 
@@ -1502,15 +1647,13 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	process := &mockRetainedProcess{pid: pane.PID, parent: 1, generation: "owned-pane", alive: true}
-	process.onSignal = func(signal processSignal) error {
-		if signal == processSignalKill {
-			if err := exec.Command("kill", "-KILL", fmt.Sprint(pane.PID)).Run(); err != nil {
-				return err
-			}
-			process.alive = false
+	processCustody := &mockSessionCustody{onKill: func() error {
+		if err := exec.Command("kill", "-KILL", fmt.Sprint(pane.PID)).Run(); err != nil {
+			return err
 		}
+		process.alive = false
 		return nil
-	}
+	}}
 	cleanup, err := tm.prepareSessionGenerationProcessCleanup(
 		generation,
 		pane,
@@ -1523,7 +1666,9 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 				}
 				return []retainedProcess{process}, nil
 			},
-			stabilize: stabilizeMockRetainedProcesses,
+			retainCustody: func(string, int) (sessionCustodyHandle, error) {
+				return processCustody, nil
+			},
 		},
 	)
 	if err != nil {
@@ -1532,8 +1677,8 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 	if err := cleanup.Run(context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if !reflect.DeepEqual(process.signals, []processSignal{processSignalKill}) {
-		t.Fatalf("Run() signals = %v, want KILL after stable freeze", process.signals)
+	if !processCustody.committed {
+		t.Fatal("Run() did not commit through the launch-time containment handle")
 	}
 	has, err := tm.HasSession(session)
 	if err != nil {

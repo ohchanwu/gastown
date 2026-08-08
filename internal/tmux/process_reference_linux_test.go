@@ -4,11 +4,58 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestLinuxRetainedProcessTreatsZombieAsExited(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "kill -STOP $$; exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Wait() })
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stat, err := readLinuxProcessStat(cmd.Process.Pid)
+		if err == nil && (stat.state == 'T' || stat.state == 't') {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child did not stop before custody acquisition: stat=%#v err=%v", stat, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	retained, err := acquireLinuxRetainedProcess(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retained.Close()
+	if err := cmd.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		stat, err := readLinuxProcessStat(cmd.Process.Pid)
+		if err == nil && linuxProcessStateTerminal(stat.state) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child did not become a zombie: stat=%#v err=%v", stat, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := retained.Freeze(ctx); !errors.Is(err, errProcessNotFound) {
+		t.Fatalf("Freeze() error = %v, want terminal process not found", err)
+	}
+	if alive, err := retained.Alive(); err != nil || alive {
+		t.Fatalf("Alive() = %v, %v; want terminal process reported exited", alive, err)
+	}
+}
 
 func TestLinuxRetainedProcessTreeFreezesAndKillsNativeChild(t *testing.T) {
 	cmd := exec.Command("sh", "-c", "sleep 60 & wait")

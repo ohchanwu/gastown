@@ -407,20 +407,28 @@ type pollerTransitionOps struct {
 	remove     func(string) error
 }
 
+// PollerReplacementCommit performs a prepared replacement and reports whether
+// its first destructive signal was issued. A false result is still pre-commit
+// and must preserve the old poller generation.
+type PollerReplacementCommit func(context.Context) (bool, error)
+
 // ReplaceBeforeStoppingPollerGenerationContext keeps the exact poller alive
-// and holds its ownership lock until replacement succeeds. A failed or timed
-// out replacement therefore leaves the surviving session under poller custody.
+// through nondestructive replacement preparation. Once the returned commit
+// function issues its first destructive signal, exact-poller reconciliation is
+// mandatory even if later cleanup or verification reports an error.
 func ReplaceBeforeStoppingPollerGenerationContext(
 	ctx context.Context,
 	townRoot, session string,
 	generation PollerGeneration,
-	replace func(context.Context) error,
+	postCommitTimeout time.Duration,
+	prepare func(context.Context) (PollerReplacementCommit, error),
 ) error {
 	return replaceBeforeStoppingPollerGenerationContext(
 		ctx,
 		townRoot,
 		session,
 		generation,
+		postCommitTimeout,
 		pollerTransitionOps{
 			read:     os.ReadFile,
 			alive:    pollerProcessAlive,
@@ -434,7 +442,7 @@ func ReplaceBeforeStoppingPollerGenerationContext(
 			},
 			remove: os.Remove,
 		},
-		replace,
+		prepare,
 	)
 }
 
@@ -442,8 +450,9 @@ func replaceBeforeStoppingPollerGenerationContext(
 	ctx context.Context,
 	townRoot, session string,
 	generation PollerGeneration,
+	postCommitTimeout time.Duration,
 	ops pollerTransitionOps,
-	replace func(context.Context) error,
+	prepare func(context.Context) (PollerReplacementCommit, error),
 ) error {
 	lock, err := lockPollerContext(ctx, townRoot, session)
 	if err != nil {
@@ -456,16 +465,31 @@ func replaceBeforeStoppingPollerGenerationContext(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := replace(ctx); err != nil {
+	commit, err := prepare(ctx)
+	if err != nil {
 		return err
 	}
-	// Replacement success is the commit point: the old session may already be
-	// gone, so caller cancellation must not skip poller reconciliation. Give the
-	// exact-generation stop a fresh bounded budget while retaining the lifecycle
-	// lock acquired above.
-	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), pollerReconcileTimeout)
+	if commit == nil {
+		return errors.New("replacement preparation returned no commit operation")
+	}
+	// Commit and exact-poller reconciliation each get a fresh post-commit
+	// budget. Caller cancellation cannot strand a killed session under a stale
+	// poller, and a slow committed cleanup cannot consume the stop budget.
+	if postCommitTimeout <= 0 {
+		postCommitTimeout = pollerReconcileTimeout
+	}
+	commitCtx, cancelCommit := context.WithTimeout(context.Background(), postCommitTimeout)
+	committed, replacementErr := commit(commitCtx)
+	cancelCommit()
+	if !committed {
+		if replacementErr == nil {
+			return errors.New("replacement commit returned without issuing a destructive signal")
+		}
+		return replacementErr
+	}
+	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), postCommitTimeout)
 	defer cancelReconcile()
-	return stopPollerWithExpectedGenerationOpsLocked(
+	stopErr := stopPollerWithExpectedGenerationOpsLocked(
 		townRoot,
 		session,
 		&generation,
@@ -477,6 +501,7 @@ func replaceBeforeStoppingPollerGenerationContext(
 		ops.quarantine,
 		ops.remove,
 	)
+	return errors.Join(replacementErr, stopErr)
 }
 
 func validatePollerGenerationLocked(

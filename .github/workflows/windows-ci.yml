@@ -47,3 +47,7 @@ jobs:
       - name: Vet
         shell: msys2 {0}
         run: go vet ./...
+
+      - name: Test generation-bound tmux custody
+        shell: msys2 {0}
+        run: go test -count=1 ./internal/tmux

@@ -406,27 +406,42 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) nudgeDeliveryRe
 		// This avoids false positives during inter-tool-call gaps where
 		// the prompt briefly appears while Claude Code is still working.
 		if err := t.WaitForIdle(sessionName, idleWatcherProbeTimeout); err == nil {
-			// Claim atomically reserves queued entries until delivery is proven.
-			// If another process raced and drained first, we get an
-			// empty slice and skip delivery to avoid duplicates.
-			claim, err := nudge.ClaimDue(townRoot, sessionName)
+			// The delivery lease is the ownership boundary for the entire
+			// claim -> receipt -> settlement transaction. In particular, do not
+			// let zombie cleanup acquire the lease after text was typed but before
+			// its durable claim was acknowledged.
+			leaseCtx, cancelLease := context.WithDeadline(context.Background(), deadline)
+			claim, releaseLease, err := claimPollerNudgeWhenIdleContext(
+				leaseCtx,
+				false,
+				func(context.Context) error { return nil },
+				func(ctx context.Context) (func(), error) {
+					return t.AcquireNudgeLeaseContext(ctx, townRoot, sessionName)
+				},
+				func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
+			)
+			cancelLease()
 			if err != nil || claim == nil {
 				return nudgeDeliveryQueued
 			}
 			formatted := nudge.FormatForInjection([]nudge.QueuedNudge{claim.Nudge})
-			receipt, err := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
-			if err != nil || !receipt.Submitted {
-				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
-				if nackErr := claim.Nack("submit-unverified", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-					fmt.Fprintf(os.Stderr, "idle-watcher: nack for %s failed: %v\n", sessionName, nackErr)
-				}
-			} else if ackErr := claim.AckSubmitted(receipt); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "idle-watcher: ack for %s failed: %v\n", sessionName, ackErr)
-				if nackErr := claim.Nack("receipt-mismatch", nudge.NextRetry(claim.Nudge.Attempts)); nackErr != nil {
-					fmt.Fprintf(os.Stderr, "idle-watcher: nack for %s failed: %v\n", sessionName, nackErr)
-				}
-				return nudgeDeliveryQueued
-			} else {
+			receipt, deliveryErr := t.NudgeSessionWithReceipt(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, DeliveryID: claim.Nudge.DeliveryID})
+			nextAttempt := nudge.NextRetry(claim.Nudge.Attempts)
+			settleErr := settlePollerClaimUnderLease(
+				releaseLease,
+				receipt,
+				deliveryErr,
+				nextAttempt,
+				claim.AckSubmitted,
+				claim.Nack,
+				claim.HasRecoverableState,
+				func() error { return claim.Nack("settlement-recovery", nextAttempt) },
+				func() { time.Sleep(nudgePollerStopInterval) },
+			)
+			if settleErr != nil {
+				fmt.Fprintf(os.Stderr, "idle-watcher: settlement for %s failed: %v\n", sessionName, settleErr)
+			}
+			if deliveryErr == nil && settleErr == nil && receipt.Submitted {
 				return nudgeDeliverySubmitted
 			}
 			return nudgeDeliveryQueued

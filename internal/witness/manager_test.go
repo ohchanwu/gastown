@@ -33,6 +33,8 @@ type fakeSessionCleanup struct {
 	pane       tmux.PaneProcessGeneration
 	logPath    string
 	run        func(context.Context) error
+	prepare    func(context.Context) (func(context.Context) (bool, error), error)
+	close      func() error
 }
 
 func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
@@ -63,7 +65,27 @@ func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
 	return nil
 }
 
-func (*fakeSessionCleanup) Close() error { return nil }
+func (cleanup *fakeSessionCleanup) PrepareCommit(ctx context.Context) (func(context.Context) (bool, error), error) {
+	if cleanup.prepare != nil {
+		return cleanup.prepare(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return func(commitCtx context.Context) (bool, error) {
+		// The fake models a commit point immediately before its historical Run
+		// behavior. Tests can therefore distinguish post-commit cleanup errors
+		// from preparation errors.
+		return true, cleanup.Run(commitCtx)
+	}, nil
+}
+
+func (cleanup *fakeSessionCleanup) Close() error {
+	if cleanup.close != nil {
+		return cleanup.close()
+	}
+	return nil
+}
 
 func newFakeTmuxManager(t *testing.T, behavior string) (*Manager, string, string) {
 	t.Helper()
@@ -736,6 +758,109 @@ exit 2
 	}
 	if err := claim.Nack("test-recovery", time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerStartHoldsDeliveryLeaseThroughPrecommitThaw(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	precommitErr := errors.New("pre-commit freeze validation failed")
+	closeEntered := make(chan struct{})
+	releaseClose := make(chan struct{})
+	mgr.prepareSessionCleanup = func(
+		generation tmux.SessionGeneration,
+		pane tmux.PaneProcessGeneration,
+	) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{
+			generation: generation,
+			pane:       pane,
+			prepare: func(context.Context) (func(context.Context) (bool, error), error) {
+				return nil, precommitErr
+			},
+			close: func() error {
+				close(closeEntered)
+				<-releaseClose
+				return nil
+			},
+		}, nil
+	}
+	result := make(chan error, 1)
+	go func() { result <- mgr.Start(false, "", nil) }()
+	select {
+	case <-closeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-commit cleanup did not enter Close")
+	}
+	townRoot := filepath.Dir(mgr.rig.Path)
+	competitor := tmux.NewTmuxWithSocket("gt-witness-thaw-lease-competitor")
+	leaseCtx, cancelLease := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	releaseCompetingLease, leaseErr := competitor.AcquireNudgeLeaseContext(leaseCtx, townRoot, mgr.SessionName())
+	cancelLease()
+	if releaseCompetingLease != nil {
+		releaseCompetingLease()
+	}
+	if !errors.Is(leaseErr, context.DeadlineExceeded) {
+		t.Fatalf("competing delivery lease error = %v, want deadline while containment thaws", leaseErr)
+	}
+	close(releaseClose)
+	if err := <-result; !errors.Is(err, precommitErr) {
+		t.Fatalf("Start() error = %v, want pre-commit failure", err)
+	}
+}
+
+func TestManagerStartAbortsWhenDeliveryMakesGenerationAliveBeforeMutation(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*)
+    count=$(cat "$FAKE_LIVENESS_STATE")
+    count=$((count + 1))
+    printf '%s' "$count" > "$FAKE_LIVENESS_STATE"
+    if [ "$count" -ge 3 ]; then
+      echo "GT_PROCESS_NAMES=other"
+    else
+      echo "GT_PROCESS_NAMES=definitely-not-running"
+    fi
+    exit 0
+    ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	livenessState := filepath.Join(t.TempDir(), "liveness-state")
+	if err := os.WriteFile(livenessState, []byte("0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_LIVENESS_STATE", livenessState)
+
+	err := mgr.Start(false, "", nil)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("Start() error = %v, want under-lease liveness abort", err)
+	}
+	logData, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "cleanup-run") || strings.Contains(string(logData), "kill-session") {
+		t.Fatalf("destructive cleanup followed under-lease liveness recovery:\n%s", logData)
 	}
 }
 

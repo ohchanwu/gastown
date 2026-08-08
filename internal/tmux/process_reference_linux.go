@@ -18,6 +18,10 @@ type linuxRetainedProcess struct {
 	resumeOnThaw bool
 }
 
+func linuxProcessStateTerminal(state byte) bool {
+	return state == 'Z' || state == 'X' || state == 'x'
+}
+
 func (p *linuxRetainedProcess) PID() int       { return p.pid }
 func (p *linuxRetainedProcess) ParentPID() int { return p.parentPID }
 func (p *linuxRetainedProcess) Close() error   { return errors.Join(p.Thaw(), unix.Close(p.fd)) }
@@ -29,6 +33,9 @@ func (p *linuxRetainedProcess) Freeze(ctx context.Context) error {
 	before, err := readLinuxProcessStat(p.pid)
 	if err != nil {
 		return err
+	}
+	if linuxProcessStateTerminal(before.state) {
+		return errProcessNotFound
 	}
 	if before.state == 'T' || before.state == 't' {
 		alive, aliveErr := p.Alive()
@@ -62,6 +69,9 @@ func (p *linuxRetainedProcess) Freeze(ctx context.Context) error {
 			}
 			return nil
 		}
+		if linuxProcessStateTerminal(stat.state) {
+			return errors.Join(errProcessNotFound, p.Thaw())
+		}
 		if err := waitForContext(ctx, processExitPollInterval); err != nil {
 			return errors.Join(err, p.Thaw())
 		}
@@ -80,6 +90,16 @@ func (p *linuxRetainedProcess) Thaw() error {
 }
 
 func (p *linuxRetainedProcess) Alive() (bool, error) {
+	stat, statErr := readLinuxProcessStat(p.pid)
+	if errors.Is(statErr, errProcessNotFound) {
+		return false, nil
+	}
+	if statErr != nil {
+		return false, statErr
+	}
+	if linuxProcessStateTerminal(stat.state) {
+		return false, nil
+	}
 	err := unix.PidfdSendSignal(p.fd, 0, nil, 0)
 	switch {
 	case err == nil, errors.Is(err, unix.EPERM):

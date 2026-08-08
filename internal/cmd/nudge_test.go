@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -716,6 +717,55 @@ func TestIdleWatcherExitsOnEmptyQueue(t *testing.T) {
 		// Good — exited because queue was empty
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchAndDeliver did not exit within 2s for empty queue")
+	}
+}
+
+func TestIdleWatcherLeaseTimeoutLeavesQueueRecoverable(t *testing.T) {
+	townRoot := t.TempDir()
+	const sessionName = "gt-idle-watcher-lease-timeout"
+	queued := nudge.QueuedNudge{
+		DeliveryID:      "ndg-idle-watcher-lease-timeout",
+		Sender:          "witness",
+		Message:         "must remain durable",
+		Priority:        nudge.PriorityUrgent,
+		DurableUntilAck: true,
+	}
+	if err := nudge.Enqueue(townRoot, sessionName, queued); err != nil {
+		t.Fatal(err)
+	}
+	owner := tmux.NewTmuxWithSocket("gt-idle-watcher-lease-owner")
+	releaseOwner, err := owner.AcquireNudgeLease(townRoot, sessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter := tmux.NewTmuxWithSocket("gt-idle-watcher-lease-waiter")
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	claim, releaseClaim, err := claimPollerNudgeWhenIdleContext(
+		ctx,
+		false,
+		func(context.Context) error { return nil },
+		func(ctx context.Context) (func(), error) {
+			return waiter.AcquireNudgeLeaseContext(ctx, townRoot, sessionName)
+		},
+		func() (*nudge.ClaimedNudge, error) { return nudge.ClaimDue(townRoot, sessionName) },
+	)
+	cancel()
+	if releaseClaim != nil {
+		releaseClaim()
+	}
+	if claim != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("claim=%#v err=%v, want lease deadline before claim", claim, err)
+	}
+	releaseOwner()
+	recovered, err := nudge.ClaimDue(townRoot, sessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Nudge.DeliveryID != queued.DeliveryID {
+		t.Fatalf("recovered claim = %#v, want %s", recovered, queued.DeliveryID)
+	}
+	if err := recovered.Nack("test-recovery", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
 	}
 }
 
