@@ -29,23 +29,17 @@ var (
 	ErrAlreadyRunning = errors.New("witness already running")
 )
 
-func validTmuxSessionID(id string) bool {
-	if len(id) < 2 || id[0] != '$' {
-		return false
-	}
-	for _, digit := range id[1:] {
-		if digit < '0' || digit > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
-	rig  *rig.Rig
-	tmux *tmux.Tmux
+	rig                   *rig.Rig
+	tmux                  *tmux.Tmux
+	prepareSessionCleanup func(tmux.SessionGeneration) (sessionGenerationCleanup, error)
+}
+
+type sessionGenerationCleanup interface {
+	Run(context.Context) error
+	Close() error
 }
 
 // NewManager creates a new witness manager for a rig.
@@ -58,6 +52,9 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	return &Manager{
 		rig:  r,
 		tmux: t,
+		prepareSessionCleanup: func(generation tmux.SessionGeneration) (sessionGenerationCleanup, error) {
+			return t.PrepareSessionGenerationProcessCleanup(generation)
+		},
 	}
 }
 
@@ -148,16 +145,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		return fmt.Errorf("checking witness session: %w", err)
 	}
 	if running {
-		sessionIDs, err := t.ListSessionIDs()
+		generation, err := t.CaptureSessionGeneration(sessionID)
 		if err != nil {
 			return fmt.Errorf("reading witness session identity: %w", err)
-		}
-		generation := sessionIDs[sessionID]
-		if generation == "" {
-			return fmt.Errorf("reading witness session identity: session %s has no immutable ID", sessionID)
-		}
-		if !validTmuxSessionID(generation) {
-			return fmt.Errorf("reading witness session identity: session %s has invalid immutable ID %q", sessionID, generation)
 		}
 		pollerGeneration, err := nudge.CapturePollerGeneration(townRoot, sessionID)
 		if err != nil {
@@ -165,7 +155,7 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		}
 
 		// Session exists - check if Claude is actually running (healthy vs zombie)
-		alive, err := t.IsAgentAliveChecked(generation)
+		alive, err := t.IsAgentAliveChecked(generation.SessionID)
 		if err != nil {
 			return fmt.Errorf("checking witness liveness: %w", err)
 		}
@@ -178,33 +168,33 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		time.Sleep(constants.ZombieKillGracePeriod)
 
 		// Re-check: abort kill if agent started or session was replaced
-		alive, err = t.IsAgentAliveChecked(generation)
+		alive, err = t.IsAgentAliveChecked(generation.SessionID)
 		if err != nil {
 			return fmt.Errorf("rechecking witness liveness: %w", err)
 		}
 		if alive {
 			return ErrAlreadyRunning
 		}
-		sessionIDs, err = t.ListSessionIDs()
+		currentGeneration, err := t.CaptureSessionGeneration(sessionID)
 		if err != nil {
 			return fmt.Errorf("rechecking witness session identity: %w", err)
 		}
-		currentGeneration := sessionIDs[sessionID]
-		if currentGeneration == "" {
-			return fmt.Errorf("rechecking witness session identity: session %s has no immutable ID", sessionID)
-		}
-		if !validTmuxSessionID(currentGeneration) {
-			return fmt.Errorf("rechecking witness session identity: session %s has invalid immutable ID %q", sessionID, currentGeneration)
-		}
-		if currentGeneration != generation {
+		if !currentGeneration.Equal(generation) {
 			// Session was replaced between checks — another process already
 			// handled the zombie. Treat as already running; caller can retry.
 			return ErrAlreadyRunning
 		}
 
-		if err := nudge.StopPollerBeforeReplacement(
-			func() error { return nudge.StopPollerGeneration(townRoot, sessionID, pollerGeneration) },
-			func() error { return t.KillSessionWithProcesses(generation) },
+		cleanup, err := m.prepareSessionCleanup(generation)
+		if err != nil {
+			return fmt.Errorf("preparing zombie session cleanup: %w", err)
+		}
+		defer cleanup.Close()
+		if err := nudge.StopPollerGenerationBeforeReplacement(
+			townRoot,
+			sessionID,
+			pollerGeneration,
+			func() error { return cleanup.Run(context.Background()) },
 		); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}

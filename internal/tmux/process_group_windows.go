@@ -33,27 +33,6 @@ func processGenerationIdentity(pid int) (string, error) {
 	return strconv.FormatInt(creation.Nanoseconds(), 10), nil
 }
 
-func signalProcessGeneration(pid int, requested processSignal) error {
-	if requested != processSignalTerminate && requested != processSignalKill {
-		return fmt.Errorf("unknown process signal %q", requested)
-	}
-	if pid <= 0 || pid > math.MaxUint32 {
-		return fmt.Errorf("invalid PID %d", pid)
-	}
-	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
-	if err != nil {
-		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
-			return errProcessNotFound
-		}
-		return err
-	}
-	defer func() { _ = windows.CloseHandle(handle) }()
-	if err := windows.TerminateProcess(handle, 1); err != nil {
-		return err
-	}
-	return nil
-}
-
 func killProcessGroup(pgid int) {
 	proc, err := os.FindProcess(pgid)
 	if err != nil {

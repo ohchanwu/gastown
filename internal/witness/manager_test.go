@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -26,6 +27,34 @@ func TestManagerStartForegroundDeprecated(t *testing.T) {
 	}
 }
 
+type fakeSessionCleanup struct {
+	generation tmux.SessionGeneration
+	logPath    string
+}
+
+func (cleanup *fakeSessionCleanup) Run(context.Context) error {
+	logFile, err := os.OpenFile(cleanup.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := logFile.WriteString("cleanup-run " + cleanup.generation.SessionID + " " + cleanup.generation.Nonce + "\n")
+	closeErr := logFile.Close()
+	if writeErr != nil || closeErr != nil {
+		return errors.Join(writeErr, closeErr)
+	}
+	if replacement := os.Getenv("FAKE_POLLER_REPLACEMENT"); replacement != "" {
+		if err := os.WriteFile(os.Getenv("FAKE_POLLER_PATH"), []byte(replacement), 0o600); err != nil {
+			return err
+		}
+	}
+	if message := os.Getenv("FAKE_CLEANUP_ERROR"); message != "" {
+		return errors.New(message)
+	}
+	return nil
+}
+
+func (*fakeSessionCleanup) Close() error { return nil }
+
 func newFakeTmuxManager(t *testing.T, behavior string) (*Manager, string, string) {
 	t.Helper()
 	townRoot := t.TempDir()
@@ -42,17 +71,48 @@ func newFakeTmuxManager(t *testing.T, behavior string) (*Manager, string, string
 
 	fakeBin := t.TempDir()
 	logPath := filepath.Join(fakeBin, "tmux.log")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_TMUX_LOG\"\n" + behavior
+	generationStatePath := filepath.Join(fakeBin, "generation-state")
+	if err := os.WriteFile(generationStatePath, []byte("0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_TMUX_LOG"
+case "$*" in
+  *"display-message"*"-p #{pid}"*)
+    count=$(cat "$FAKE_GENERATION_STATE")
+    count=$((count + 1))
+    printf '%s' "$count" > "$FAKE_GENERATION_STATE"
+    case "$FAKE_GENERATION_MODE" in
+      first-fail) echo "generation query failed" >&2; exit 2 ;;
+      first-malformed) echo "malformed-generation"; exit 0 ;;
+      second-fail) if [ "$count" -ge 3 ]; then echo "second generation query failed" >&2; exit 2; fi ;;
+      second-malformed) if [ "$count" -ge 3 ]; then echo "malformed-generation"; exit 0; fi ;;
+      replacement) if [ "$count" -ge 3 ]; then nonce="fixture-generation-replacement"; else nonce="fixture-generation-original"; fi ;;
+      poller-advance)
+        if [ "$count" -eq 3 ]; then printf '%s' "$FAKE_POLLER_RECORD" > "$FAKE_POLLER_PATH"; fi
+        ;;
+    esac
+    : "${nonce:=fixture-generation-original}"
+    printf '%s\t$1\t%s\n' "$FAKE_TMUX_SERVER_PID" "$nonce"
+    exit 0
+    ;;
+esac
+` + behavior
 	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("FAKE_GENERATION_STATE", generationStatePath)
+	t.Setenv("FAKE_TMUX_SERVER_PID", strconv.Itoa(os.Getpid()))
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	mgr := NewManagerWithTmux(
 		&rig.Rig{Name: "testrig", Path: rigPath},
 		tmux.NewTmuxWithSocket("gt-wsf-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
 	)
+	mgr.prepareSessionCleanup = func(generation tmux.SessionGeneration) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{generation: generation, logPath: logPath}, nil
+	}
 	t.Setenv("FAKE_SESSION_NAME", mgr.SessionName())
 	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
 	if err := os.MkdirAll(pollerDir, 0o700); err != nil {
@@ -124,6 +184,7 @@ case "$*" in
 esac
 exit 2
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "first-fail")
 
 	err := mgr.Start(false, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "reading witness session identity") {
@@ -140,9 +201,10 @@ case "$*" in
 esac
 exit 2
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "first-malformed")
 
 	err := mgr.Start(false, "", nil)
-	if err == nil || !strings.Contains(err.Error(), "has no immutable ID") {
+	if err == nil || !strings.Contains(err.Error(), "unexpected field count") {
 		t.Fatalf("Start() error = %v, want invalid session-identity failure", err)
 	}
 	assertFakePollerPreserved(t, pollerPath, logPath)
@@ -202,6 +264,7 @@ case "$*" in
 esac
 exit 2
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "second-fail")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
@@ -234,6 +297,7 @@ case "$*" in
 esac
 exit 2
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "second-malformed")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
@@ -241,7 +305,7 @@ exit 2
 	t.Setenv("FAKE_TMUX_STATE", statePath)
 
 	err := mgr.Start(false, "", nil)
-	if err == nil || !strings.Contains(err.Error(), "has no immutable ID") {
+	if err == nil || !strings.Contains(err.Error(), "rechecking witness session identity") {
 		t.Fatalf("Start() error = %v, want invalid second session identity", err)
 	}
 	assertFakePollerPreserved(t, pollerPath, logPath)
@@ -268,6 +332,7 @@ case "$*" in
 esac
 exit 2
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "second-malformed")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
@@ -275,7 +340,7 @@ exit 2
 	t.Setenv("FAKE_TMUX_STATE", statePath)
 
 	err := mgr.Start(false, "", nil)
-	if err == nil || !strings.Contains(err.Error(), "invalid immutable ID") {
+	if err == nil || !strings.Contains(err.Error(), "rechecking witness session identity") {
 		t.Fatalf("Start() error = %v, want malformed second session identity", err)
 	}
 	assertFakePollerPreserved(t, pollerPath, logPath)
@@ -308,6 +373,7 @@ case "$*" in
 esac
 exit 0
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "replacement")
 	if err := os.Remove(pollerPath); err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +420,7 @@ case "$*" in
 esac
 exit 0
 `)
+	t.Setenv("FAKE_GENERATION_MODE", "poller-advance")
 	if err := os.Remove(pollerPath); err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +490,8 @@ exit 0
 	t.Setenv("FAKE_POLLER_PATH", pollerPath)
 	t.Setenv("FAKE_CLEANUP_STATE", cleanupStatePath)
 	t.Setenv("FAKE_PANE_PID", startTestSleeper(t))
+	t.Setenv("FAKE_POLLER_REPLACEMENT", "replacement-generation")
+	t.Setenv("FAKE_CLEANUP_ERROR", "expected captured-generation cleanup failure")
 
 	err := mgr.Start(false, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "killing zombie session") {
@@ -437,8 +506,8 @@ exit 0
 		t.Fatal(readErr)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "kill-session -t $1") {
-		t.Fatalf("captured tmux generation was not targeted:\n%s", logText)
+	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original") {
+		t.Fatalf("captured tmux generation was not passed to cleanup:\n%s", logText)
 	}
 	if strings.Contains(logText, "kill-session -t "+mgr.SessionName()) {
 		t.Fatalf("replacement session name was targeted:\n%s", logText)
@@ -475,6 +544,7 @@ exit 0
 	cleanupStatePath := filepath.Join(t.TempDir(), "cleanup-state")
 	t.Setenv("FAKE_CLEANUP_STATE", cleanupStatePath)
 	t.Setenv("FAKE_PANE_PID", startTestSleeper(t))
+	t.Setenv("FAKE_CLEANUP_ERROR", "expected cleanup failure")
 
 	err := mgr.Start(false, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "killing zombie session") {
@@ -485,7 +555,7 @@ exit 0
 		t.Fatal(err)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "set-hook") || !strings.Contains(logText, "kill-session") {
+	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original") {
 		t.Fatalf("zombie replacement skipped process-aware cleanup:\n%s", logText)
 	}
 }

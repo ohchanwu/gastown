@@ -52,25 +52,6 @@ func processAliveChecked(pid int) (bool, error) {
 	}
 }
 
-func signalProcessGeneration(pid int, requested processSignal) error {
-	var signal syscall.Signal
-	switch requested {
-	case processSignalTerminate:
-		signal = syscall.SIGTERM
-	case processSignalKill:
-		signal = syscall.SIGKILL
-	default:
-		return fmt.Errorf("unknown process signal %q", requested)
-	}
-	if err := syscall.Kill(pid, signal); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return errProcessNotFound
-		}
-		return err
-	}
-	return nil
-}
-
 func killProcessGroup(pgid int) {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	time.Sleep(100 * time.Millisecond)

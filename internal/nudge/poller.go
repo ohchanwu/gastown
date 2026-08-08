@@ -377,6 +377,35 @@ func StopPollerGeneration(townRoot, session string, generation PollerGeneration)
 	return stopPoller(townRoot, session, &generation)
 }
 
+// StopPollerGenerationBeforeReplacement holds the same ownership lock used by
+// StartPoller across both the generation-bound stop and the replacement
+// callback. A competing poller therefore cannot advance after validation but
+// before the tmux generation is replaced.
+func StopPollerGenerationBeforeReplacement(
+	townRoot, session string,
+	generation PollerGeneration,
+	replace func() error,
+) error {
+	lock, err := lockPoller(townRoot, session)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+	if err := stopPollerWithExpectedGenerationOpsLocked(
+		townRoot, session, &generation,
+		os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
+		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) },
+		waitPollerExit,
+		func(path string, data []byte) error {
+			return quarantinePollerRecord(path, data, func(destination string) error { return os.Rename(path, destination) })
+		},
+		os.Remove,
+	); err != nil {
+		return err
+	}
+	return replace()
+}
+
 func stopPoller(townRoot, session string, expected *PollerGeneration) error {
 	return stopPollerWithExpectedGenerationOps(townRoot, session, expected, os.ReadFile, pollerProcessAlive, lookupPollerIdentity,
 		func(data []byte) error { return os.WriteFile(pollerStopFile(townRoot, session), data, 0600) }, waitPollerExit,
@@ -428,7 +457,23 @@ func stopPollerWithExpectedGenerationOps(
 		return err
 	}
 	defer func() { _ = lock.Unlock() }()
+	return stopPollerWithExpectedGenerationOpsLocked(
+		townRoot, sessionName, expected,
+		readPID, alive, identity, stop, waitExit, quarantine, remove,
+	)
+}
 
+func stopPollerWithExpectedGenerationOpsLocked(
+	townRoot, sessionName string,
+	expected *PollerGeneration,
+	readPID func(string) ([]byte, error),
+	alive func(int) bool,
+	identity func(int) (pollerIdentity, error),
+	stop func([]byte) error,
+	waitExit func(int, pollerRecord) error,
+	quarantine func(string, []byte) error,
+	remove func(string) error,
+) error {
 	pidPath := pollerPidFile(townRoot, sessionName)
 	data, err := readPID(pidPath)
 	if err != nil {

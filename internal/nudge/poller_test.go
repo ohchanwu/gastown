@@ -32,6 +32,44 @@ func TestStopPollerBeforeReplacementOrdering(t *testing.T) {
 	}
 }
 
+func TestStopPollerGenerationBeforeReplacementHoldsOwnershipLock(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-gastown-polecat-test"
+	generation, err := CapturePollerGeneration(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockResult := make(chan error, 1)
+
+	err = StopPollerGenerationBeforeReplacement(townRoot, session, generation, func() error {
+		go func() {
+			lock, lockErr := lockPoller(townRoot, session)
+			if lockErr == nil {
+				_ = lock.Unlock()
+			}
+			lockResult <- lockErr
+		}()
+		select {
+		case lockErr := <-lockResult:
+			t.Fatalf("competing ownership lock acquired during replacement: %v", lockErr)
+		case <-time.After(100 * time.Millisecond):
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case lockErr := <-lockResult:
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("competing ownership lock did not acquire after replacement")
+	}
+}
+
 func TestStartPollerSerializesConcurrentLaunches(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-polecat-test"
