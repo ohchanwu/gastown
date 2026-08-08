@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -68,13 +69,15 @@ func withoutEnvironmentKeys(env []string, keys ...string) []string {
 }
 
 type linuxCustodyLaunch struct {
-	child  *exec.Cmd
-	wait   <-chan error
-	pidfd  int
-	ready  *os.File
-	permit *os.File
-	life   *os.File
-	broker *os.File
+	child         *exec.Cmd
+	wait          <-chan error
+	pidfd         int
+	ready         *os.File
+	permit        *os.File
+	life          *os.File
+	broker        *os.File
+	proxyExpected bool
+	proxies       linuxCustodyProxySet
 }
 
 func startLinuxCustodyWait(child *exec.Cmd) <-chan error {
@@ -195,6 +198,7 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	launch := &linuxCustodyLaunch{
 		child: child, wait: startLinuxCustodyWait(child), pidfd: pidfd,
 		ready: readyReader, permit: permitWriter, life: lifeWriter, broker: brokerServer,
+		proxyExpected: namespaced,
 	}
 	brokerServer = nil
 	_ = readyWriter.Close()
@@ -257,6 +261,9 @@ func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
 	if terminate && launch.broker != nil {
 		errs = append(errs, launch.broker.Close())
 		launch.broker = nil
+	}
+	if terminate {
+		errs = append(errs, launch.proxies.Close())
 	}
 	if terminate && reaped && launch.pidfd >= 0 {
 		errs = append(errs, unix.Close(launch.pidfd))
@@ -344,6 +351,14 @@ func launchLinuxCustodyCommandValidated(command string, start linuxCustodyStarte
 		}
 		return launch, false, nil
 	}
+	if launch.proxyExpected {
+		if launch.broker == nil {
+			return nil, false, errors.Join(errors.New("session custody proxy handoff has no broker endpoint"), closeLinuxCustodyLaunch(launch, true))
+		}
+		if err := waitLinuxCustodyProxySet(launch, linuxCustodyHandshakeTimeout); err != nil {
+			return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
+		}
+	}
 	if err := waitLinuxCustodyReady(launch); err != nil {
 		return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
 	}
@@ -375,8 +390,20 @@ func runSessionCustodyInit() (bool, error) {
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	if err := validateLinuxSessionBrokerEndpoint(linuxSessionBrokerFD); err != nil {
+		return true, err
+	}
+	var proxyPorts *linuxCustodyProxyPorts
 	if os.Getenv(envLinuxSessionCustodyNamespaced) == "1" {
 		if err := prepareLinuxCustodyNamespace(); err != nil {
+			return true, err
+		}
+		ports, err := createAndSendLinuxCustodyProxyListeners(linuxSessionBrokerFD)
+		if err != nil {
+			return true, err
+		}
+		proxyPorts = &ports
+		if err := dropLinuxCustodyCapabilities(); err != nil {
 			return true, err
 		}
 	}
@@ -388,9 +415,6 @@ func runSessionCustodyInit() (bool, error) {
 	life := os.NewFile(linuxCustodySupervisorLifeFD, "session-custody-supervisor-life")
 	if ready == nil || permit == nil || life == nil {
 		return true, errors.New("session custody init protocol descriptors are unavailable")
-	}
-	if err := validateLinuxSessionBrokerEndpoint(linuxSessionBrokerFD); err != nil {
-		return true, err
 	}
 	unix.CloseOnExec(int(life.Fd()))
 	go func() {
@@ -424,7 +448,7 @@ func runSessionCustodyInit() (bool, error) {
 	if err := ready.Close(); err != nil {
 		return true, err
 	}
-	return true, runLinuxCustodyWorkload(command)
+	return true, runLinuxCustodyWorkload(command, proxyPorts)
 }
 
 func prepareLinuxCustodyNamespace() error {
@@ -434,6 +458,13 @@ func prepareLinuxCustodyNamespace() error {
 	if err := unix.Mount("proc", linuxProcRoot, "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
 		return fmt.Errorf("mounting private session custody procfs: %w", err)
 	}
+	if err := bringUpLinuxCustodyLoopback(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func dropLinuxCustodyCapabilities() error {
 	for capability := 0; capability < 64; capability++ {
 		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && !errors.Is(err, unix.EINVAL) {
 			return fmt.Errorf("dropping session custody capability %d: %w", capability, err)
@@ -447,7 +478,7 @@ func prepareLinuxCustodyNamespace() error {
 	return nil
 }
 
-func runLinuxCustodyWorkload(command string) error {
+func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts) error {
 	env := withoutEnvironmentKeys(
 		os.Environ(),
 		EnvSessionCustody,
@@ -457,6 +488,9 @@ func runLinuxCustodyWorkload(command string) error {
 		"TMUX",
 		"TMUX_PANE",
 	)
+	if proxyPorts != nil {
+		env = rewriteLinuxCustodyNetworkEnvironment(env, *proxyPorts)
+	}
 	_, err := syscall.ForkExec(
 		"/bin/sh",
 		[]string{"/bin/sh", "-lc", command},
@@ -488,72 +522,81 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	if err != nil {
 		return err
 	}
-	var brokerDone <-chan error
-	if contained {
-		if launch.broker == nil {
-			return errors.Join(errors.New("contained session has no broker endpoint"), closeLinuxCustodyLaunch(launch, true))
+	if !contained {
+		for {
+			time.Sleep(time.Hour)
+			runtime.KeepAlive(launch)
 		}
-		brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
-		if dupErr != nil {
-			return errors.Join(fmt.Errorf("retaining session broker endpoint: %w", dupErr), closeLinuxCustodyLaunch(launch, true))
-		}
-		if closeErr := launch.broker.Close(); closeErr != nil {
-			_ = unix.Close(brokerFD)
-			launch.broker = nil
-			return errors.Join(fmt.Errorf("closing original session broker endpoint: %w", closeErr), closeLinuxCustodyLaunch(launch, true))
-		}
-		launch.broker = nil
-		executable, executableErr := os.Executable()
-		if executableErr != nil {
-			_ = unix.Close(brokerFD)
-			return errors.Join(executableErr, closeLinuxCustodyLaunch(launch, true))
-		}
-		brokerContext, cancelBroker := context.WithCancel(context.Background())
-		defer cancelBroker()
-		result := make(chan error, 1)
-		go func() {
-			result <- ServeSessionBroker(brokerContext, executable, brokerFD, validate)
-		}()
-		brokerDone = result
 	}
+	if launch.broker == nil || launch.proxies.HTTPS == nil || launch.proxies.Dolt == nil {
+		return errors.Join(errors.New("contained session is missing broker or proxy endpoints"), closeLinuxCustodyLaunch(launch, true))
+	}
+	doltHost, doltPort, err := captureConfiguredDoltEndpoint(os.Environ())
+	if err != nil {
+		return errors.Join(err, closeLinuxCustodyLaunch(launch, true))
+	}
+	brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
+	if dupErr != nil {
+		return errors.Join(fmt.Errorf("retaining session broker endpoint: %w", dupErr), closeLinuxCustodyLaunch(launch, true))
+	}
+	if closeErr := launch.broker.Close(); closeErr != nil {
+		_ = unix.Close(brokerFD)
+		launch.broker = nil
+		return errors.Join(fmt.Errorf("closing original session broker endpoint: %w", closeErr), closeLinuxCustodyLaunch(launch, true))
+	}
+	launch.broker = nil
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		_ = unix.Close(brokerFD)
+		return errors.Join(executableErr, closeLinuxCustodyLaunch(launch, true))
+	}
+	type serviceResult struct {
+		name string
+		err  error
+	}
+	serviceContext, cancelServices := context.WithCancel(context.Background())
+	defer cancelServices()
+	serviceDone := make(chan serviceResult, 3)
+	go func() {
+		serviceDone <- serviceResult{name: "command broker", err: ServeSessionBroker(serviceContext, executable, brokerFD, validate)}
+	}()
+	go func() {
+		serviceDone <- serviceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
+	}()
+	go func() {
+		upstream := net.JoinHostPort(doltHost, strconv.Itoa(int(doltPort)))
+		serviceDone <- serviceResult{name: "Dolt proxy", err: serveDoltProxy(serviceContext, launch.proxies.Dolt, upstream)}
+	}()
 	// Retain the namespace init pidfd and the supervisor-liveness writer until
 	// exact teardown. The trusted init remains alive after reaping the workload,
 	// so it is a stable direct-child custody boundary rather than an untrusted
 	// PID-1 process or a signal-disposition-dependent zombie.
 	timer := time.NewTimer(sessionCustodyReadyProbe)
 	defer timer.Stop()
-	if brokerDone != nil {
-		select {
-		case brokerErr := <-brokerDone:
-			if brokerErr == nil {
-				brokerErr = errors.New("session broker stopped without an error")
-			}
-			return errors.Join(
-				fmt.Errorf("session broker stopped before readiness: %w", brokerErr),
-				closeLinuxCustodyLaunch(launch, true),
-			)
-		case <-timer.C:
+	select {
+	case stopped := <-serviceDone:
+		if stopped.err == nil {
+			stopped.err = errors.New("service stopped without an error")
 		}
-	} else {
-		<-timer.C
+		return errors.Join(
+			fmt.Errorf("session %s stopped before readiness: %w", stopped.name, stopped.err),
+			closeLinuxCustodyLaunch(launch, true),
+		)
+	case <-timer.C:
 	}
 	for {
-		if brokerDone != nil {
-			select {
-			case brokerErr := <-brokerDone:
-				if brokerErr == nil {
-					brokerErr = errors.New("session broker stopped without an error")
-				}
-				return errors.Join(
-					fmt.Errorf("session broker stopped: %w", brokerErr),
-					closeLinuxCustodyLaunch(launch, true),
-				)
-			case <-time.After(time.Hour):
+		select {
+		case stopped := <-serviceDone:
+			if stopped.err == nil {
+				stopped.err = errors.New("service stopped without an error")
 			}
-		} else {
-			time.Sleep(time.Hour)
+			return errors.Join(
+				fmt.Errorf("session %s stopped: %w", stopped.name, stopped.err),
+				closeLinuxCustodyLaunch(launch, true),
+			)
+		case <-time.After(time.Hour):
 		}
-		if contained && launch.life == nil {
+		if launch.life == nil {
 			return errors.New("session custody lost its supervisor liveness handle")
 		}
 		runtime.KeepAlive(launch)

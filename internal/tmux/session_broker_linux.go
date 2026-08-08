@@ -399,6 +399,8 @@ func writeSessionBrokerNonblocking(fd int, payload []byte) {
 
 func closeSessionBrokerDescriptors(descriptors []int) {
 	for _, fd := range descriptors {
-		_ = unix.Close(fd)
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
 	}
 }

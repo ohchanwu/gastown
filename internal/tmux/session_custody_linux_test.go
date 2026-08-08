@@ -3,11 +3,13 @@
 package tmux
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -138,6 +140,54 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 		_ = connection.Close()
 	}
 	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_NETWORK"), []byte(networkResult), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxyEvidence := make([]string, 0, 16)
+	doltEndpoint := net.JoinHostPort(os.Getenv("GT_DOLT_HOST"), os.Getenv("GT_DOLT_PORT"))
+	doltConnection, doltErr := net.DialTimeout("tcp", doltEndpoint, time.Second)
+	if doltErr != nil {
+		proxyEvidence = append(proxyEvidence, "dolt="+doltErr.Error())
+	} else {
+		_ = doltConnection.SetDeadline(time.Now().Add(time.Second))
+		payload := []byte("isolated-dolt-proxy")
+		_, writeErr := doltConnection.Write(payload)
+		response := make([]byte, len(payload))
+		_, readErr := io.ReadFull(doltConnection, response)
+		_ = doltConnection.Close()
+		if writeErr == nil && readErr == nil && string(response) == string(payload) {
+			proxyEvidence = append(proxyEvidence, "dolt=exact-echo")
+		} else {
+			proxyEvidence = append(proxyEvidence, fmt.Sprintf("dolt=failed:%v:%v:%q", writeErr, readErr, response))
+		}
+	}
+	httpsProxy, parseErr := url.Parse(os.Getenv("HTTPS_PROXY"))
+	if parseErr != nil || httpsProxy.Host == "" {
+		proxyEvidence = append(proxyEvidence, fmt.Sprintf("https_proxy=invalid:%v", parseErr))
+	} else {
+		proxyConnection, proxyErr := net.DialTimeout("tcp", httpsProxy.Host, time.Second)
+		if proxyErr != nil {
+			proxyEvidence = append(proxyEvidence, "https_proxy="+proxyErr.Error())
+		} else {
+			_ = proxyConnection.SetDeadline(time.Now().Add(time.Second))
+			_, _ = io.WriteString(proxyConnection, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+			status, _ := bufio.NewReader(proxyConnection).ReadString('\n')
+			_ = proxyConnection.Close()
+			proxyEvidence = append(proxyEvidence, "https_proxy="+strings.TrimSpace(status))
+		}
+	}
+	for _, target := range []string{"10.0.0.1:443", "8.8.8.8:80"} {
+		connection, directErr := net.DialTimeout("tcp", target, 250*time.Millisecond)
+		if directErr == nil {
+			_ = connection.Close()
+			proxyEvidence = append(proxyEvidence, "direct="+target+":connected")
+		} else {
+			proxyEvidence = append(proxyEvidence, "direct="+target+":denied")
+		}
+	}
+	for _, key := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "GT_DOLT_HOST", "GT_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+		proxyEvidence = append(proxyEvidence, key+"="+os.Getenv(key))
+	}
+	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_PROXY"), []byte(strings.Join(proxyEvidence, "\n")), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getenv("GT_TEST_SESSION_CUSTODY_BROKER_PROOF") != "" {
@@ -482,8 +532,26 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 	socketPath := testDir + "/socket"
 	hardeningPath := testDir + "/hardening"
 	networkPath := testDir + "/network"
+	proxyPath := testDir + "/proxy"
 	brokerProofPath := testDir + "/broker-proof"
 	wantBrokerPIDNamespace, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doltListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doltListener.Close()
+	go func() {
+		connection, acceptErr := doltListener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = io.Copy(connection, connection)
+	}()
+	doltHost, doltPort, err := net.SplitHostPort(doltListener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,8 +565,11 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		"GT_TEST_SESSION_CUSTODY_SOCKET="+socketPath,
 		"GT_TEST_SESSION_CUSTODY_HARDENING="+hardeningPath,
 		"GT_TEST_SESSION_CUSTODY_NETWORK="+networkPath,
+		"GT_TEST_SESSION_CUSTODY_PROXY="+proxyPath,
 		"GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK="+hostListener.Addr().String(),
 		"GT_TEST_SESSION_CUSTODY_BROKER_PROOF="+brokerProofPath,
+		"GT_DOLT_HOST="+doltHost,
+		"GT_DOLT_PORT="+doltPort,
 	)
 	var output synchronizedStringBuilder
 	cmd.Stdout = &output
@@ -529,7 +600,8 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		hardeningResult, hardeningErr := os.ReadFile(hardeningPath)
 		networkResult, networkErr := os.ReadFile(networkPath)
 		brokerProof, brokerProofErr := os.ReadFile(brokerProofPath)
-		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil && hardeningErr == nil && networkErr == nil && brokerProofErr == nil {
+		proxyResult, proxyErr := os.ReadFile(proxyPath)
+		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil && hardeningErr == nil && networkErr == nil && brokerProofErr == nil && proxyErr == nil {
 			if strings.Contains(strings.TrimSpace(string(escape)), "escaped") {
 				t.Fatal("contained workload joined the supervisor PID namespace")
 			}
@@ -576,6 +648,22 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 			}
 			if strings.TrimSpace(string(networkResult)) == "connected" {
 				t.Fatal("contained workload reached the supervisor host loopback")
+			}
+			proxyEvidence := string(proxyResult)
+			for _, field := range []string{
+				"dolt=exact-echo",
+				"https_proxy=HTTP/1.1 403 Forbidden",
+				"direct=10.0.0.1:443:denied",
+				"direct=8.8.8.8:80:denied",
+				"GT_DOLT_HOST=127.0.0.1",
+				"BEADS_DOLT_SERVER_HOST=127.0.0.1",
+			} {
+				if !strings.Contains(proxyEvidence, field) {
+					t.Fatalf("contained workload proxy evidence missing %q: %q", field, proxyResult)
+				}
+			}
+			if strings.Contains(proxyEvidence, doltListener.Addr().String()) {
+				t.Fatalf("captured Dolt upstream leaked into contained environment: %q", proxyResult)
 			}
 			brokerEvidence := string(brokerProof)
 			for _, field := range []string{
