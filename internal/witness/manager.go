@@ -34,7 +34,8 @@ var (
 type Manager struct {
 	rig                   *rig.Rig
 	tmux                  *tmux.Tmux
-	prepareSessionCleanup func(tmux.SessionGeneration) (sessionGenerationCleanup, error)
+	capturePaneGeneration func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error)
+	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
 }
 
 type sessionGenerationCleanup interface {
@@ -50,10 +51,14 @@ func NewManager(r *rig.Rig) *Manager {
 // NewManagerWithTmux creates a witness manager on the caller's tmux transport.
 func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	return &Manager{
-		rig:  r,
-		tmux: t,
-		prepareSessionCleanup: func(generation tmux.SessionGeneration) (sessionGenerationCleanup, error) {
-			return t.PrepareSessionGenerationProcessCleanup(generation)
+		rig:                   r,
+		tmux:                  t,
+		capturePaneGeneration: t.CapturePaneProcessGeneration,
+		prepareSessionCleanup: func(
+			generation tmux.SessionGeneration,
+			paneGeneration tmux.PaneProcessGeneration,
+		) (sessionGenerationCleanup, error) {
+			return t.PrepareSessionGenerationProcessCleanup(generation, paneGeneration)
 		},
 	}
 }
@@ -149,6 +154,10 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		if err != nil {
 			return fmt.Errorf("reading witness session identity: %w", err)
 		}
+		paneGeneration, err := m.capturePaneGeneration(generation)
+		if err != nil {
+			return fmt.Errorf("reading witness pane process identity: %w", err)
+		}
 		pollerGeneration, err := nudge.CapturePollerGeneration(townRoot, sessionID)
 		if err != nil {
 			return fmt.Errorf("reading witness poller generation: %w", err)
@@ -185,17 +194,18 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 			return ErrAlreadyRunning
 		}
 
-		cleanup, err := m.prepareSessionCleanup(generation)
+		cleanup, err := m.prepareSessionCleanup(generation, paneGeneration)
 		if err != nil {
 			return fmt.Errorf("preparing zombie session cleanup: %w", err)
 		}
-		defer cleanup.Close()
-		if err := nudge.StopPollerGenerationBeforeReplacement(
+		replaceErr := nudge.StopPollerGenerationBeforeReplacement(
 			townRoot,
 			sessionID,
 			pollerGeneration,
 			func() error { return cleanup.Run(context.Background()) },
-		); err != nil {
+		)
+		closeErr := cleanup.Close()
+		if err := errors.Join(replaceErr, closeErr); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}

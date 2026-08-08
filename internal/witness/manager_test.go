@@ -29,6 +29,7 @@ func TestManagerStartForegroundDeprecated(t *testing.T) {
 
 type fakeSessionCleanup struct {
 	generation tmux.SessionGeneration
+	pane       tmux.PaneProcessGeneration
 	logPath    string
 }
 
@@ -37,7 +38,7 @@ func (cleanup *fakeSessionCleanup) Run(context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, writeErr := logFile.WriteString("cleanup-run " + cleanup.generation.SessionID + " " + cleanup.generation.Nonce + "\n")
+	_, writeErr := logFile.WriteString("cleanup-run " + cleanup.generation.SessionID + " " + cleanup.generation.Nonce + " " + cleanup.pane.Identity + "\n")
 	closeErr := logFile.Close()
 	if writeErr != nil || closeErr != nil {
 		return errors.Join(writeErr, closeErr)
@@ -110,8 +111,14 @@ esac
 		&rig.Rig{Name: "testrig", Path: rigPath},
 		tmux.NewTmuxWithSocket("gt-wsf-"+strconv.FormatInt(time.Now().UnixNano(), 10)),
 	)
-	mgr.prepareSessionCleanup = func(generation tmux.SessionGeneration) (sessionGenerationCleanup, error) {
-		return &fakeSessionCleanup{generation: generation, logPath: logPath}, nil
+	mgr.capturePaneGeneration = func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error) {
+		return tmux.PaneProcessGeneration{PID: os.Getpid(), Identity: "fixture-pane-generation"}, nil
+	}
+	mgr.prepareSessionCleanup = func(
+		generation tmux.SessionGeneration,
+		pane tmux.PaneProcessGeneration,
+	) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{generation: generation, pane: pane, logPath: logPath}, nil
 	}
 	t.Setenv("FAKE_SESSION_NAME", mgr.SessionName())
 	pollerDir := filepath.Join(townRoot, ".runtime", "nudge_poller")
@@ -241,6 +248,56 @@ exit 2
 		t.Fatalf("Start() error = %v, want second checked liveness failure", err)
 	}
 	assertFakePollerPreserved(t, pollerPath, logPath)
+}
+
+func TestManagerStartCarriesPaneGenerationCapturedBeforeLivenessDecision(t *testing.T) {
+	mgr, _, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*)
+    printf '1' > "$FAKE_PANE_STATE"
+    echo "GT_PROCESS_NAMES=definitely-not-running"
+    exit 0
+    ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	statePath := filepath.Join(t.TempDir(), "pane-state")
+	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_PANE_STATE", statePath)
+	mgr.capturePaneGeneration = func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error) {
+		state, err := os.ReadFile(statePath)
+		if err != nil {
+			return tmux.PaneProcessGeneration{}, err
+		}
+		if string(state) == "0" {
+			return tmux.PaneProcessGeneration{PID: 123, Identity: "pre-liveness-pane"}, nil
+		}
+		return tmux.PaneProcessGeneration{PID: 123, Identity: "replacement-pane"}, nil
+	}
+	prepareErr := errors.New("stop after pane token assertion")
+	var preparedPane tmux.PaneProcessGeneration
+	mgr.prepareSessionCleanup = func(
+		_ tmux.SessionGeneration,
+		pane tmux.PaneProcessGeneration,
+	) (sessionGenerationCleanup, error) {
+		preparedPane = pane
+		return nil, prepareErr
+	}
+
+	err := mgr.Start(false, "", nil)
+	if !errors.Is(err, prepareErr) {
+		t.Fatalf("Start() error = %v, want prepare sentinel", err)
+	}
+	if preparedPane.Identity != "pre-liveness-pane" {
+		t.Fatalf("prepared pane = %+v, want token captured before liveness changed state", preparedPane)
+	}
 }
 
 func TestManagerStartPreservesZombieWhenSecondIdentityQueryFails(t *testing.T) {
@@ -506,7 +563,7 @@ exit 0
 		t.Fatal(readErr)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original") {
+	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
 		t.Fatalf("captured tmux generation was not passed to cleanup:\n%s", logText)
 	}
 	if strings.Contains(logText, "kill-session -t "+mgr.SessionName()) {
@@ -555,7 +612,7 @@ exit 0
 		t.Fatal(err)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original") {
+	if !strings.Contains(logText, "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
 		t.Fatalf("zombie replacement skipped process-aware cleanup:\n%s", logText)
 	}
 }

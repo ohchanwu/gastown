@@ -993,6 +993,8 @@ type mockRetainedProcess struct {
 	closed              bool
 	aliveChecks         int
 	aliveSequence       []bool
+	onSignal            func(processSignal) error
+	closeErr            error
 }
 
 func (p *mockRetainedProcess) PID() int       { return p.pid }
@@ -1009,12 +1011,17 @@ func (p *mockRetainedProcess) Alive() (bool, error) {
 func (p *mockRetainedProcess) Signal(signal processSignal) error {
 	p.signals = append(p.signals, signal)
 	p.signaledGenerations = append(p.signaledGenerations, p.generation)
+	if p.onSignal != nil {
+		if err := p.onSignal(signal); err != nil {
+			return err
+		}
+	}
 	if signal == processSignalKill {
 		p.alive = false
 	}
 	return nil
 }
-func (p *mockRetainedProcess) Close() error { p.closed = true; return nil }
+func (p *mockRetainedProcess) Close() error { p.closed = true; return p.closeErr }
 
 func TestCaptureRetainedProcessTreeRejectsReusedAncestry(t *testing.T) {
 	root := &mockRetainedProcess{pid: 100, parent: 1, generation: "root", alive: true}
@@ -1109,6 +1116,7 @@ func TestPrepareSessionGenerationProcessCleanupRejectsSamePIDReplacement(t *test
 	err := NewTmuxWithSocket("gt-same-pid-replacement-test").killSessionGenerationWithProcessesContext(
 		context.Background(),
 		SessionGeneration{},
+		PaneProcessGeneration{PID: 123, Identity: "old-process-start"},
 		ops,
 	)
 	if !errors.Is(err, ErrSessionGenerationChanged) {
@@ -1124,6 +1132,172 @@ func TestPrepareSessionGenerationProcessCleanupRejectsSamePIDReplacement(t *test
 		t.Fatalf("tmux mutation followed same-PID process replacement:\n%s", logData)
 	} else if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatal(readErr)
+	}
+}
+
+func TestPrepareSessionGenerationProcessCleanupRejectsReplacementBeforeFirstIdentity(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "tmux.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_TMUX_LOG\"\nexit 2\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	retainCalls := 0
+	replacement := &mockRetainedProcess{pid: 123, parent: 1, generation: "replacement", alive: true}
+	ops := sessionProcessCustodyOps{
+		readPane: func(SessionGeneration) (int, bool, error) { return 123, true, nil },
+		identity: func(int) (string, error) {
+			return "replacement-process-start", nil
+		},
+		retain: func(int) ([]retainedProcess, error) {
+			retainCalls++
+			return []retainedProcess{replacement}, nil
+		},
+	}
+
+	err := NewTmuxWithSocket("gt-before-first-identity-test").killSessionGenerationWithProcessesContext(
+		context.Background(),
+		SessionGeneration{},
+		PaneProcessGeneration{PID: 123, Identity: "authoritative-old-start"},
+		ops,
+	)
+	if !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("killSessionGenerationWithProcessesContext() error = %v, want generation change", err)
+	}
+	if retainCalls != 0 || len(replacement.signals) != 0 {
+		t.Fatalf("replacement retain calls=%d signals=%v, want no custody or signal", retainCalls, replacement.signals)
+	}
+	if logData, readErr := os.ReadFile(logPath); readErr == nil && len(logData) > 0 {
+		t.Fatalf("tmux mutation followed pre-identity replacement:\n%s", logData)
+	} else if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+}
+
+func TestSessionGenerationCleanupPreservesPaneReplacementBeforeFinalKill(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-final-pane-%d", time.Now().UnixNano()))
+	session := "gt-final-pane"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProcess := &mockRetainedProcess{pid: pane.PID, parent: 1, generation: "old-pane", alive: true}
+	oldProcess.onSignal = func(signal processSignal) error {
+		if signal != processSignalKill {
+			return nil
+		}
+		_, err := tm.run("respawn-pane", "-k", "-t", generation.SessionID, "sleep 60")
+		return err
+	}
+	cleanup := &SessionGenerationCleanup{
+		tmux:         tm,
+		generation:   generation,
+		panePID:      pane.PID,
+		paneIdentity: pane.Identity,
+		identity:     processGenerationIdentity,
+		processes:    []retainedProcess{oldProcess},
+	}
+
+	err = cleanup.Run(context.Background())
+	if !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("Run() error = %v, want final pane generation change", err)
+	}
+	has, err := tm.HasSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("same-session pane replacement was killed at final boundary")
+	}
+}
+
+func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-success-%d", time.Now().UnixNano()))
+	session := "gt-cleanup-success"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := &mockRetainedProcess{pid: pane.PID, parent: 1, generation: "owned-pane", alive: true}
+	process.onSignal = func(signal processSignal) error {
+		if signal == processSignalKill {
+			if err := exec.Command("kill", "-KILL", fmt.Sprint(pane.PID)).Run(); err != nil {
+				return err
+			}
+			process.alive = false
+		}
+		return nil
+	}
+	cleanup, err := tm.prepareSessionGenerationProcessCleanup(
+		generation,
+		pane,
+		sessionProcessCustodyOps{
+			readPane: tm.getPanePIDGeneration,
+			identity: processGenerationIdentity,
+			retain: func(pid int) ([]retainedProcess, error) {
+				if pid != pane.PID {
+					return nil, fmt.Errorf("retained PID %d, want %d", pid, pane.PID)
+				}
+				return []retainedProcess{process}, nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("prepareSessionGenerationProcessCleanup() error = %v", err)
+	}
+	if err := cleanup.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if err := cleanup.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !process.closed {
+		t.Fatal("retained process reference was not closed")
+	}
+}
+
+func TestSessionGenerationCleanupClose(t *testing.T) {
+	closeErr := errors.New("injected close failure")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "success"},
+		{name: "error", err: closeErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			process := &mockRetainedProcess{pid: 123, closeErr: tc.err}
+			cleanup := &SessionGenerationCleanup{processes: []retainedProcess{process}}
+			err := cleanup.Close()
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("Close() error = %v, want %v", err, tc.err)
+			}
+			if !process.closed {
+				t.Fatal("retained process reference was not closed")
+			}
+			if err := cleanup.Close(); err != nil {
+				t.Fatalf("second Close() error = %v", err)
+			}
+		})
 	}
 }
 
