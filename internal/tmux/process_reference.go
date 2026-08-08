@@ -91,6 +91,15 @@ func captureRetainedProcessTree(
 				progress = true
 				continue
 			}
+			parentAlive, aliveErr = parent.Alive()
+			if aliveErr != nil || !parentAlive {
+				_ = child.Close()
+				closeRetainedProcesses(processes)
+				if aliveErr != nil {
+					return nil, fmt.Errorf("revalidating retained parent process %d after child acquisition: %w", relation.ParentPID, aliveErr)
+				}
+				return nil, fmt.Errorf("retained parent process %d exited during ancestry capture", relation.ParentPID)
+			}
 			owned[relation.PID] = child
 			processes = append(processes, child)
 			progress = true

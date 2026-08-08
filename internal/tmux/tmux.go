@@ -908,7 +908,11 @@ func (t *Tmux) runGuardedSessionGenerationPane(generation SessionGeneration, pan
 	if panePID <= 0 {
 		return errors.New("invalid tmux pane process generation")
 	}
-	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_pid},%d}}", condition, panePID)
+	condition = fmt.Sprintf(
+		"#{&&:%s,#{&&:#{==:#{pane_pid},%d},#{==:#{pane_dead},0}}}",
+		condition,
+		panePID,
+	)
 	return t.runGuardedSessionGenerationCondition(generation, condition, command)
 }
 
@@ -960,7 +964,7 @@ func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, er
 	out, err := t.run(
 		"if-shell", "-F", "-t", generation.SessionID,
 		condition,
-		"display-message -p '"+paneMarker+"#{pane_pid}'",
+		"display-message -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
 		"display-message -p "+changedMarker,
 	)
 	if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
@@ -976,7 +980,11 @@ func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, er
 	if !strings.HasPrefix(out, paneMarker) {
 		return 0, false, fmt.Errorf("guarded pane PID read returned unexpected receipt %q", out)
 	}
-	panePID, err := strconv.Atoi(strings.TrimPrefix(out, paneMarker))
+	paneFields := strings.Split(strings.TrimPrefix(out, paneMarker), ":")
+	if len(paneFields) != 2 || paneFields[1] != "0" {
+		return 0, false, ErrSessionGenerationChanged
+	}
+	panePID, err := strconv.Atoi(paneFields[0])
 	if err != nil || panePID <= 0 {
 		return 0, false, fmt.Errorf("guarded pane PID read returned invalid PID %q", out)
 	}
@@ -986,28 +994,90 @@ func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, er
 // SessionGenerationCleanup holds generation-bound kernel process references
 // acquired before any poller or tmux mutation.
 type SessionGenerationCleanup struct {
-	tmux       *Tmux
-	generation SessionGeneration
-	panePID    int
-	processes  []retainedProcess
+	tmux         *Tmux
+	generation   SessionGeneration
+	panePID      int
+	paneIdentity string
+	identity     func(int) (string, error)
+	processes    []retainedProcess
+}
+
+type sessionProcessCustodyOps struct {
+	readPane func(SessionGeneration) (int, bool, error)
+	identity func(int) (string, error)
+	retain   func(int) ([]retainedProcess, error)
 }
 
 // PrepareSessionGenerationProcessCleanup captures the exact pane process tree
 // without changing the poller, process, or tmux session. The caller must Close
 // the returned custody object.
 func (t *Tmux) PrepareSessionGenerationProcessCleanup(generation SessionGeneration) (*SessionGenerationCleanup, error) {
-	panePID, exists, err := t.getPanePIDGeneration(generation)
+	return t.prepareSessionGenerationProcessCleanup(generation, t.sessionProcessCustodyOps())
+}
+
+func (t *Tmux) sessionProcessCustodyOps() sessionProcessCustodyOps {
+	return sessionProcessCustodyOps{
+		readPane: t.getPanePIDGeneration,
+		identity: processGenerationIdentity,
+		retain:   retainProcessTree,
+	}
+}
+
+func (t *Tmux) prepareSessionGenerationProcessCleanup(
+	generation SessionGeneration,
+	ops sessionProcessCustodyOps,
+) (*SessionGenerationCleanup, error) {
+	panePID, exists, err := ops.readPane(generation)
 	if err != nil || !exists {
 		if err != nil {
 			return nil, err
 		}
 		return nil, ErrSessionGenerationChanged
 	}
-	processes, err := retainProcessTree(panePID)
+	paneIdentity, err := ops.identity(panePID)
+	if err != nil {
+		return nil, fmt.Errorf("reading pane process identity before retained custody: %w", err)
+	}
+	processes, err := ops.retain(panePID)
 	if err != nil {
 		return nil, fmt.Errorf("retaining pane process tree before tmux mutation: %w", err)
 	}
-	return &SessionGenerationCleanup{tmux: t, generation: generation, panePID: panePID, processes: processes}, nil
+	reject := func(err error) (*SessionGenerationCleanup, error) {
+		closeRetainedProcesses(processes)
+		return nil, err
+	}
+	if len(processes) == 0 || processes[0].PID() != panePID {
+		return reject(errors.New("retained pane process custody did not return the captured root"))
+	}
+	confirmedPanePID, exists, err := ops.readPane(generation)
+	if err != nil {
+		return reject(err)
+	}
+	if !exists || confirmedPanePID != panePID {
+		return reject(ErrSessionGenerationChanged)
+	}
+	confirmedIdentity, err := ops.identity(panePID)
+	if err != nil {
+		return reject(fmt.Errorf("re-reading pane process identity after retained custody: %w", err))
+	}
+	if confirmedIdentity != paneIdentity {
+		return reject(ErrSessionGenerationChanged)
+	}
+	rootAlive, err := processes[0].Alive()
+	if err != nil {
+		return reject(fmt.Errorf("revalidating retained pane process after acquisition: %w", err))
+	}
+	if !rootAlive {
+		return reject(ErrSessionGenerationChanged)
+	}
+	return &SessionGenerationCleanup{
+		tmux:         t,
+		generation:   generation,
+		panePID:      panePID,
+		paneIdentity: paneIdentity,
+		identity:     ops.identity,
+		processes:    processes,
+	}, nil
 }
 
 // Close releases the retained kernel process references without signaling.
@@ -1028,11 +1098,25 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 // Run performs the destructive cleanup while retaining the captured kernel
 // references. Callers may wrap Run in a broader ownership transaction.
 func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
-	if cleanup == nil || cleanup.tmux == nil || len(cleanup.processes) == 0 {
+	if cleanup == nil || cleanup.tmux == nil || cleanup.identity == nil || cleanup.paneIdentity == "" || len(cleanup.processes) == 0 {
 		return errors.New("tmux session generation cleanup has no retained process custody")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	rootAlive, err := cleanup.processes[0].Alive()
+	if err != nil {
+		return fmt.Errorf("revalidating retained pane process before disarm: %w", err)
+	}
+	if !rootAlive {
+		return ErrSessionGenerationChanged
+	}
+	identity, err := cleanup.identity(cleanup.panePID)
+	if err != nil {
+		return fmt.Errorf("re-reading pane process identity before disarm: %w", err)
+	}
+	if identity != cleanup.paneIdentity {
+		return ErrSessionGenerationChanged
 	}
 
 	if err := cleanup.tmux.runGuardedSessionGenerationPane(
@@ -1055,10 +1139,18 @@ func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
 // generation captured by CaptureSessionGeneration. Platforms without retained
 // kernel process references fail before any destructive mutation.
 func (t *Tmux) KillSessionGenerationWithProcessesContext(ctx context.Context, generation SessionGeneration) error {
+	return t.killSessionGenerationWithProcessesContext(ctx, generation, t.sessionProcessCustodyOps())
+}
+
+func (t *Tmux) killSessionGenerationWithProcessesContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	ops sessionProcessCustodyOps,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	cleanup, err := t.PrepareSessionGenerationProcessCleanup(generation)
+	cleanup, err := t.prepareSessionGenerationProcessCleanup(generation, ops)
 	if err != nil {
 		return err
 	}

@@ -959,10 +959,12 @@ func TestSessionGenerationCleanupRejectsReplacementPane(t *testing.T) {
 	}
 	oldProcess := &mockRetainedProcess{pid: panePID, parent: 1, generation: "old-pane", alive: true}
 	cleanup := &SessionGenerationCleanup{
-		tmux:       tm,
-		generation: generation,
-		panePID:    panePID + 1,
-		processes:  []retainedProcess{oldProcess},
+		tmux:         tm,
+		generation:   generation,
+		panePID:      panePID + 1,
+		paneIdentity: "old-pane-start",
+		identity:     func(int) (string, error) { return "old-pane-start", nil },
+		processes:    []retainedProcess{oldProcess},
 	}
 
 	err = cleanup.Run(context.Background())
@@ -989,11 +991,21 @@ type mockRetainedProcess struct {
 	signals             []processSignal
 	signaledGenerations []string
 	closed              bool
+	aliveChecks         int
+	aliveSequence       []bool
 }
 
-func (p *mockRetainedProcess) PID() int             { return p.pid }
-func (p *mockRetainedProcess) ParentPID() int       { return p.parent }
-func (p *mockRetainedProcess) Alive() (bool, error) { return p.alive, nil }
+func (p *mockRetainedProcess) PID() int       { return p.pid }
+func (p *mockRetainedProcess) ParentPID() int { return p.parent }
+func (p *mockRetainedProcess) Alive() (bool, error) {
+	if p.aliveChecks < len(p.aliveSequence) {
+		alive := p.aliveSequence[p.aliveChecks]
+		p.aliveChecks++
+		return alive, nil
+	}
+	p.aliveChecks++
+	return p.alive, nil
+}
 func (p *mockRetainedProcess) Signal(signal processSignal) error {
 	p.signals = append(p.signals, signal)
 	p.signaledGenerations = append(p.signaledGenerations, p.generation)
@@ -1030,6 +1042,88 @@ func TestCaptureRetainedProcessTreeRejectsReusedAncestry(t *testing.T) {
 	}
 	if !reused.closed {
 		t.Fatal("reused unrelated descendant reference was not closed")
+	}
+}
+
+func TestCaptureRetainedProcessTreeRechecksParentAfterChildAcquire(t *testing.T) {
+	root := &mockRetainedProcess{
+		pid:           100,
+		parent:        1,
+		generation:    "old-root",
+		alive:         false,
+		aliveSequence: []bool{true, false},
+	}
+	child := &mockRetainedProcess{pid: 101, parent: 100, generation: "replacement-child", alive: true}
+	_, err := captureRetainedProcessTree(
+		100,
+		[]processRelation{{PID: 101, ParentPID: 100}},
+		func(pid int) (retainedProcess, error) {
+			switch pid {
+			case 100:
+				return root, nil
+			case 101:
+				return child, nil
+			default:
+				return nil, errProcessNotFound
+			}
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "exited during ancestry capture") {
+		t.Fatalf("captureRetainedProcessTree() error = %v, want post-acquire parent exit", err)
+	}
+	if !root.closed || !child.closed {
+		t.Fatalf("failed ancestry custody was not closed: root=%v child=%v", root.closed, child.closed)
+	}
+}
+
+func TestPrepareSessionGenerationProcessCleanupRejectsSamePIDReplacement(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "tmux.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_TMUX_LOG\"\nexit 2\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_TMUX_LOG", logPath)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	identityCalls := 0
+	paneReads := 0
+	replacement := &mockRetainedProcess{pid: 123, parent: 1, generation: "replacement", alive: true}
+	ops := sessionProcessCustodyOps{
+		readPane: func(SessionGeneration) (int, bool, error) {
+			paneReads++
+			return 123, true, nil
+		},
+		identity: func(int) (string, error) {
+			identityCalls++
+			if identityCalls == 1 {
+				return "old-process-start", nil
+			}
+			return "replacement-process-start", nil
+		},
+		retain: func(int) ([]retainedProcess, error) {
+			return []retainedProcess{replacement}, nil
+		},
+	}
+
+	err := NewTmuxWithSocket("gt-same-pid-replacement-test").killSessionGenerationWithProcessesContext(
+		context.Background(),
+		SessionGeneration{},
+		ops,
+	)
+	if !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("killSessionGenerationWithProcessesContext() error = %v, want generation change", err)
+	}
+	if paneReads < 2 {
+		t.Fatalf("guarded pane reads = %d, want pre/post acquisition reads", paneReads)
+	}
+	if !replacement.closed || len(replacement.signals) != 0 {
+		t.Fatalf("replacement custody closed=%v signals=%v, want closed without signal", replacement.closed, replacement.signals)
+	}
+	if logData, readErr := os.ReadFile(logPath); readErr == nil && len(logData) > 0 {
+		t.Fatalf("tmux mutation followed same-PID process replacement:\n%s", logData)
+	} else if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
 	}
 }
 
