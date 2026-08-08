@@ -15,7 +15,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,6 +23,7 @@ const (
 	linuxProcRoot                         = "/proc"
 	sessionCustodyReadyProbe              = 300 * time.Millisecond
 	linuxCustodyHandshakeTimeout          = 3 * time.Second
+	linuxCustodyReapTimeout               = 3 * time.Second
 	linuxCustodyReadyFD                   = 3
 	linuxCustodyPermitFD                  = 4
 	linuxCustodySupervisorLifeFD          = 5
@@ -31,6 +31,7 @@ const (
 	envLinuxSessionCustodyCommand         = "GT_INTERNAL_SESSION_CUSTODY_COMMAND"
 	envLinuxSessionCustodyNamespaced      = "GT_INTERNAL_SESSION_CUSTODY_NAMESPACED"
 	linuxSessionCustodyReadyByte     byte = 'R'
+	linuxSessionCustodyHardenedByte  byte = 'H'
 )
 
 type linuxSessionCustody struct {
@@ -68,10 +69,35 @@ func withoutEnvironmentKeys(env []string, keys ...string) []string {
 
 type linuxCustodyLaunch struct {
 	child  *exec.Cmd
+	wait   <-chan error
 	pidfd  int
 	ready  *os.File
 	permit *os.File
 	life   *os.File
+}
+
+func startLinuxCustodyWait(child *exec.Cmd) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		result <- child.Wait()
+		close(result)
+	}()
+	return result
+}
+
+func waitLinuxCustodyProcess(launch *linuxCustodyLaunch, timeout time.Duration) error {
+	if launch == nil || launch.wait == nil {
+		return errors.New("session custody process has no wait handle")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-launch.wait:
+		launch.wait = nil
+		return err
+	case <-timer.C:
+		return fmt.Errorf("session custody process was not reaped: %w", context.DeadlineExceeded)
+	}
 }
 
 func newLinuxUncontainedCustodyCommand(command string) (*exec.Cmd, *int) {
@@ -141,7 +167,7 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 		PidFD: &pidfd,
 	}
 	if namespaced {
-		child.SysProcAttr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNS
+		child.SysProcAttr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNS | unix.CLONE_NEWNET
 		child.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}}
 		child.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}}
 		child.SysProcAttr.GidMappingsEnableSetgroups = false
@@ -149,15 +175,17 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	if err := child.Start(); err != nil {
 		return nil, err
 	}
+	launch := &linuxCustodyLaunch{
+		child: child, wait: startLinuxCustodyWait(child), pidfd: pidfd,
+		ready: readyReader, permit: permitWriter, life: lifeWriter,
+	}
 	_ = readyWriter.Close()
 	_ = permitReader.Close()
 	_ = lifeReader.Close()
 	if pidfd < 0 {
-		_ = child.Process.Kill()
-		_ = child.Wait()
-		return nil, errors.New("kernel did not return a pidfd for session custody")
+		return nil, errors.Join(errors.New("kernel did not return a pidfd for session custody"), closeLinuxCustodyLaunch(launch, true))
 	}
-	return &linuxCustodyLaunch{child: child, pidfd: pidfd, ready: readyReader, permit: permitWriter, life: lifeWriter}, nil
+	return launch, nil
 }
 
 func startLinuxCustodyCommand(command string, namespaced bool) (*linuxCustodyLaunch, error) {
@@ -168,12 +196,11 @@ func startLinuxCustodyCommand(command string, namespaced bool) (*linuxCustodyLau
 	if err := child.Start(); err != nil {
 		return nil, err
 	}
+	launch := &linuxCustodyLaunch{child: child, wait: startLinuxCustodyWait(child), pidfd: *pidfd}
 	if *pidfd < 0 {
-		_ = child.Process.Kill()
-		_ = child.Wait()
-		return nil, errors.New("kernel did not return a pidfd for session custody")
+		return nil, errors.Join(errors.New("kernel did not return a pidfd for session custody"), closeLinuxCustodyLaunch(launch, true))
 	}
-	return &linuxCustodyLaunch{child: child, pidfd: *pidfd}, nil
+	return launch, nil
 }
 
 type linuxCustodyStarter func(string, bool) (*linuxCustodyLaunch, error)
@@ -184,13 +211,16 @@ func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
 		return nil
 	}
 	var errs []error
+	reaped := false
 	if terminate && launch.child != nil {
 		if launch.pidfd >= 0 {
 			errs = append(errs, unix.PidfdSendSignal(launch.pidfd, unix.SIGKILL, nil, 0))
 		} else {
 			errs = append(errs, launch.child.Process.Kill())
 		}
-		errs = append(errs, launch.child.Wait())
+		waitErr := waitLinuxCustodyProcess(launch, linuxCustodyReapTimeout)
+		errs = append(errs, waitErr)
+		reaped = !errors.Is(waitErr, context.DeadlineExceeded)
 	}
 	if launch.ready != nil {
 		errs = append(errs, launch.ready.Close())
@@ -204,7 +234,7 @@ func closeLinuxCustodyLaunch(launch *linuxCustodyLaunch, terminate bool) error {
 		errs = append(errs, launch.life.Close())
 		launch.life = nil
 	}
-	if terminate && launch.pidfd >= 0 {
+	if terminate && reaped && launch.pidfd >= 0 {
 		errs = append(errs, unix.Close(launch.pidfd))
 		launch.pidfd = -1
 	}
@@ -215,6 +245,17 @@ func waitLinuxCustodyReady(launch *linuxCustodyLaunch) error {
 	if launch == nil || launch.ready == nil {
 		return errors.New("session custody init has no readiness pipe")
 	}
+	return waitLinuxCustodyProtocolByte(launch.ready, linuxSessionCustodyReadyByte, "readiness")
+}
+
+func waitLinuxCustodyHardened(launch *linuxCustodyLaunch) error {
+	if launch == nil || launch.ready == nil {
+		return errors.New("session custody init has no hardening pipe")
+	}
+	return waitLinuxCustodyProtocolByte(launch.ready, linuxSessionCustodyHardenedByte, "hardening")
+}
+
+func waitLinuxCustodyProtocolByte(file *os.File, expected byte, phase string) error {
 	type readResult struct {
 		value byte
 		err   error
@@ -222,22 +263,22 @@ func waitLinuxCustodyReady(launch *linuxCustodyLaunch) error {
 	result := make(chan readResult, 1)
 	go func() {
 		var value [1]byte
-		_, err := io.ReadFull(launch.ready, value[:])
+		_, err := io.ReadFull(file, value[:])
 		result <- readResult{value: value[0], err: err}
 	}()
 	timer := time.NewTimer(linuxCustodyHandshakeTimeout)
 	defer timer.Stop()
 	select {
-	case ready := <-result:
-		if ready.err != nil {
-			return fmt.Errorf("session custody init readiness: %w", ready.err)
+	case received := <-result:
+		if received.err != nil {
+			return fmt.Errorf("session custody init %s: %w", phase, received.err)
 		}
-		if ready.value != linuxSessionCustodyReadyByte {
-			return fmt.Errorf("session custody init sent invalid readiness byte %d", ready.value)
+		if received.value != expected {
+			return fmt.Errorf("session custody init sent invalid %s byte %d", phase, received.value)
 		}
 		return nil
 	case <-timer.C:
-		return errors.New("timed out waiting for session custody init readiness")
+		return fmt.Errorf("timed out waiting for session custody init %s", phase)
 	}
 }
 
@@ -288,6 +329,9 @@ func launchLinuxCustodyCommandValidated(command string, start linuxCustodyStarte
 	if err := writeLinuxCustodyProtocolByte(launch.permit, 1); err != nil {
 		return nil, false, errors.Join(err, closeLinuxCustodyLaunch(launch, true))
 	}
+	if err := waitLinuxCustodyHardened(launch); err != nil {
+		return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
+	}
 	if err := writeLinuxCustodyProtocolByte(launch.life, 1); err != nil {
 		return nil, false, errors.Join(errors.New("session custody supervisor liveness handshake failed"), err, closeLinuxCustodyLaunch(launch, true))
 	}
@@ -305,6 +349,8 @@ func runSessionCustodyInit() (bool, error) {
 	if strings.TrimSpace(command) == "" {
 		return true, errors.New("session custody init command is empty")
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if os.Getenv(envLinuxSessionCustodyNamespaced) == "1" {
 		if err := prepareLinuxCustodyNamespace(); err != nil {
 			return true, err
@@ -335,14 +381,20 @@ func runSessionCustodyInit() (bool, error) {
 	if err := writeLinuxCustodyProtocolByte(ready, linuxSessionCustodyReadyByte); err != nil {
 		return true, err
 	}
-	if err := ready.Close(); err != nil {
-		return true, err
-	}
 	var permission [1]byte
 	if _, err := io.ReadFull(permit, permission[:]); err != nil {
 		return true, fmt.Errorf("waiting for session custody launch permit: %w", err)
 	}
 	if err := permit.Close(); err != nil {
+		return true, err
+	}
+	if err := setLinuxCustodyNonDumpable(); err != nil {
+		return true, err
+	}
+	if err := writeLinuxCustodyProtocolByte(ready, linuxSessionCustodyHardenedByte); err != nil {
+		return true, err
+	}
+	if err := ready.Close(); err != nil {
 		return true, err
 	}
 	return true, runLinuxCustodyWorkload(command)
@@ -364,43 +416,6 @@ func prepareLinuxCustodyNamespace() error {
 	data := [2]unix.CapUserData{}
 	if err := unix.Capset(&header, &data[0]); err != nil {
 		return fmt.Errorf("clearing session custody capabilities: %w", err)
-	}
-	return nil
-}
-
-func installLinuxCustodySeccomp() error {
-	var auditArchitecture uint32
-	switch runtime.GOARCH {
-	case "amd64":
-		auditArchitecture = unix.AUDIT_ARCH_X86_64
-	case "arm64":
-		auditArchitecture = unix.AUDIT_ARCH_AARCH64
-	default:
-		return ErrSessionCustodyUnsupported
-	}
-	deny := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM))
-	filter := []unix.SockFilter{
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 0, K: auditArchitecture},
-		{Code: unix.BPF_RET | unix.BPF_K, K: deny},
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 2, K: uint32(unix.SYS_SOCKET)},
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 4, Jf: 5, K: uint32(unix.AF_UNIX)},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 2, K: uint32(unix.SYS_SOCKETPAIR)},
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 2, K: uint32(unix.AF_UNIX)},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.SYS_IO_URING_SETUP)},
-		{Code: unix.BPF_RET | unix.BPF_K, K: deny},
-		{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
-	}
-	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("setting session custody no-new-privileges: %w", err)
-	}
-	_, _, errno := unix.RawSyscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, 0, uintptr(unsafe.Pointer(&program)))
-	if errno != 0 {
-		return fmt.Errorf("installing session custody seccomp filter: %w", errno)
 	}
 	return nil
 }

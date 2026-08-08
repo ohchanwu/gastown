@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +33,7 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	}
 	escape := "open-denied"
 	if parentNS, openErr := os.Open(fmt.Sprintf("/proc/%d/ns/pid", supervisorPID)); openErr == nil {
-		_, _, setnsErr := syscall.RawSyscall(syscall.SYS_SETNS, parentNS.Fd(), uintptr(unix.CLONE_NEWPID), 0)
+		_, _, setnsErr := syscall.RawSyscall(uintptr(unix.SYS_SETNS), parentNS.Fd(), uintptr(unix.CLONE_NEWPID), 0)
 		_ = parentNS.Close()
 		escape = "setns-denied:" + setnsErr.Error()
 		if setnsErr == 0 {
@@ -52,6 +54,15 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 			}
 			break
 		}
+	}
+	hardening := make([]string, 0, 3)
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "CapEff:") || strings.HasPrefix(line, "CapBnd:") || strings.HasPrefix(line, "NoNewPrivs:") {
+			hardening = append(hardening, line)
+		}
+	}
+	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_HARDENING"), []byte(strings.Join(hardening, "\n")), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if unmountErr := unix.Unmount(linuxProcRoot, unix.MNT_DETACH); unmountErr == nil {
 		escape += ";mount-escaped"
@@ -77,6 +88,21 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	}
 	_, _, ioUringErr := unix.RawSyscall(unix.SYS_IO_URING_SETUP, 1, 0, 0)
 	socketResult += ";io_uring=" + ioUringErr.Error()
+	for name, syscallNumber := range map[string]uintptr{
+		"ptrace":            unix.SYS_PTRACE,
+		"process_vm_readv":  unix.SYS_PROCESS_VM_READV,
+		"process_vm_writev": unix.SYS_PROCESS_VM_WRITEV,
+		"kcmp":              unix.SYS_KCMP,
+		"pidfd_getfd":       unix.SYS_PIDFD_GETFD,
+	} {
+		_, _, syscallErr := unix.RawSyscall6(syscallNumber, ^uintptr(0), 0, 0, 0, 0, 0)
+		socketResult += ";" + name + "=" + syscallErr.Error()
+	}
+	if closeErr := unix.Close(int(linuxCustodyBrokerFD)); closeErr != nil {
+		socketResult += ";broker_close=" + closeErr.Error()
+	} else {
+		socketResult += ";broker_close=allowed"
+	}
 	if inetFD, inetErr := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0); inetErr != nil {
 		socketResult += ";inet=" + inetErr.Error()
 	} else {
@@ -84,6 +110,16 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 		_ = unix.Close(inetFD)
 	}
 	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_SOCKET"), []byte(socketResult), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	networkResult := "connected"
+	connection, networkErr := net.DialTimeout("tcp", os.Getenv("GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK"), 250*time.Millisecond)
+	if networkErr != nil {
+		networkResult = networkErr.Error()
+	} else {
+		_ = connection.Close()
+	}
+	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_NETWORK"), []byte(networkResult), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	grandchildPath := os.Getenv("GT_TEST_SESSION_CUSTODY_GRANDCHILD")
@@ -266,13 +302,109 @@ func TestLinuxSessionCustodyRetainsEmptyNamespaceInit(t *testing.T) {
 	}
 }
 
+func TestLaunchLinuxCustodyRequiresHardeningAckBeforeLiveness(t *testing.T) {
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyWriter.Close()
+	permitReader, permitWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permitReader.Close()
+	lifeReader, lifeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lifeReader.Close()
+	launch := &linuxCustodyLaunch{
+		child:  &exec.Cmd{Process: &os.Process{Pid: 424242}},
+		pidfd:  -1,
+		ready:  readyReader,
+		permit: permitWriter,
+		life:   lifeWriter,
+	}
+	permitObserved := make(chan struct{})
+	sendHardeningAck := make(chan struct{})
+	go func() {
+		_ = writeLinuxCustodyProtocolByte(readyWriter, linuxSessionCustodyReadyByte)
+		var permit [1]byte
+		_, _ = io.ReadFull(permitReader, permit[:])
+		close(permitObserved)
+		<-sendHardeningAck
+		_ = writeLinuxCustodyProtocolByte(readyWriter, 'H')
+	}()
+	result := make(chan error, 1)
+	go func() {
+		_, _, launchErr := launchLinuxCustodyCommandValidated(
+			"ignored",
+			func(string, bool) (*linuxCustodyLaunch, error) { return launch, nil },
+			func(string, int, int) (string, uint64, error) { return "identity", 99, nil },
+		)
+		result <- launchErr
+	}()
+	select {
+	case <-permitObserved:
+	case <-time.After(time.Second):
+		t.Fatal("launch did not send validation permit")
+	}
+	lifeResult := make(chan error, 1)
+	go func() {
+		var value [1]byte
+		_, readErr := io.ReadFull(lifeReader, value[:])
+		lifeResult <- readErr
+	}()
+	select {
+	case readErr := <-lifeResult:
+		t.Fatalf("supervisor liveness was exposed before hardening acknowledgment: %v", readErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(sendHardeningAck)
+	select {
+	case readErr := <-lifeResult:
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("supervisor liveness was not exposed after hardening acknowledgment")
+	}
+	select {
+	case launchErr := <-result:
+		if launchErr != nil {
+			t.Fatal(launchErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("launch did not finish after hardening acknowledgment")
+	}
+}
+
+func TestWaitLinuxCustodyProcessBoundsUnreapedChild(t *testing.T) {
+	launch := &linuxCustodyLaunch{wait: make(chan error)}
+	started := time.Now()
+	err := waitLinuxCustodyProcess(launch, 50*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded wait took %v", elapsed)
+	}
+}
+
 func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testing.T) {
 	custody := uuid.NewString()
 	testDir := t.TempDir()
+	hostListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostListener.Close()
 	escapePath := testDir + "/escape"
 	grandchildPath := testDir + "/grandchild"
 	workloadPIDPath := testDir + "/workload-pid"
 	socketPath := testDir + "/socket"
+	hardeningPath := testDir + "/hardening"
+	networkPath := testDir + "/network"
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCustodySupervisorHelper$")
 	cmd.Env = append(os.Environ(),
 		"GT_TEST_SESSION_CUSTODY_HELPER="+custody,
@@ -281,6 +413,9 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		"GT_TEST_SESSION_CUSTODY_GRANDCHILD="+grandchildPath,
 		"GT_TEST_SESSION_CUSTODY_WORKLOAD_PID="+workloadPIDPath,
 		"GT_TEST_SESSION_CUSTODY_SOCKET="+socketPath,
+		"GT_TEST_SESSION_CUSTODY_HARDENING="+hardeningPath,
+		"GT_TEST_SESSION_CUSTODY_NETWORK="+networkPath,
+		"GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK="+hostListener.Addr().String(),
 	)
 	var output strings.Builder
 	cmd.Stdout = &output
@@ -308,7 +443,9 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		grandchild, grandchildErr := os.ReadFile(grandchildPath)
 		workloadPID, workloadPIDErr := os.ReadFile(workloadPIDPath)
 		socketResult, socketErr := os.ReadFile(socketPath)
-		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil {
+		hardeningResult, hardeningErr := os.ReadFile(hardeningPath)
+		networkResult, networkErr := os.ReadFile(networkPath)
+		if escapeErr == nil && grandchildErr == nil && workloadPIDErr == nil && socketErr == nil && hardeningErr == nil && networkErr == nil {
 			if strings.Contains(strings.TrimSpace(string(escape)), "escaped") {
 				t.Fatal("contained workload joined the supervisor PID namespace")
 			}
@@ -321,13 +458,36 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 				t.Fatalf("workload must run below trusted namespace init, got %q", workloadPID)
 			}
 			socketEvidence := strings.ToLower(string(socketResult))
-			for _, field := range []string{"unix=operation not permitted", "socketpair=operation not permitted", "io_uring=operation not permitted"} {
+			for _, field := range []string{
+				"unix=operation not permitted",
+				"socketpair=operation not permitted",
+				"io_uring=operation not permitted",
+				"ptrace=operation not permitted",
+				"process_vm_readv=operation not permitted",
+				"process_vm_writev=operation not permitted",
+				"kcmp=operation not permitted",
+				"pidfd_getfd=operation not permitted",
+				"broker_close=operation not permitted",
+			} {
 				if !strings.Contains(socketEvidence, field) {
 					t.Fatalf("contained workload bypassed socket broker containment: %q", socketResult)
 				}
 			}
+			hardeningEvidence := strings.ToLower(string(hardeningResult))
+			for _, field := range []string{
+				"capeff:\t0000000000000000",
+				"capbnd:\t0000000000000000",
+				"nonewprivs:\t1",
+			} {
+				if !strings.Contains(hardeningEvidence, field) {
+					t.Fatalf("contained workload lacks hardening %q: %q", field, hardeningResult)
+				}
+			}
 			if !strings.Contains(socketEvidence, "inet=allowed") {
 				t.Fatalf("session custody blocked ordinary TCP sockets: %q", socketResult)
+			}
+			if strings.TrimSpace(string(networkResult)) == "connected" {
+				t.Fatal("contained workload reached the supervisor host loopback")
 			}
 			grandchildNamespacePID, parseErr := strconv.Atoi(fields[len(fields)-1])
 			if parseErr != nil {
