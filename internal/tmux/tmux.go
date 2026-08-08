@@ -897,6 +897,22 @@ func (t *Tmux) runGuardedSessionGeneration(generation SessionGeneration, command
 	if err != nil {
 		return err
 	}
+	return t.runGuardedSessionGenerationCondition(generation, condition, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationPane(generation SessionGeneration, panePID int, command string) error {
+	condition, err := sessionGenerationCondition(generation)
+	if err != nil {
+		return err
+	}
+	if panePID <= 0 {
+		return errors.New("invalid tmux pane process generation")
+	}
+	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_pid},%d}}", condition, panePID)
+	return t.runGuardedSessionGenerationCondition(generation, condition, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationCondition(generation SessionGeneration, condition, command string) error {
 	if err := validateServerGeneration(generation); err != nil {
 		return err
 	}
@@ -972,6 +988,7 @@ func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, er
 type SessionGenerationCleanup struct {
 	tmux       *Tmux
 	generation SessionGeneration
+	panePID    int
 	processes  []retainedProcess
 }
 
@@ -990,7 +1007,7 @@ func (t *Tmux) PrepareSessionGenerationProcessCleanup(generation SessionGenerati
 	if err != nil {
 		return nil, fmt.Errorf("retaining pane process tree before tmux mutation: %w", err)
 	}
-	return &SessionGenerationCleanup{tmux: t, generation: generation, processes: processes}, nil
+	return &SessionGenerationCleanup{tmux: t, generation: generation, panePID: panePID, processes: processes}, nil
 }
 
 // Close releases the retained kernel process references without signaling.
@@ -1018,8 +1035,9 @@ func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
 		return err
 	}
 
-	if err := cleanup.tmux.runGuardedSessionGeneration(
+	if err := cleanup.tmux.runGuardedSessionGenerationPane(
 		cleanup.generation,
+		cleanup.panePID,
 		"set-option -t "+cleanup.generation.SessionID+" remain-on-exit off ; set-hook -t "+cleanup.generation.SessionID+" -u pane-died",
 	); err != nil {
 		return fmt.Errorf("disarming exact tmux session generation: %w", err)

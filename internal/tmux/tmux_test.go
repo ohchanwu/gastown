@@ -941,6 +941,46 @@ func TestKillSessionGenerationRejectsServerIdentityMismatch(t *testing.T) {
 	}
 }
 
+func TestSessionGenerationCleanupRejectsReplacementPane(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-pane-%d", time.Now().UnixNano()))
+	session := "gt-generation-pane"
+	defer func() { _ = tm.KillServer() }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	panePID, exists, err := tm.getPanePIDGeneration(generation)
+	if err != nil || !exists {
+		t.Fatalf("getPanePIDGeneration() pid=%d exists=%v err=%v", panePID, exists, err)
+	}
+	oldProcess := &mockRetainedProcess{pid: panePID, parent: 1, generation: "old-pane", alive: true}
+	cleanup := &SessionGenerationCleanup{
+		tmux:       tm,
+		generation: generation,
+		panePID:    panePID + 1,
+		processes:  []retainedProcess{oldProcess},
+	}
+
+	err = cleanup.Run(context.Background())
+	if !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("Run() error = %v, want pane generation change", err)
+	}
+	if len(oldProcess.signals) != 0 {
+		t.Fatalf("old process was signaled after pane replacement: %v", oldProcess.signals)
+	}
+	has, err := tm.HasSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("session was killed after pane generation mismatch")
+	}
+}
+
 type mockRetainedProcess struct {
 	pid                 int
 	parent              int
