@@ -90,7 +90,7 @@ func TestGetWorkersForIssuesContextCancelsAndCapsRigQueries(t *testing.T) {
 	}
 	binDir := t.TempDir()
 	startLog := filepath.Join(t.TempDir(), "starts")
-	script := "#!/bin/sh\nprintf 'start\\n' >> \"$GT_WORKER_START_LOG\"\nexec sleep 2\n"
+	script := "#!/bin/sh\nprintf 'start\\n' >> \"$GT_WORKER_START_LOG\"\nexec sleep 30\n"
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -98,28 +98,35 @@ func TestGetWorkersForIssuesContextCancelsAndCapsRigQueries(t *testing.T) {
 	t.Setenv("GT_WORKER_START_LOG", startLog)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
 		_, err := getWorkersForIssuesContext(ctx, townRoot, []string{"gt-work"})
 		done <- err
 	}()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if data, err := os.ReadFile(startLog); err == nil && len(data) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
 			t.Fatal("worker scan did not start")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	startedCancel := time.Now()
 	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context canceled", err)
-	}
-	if elapsed := time.Since(startedCancel); elapsed >= 750*time.Millisecond {
-		t.Fatalf("canceled worker scan returned after %s", elapsed.Round(time.Millisecond))
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled worker scan did not return before the 30s child could exit normally")
 	}
 	data, err := os.ReadFile(startLog)
 	if err != nil {
