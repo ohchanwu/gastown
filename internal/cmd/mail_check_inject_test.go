@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/steveyegge/gastown/internal/delivery"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestRunMailCheckReceiptUsesManagedHookIdentityOutsideWorkspace(t *testing.T) {
@@ -59,6 +63,51 @@ func TestRecordCodexSubmissionReceiptFromHookInput(t *testing.T) {
 	receipt, ok, err := delivery.FindSubmittedAfter(townRoot, session, deliveryID, baseline)
 	if err != nil || !ok || !receipt.Submitted || receipt.Runtime != "codex" {
 		t.Fatalf("FindSubmittedAfter = %#v, %v, %v", receipt, ok, err)
+	}
+}
+
+func TestInjectQueuedNudgePreservesDurableQueueWhileDeliveryLeaseContended(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "gt-test-mail-check-lease"
+	const deliveryID = "ndg-mail-check-lease-contender"
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+		DeliveryID:      deliveryID,
+		Sender:          "witness",
+		Message:         "mail-check contender must not claim me",
+		Priority:        nudge.PriorityUrgent,
+		DurableUntilAck: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := tmux.NewTmuxWithSocket("gt-mail-check-lease-owner")
+	releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseOwner()
+
+	var output, errorOutput bytes.Buffer
+	injectQueuedNudgeForMailCheck(context.Background(), townRoot, session, &output, &errorOutput)
+	if output.Len() != 0 {
+		t.Fatalf("contended mail-check injected unowned output: %q", output.String())
+	}
+	queued, err := nudge.ListQueued(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 || queued[0].DeliveryID != deliveryID || queued[0].Attempts != 0 {
+		t.Fatalf("queue after contention = %#v, want untouched %s", queued, deliveryID)
+	}
+	if !strings.Contains(errorOutput.String(), "nudge delivery lease error") {
+		t.Fatalf("contention diagnostic = %q", errorOutput.String())
+	}
+
+	releaseOwner()
+	output.Reset()
+	errorOutput.Reset()
+	injectQueuedNudgeForMailCheck(context.Background(), townRoot, session, &output, &errorOutput)
+	if !strings.Contains(output.String(), "mail-check contender must not claim me") {
+		t.Fatalf("delivery after lease release missing queued message: %q", output.String())
 	}
 }
 

@@ -145,6 +145,7 @@ esac
 	mgr.capturePaneGeneration = func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error) {
 		return tmux.PaneProcessGeneration{PID: os.Getpid(), Identity: "fixture-pane-generation"}, nil
 	}
+	mgr.zombieKillGrace = 0
 	mgr.prepareSessionCleanup = func(
 		generation tmux.SessionGeneration,
 		pane tmux.PaneProcessGeneration,
@@ -188,6 +189,11 @@ func assertFakePollerPreserved(t *testing.T, pollerPath, logPath string) {
 	if err != nil || string(data) != "invalid ownership" {
 		t.Fatalf("poller custody changed: data=%q err=%v", data, err)
 	}
+	assertNoFakeSessionKill(t, logPath)
+}
+
+func assertNoFakeSessionKill(t *testing.T, logPath string) {
+	t.Helper()
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
@@ -268,6 +274,9 @@ case "$*" in
 esac
 exit 2
 `)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
@@ -278,11 +287,11 @@ exit 2
 	if err == nil || !strings.Contains(err.Error(), "rechecking witness liveness") {
 		t.Fatalf("Start() error = %v, want second checked liveness failure", err)
 	}
-	assertFakePollerPreserved(t, pollerPath, logPath)
+	assertNoFakeSessionKill(t, logPath)
 }
 
-func TestManagerStartCarriesPaneGenerationCapturedBeforeLivenessDecision(t *testing.T) {
-	mgr, _, _ := newFakeTmuxManager(t, `
+func TestManagerStartRejectsPaneGenerationChangedAfterLivenessDecision(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
 case "$*" in
   *"has-session"*) exit 0 ;;
   *"show-environment"*"GT_PROCESS_NAMES"*)
@@ -297,6 +306,9 @@ case "$*" in
 esac
 exit 2
 `)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
 	statePath := filepath.Join(t.TempDir(), "pane-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
@@ -312,22 +324,21 @@ exit 2
 		}
 		return tmux.PaneProcessGeneration{PID: 123, Identity: "replacement-pane"}, nil
 	}
-	prepareErr := errors.New("stop after pane token assertion")
-	var preparedPane tmux.PaneProcessGeneration
+	prepared := false
 	mgr.prepareSessionCleanup = func(
 		_ tmux.SessionGeneration,
 		pane tmux.PaneProcessGeneration,
 	) (sessionGenerationCleanup, error) {
-		preparedPane = pane
-		return nil, prepareErr
+		prepared = true
+		return nil, errors.New("cleanup must not prepare after pane replacement")
 	}
 
 	err := mgr.Start(false, "", nil)
-	if !errors.Is(err, prepareErr) {
-		t.Fatalf("Start() error = %v, want prepare sentinel", err)
+	if !errors.Is(err, tmux.ErrSessionGenerationChanged) {
+		t.Fatalf("Start() error = %v, want exact pane-generation refusal", err)
 	}
-	if preparedPane.Identity != "pre-liveness-pane" {
-		t.Fatalf("prepared pane = %+v, want token captured before liveness changed state", preparedPane)
+	if prepared {
+		t.Fatal("cleanup prepared after pane generation changed")
 	}
 }
 
@@ -352,6 +363,9 @@ case "$*" in
 esac
 exit 2
 `)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("FAKE_GENERATION_MODE", "second-fail")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
@@ -363,7 +377,7 @@ exit 2
 	if err == nil || !strings.Contains(err.Error(), "rechecking witness session identity") {
 		t.Fatalf("Start() error = %v, want second checked identity failure", err)
 	}
-	assertFakePollerPreserved(t, pollerPath, logPath)
+	assertNoFakeSessionKill(t, logPath)
 }
 
 func TestManagerStartPreservesZombieWhenSecondIdentityIsInvalid(t *testing.T) {
@@ -385,6 +399,9 @@ case "$*" in
 esac
 exit 2
 `)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("FAKE_GENERATION_MODE", "second-malformed")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
@@ -396,7 +413,7 @@ exit 2
 	if err == nil || !strings.Contains(err.Error(), "rechecking witness session identity") {
 		t.Fatalf("Start() error = %v, want invalid second session identity", err)
 	}
-	assertFakePollerPreserved(t, pollerPath, logPath)
+	assertNoFakeSessionKill(t, logPath)
 }
 
 func TestManagerStartPreservesZombieWhenSecondIdentityIsMalformed(t *testing.T) {
@@ -420,6 +437,9 @@ case "$*" in
 esac
 exit 2
 `)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("FAKE_GENERATION_MODE", "second-malformed")
 	statePath := filepath.Join(t.TempDir(), "tmux-state")
 	if err := os.WriteFile(statePath, []byte("0"), 0o600); err != nil {
@@ -431,7 +451,7 @@ exit 2
 	if err == nil || !strings.Contains(err.Error(), "rechecking witness session identity") {
 		t.Fatalf("Start() error = %v, want malformed second session identity", err)
 	}
-	assertFakePollerPreserved(t, pollerPath, logPath)
+	assertNoFakeSessionKill(t, logPath)
 }
 
 func TestManagerStartPreservesSameSecondReplacement(t *testing.T) {
@@ -473,8 +493,8 @@ exit 0
 	t.Setenv("FAKE_SESSION_NAME", mgr.SessionName())
 
 	err := mgr.Start(false, "", nil)
-	if !errors.Is(err, ErrAlreadyRunning) {
-		t.Fatalf("Start() error = %v, want replacement preserved", err)
+	if !errors.Is(err, tmux.ErrSessionGenerationChanged) {
+		t.Fatalf("Start() error = %v, want exact-generation refusal", err)
 	}
 	logData, readErr := os.ReadFile(logPath)
 	if readErr != nil {
@@ -814,9 +834,22 @@ exit 2
 	if !errors.Is(leaseErr, context.DeadlineExceeded) {
 		t.Fatalf("competing delivery lease error = %v, want deadline while containment thaws", leaseErr)
 	}
+	pollerCaptureDone := make(chan error, 1)
+	go func() {
+		_, err := nudge.CapturePollerGeneration(townRoot, mgr.SessionName())
+		pollerCaptureDone <- err
+	}()
+	select {
+	case err := <-pollerCaptureDone:
+		t.Fatalf("poller lifecycle lock released before cleanup Close: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
 	close(releaseClose)
 	if err := <-result; !errors.Is(err, precommitErr) {
 		t.Fatalf("Start() error = %v, want pre-commit failure", err)
+	}
+	if err := <-pollerCaptureDone; err != nil {
+		t.Fatalf("capturing poller after cleanup Close: %v", err)
 	}
 }
 
@@ -864,7 +897,7 @@ exit 2
 	}
 }
 
-func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testing.T) {
+func TestManagerStopAbsentSessionPreservesInvalidPollerOwnership(t *testing.T) {
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
@@ -879,10 +912,90 @@ func TestManagerStopSessionPreservesSessionWhenPollerOwnershipIsInvalid(t *testi
 		t.Fatal(err)
 	}
 
-	replaced := false
-	err := mgr.stopSession(townRoot, mgr.SessionName(), func() error { replaced = true; return nil })
-	if err == nil || replaced {
-		t.Fatalf("stopSession err=%v replaced=%v, want ownership error without replacement", err, replaced)
+	generation, err := nudge.CapturePollerGeneration(townRoot, mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = mgr.stopPollerForAbsentSession(townRoot, mgr.SessionName(), generation)
+	if err == nil {
+		t.Fatal("stopPollerForAbsentSession() succeeded with invalid poller ownership")
+	}
+}
+
+func TestManagerStopUsesExactTransactionForLiveSession(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=other"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
+		t.Fatalf("Stop skipped exact generation cleanup:\n%s", logData)
+	}
+}
+
+func TestManagerFailedStartupRollbackUsesExactTransaction(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=other"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := mgr.tmux.CaptureSessionGeneration(mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	paneGeneration, err := mgr.capturePaneGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollerGeneration, err := nudge.CapturePollerGeneration(filepath.Dir(mgr.rig.Path), mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startupErr := errors.New("agent startup failed")
+	err = mgr.rollbackFailedStart(
+		filepath.Dir(mgr.rig.Path),
+		mgr.SessionName(),
+		generation,
+		paneGeneration,
+		pollerGeneration,
+		startupErr,
+		nil,
+	)
+	if !errors.Is(err, startupErr) {
+		t.Fatalf("rollbackFailedStart() error = %v, want startup cause", err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
+		t.Fatalf("startup rollback skipped exact generation cleanup:\n%s", logData)
 	}
 }
 

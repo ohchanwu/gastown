@@ -6,257 +6,330 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 const (
-	linuxCgroupRoot          = "/sys/fs/cgroup"
 	linuxProcRoot            = "/proc"
-	sessionCustodyPrefix     = ".gastown-session-"
 	sessionCustodyReadyProbe = 300 * time.Millisecond
 )
 
 type linuxSessionCustody struct {
-	dir       *os.File
-	parent    *os.File
-	name      string
-	frozen    bool
-	committed bool
+	supervisorPID      int
+	supervisorIdentity string
+	supervisorFD       int
+	initPID            int
+	initIdentity       string
+	initNamespace      uint64
+	initFD             int
+	prepared           bool
+	committed          bool
 }
 
 func sessionCustodyLaunchSupported() bool { return true }
 
-func linuxUnifiedCgroupPath(procRoot string, pid int) (string, error) {
-	data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			path := strings.TrimPrefix(line, "0::")
-			if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-				return "", errors.New("invalid unified cgroup path")
-			}
-			return path, nil
+func withoutEnvironmentKey(env []string, key string) []string {
+	prefix := key + "="
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			filtered = append(filtered, entry)
 		}
 	}
-	return "", errors.New("process is not in a cgroup v2 hierarchy")
+	return filtered
 }
 
-func linuxCgroupFilesystemPath(relative string) (string, error) {
-	clean := filepath.Clean(relative)
-	if !filepath.IsAbs(clean) || clean == "/" && relative != "/" {
-		return "", errors.New("invalid cgroup path")
-	}
-	path := filepath.Join(linuxCgroupRoot, strings.TrimPrefix(clean, "/"))
-	rootWithSeparator := linuxCgroupRoot + string(os.PathSeparator)
-	if path != linuxCgroupRoot && !strings.HasPrefix(path, rootWithSeparator) {
-		return "", errors.New("cgroup path escapes unified hierarchy")
-	}
-	return path, nil
-}
-
-func expectedSessionCustodyCgroup(custody string) string {
-	return sessionCustodyPrefix + custody
-}
-
-func activateLinuxSessionCustody(custody string) error {
-	current, err := linuxUnifiedCgroupPath(linuxProcRoot, os.Getpid())
-	if err != nil {
-		return err
-	}
-	parentPath, err := linuxCgroupFilesystemPath(current)
-	if err != nil {
-		return err
-	}
-	childPath := filepath.Join(parentPath, expectedSessionCustodyCgroup(custody))
-	if err := os.Mkdir(childPath, 0o700); err != nil {
-		return fmt.Errorf("creating delegated session cgroup: %w", err)
-	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(childPath)
-		}
-	}()
-	for _, control := range []string{"cgroup.freeze", "cgroup.kill", "cgroup.events", "cgroup.procs"} {
-		if _, err := os.Stat(filepath.Join(childPath, control)); err != nil {
-			return fmt.Errorf("session cgroup lacks %s: %w", control, err)
-		}
-	}
-	pid := []byte(strconv.Itoa(os.Getpid()))
-	if err := os.WriteFile(filepath.Join(childPath, "cgroup.procs"), pid, 0o600); err != nil {
-		return fmt.Errorf("entering session cgroup: %w", err)
-	}
-	confirmed, err := linuxUnifiedCgroupPath(linuxProcRoot, os.Getpid())
-	if err != nil || filepath.Base(confirmed) != expectedSessionCustodyCgroup(custody) {
-		_ = os.WriteFile(filepath.Join(parentPath, "cgroup.procs"), pid, 0o600)
-		if err != nil {
-			return fmt.Errorf("confirming session cgroup: %w", err)
-		}
-		return errors.New("session process did not enter the generation-bound cgroup")
-	}
-	cleanup = false
-	return nil
-}
-
-func runSessionWithCustody(custody, command string) error {
-	if err := activateLinuxSessionCustody(custody); err != nil {
-		// Availability varies by cgroup delegation. Preserve ordinary startup,
-		// but leave the pane provably uncontained so later destructive cleanup
-		// fails closed.
-		fmt.Fprintf(os.Stderr, "gt session-custody: containment unavailable: %v\n", err)
-	}
+func newLinuxCustodyCommand(command string, namespaced bool) (*exec.Cmd, *int) {
 	child := exec.Command("/bin/sh", "-lc", command)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
+	child.Env = withoutEnvironmentKey(os.Environ(), EnvSessionCustody)
+	pidfd := -1
+	attrs := &syscall.SysProcAttr{
+		Pdeathsig: unix.SIGKILL,
+		PidFD:     &pidfd,
+	}
+	if namespaced {
+		attrs.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWPID
+		attrs.UidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}}
+		attrs.GidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}}
+		attrs.GidMappingsEnableSetgroups = false
+	}
+	child.SysProcAttr = attrs
+	return child, &pidfd
+}
+
+func startLinuxCustodyCommand(command string, namespaced bool) (*exec.Cmd, int, error) {
+	child, pidfd := newLinuxCustodyCommand(command, namespaced)
 	if err := child.Start(); err != nil {
+		return nil, -1, err
+	}
+	if *pidfd < 0 {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		return nil, -1, errors.New("kernel did not return a pidfd for session custody")
+	}
+	return child, *pidfd, nil
+}
+
+type linuxCustodyStarter func(string, bool) (*exec.Cmd, int, error)
+
+func launchLinuxCustodyCommand(command string, start linuxCustodyStarter) (*exec.Cmd, int, bool, error) {
+	child, pidfd, err := start(command, true)
+	if err == nil {
+		_, _, err = validateLinuxNamespaceInit(linuxProcRoot, os.Getpid(), child.Process.Pid)
+	}
+	if err != nil {
+		if child != nil {
+			if pidfd >= 0 {
+				_ = unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+			} else {
+				_ = child.Process.Kill()
+			}
+			_ = child.Wait()
+			if pidfd >= 0 {
+				_ = unix.Close(pidfd)
+			}
+		}
+		// User namespaces may be disabled by the host. Preserve ordinary
+		// startup, but leave a directly observable non-namespace child so later
+		// destructive cleanup fails closed.
+		fmt.Fprintf(os.Stderr, "gt session-custody: PID namespace unavailable: %v\n", err)
+		child, pidfd, err = start(command, false)
+		if err != nil {
+			return nil, -1, false, err
+		}
+		return child, pidfd, false, nil
+	}
+	return child, pidfd, true, nil
+}
+
+func runSessionWithCustody(_ string, command string) error {
+	child, pidfd, _, err := launchLinuxCustodyCommand(command, startLinuxCustodyCommand)
+	if err != nil {
 		return err
 	}
-	done := make(chan error, 1)
-	go func() { done <- child.Wait() }()
+	// Retain both the direct-child relationship and the pidfd until exact
+	// teardown. Never reap the namespace init here: if the workload exits, its
+	// zombie remains a generation-stable proof that the namespace and all of its
+	// descendants have terminated.
+	_ = child
+	_ = pidfd
 	timer := time.NewTimer(sessionCustodyReadyProbe)
 	defer timer.Stop()
-	select {
-	case err := <-done:
-		return err
-	case <-timer.C:
-	}
-	// After startup is proven, keep the pane root alive if the agent exits.
-	// Witness can then revalidate the exact pane and cgroup generations before
-	// replacing a zombie. Normal TERM/KILL signals still terminate this process.
-	if err := <-done; err != nil {
-		fmt.Fprintf(os.Stderr, "gt session-custody: supervised command exited: %v\n", err)
-	}
+	<-timer.C
 	for {
 		time.Sleep(time.Hour)
 	}
 }
 
-func openCgroupControl(dir *os.File, name string, flags int) (*os.File, error) {
-	fd, err := unix.Openat(int(dir.Fd()), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+func linuxDirectChildren(procRoot string, pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("%s/%d/task/%d/children", procRoot, pid, pid))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errProcessNotFound
+		}
 		return nil, err
 	}
-	return os.NewFile(uintptr(fd), name), nil
-}
-
-func readCgroupControl(dir *os.File, name string) (string, error) {
-	file, err := openCgroupControl(dir, name, unix.O_RDONLY)
-	if err != nil {
-		return "", err
-	}
-	data, readErr := io.ReadAll(file)
-	return string(data), errors.Join(readErr, file.Close())
-}
-
-func writeCgroupControl(dir *os.File, name, value string) error {
-	file, err := openCgroupControl(dir, name, unix.O_WRONLY)
-	if err != nil {
-		return err
-	}
-	_, writeErr := io.WriteString(file, value)
-	return errors.Join(writeErr, file.Close())
-}
-
-func cgroupEventValue(events, key string) (string, bool) {
-	for _, line := range strings.Split(events, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[0] == key {
-			return fields[1], true
+	fields := strings.Fields(string(data))
+	children := make([]int, 0, len(fields))
+	for _, field := range fields {
+		child, err := strconv.Atoi(field)
+		if err != nil || child <= 0 {
+			return nil, fmt.Errorf("invalid direct child PID %q", field)
 		}
+		children = append(children, child)
 	}
-	return "", false
+	return children, nil
 }
 
-func cgroupContainsPID(dir *os.File, pid int) (bool, error) {
-	data, err := readCgroupControl(dir, "cgroup.procs")
+func linuxNamespacePIDs(procRoot string, pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("%s/%d/status", procRoot, pid))
 	if err != nil {
-		return false, err
-	}
-	want := strconv.Itoa(pid)
-	for _, line := range strings.Fields(data) {
-		if line == want {
-			return true, nil
+		if os.IsNotExist(err) {
+			return nil, errProcessNotFound
 		}
+		return nil, err
 	}
-	return false, nil
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "NSpid:") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, "NSpid:"))
+		pids := make([]int, 0, len(fields))
+		for _, field := range fields {
+			value, err := strconv.Atoi(field)
+			if err != nil || value <= 0 {
+				return nil, fmt.Errorf("invalid namespace PID %q", field)
+			}
+			pids = append(pids, value)
+		}
+		if len(pids) == 0 {
+			return nil, errors.New("process status has an empty NSpid field")
+		}
+		return pids, nil
+	}
+	return nil, errors.New("process status has no NSpid field")
+}
+
+func linuxPIDNamespaceInode(procRoot string, pid int) (uint64, error) {
+	info, err := os.Stat(fmt.Sprintf("%s/%d/ns/pid", procRoot, pid))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, errProcessNotFound
+		}
+		return 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Ino == 0 {
+		return 0, errors.New("PID namespace has no inode identity")
+	}
+	return stat.Ino, nil
+}
+
+func validateLinuxNamespaceInit(procRoot string, supervisorPID, initPID int) (string, uint64, error) {
+	stat, err := readLinuxProcessStatAt(procRoot, initPID)
+	if err != nil {
+		return "", 0, err
+	}
+	if stat.parentPID != supervisorPID {
+		return "", 0, errors.New("session namespace init is not the pane supervisor's direct child")
+	}
+	nspids, err := linuxNamespacePIDs(procRoot, initPID)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(nspids) < 2 || nspids[len(nspids)-1] != 1 {
+		return "", 0, ErrSessionCustodyUnsupported
+	}
+	namespace, err := linuxPIDNamespaceInode(procRoot, initPID)
+	if err != nil {
+		return "", 0, err
+	}
+	return stat.startTime, namespace, nil
+}
+
+func readLinuxProcessStatAt(procRoot string, pid int) (linuxProcessStat, error) {
+	data, err := os.ReadFile(fmt.Sprintf("%s/%d/stat", procRoot, pid))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return linuxProcessStat{}, errProcessNotFound
+		}
+		return linuxProcessStat{}, err
+	}
+	return parseLinuxProcessStat(data)
 }
 
 func retainSessionCustody(custody string, panePID int) (sessionCustodyHandle, error) {
 	if !validSessionGenerationRe.MatchString(custody) {
 		return nil, ErrSessionCustodyUnsupported
 	}
-	relative, err := linuxUnifiedCgroupPath(linuxProcRoot, panePID)
-	if err != nil || filepath.Base(relative) != expectedSessionCustodyCgroup(custody) {
+	supervisorStat, err := readLinuxProcessStat(panePID)
+	if err != nil || linuxProcessStateTerminal(supervisorStat.state) {
 		return nil, errors.Join(ErrSessionCustodyUnsupported, err)
 	}
-	path, err := linuxCgroupFilesystemPath(relative)
+	supervisorFD, err := unix.PidfdOpen(panePID, 0)
 	if err != nil {
 		return nil, errors.Join(ErrSessionCustodyUnsupported, err)
 	}
-	parentPath := filepath.Dir(path)
-	name := filepath.Base(path)
-	parentFD, err := unix.Open(parentPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, errors.Join(ErrSessionCustodyUnsupported, err)
-	}
-	parent := os.NewFile(uintptr(parentFD), parentPath)
-	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, errors.Join(ErrSessionCustodyUnsupported, err, parent.Close())
-	}
-	dir := os.NewFile(uintptr(fd), path)
-	reject := func(err error) (sessionCustodyHandle, error) {
-		return nil, errors.Join(ErrSessionCustodyUnsupported, err, dir.Close(), parent.Close())
-	}
-	var stat unix.Statfs_t
-	if err := unix.Fstatfs(fd, &stat); err != nil || stat.Type != unix.CGROUP2_SUPER_MAGIC {
-		return reject(errors.Join(errors.New("session custody is not a cgroup v2 directory"), err))
-	}
-	confirmed, err := linuxUnifiedCgroupPath(linuxProcRoot, panePID)
-	if err != nil || confirmed != relative {
-		return reject(errors.Join(errors.New("pane cgroup changed during custody acquisition"), err))
-	}
-	contains, err := cgroupContainsPID(dir, panePID)
-	if err != nil || !contains {
-		return reject(errors.Join(errors.New("session cgroup does not contain the captured pane process"), err))
-	}
-	for control, flags := range map[string]int{
-		"cgroup.freeze": unix.O_WRONLY,
-		"cgroup.kill":   unix.O_WRONLY,
-		"cgroup.events": unix.O_RDONLY,
-	} {
-		file, err := openCgroupControl(dir, control, flags)
-		if err != nil {
-			return reject(fmt.Errorf("opening %s: %w", control, err))
+	reject := func(primary error, initFD int) (sessionCustodyHandle, error) {
+		var initCloseErr error
+		if initFD >= 0 {
+			initCloseErr = unix.Close(initFD)
 		}
-		if err := file.Close(); err != nil {
-			return reject(fmt.Errorf("closing %s: %w", control, err))
-		}
+		return nil, errors.Join(ErrSessionCustodyUnsupported, primary, initCloseErr, unix.Close(supervisorFD))
 	}
-	return &linuxSessionCustody{dir: dir, parent: parent, name: name}, nil
+	children, err := linuxDirectChildren(linuxProcRoot, panePID)
+	if err != nil || len(children) != 1 {
+		if err == nil {
+			err = fmt.Errorf("pane supervisor has %d direct children, want one namespace init", len(children))
+		}
+		return reject(err, -1)
+	}
+	initPID := children[0]
+	initIdentity, namespace, err := validateLinuxNamespaceInit(linuxProcRoot, panePID, initPID)
+	if err != nil {
+		return reject(err, -1)
+	}
+	initFD, err := unix.PidfdOpen(initPID, 0)
+	if err != nil {
+		return reject(err, -1)
+	}
+	confirmedSupervisor, err := readLinuxProcessStat(panePID)
+	if err != nil || confirmedSupervisor.startTime != supervisorStat.startTime || linuxProcessStateTerminal(confirmedSupervisor.state) {
+		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
+	}
+	confirmedIdentity, confirmedNamespace, err := validateLinuxNamespaceInit(linuxProcRoot, panePID, initPID)
+	if err != nil || confirmedIdentity != initIdentity || confirmedNamespace != namespace {
+		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
+	}
+	return &linuxSessionCustody{
+		supervisorPID:      panePID,
+		supervisorIdentity: supervisorStat.startTime,
+		supervisorFD:       supervisorFD,
+		initPID:            initPID,
+		initIdentity:       initIdentity,
+		initNamespace:      namespace,
+		initFD:             initFD,
+	}, nil
 }
 
-func (custody *linuxSessionCustody) waitEvent(ctx context.Context, key, want string) error {
+func (custody *linuxSessionCustody) revalidate() (linuxProcessStat, error) {
+	if custody == nil || custody.supervisorFD < 0 || custody.initFD < 0 {
+		return linuxProcessStat{}, ErrSessionCustodyUnsupported
+	}
+	supervisor, err := readLinuxProcessStat(custody.supervisorPID)
+	if err != nil || supervisor.startTime != custody.supervisorIdentity || linuxProcessStateTerminal(supervisor.state) {
+		return linuxProcessStat{}, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	identity, namespace, err := validateLinuxNamespaceInit(linuxProcRoot, custody.supervisorPID, custody.initPID)
+	if err != nil || identity != custody.initIdentity || namespace != custody.initNamespace {
+		return linuxProcessStat{}, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	return readLinuxProcessStat(custody.initPID)
+}
+
+func (custody *linuxSessionCustody) Freeze(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := custody.revalidate(); err != nil {
+		return err
+	}
+	// PID namespace membership is inherited at clone time and cannot migrate
+	// outward. No stop-the-world mutation is needed before the final checks.
+	custody.prepared = true
+	return nil
+}
+
+func (custody *linuxSessionCustody) Thaw() error {
+	if custody != nil && !custody.committed {
+		custody.prepared = false
+	}
+	return nil
+}
+
+func waitLinuxProcessTerminal(ctx context.Context, pid int, identity string) error {
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
+		stat, err := readLinuxProcessStat(pid)
+		if errors.Is(err, errProcessNotFound) {
+			return nil
 		}
-		events, err := readCgroupControl(custody.dir, "cgroup.events")
 		if err != nil {
 			return err
 		}
-		if got, ok := cgroupEventValue(events, key); ok && got == want {
+		if stat.startTime != identity {
+			return ErrSessionGenerationChanged
+		}
+		if linuxProcessStateTerminal(stat.state) {
 			return nil
 		}
 		if err := waitForContext(ctx, processExitPollInterval); err != nil {
@@ -265,70 +338,50 @@ func (custody *linuxSessionCustody) waitEvent(ctx context.Context, key, want str
 	}
 }
 
-func (custody *linuxSessionCustody) Freeze(ctx context.Context) error {
-	if custody == nil || custody.dir == nil {
-		return ErrSessionCustodyUnsupported
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := writeCgroupControl(custody.dir, "cgroup.freeze", "1"); err != nil {
-		return err
-	}
-	custody.frozen = true
-	if err := custody.waitEvent(ctx, "frozen", "1"); err != nil {
-		return errors.Join(err, custody.Thaw())
-	}
-	return nil
-}
-
-func (custody *linuxSessionCustody) Thaw() error {
-	if custody == nil || custody.dir == nil || !custody.frozen || custody.committed {
-		return nil
-	}
-	if err := writeCgroupControl(custody.dir, "cgroup.freeze", "0"); err != nil {
-		return err
-	}
-	custody.frozen = false
-	return nil
-}
-
 func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
-	if custody == nil || custody.dir == nil || !custody.frozen {
-		return false, errors.New("session custody is not frozen")
+	if custody == nil || !custody.prepared {
+		return false, errors.New("session PID namespace custody is not prepared")
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if err := writeCgroupControl(custody.dir, "cgroup.kill", "1"); err != nil {
+	initStat, err := custody.revalidate()
+	if err != nil {
+		return false, err
+	}
+	targetFD := custody.initFD
+	targetPID := custody.initPID
+	targetIdentity := custody.initIdentity
+	if linuxProcessStateTerminal(initStat.state) {
+		// The namespace init already exited, which proves all processes in that
+		// namespace are terminal. Killing the exact pane supervisor is now the
+		// first destructive operation and preserves truthful commit accounting.
+		targetFD = custody.supervisorFD
+		targetPID = custody.supervisorPID
+		targetIdentity = custody.supervisorIdentity
+	}
+	if err := unix.PidfdSendSignal(targetFD, unix.SIGKILL, nil, 0); err != nil {
 		return false, err
 	}
 	custody.committed = true
-	if err := custody.waitEvent(ctx, "populated", "0"); err != nil {
+	if err := waitLinuxProcessTerminal(ctx, targetPID, targetIdentity); err != nil {
 		return true, err
 	}
-	custody.frozen = false
 	return true, nil
 }
 
 func (custody *linuxSessionCustody) Close() error {
-	if custody == nil || custody.dir == nil {
+	if custody == nil {
 		return nil
 	}
-	thawErr := custody.Thaw()
-	closeErr := custody.dir.Close()
-	custody.dir = nil
-	var removeErr error
-	if custody.committed && custody.parent != nil {
-		removeErr = unix.Unlinkat(int(custody.parent.Fd()), custody.name, unix.AT_REMOVEDIR)
-		if errors.Is(removeErr, unix.ENOENT) {
-			removeErr = nil
-		}
+	var errs []error
+	if custody.initFD >= 0 {
+		errs = append(errs, unix.Close(custody.initFD))
+		custody.initFD = -1
 	}
-	var parentCloseErr error
-	if custody.parent != nil {
-		parentCloseErr = custody.parent.Close()
-		custody.parent = nil
+	if custody.supervisorFD >= 0 {
+		errs = append(errs, unix.Close(custody.supervisorFD))
+		custody.supervisorFD = -1
 	}
-	return errors.Join(thawErr, closeErr, removeErr, parentCloseErr)
+	return errors.Join(errs...)
 }

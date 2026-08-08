@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestNewPropeller(t *testing.T) {
@@ -95,6 +96,65 @@ func TestPropeller_DeliverNudges_RequeuesWhenSessionUnavailable(t *testing.T) {
 		t.Fatalf("expected requeued nudge to remain pending, got %d", pending)
 	}
 
+}
+
+func TestPropellerDeliverNudgesPreservesQueueWhileDeliveryLeaseContended(t *testing.T) {
+	townRoot := t.TempDir()
+	const session = "hq-mayor"
+	const deliveryID = "ndg-acp-lease-contender"
+	if err := nudge.Enqueue(townRoot, session, nudge.QueuedNudge{
+		DeliveryID:      deliveryID,
+		Sender:          "witness",
+		Message:         "lease contender must not claim me",
+		Priority:        nudge.PriorityUrgent,
+		DurableUntilAck: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := tmux.NewTmuxWithSocket("gt-acp-lease-owner")
+	releaseOwner, err := owner.AcquireNudgeLease(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseOwner()
+
+	proxy := NewProxy()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	proxy.setStreams(nil, w)
+	proxy.sessionMux.Lock()
+	proxy.sessionID = "attached-session"
+	proxy.sessionMux.Unlock()
+	prop := NewPropeller(proxy, townRoot, session)
+	leaseCtx, cancelLease := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	prop.ctx = leaseCtx
+	prop.deliverNudges()
+	cancelLease()
+
+	queued, err := nudge.ListQueued(townRoot, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 || queued[0].DeliveryID != deliveryID || queued[0].Attempts != 0 {
+		t.Fatalf("queue after contention = %#v, want untouched %s", queued, deliveryID)
+	}
+
+	releaseOwner()
+	prop.ctx = context.Background()
+	prop.deliverNudges()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if _, err := output.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output.Bytes(), []byte("lease contender must not claim me")) {
+		t.Fatalf("delivery after lease release missing queued message: %s", output.String())
+	}
 }
 
 func TestPropeller_NotifyReturnsErrorWithoutSessionID(t *testing.T) {

@@ -40,6 +40,7 @@ type Manager struct {
 	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
 	wrapSessionCommand    func(string) (string, string, error)
 	cleanupTimeout        time.Duration
+	zombieKillGrace       time.Duration
 }
 
 type sessionGenerationCleanup interface {
@@ -59,6 +60,7 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 		tmux:                  t,
 		capturePaneGeneration: t.CapturePaneProcessGeneration,
 		cleanupTimeout:        witnessCleanupTimeout,
+		zombieKillGrace:       constants.ZombieKillGracePeriod,
 		prepareSessionCleanup: func(
 			generation tmux.SessionGeneration,
 			paneGeneration tmux.PaneProcessGeneration,
@@ -75,15 +77,16 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	}
 }
 
-func (m *Manager) revalidateZombieGenerationUnderLease(
+func (m *Manager) revalidateSessionGenerationUnderLease(
 	generation tmux.SessionGeneration,
 	paneGeneration tmux.PaneProcessGeneration,
+	requireDead bool,
 ) error {
 	alive, err := m.tmux.IsAgentAliveChecked(generation.SessionID)
 	if err != nil {
 		return fmt.Errorf("rechecking witness liveness under delivery lease: %w", err)
 	}
-	if alive {
+	if requireDead && alive {
 		return ErrAlreadyRunning
 	}
 	currentGeneration, err := m.tmux.CaptureSessionGeneration(generation.Name)
@@ -101,6 +104,106 @@ func (m *Manager) revalidateZombieGenerationUnderLease(
 		return tmux.ErrSessionGenerationChanged
 	}
 	return nil
+}
+
+func (m *Manager) teardownSessionGeneration(
+	townRoot, sessionID string,
+	generation tmux.SessionGeneration,
+	paneGeneration tmux.PaneProcessGeneration,
+	pollerGeneration nudge.PollerGeneration,
+	requireDead bool,
+) error {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
+	defer cancelCleanup()
+	releaseDeliveryLease, err := m.tmux.AcquireNudgeLeaseContext(cleanupCtx, townRoot, sessionID)
+	if err != nil {
+		return fmt.Errorf("acquiring session teardown delivery lease: %w", err)
+	}
+	defer releaseDeliveryLease()
+
+	var cleanup sessionGenerationCleanup
+	closeCleanup := func() error {
+		if cleanup == nil {
+			return nil
+		}
+		err := cleanup.Close()
+		cleanup = nil
+		return err
+	}
+	replaceErr := nudge.ReplaceBeforeStoppingPollerGenerationContext(
+		cleanupCtx,
+		townRoot,
+		sessionID,
+		pollerGeneration,
+		m.cleanupTimeout,
+		func(ctx context.Context) (nudge.PollerReplacementCommit, error) {
+			if err := m.revalidateSessionGenerationUnderLease(generation, paneGeneration, requireDead); err != nil {
+				return nil, err
+			}
+			var err error
+			cleanup, err = m.prepareSessionCleanup(generation, paneGeneration)
+			if err != nil {
+				return nil, errors.Join(err, closeCleanup())
+			}
+			commit, err := cleanup.PrepareCommit(ctx)
+			if err != nil {
+				return nil, errors.Join(err, closeCleanup())
+			}
+			if commit == nil {
+				return nil, errors.Join(errors.New("session cleanup preparation returned no commit operation"), closeCleanup())
+			}
+			return func(commitCtx context.Context) (bool, error) {
+				committed, commitErr := commit(commitCtx)
+				return committed, errors.Join(commitErr, closeCleanup())
+			}, nil
+		},
+	)
+	// The normal commit path closes retained custody while both the delivery
+	// lease and poller lifecycle lock are held. This final close is a defensive
+	// pre-commit/error-path release while the delivery lease is still held.
+	return errors.Join(replaceErr, closeCleanup())
+}
+
+func (m *Manager) stopPollerForAbsentSession(
+	townRoot, sessionID string,
+	pollerGeneration nudge.PollerGeneration,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), m.cleanupTimeout)
+	defer cancel()
+	releaseDeliveryLease, err := m.tmux.AcquireNudgeLeaseContext(ctx, townRoot, sessionID)
+	if err != nil {
+		return err
+	}
+	defer releaseDeliveryLease()
+	running, err := m.tmux.HasSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("rechecking absent witness session under delivery lease: %w", err)
+	}
+	if running {
+		return tmux.ErrSessionGenerationChanged
+	}
+	return nudge.StopPollerGeneration(townRoot, sessionID, pollerGeneration)
+}
+
+func (m *Manager) rollbackFailedStart(
+	townRoot, sessionID string,
+	generation tmux.SessionGeneration,
+	paneGeneration tmux.PaneProcessGeneration,
+	pollerGeneration nudge.PollerGeneration,
+	startupErr, captureErr error,
+) error {
+	if captureErr != nil {
+		return fmt.Errorf("waiting for witness to start; preserving unprovable session: %w", errors.Join(startupErr, captureErr))
+	}
+	rollbackErr := m.teardownSessionGeneration(
+		townRoot,
+		sessionID,
+		generation,
+		paneGeneration,
+		pollerGeneration,
+		false,
+	)
+	return fmt.Errorf("waiting for witness to start: %w", errors.Join(startupErr, rollbackErr))
 }
 
 // IsRunning checks if the witness session is active and healthy.
@@ -214,59 +317,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		}
 		// Zombie detected — tmux alive but agent dead. Wait briefly, then
 		// re-verify the immutable tmux generation before destructive cleanup.
-		time.Sleep(constants.ZombieKillGracePeriod)
+		time.Sleep(m.zombieKillGrace)
 
-		// Re-check: abort kill if agent started or session was replaced
-		alive, err = t.IsAgentAliveChecked(generation.SessionID)
-		if err != nil {
-			return fmt.Errorf("rechecking witness liveness: %w", err)
-		}
-		if alive {
-			return ErrAlreadyRunning
-		}
-		currentGeneration, err := t.CaptureSessionGeneration(sessionID)
-		if err != nil {
-			return fmt.Errorf("rechecking witness session identity: %w", err)
-		}
-		if !currentGeneration.Equal(generation) {
-			// Session was replaced between checks — another process already
-			// handled the zombie. Treat as already running; caller can retry.
-			return ErrAlreadyRunning
-		}
-
-		cleanup, err := m.prepareSessionCleanup(generation, paneGeneration)
-		if err != nil {
-			return fmt.Errorf("preparing zombie session cleanup: %w", err)
-		}
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
-		var releaseDeliveryLease func()
-		replaceErr := func() error {
-			var err error
-			releaseDeliveryLease, err = t.AcquireNudgeLeaseContext(cleanupCtx, townRoot, sessionID)
-			if err != nil {
-				return fmt.Errorf("acquiring zombie cleanup delivery lease: %w", err)
-			}
-			return nudge.ReplaceBeforeStoppingPollerGenerationContext(
-				cleanupCtx,
-				townRoot,
-				sessionID,
-				pollerGeneration,
-				m.cleanupTimeout,
-				func(ctx context.Context) (nudge.PollerReplacementCommit, error) {
-					if err := m.revalidateZombieGenerationUnderLease(generation, paneGeneration); err != nil {
-						return nil, err
-					}
-					commit, err := cleanup.PrepareCommit(ctx)
-					return nudge.PollerReplacementCommit(commit), err
-				},
-			)
-		}()
-		cancelCleanup()
-		closeErr := cleanup.Close()
-		if releaseDeliveryLease != nil {
-			releaseDeliveryLease()
-		}
-		if err := errors.Join(replaceErr, closeErr); err != nil {
+		if err := m.teardownSessionGeneration(townRoot, sessionID, generation, paneGeneration, pollerGeneration, true); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
 	}
@@ -369,6 +422,14 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	if err := t.NewSessionWithCommandAndEnv(sessionID, witnessDir, command, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
+	startupGeneration, generationErr := t.CaptureSessionGeneration(sessionID)
+	var startupPaneGeneration tmux.PaneProcessGeneration
+	var paneGenerationErr error
+	if generationErr == nil {
+		startupPaneGeneration, paneGenerationErr = m.capturePaneGeneration(startupGeneration)
+	}
+	startupPollerGeneration, pollerGenerationErr := nudge.CapturePollerGeneration(townRoot, sessionID)
+	rollbackCaptureErr := errors.Join(generationErr, paneGenerationErr, pollerGenerationErr)
 
 	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "witness", "")
@@ -376,9 +437,15 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 
 	// Wait for Claude to start - fatal if Claude fails to launch
 	if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
-		_ = t.KillSessionWithProcesses(sessionID)
-		return fmt.Errorf("waiting for witness to start: %w", err)
+		return m.rollbackFailedStart(
+			townRoot,
+			sessionID,
+			startupGeneration,
+			startupPaneGeneration,
+			startupPollerGeneration,
+			err,
+			rollbackCaptureErr,
+		)
 	}
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
@@ -521,18 +588,26 @@ func (m *Manager) Stop() error {
 	if err != nil {
 		return fmt.Errorf("checking witness session: %w", err)
 	}
-
-	return m.stopSession(townRoot, sessionID, func() error {
-		if !running {
-			return ErrNotRunning
+	pollerGeneration, err := nudge.CapturePollerGeneration(townRoot, sessionID)
+	if err != nil {
+		return fmt.Errorf("reading witness poller generation: %w", err)
+	}
+	if !running {
+		if err := m.stopPollerForAbsentSession(townRoot, sessionID, pollerGeneration); err != nil {
+			return fmt.Errorf("stopping poller for absent witness session: %w", err)
 		}
-		return t.KillSessionWithProcesses(sessionID)
-	})
-}
-
-func (m *Manager) stopSession(townRoot, sessionID string, stopSession func() error) error {
-	return nudge.StopPollerBeforeReplacement(
-		func() error { return nudge.StopPoller(townRoot, sessionID) },
-		stopSession,
-	)
+		return ErrNotRunning
+	}
+	generation, err := t.CaptureSessionGeneration(sessionID)
+	if err != nil {
+		return fmt.Errorf("reading witness session identity: %w", err)
+	}
+	paneGeneration, err := m.capturePaneGeneration(generation)
+	if err != nil {
+		return fmt.Errorf("reading witness pane process identity: %w", err)
+	}
+	if err := m.teardownSessionGeneration(townRoot, sessionID, generation, paneGeneration, pollerGeneration, false); err != nil {
+		return fmt.Errorf("stopping witness session: %w", err)
+	}
+	return nil
 }

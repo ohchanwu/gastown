@@ -24,6 +24,10 @@ func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
 		}
 		return linuxProcessStat{}, err
 	}
+	return parseLinuxProcessStat(data)
+}
+
+func parseLinuxProcessStat(data []byte) (linuxProcessStat, error) {
 	stat := string(data)
 	commandEnd := strings.LastIndex(stat, ")")
 	if commandEnd < 0 || commandEnd+2 > len(stat) {
