@@ -1020,6 +1020,57 @@ func TestLinuxSessionCustodyKillRefreshesEveryPostCommitBudget(t *testing.T) {
 	}
 }
 
+func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T) {
+	custody := &linuxSessionCustody{
+		supervisorPID:      101,
+		supervisorIdentity: "supervisor",
+		supervisorFD:       -1,
+		initFD:             -1,
+		cgroup:             "/fixture/session",
+		prepared:           true,
+		committed:          true,
+	}
+	reapErr := errors.New("supervisor still awaiting parent reap")
+	removeCalls := 0
+	err := custody.finalizeAfterParentReleaseWithOps(
+		context.Background(),
+		func(context.Context, int, string) error { return reapErr },
+		func(string, time.Duration) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, reapErr) {
+		t.Fatalf("finalize error = %v, want reap evidence", err)
+	}
+	if custody.finalized || removeCalls != 0 {
+		t.Fatalf("failed finalization = finalized %v, removals %d; want retained receipt", custody.finalized, removeCalls)
+	}
+	if err := custody.Close(); err == nil || !strings.Contains(err.Error(), "retaining ownership handles") {
+		t.Fatalf("Close() error = %v, want retained ownership", err)
+	}
+
+	if err := custody.finalizeAfterParentReleaseWithOps(
+		context.Background(),
+		func(context.Context, int, string) error { return nil },
+		func(path string, _ time.Duration) error {
+			removeCalls++
+			if path != "/fixture/session" {
+				t.Fatalf("remove cgroup path = %q", path)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("retry finalization: %v", err)
+	}
+	if !custody.finalized || custody.cgroup != "" || removeCalls != 1 {
+		t.Fatalf("confirmed finalization = finalized %v, cgroup %q, removals %d", custody.finalized, custody.cgroup, removeCalls)
+	}
+	if err := custody.Close(); err != nil {
+		t.Fatalf("Close() after confirmed finalization: %v", err)
+	}
+}
+
 func TestLinuxCustodyServiceShutdownBoundsIgnoredBrokerWorker(t *testing.T) {
 	serviceContext, cancelServices := context.WithCancel(context.Background())
 	results := make(chan linuxCustodyServiceResult, 3)

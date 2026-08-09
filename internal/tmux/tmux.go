@@ -37,9 +37,10 @@ var sessionNudgeLocks sync.Map // map[string]chan struct{}
 // rather than blocking forever. This prevents a hung tmux from permanently
 // blocking all future nudges to that session.
 const (
-	nudgeLockTimeout                 = 30 * time.Second
-	sessionGenerationTmuxKillTimeout = 2 * time.Second
-	envPinnedTmuxBinary              = "GT_INTERNAL_PINNED_TMUX_BINARY"
+	nudgeLockTimeout                      = 30 * time.Second
+	sessionGenerationTmuxKillTimeout      = 2 * time.Second
+	sessionGenerationParentReleaseTimeout = 10 * time.Second
+	envPinnedTmuxBinary                   = "GT_INTERNAL_PINNED_TMUX_BINARY"
 )
 
 // validSessionNameRe validates session names to prevent shell injection
@@ -1309,6 +1310,13 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 	}
 	var errs []error
 	if cleanup.custody != nil {
+		if parentReleaseCustody, ok := cleanup.custody.(sessionCustodyParentReleaseHandle); ok && parentReleaseCustody.ParentReleaseFinalizationPending() {
+			finalReapCtx, cancelFinalReap := context.WithTimeout(context.Background(), sessionGenerationParentReleaseTimeout)
+			if err := parentReleaseCustody.FinalizeAfterParentRelease(finalReapCtx); err != nil {
+				errs = append(errs, fmt.Errorf("retrying session containment after tmux parent release: %w", err))
+			}
+			cancelFinalReap()
+		}
 		if err := cleanup.custody.Close(); err != nil {
 			errs = append(errs, err)
 		} else {
@@ -1512,7 +1520,14 @@ func (cleanup *SessionGenerationCleanup) PrepareCommit(ctx context.Context) (fun
 		return rejectFrozen(ErrSessionGenerationChanged)
 	}
 	return func(commitCtx context.Context) (bool, error) {
-		committed, killErr := cleanup.custody.Kill(commitCtx)
+		parentReleaseCustody, releasesParent := cleanup.custody.(sessionCustodyParentReleaseHandle)
+		var committed bool
+		var killErr error
+		if releasesParent {
+			committed, killErr = parentReleaseCustody.KillBeforeParentRelease(commitCtx)
+		} else {
+			committed, killErr = cleanup.custody.Kill(commitCtx)
+		}
 		if !committed {
 			return false, fmt.Errorf("killing launch-time session containment: %w", killErr)
 		}
@@ -1546,10 +1561,19 @@ func (cleanup *SessionGenerationCleanup) PrepareCommit(ctx context.Context) (fun
 		if sessionErr != nil {
 			sessionErr = fmt.Errorf("reconciling exact tmux session generation after committed cleanup: %w", sessionErr)
 		}
+		var finalReapErr error
+		if releasesParent {
+			finalReapCtx, cancelFinalReap := context.WithTimeout(context.Background(), sessionGenerationParentReleaseTimeout)
+			finalReapErr = parentReleaseCustody.FinalizeAfterParentRelease(finalReapCtx)
+			cancelFinalReap()
+			if finalReapErr != nil {
+				finalReapErr = fmt.Errorf("verifying session containment after tmux parent release: %w", finalReapErr)
+			}
+		}
 		if killErr != nil {
 			killErr = fmt.Errorf("verifying launch-time session containment exit: %w", killErr)
 		}
-		return true, errors.Join(killErr, sessionErr)
+		return true, errors.Join(killErr, sessionErr, finalReapErr)
 	}, nil
 }
 

@@ -61,6 +61,15 @@ type sessionCustodyHandle interface {
 	Close() error
 }
 
+// sessionCustodyParentReleaseHandle splits committed teardown around release of
+// the exact tmux generation. On Linux, tmux is the supervisor's parent and may
+// need to process kill-session before the exited supervisor can be reaped.
+type sessionCustodyParentReleaseHandle interface {
+	KillBeforeParentRelease(context.Context) (bool, error)
+	FinalizeAfterParentRelease(context.Context) error
+	ParentReleaseFinalizationPending() bool
+}
+
 // WrapSessionCommandWithCustody wraps a long-lived agent command with the
 // hidden launcher that establishes an OS-owned containment boundary before the
 // command can fork. Unsupported platforms return the command unchanged; their

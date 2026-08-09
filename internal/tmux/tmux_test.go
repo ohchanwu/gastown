@@ -1083,6 +1083,44 @@ type mockSessionCustody struct {
 	onKillContext func(context.Context) (bool, error)
 }
 
+type mockParentReleaseSessionCustody struct {
+	*mockSessionCustody
+	beforeParentRelease func(context.Context) (bool, error)
+	afterParentRelease  func(context.Context) error
+	pending             bool
+}
+
+func (custody *mockParentReleaseSessionCustody) Kill(context.Context) (bool, error) {
+	return false, errors.New("legacy one-phase custody kill used")
+}
+
+func (custody *mockParentReleaseSessionCustody) KillBeforeParentRelease(ctx context.Context) (bool, error) {
+	committed, err := custody.beforeParentRelease(ctx)
+	if committed {
+		custody.pending = true
+	}
+	return committed, err
+}
+
+func (custody *mockParentReleaseSessionCustody) FinalizeAfterParentRelease(ctx context.Context) error {
+	err := custody.afterParentRelease(ctx)
+	if err == nil {
+		custody.pending = false
+	}
+	return err
+}
+
+func (custody *mockParentReleaseSessionCustody) ParentReleaseFinalizationPending() bool {
+	return custody.pending
+}
+
+func (custody *mockParentReleaseSessionCustody) Close() error {
+	if custody.pending {
+		return errors.New("mock final reap is pending; retaining ownership")
+	}
+	return custody.mockSessionCustody.Close()
+}
+
 func (custody *mockSessionCustody) Freeze(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1648,6 +1686,67 @@ func TestSessionGenerationCleanupRefreshesTmuxBudgetAfterCommittedKill(t *testin
 	}
 }
 
+func TestSessionGenerationCleanupReleasesTmuxParentBeforeFinalCustodyReap(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-parent-release-%d", time.Now().UnixNano()))
+	session := "gt-cleanup-parent-release"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := &mockRetainedProcess{pid: pane.PID, parent: 1, generation: pane.Identity, alive: true}
+	finalized := false
+	custody := &mockParentReleaseSessionCustody{
+		mockSessionCustody: &mockSessionCustody{},
+		beforeParentRelease: func(ctx context.Context) (bool, error) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if err := exec.Command("kill", "-KILL", fmt.Sprint(pane.PID)).Run(); err != nil {
+				return false, err
+			}
+			process.alive = false
+			return true, nil
+		},
+		afterParentRelease: func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			running, err := tm.HasSession(session)
+			if err != nil {
+				return err
+			}
+			if running {
+				return errors.New("final custody reap ran before exact tmux parent release")
+			}
+			finalized = true
+			return nil
+		},
+	}
+	cleanup := &SessionGenerationCleanup{
+		tmux:         tm,
+		generation:   generation,
+		panePID:      pane.PID,
+		paneIdentity: pane.Identity,
+		identity:     processGenerationIdentity,
+		processes:    []retainedProcess{process},
+		custody:      custody,
+	}
+	if err := cleanup.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v, want parent release before final custody reap", err)
+	}
+	if !finalized {
+		t.Fatal("final custody reap was not called")
+	}
+}
+
 func TestReconcileSessionGenerationRetriesPaneRaceUntilAbsent(t *testing.T) {
 	original := SessionGeneration{Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server"}
 	captures := 0
@@ -1920,6 +2019,40 @@ func TestSessionGenerationCleanupCloseRetainsCustodyUntilSuccessfulRetry(t *test
 	}
 	if cleanup.custody != nil {
 		t.Fatal("successful custody close retained a stale owner")
+	}
+}
+
+func TestSessionGenerationCleanupCloseRetriesPendingParentReleaseFinalization(t *testing.T) {
+	reapErr := errors.New("injected final reap delay")
+	finalizeCalls := 0
+	custody := &mockParentReleaseSessionCustody{
+		mockSessionCustody: &mockSessionCustody{},
+		beforeParentRelease: func(context.Context) (bool, error) {
+			return true, nil
+		},
+		afterParentRelease: func(context.Context) error {
+			finalizeCalls++
+			if finalizeCalls == 1 {
+				return reapErr
+			}
+			return nil
+		},
+	}
+	if committed, err := custody.KillBeforeParentRelease(context.Background()); !committed || err != nil {
+		t.Fatalf("KillBeforeParentRelease() = %v, %v", committed, err)
+	}
+	if err := custody.FinalizeAfterParentRelease(context.Background()); !errors.Is(err, reapErr) {
+		t.Fatalf("first FinalizeAfterParentRelease() error = %v, want %v", err, reapErr)
+	}
+	cleanup := &SessionGenerationCleanup{custody: custody}
+	if err := cleanup.Close(); err != nil {
+		t.Fatalf("Close() retry error = %v", err)
+	}
+	if finalizeCalls != 2 || custody.ParentReleaseFinalizationPending() {
+		t.Fatalf("final reap retry = calls %d pending %v, want calls 2 pending false", finalizeCalls, custody.ParentReleaseFinalizationPending())
+	}
+	if cleanup.custody != nil {
+		t.Fatal("successful final reap retry retained stale custody")
 	}
 }
 

@@ -60,6 +60,7 @@ type linuxSessionCustody struct {
 	cgroup             string
 	prepared           bool
 	committed          bool
+	finalized          bool
 }
 
 type linuxCustodyKillBudgets struct {
@@ -1396,7 +1397,14 @@ func waitLinuxProcessGone(ctx context.Context, pid int, identity string) error {
 }
 
 func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
-	return custody.killWithBudgets(
+	committed, killErr := custody.KillBeforeParentRelease(ctx)
+	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), linuxCustodySupervisorExitTimeout)
+	defer cancelFinalize()
+	return committed, errors.Join(killErr, custody.FinalizeAfterParentRelease(finalizeCtx))
+}
+
+func (custody *linuxSessionCustody) KillBeforeParentRelease(ctx context.Context) (bool, error) {
+	return custody.killBeforeParentReleaseWithBudgets(
 		ctx,
 		linuxCustodyKillBudgets{
 			Init:       linuxCustodyInitExitTimeout,
@@ -1414,7 +1422,27 @@ func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
 	)
 }
 
+func (custody *linuxSessionCustody) FinalizeAfterParentRelease(ctx context.Context) error {
+	return custody.finalizeAfterParentReleaseWithOps(ctx, waitLinuxProcessGone, removeLinuxSessionCgroup)
+}
+
+func (custody *linuxSessionCustody) ParentReleaseFinalizationPending() bool {
+	return custody != nil && custody.committed && !custody.finalized
+}
+
 func (custody *linuxSessionCustody) killWithBudgets(
+	ctx context.Context,
+	budgets linuxCustodyKillBudgets,
+	ops linuxCustodyKillOps,
+) (bool, error) {
+	committed, killErr := custody.killBeforeParentReleaseWithBudgets(ctx, budgets, ops)
+	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), budgets.Supervisor)
+	defer cancelFinalize()
+	finalizeErr := custody.finalizeAfterParentReleaseWithOps(finalizeCtx, ops.waitGone, removeLinuxSessionCgroup)
+	return committed, errors.Join(killErr, finalizeErr)
+}
+
+func (custody *linuxSessionCustody) killBeforeParentReleaseWithBudgets(
 	ctx context.Context,
 	budgets linuxCustodyKillBudgets,
 	ops linuxCustodyKillOps,
@@ -1475,19 +1503,44 @@ func (custody *linuxSessionCustody) killWithBudgets(
 			custody.committed = true
 		}
 	}
-	errs = append(errs, waitPhase(ops.waitGone, budgets.Supervisor, custody.supervisorPID, custody.supervisorIdentity, "verifying session supervisor reap"))
-	if custody.cgroup != "" {
-		errs = append(errs, clearLinuxSessionCgroupReceipt(&custody.cgroup, removeLinuxSessionCgroup))
-	}
 	if !custody.committed {
 		errs = append(errs, ErrSessionGenerationChanged)
 	}
 	return custody.committed, errors.Join(errs...)
 }
 
+func (custody *linuxSessionCustody) finalizeAfterParentReleaseWithOps(
+	ctx context.Context,
+	waitGone func(context.Context, int, string) error,
+	removeCgroup func(string, time.Duration) error,
+) error {
+	if custody == nil || !custody.prepared || !custody.committed {
+		return errors.New("session PID namespace custody has not committed teardown")
+	}
+	if waitGone == nil || removeCgroup == nil {
+		return errors.New("session custody final reap operations are unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := waitGone(ctx, custody.supervisorPID, custody.supervisorIdentity); err != nil {
+		return fmt.Errorf("verifying session supervisor reap: %w", err)
+	}
+	if custody.cgroup != "" {
+		if err := clearLinuxSessionCgroupReceipt(&custody.cgroup, removeCgroup); err != nil {
+			return err
+		}
+	}
+	custody.finalized = true
+	return nil
+}
+
 func (custody *linuxSessionCustody) Close() error {
 	if custody == nil {
 		return nil
+	}
+	if custody.committed && !custody.finalized {
+		return errors.New("session custody final reap is unconfirmed; retaining ownership handles")
 	}
 	var errs []error
 	if custody.initFD >= 0 {
