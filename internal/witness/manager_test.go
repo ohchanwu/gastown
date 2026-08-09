@@ -680,23 +680,28 @@ exit 2
 		t.Fatal(err)
 	}
 	mgr.cleanupTimeout = 50 * time.Millisecond
+	observedBudget := make(chan time.Duration, 1)
 	mgr.prepareSessionCleanup = func(generation tmux.SessionGeneration, pane tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
 		return &fakeSessionCleanup{
 			generation: generation,
 			pane:       pane,
 			prepare: func(ctx context.Context) (func(context.Context) (bool, error), error) {
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					return nil, errors.New("cleanup context has no deadline")
+				}
+				observedBudget <- time.Until(deadline)
 				<-ctx.Done()
 				return nil, ctx.Err()
 			},
 		}, nil
 	}
-	started := time.Now()
 	err := mgr.Start(false, "", nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Start() error = %v, want cleanup deadline", err)
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("bounded cleanup took %v", elapsed)
+	if budget := <-observedBudget; budget > mgr.cleanupTimeout {
+		t.Fatalf("cleanup transaction budget = %v, want at most %v", budget, mgr.cleanupTimeout)
 	}
 }
 
