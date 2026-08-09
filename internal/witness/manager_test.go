@@ -83,6 +83,54 @@ func (cleanup *fakeSessionCleanup) Close() error {
 	return nil
 }
 
+func TestManagerRetainsCommittedCleanupOwnerUntilCloseRetrySucceeds(t *testing.T) {
+	closeErr := errors.New("injected committed cleanup close failure")
+	closeCalls := 0
+	cleanup := &fakeSessionCleanup{
+		prepare: func(context.Context) (func(context.Context) (bool, error), error) {
+			return func(context.Context) (bool, error) { return true, nil }, nil
+		},
+		close: func() error {
+			closeCalls++
+			if closeCalls == 1 {
+				return closeErr
+			}
+			return nil
+		},
+	}
+	commit, err := cleanup.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := commit(context.Background())
+	if err != nil || !committed {
+		t.Fatalf("commit = %v, err %v; want committed success", committed, err)
+	}
+
+	mgr := &Manager{}
+	if err := mgr.closeOrRetainCleanup(cleanup); !errors.Is(err, closeErr) {
+		t.Fatalf("initial Close error = %v, want %v", err, closeErr)
+	}
+	mgr.pendingCleanupMu.Lock()
+	pending := len(mgr.pendingCleanups)
+	mgr.pendingCleanupMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending cleanup owners = %d, want 1", pending)
+	}
+	if err := mgr.retryPendingCleanups(); err != nil {
+		t.Fatalf("retrying retained cleanup: %v", err)
+	}
+	if closeCalls != 2 {
+		t.Fatalf("Close calls = %d, want 2", closeCalls)
+	}
+	mgr.pendingCleanupMu.Lock()
+	pending = len(mgr.pendingCleanups)
+	mgr.pendingCleanupMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("successful cleanup retry retained %d owners", pending)
+	}
+}
+
 func newFakeTmuxManager(t *testing.T, behavior string) (*Manager, string, string) {
 	t.Helper()
 	townRoot := t.TempDir()

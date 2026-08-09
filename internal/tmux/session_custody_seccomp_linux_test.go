@@ -79,6 +79,9 @@ func runLinuxCustodySeccompProgram(
 			} else {
 				pc += int(instruction.Jf) + 1
 			}
+		case unix.BPF_ALU | unix.BPF_AND | unix.BPF_K:
+			accumulator &= instruction.K
+			pc++
 		case unix.BPF_RET | unix.BPF_K:
 			return instruction.K
 		default:
@@ -125,6 +128,61 @@ func TestLinuxCustodySeccompDeniesProcessInspection(t *testing.T) {
 				t.Fatalf("syscall action = %#x, want %#x", got, want)
 			}
 		})
+	}
+}
+
+func TestLinuxCustodySeccompAllowsOnlyReviewedInternetSockets(t *testing.T) {
+	filter, err := buildLinuxCustodySeccompFilter(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeny := uint32(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM))
+	wantAllow := uint32(unix.SECCOMP_RET_ALLOW)
+	tests := []struct {
+		name   string
+		family uint64
+		type_  uint64
+		want   uint32
+	}{
+		{name: "IPv4 stream", family: unix.AF_INET, type_: unix.SOCK_STREAM | unix.SOCK_CLOEXEC, want: wantAllow},
+		{name: "IPv6 stream", family: unix.AF_INET6, type_: unix.SOCK_STREAM | unix.SOCK_NONBLOCK, want: wantAllow},
+		{name: "IPv4 datagram", family: unix.AF_INET, type_: unix.SOCK_DGRAM | unix.SOCK_CLOEXEC, want: wantAllow},
+		{name: "IPv6 datagram", family: unix.AF_INET6, type_: unix.SOCK_DGRAM, want: wantAllow},
+		{name: "Unix", family: unix.AF_UNIX, type_: unix.SOCK_STREAM, want: wantDeny},
+		{name: "VSOCK", family: unix.AF_VSOCK, type_: unix.SOCK_STREAM, want: wantDeny},
+		{name: "netlink", family: unix.AF_NETLINK, type_: unix.SOCK_RAW, want: wantDeny},
+		{name: "packet", family: unix.AF_PACKET, type_: unix.SOCK_RAW, want: wantDeny},
+		{name: "IPv4 raw", family: unix.AF_INET, type_: unix.SOCK_RAW, want: wantDeny},
+		{name: "IPv6 seqpacket", family: unix.AF_INET6, type_: unix.SOCK_SEQPACKET, want: wantDeny},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := runLinuxCustodySeccompProgram(
+				t,
+				filter,
+				testLinuxAuditArchitecture(t),
+				uint32(unix.SYS_SOCKET),
+				test.family,
+				test.type_,
+			)
+			if got != test.want {
+				t.Fatalf("socket action = %#x, want %#x", got, test.want)
+			}
+		})
+	}
+
+	for _, family := range []uint64{unix.AF_UNIX, unix.AF_INET, unix.AF_INET6} {
+		got := runLinuxCustodySeccompProgram(
+			t,
+			filter,
+			testLinuxAuditArchitecture(t),
+			uint32(unix.SYS_SOCKETPAIR),
+			family,
+			unix.SOCK_STREAM,
+		)
+		if got != wantDeny {
+			t.Fatalf("socketpair family %d action = %#x, want %#x", family, got, wantDeny)
+		}
 	}
 }
 

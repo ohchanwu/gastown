@@ -74,6 +74,10 @@ func TestContainedWitnessFlow(t *testing.T) {
 	flowDir := filepath.Join(townRoot, "flow")
 	agentPath := filepath.Join(townRoot, "contained-flow-agent")
 	mayorAgentPath := filepath.Join(townRoot, "contained-flow-mayor")
+	outerSentinel := filepath.Join(t.TempDir(), "must-stay-outside-contained-root")
+	if err := os.WriteFile(outerSentinel, []byte("outer-only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	nonce := "contained-flow-" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	setupContainedFlowTown(t, townRoot, rigName, rigPath, flowDir, agentPath, mayorAgentPath)
 
@@ -154,6 +158,9 @@ func TestContainedWitnessFlow(t *testing.T) {
 		"GT_TEST_FLOW_SOCKET=" + socket,
 		"GT_TEST_FLOW_CA=" + caPath,
 		"GT_TEST_FLOW_PRIVATE_IP=" + privateDoltIP,
+		"GT_TEST_FLOW_OUTER_PATH=" + outerSentinel,
+		"GT_TEST_OUTER_SENTINEL=must-not-pass",
+		"BD_PATH=" + os.Getenv("BD_PATH"),
 	}); err != nil {
 		t.Fatalf("start contained Witness: %v", err)
 	}
@@ -176,6 +183,29 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 	if !strings.Contains(primeOutput, "gt hook show") {
 		t.Fatalf("contained prime omitted broker-scoped live follow-up: %q", primeOutput)
+	}
+	primeCommandResults := map[string]string{
+		"gt hook show":                        "prime_hook_show",
+		"gt mol current":                      "prime_current",
+		"gt mol step close":                   "prime_step_close",
+		"gt patrol scan --rig testrig --json": "patrol_scan",
+		"gt mail inbox --unread":              "mail_inbox",
+		"gt agents list":                      "agents",
+		"gt polecat list testrig":             "polecats",
+		"gt status --fast":                    "status",
+	}
+	containedContext := primeOutput[strings.Index(primeOutput, "# Contained Witness Context"):]
+	segments := strings.Split(containedContext, "`")
+	for index := 1; index < len(segments); index += 2 {
+		resultName, ok := primeCommandResults[segments[index]]
+		if !ok {
+			t.Fatalf("contained prime emitted unexercised actionable command %q", segments[index])
+		}
+		assertContainedFlowExit(t, results, resultName, true)
+		delete(primeCommandResults, segments[index])
+	}
+	if len(primeCommandResults) != 0 {
+		t.Fatalf("contained prime omitted reviewed command evidence: %#v", primeCommandResults)
 	}
 	for _, name := range []string{"prime_hook_show", "prime_current", "prime_step_close", "prime_after_close"} {
 		assertContainedFlowExit(t, results, name, true)
@@ -209,7 +239,8 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 
 	for _, name := range []string{
-		"preset_env", "prime", "patrol_scan", "patrol_report", "mail_inbox", "mail_read", "mail_send",
+		"preset_env", "outer_env", "outer_file", "device_null", "device_full", "private_pts", "forbidden_families",
+		"prime", "patrol_scan", "patrol_report", "mail_inbox", "mail_read", "mail_send",
 		"nudge_queue", "nudge_immediate", "hook", "agents", "polecats", "status",
 		"https",
 	} {
@@ -886,7 +917,24 @@ run_flow() {
   printf '\nGT_FLOW_END:%s\n' "$name"
   rm -f "$stdout" "$stderr"
 }
-run_flow preset_env test "${GT_TEST_FLOW_PRESET_ENV:-}" = contained-preset-env
+run_flow preset_env test -z "${GT_TEST_FLOW_PRESET_ENV:-}"
+run_flow outer_env test -z "${GT_TEST_OUTER_SENTINEL:-}"
+run_flow outer_file test ! -r "$GT_TEST_FLOW_OUTER_PATH"
+run_flow device_null sh -c 'test -c /dev/null && printf ok >/dev/null'
+run_flow device_full test ! -e /dev/full
+run_flow private_pts python3 -c 'import os,sys; sys.exit(0 if sorted(os.listdir("/dev/pts")) == ["ptmx"] else 1)'
+run_flow forbidden_families python3 -c 'import errno,socket,sys
+for family,socktype in ((40,socket.SOCK_STREAM),(16,socket.SOCK_RAW),(17,socket.SOCK_RAW)):
+    try:
+        value=socket.socket(family,socktype,0)
+    except OSError as error:
+        if error.errno == errno.EPERM:
+            continue
+        print("unexpected errno",family,error.errno,file=sys.stderr)
+        sys.exit(1)
+    value.close()
+    print("socket family allowed",family,file=sys.stderr)
+    sys.exit(1)'
 run_flow prime "$GT_TEST_FLOW_GT" prime --hook
 run_flow prime_hook_show "$GT_TEST_FLOW_GT" hook show
 run_flow prime_current "$GT_TEST_FLOW_GT" mol current

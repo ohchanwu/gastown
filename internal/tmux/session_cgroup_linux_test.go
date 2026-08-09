@@ -40,12 +40,27 @@ func TestProvisionSessionCgroupRootMatchesSystemdDelegationShape(t *testing.T) {
 	if err := ensureLinuxSessionCgroupControllers(delegated); err != nil {
 		t.Fatal(err)
 	}
-	service := filepath.Join(delegated, "gastown-daemon-test")
-	if err := os.Mkdir(service, 0o700); err != nil {
+	service, err := os.MkdirTemp(delegated, "gastown-daemon-test-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(service)
-	command := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCgroupProvisionHelper$")
+	var command *exec.Cmd
+	t.Cleanup(func() {
+		if command != nil && command.Process != nil && command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+		for _, path := range []string{
+			filepath.Join(service, linuxSessionCgroupControlDir),
+			filepath.Join(service, linuxSessionCgroupPoolDir),
+			service,
+		} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				t.Errorf("removing owned test cgroup %s: %v", path, err)
+			}
+		}
+	})
+	command = exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCgroupProvisionHelper$")
 	command.Env = append(os.Environ(), "GT_TEST_SESSION_CGROUP_PROVISION_HELPER=1")
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -63,6 +78,8 @@ func TestProvisionSessionCgroupRootMatchesSystemdDelegationShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := stdin.Write([]byte{1}); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
 		t.Fatal(err)
 	}
 	_ = stdin.Close()
@@ -87,13 +104,6 @@ func TestProvisionSessionCgroupRootMatchesSystemdDelegationShape(t *testing.T) {
 				t.Fatalf("%s lacks delegated %s controller: %q", root, controller, controllers)
 			}
 		}
-	}
-	control := filepath.Join(service, linuxSessionCgroupControlDir)
-	if err := os.Remove(control); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(wantRoot); err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -39,6 +39,21 @@ func TestWrapSessionCommandWithCustodyIsPlatformHonest(t *testing.T) {
 	}
 }
 
+func TestEncodeSessionCustodyPathsRejectsUnboundedAndCanonicalizes(t *testing.T) {
+	encoded, err := EncodeSessionCustodyPaths([]string{"/srv/witness", "/srv/witness", "/opt/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encoded != `["/srv/witness","/opt/runtime"]` {
+		t.Fatalf("encoded allowlist = %q", encoded)
+	}
+	for _, paths := range [][]string{nil, {"relative/path"}, {"/"}} {
+		if _, err := EncodeSessionCustodyPaths(paths); err == nil {
+			t.Fatalf("EncodeSessionCustodyPaths(%q) unexpectedly succeeded", paths)
+		}
+	}
+}
+
 func TestCanWrapCurrentExecutableRejectsTestBinary(t *testing.T) {
 	if CanWrapCurrentExecutable("/tmp/witness.test") {
 		t.Fatal("Go test binary was accepted as the hidden session-custody launcher")

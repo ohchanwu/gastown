@@ -404,7 +404,7 @@ func handleSessionBrokerRequest(
 	command.Stdin = &sessionBrokerQuotaReader{reader: stdin, remaining: sessionBrokerMaxStdinBytes}
 	command.Stdout = stdout
 	command.Stderr = stderr
-	command.Env = sanitizedSessionBrokerEnvironment(os.Environ())
+	command.Env = append(sanitizedSessionBrokerEnvironment(os.Environ()), EnvSessionBrokerWorker+"=1")
 	if tmuxExecutable != nil {
 		command.ExtraFiles = append(command.ExtraFiles, tmuxExecutable)
 		command.Env = append(command.Env, envPinnedTmuxBinary+"=/proc/self/fd/4")
@@ -452,9 +452,12 @@ func sanitizedSessionBrokerEnvironment(env []string) []string {
 	return withoutEnvironmentKeys(
 		env,
 		EnvSessionCustody,
+		EnvSessionCustodyPaths,
+		EnvSessionBrokerWorker,
 		envLinuxSessionCustodyInit,
 		envLinuxSessionCustodyCommand,
 		envLinuxSessionCustodyNamespaced,
+		envLinuxSessionScratch,
 		envPinnedTmuxBinary,
 	)
 }

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,11 +66,51 @@ type Manager struct {
 	cleanupTimeout         time.Duration
 	teardownBudgets        teardownBudgets
 	zombieKillGrace        time.Duration
+	pendingCleanupMu       sync.Mutex
+	pendingCleanups        []sessionGenerationCleanup
 }
 
 type sessionGenerationCleanup interface {
 	PrepareCommit(context.Context) (func(context.Context) (bool, error), error)
 	Close() error
+}
+
+func (m *Manager) closeOrRetainCleanup(cleanup sessionGenerationCleanup) error {
+	if cleanup == nil {
+		return nil
+	}
+	if err := cleanup.Close(); err != nil {
+		m.pendingCleanupMu.Lock()
+		m.pendingCleanups = append(m.pendingCleanups, cleanup)
+		m.pendingCleanupMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) retryPendingCleanups() error {
+	m.pendingCleanupMu.Lock()
+	pending := m.pendingCleanups
+	m.pendingCleanups = nil
+	m.pendingCleanupMu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var errs []error
+	var failed []sessionGenerationCleanup
+	for _, cleanup := range pending {
+		if err := cleanup.Close(); err != nil {
+			errs = append(errs, err)
+			failed = append(failed, cleanup)
+		}
+	}
+	if len(failed) != 0 {
+		m.pendingCleanupMu.Lock()
+		m.pendingCleanups = append(failed, m.pendingCleanups...)
+		m.pendingCleanupMu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 // NewManager creates a new witness manager for a rig.
@@ -108,6 +150,81 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 	}
 }
 
+func appendWitnessCustodyExecutable(paths []string, command, pathEnv string) []string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return paths
+	}
+	resolved := command
+	if !filepath.IsAbs(resolved) {
+		for _, dir := range filepath.SplitList(pathEnv) {
+			candidate := filepath.Join(dir, command)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				resolved = candidate
+				break
+			}
+		}
+		if !filepath.IsAbs(resolved) {
+			if candidate, err := exec.LookPath(command); err == nil {
+				resolved = candidate
+			}
+		}
+	}
+	if !filepath.IsAbs(resolved) {
+		return paths
+	}
+	resolved, _ = filepath.Abs(resolved)
+	if canonical, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = canonical
+	}
+	for _, systemRoot := range []string{"/bin", "/sbin", "/usr", "/opt"} {
+		if resolved == systemRoot || strings.HasPrefix(resolved, systemRoot+string(filepath.Separator)) {
+			return paths
+		}
+	}
+	return append(paths, filepath.Dir(resolved))
+}
+
+func witnessSessionCustodyPaths(witnessDir, runtimeConfigDir, witnessSettingsDir string, runtimeConfig *config.RuntimeConfig, envVars map[string]string) (string, error) {
+	paths := []string{witnessDir, witnessSettingsDir}
+	for _, path := range []string{runtimeConfigDir, envVars["CLAUDE_CONFIG_DIR"], envVars["CODEX_HOME"], envVars["GT_CONTEXT_FILE"]} {
+		if strings.TrimSpace(path) != "" {
+			paths = append(paths, path)
+		}
+	}
+	pathEnv := envVars["PATH"]
+	if pathEnv == "" {
+		pathEnv = os.Getenv("PATH")
+	}
+	if runtimeConfig == nil {
+		return "", errors.New("resolved Witness runtime configuration is unavailable")
+	}
+	paths = appendWitnessCustodyExecutable(paths, runtimeConfig.Command, pathEnv)
+	if len(runtimeConfig.ExecWrapper) != 0 {
+		paths = appendWitnessCustodyExecutable(paths, runtimeConfig.ExecWrapper[0], pathEnv)
+	}
+	if executable, err := os.Executable(); err == nil {
+		paths = appendWitnessCustodyExecutable(paths, executable, pathEnv)
+	}
+
+	// Privileged contained-flow tests use disposable executables and evidence
+	// paths outside witnessDir. Admit only their absolute test-scoped values;
+	// production runtime overrides cannot expand this allowlist.
+	if strings.HasSuffix(os.Args[0], ".test") {
+		for key, value := range envVars {
+			if (strings.HasPrefix(key, "GT_TEST_FLOW_") || key == "BD_PATH") && key != "GT_TEST_FLOW_OUTER_PATH" && filepath.IsAbs(value) {
+				info, err := os.Stat(value)
+				if err == nil && !info.IsDir() {
+					value = filepath.Dir(value)
+				}
+				paths = append(paths, value)
+			}
+		}
+	}
+
+	return tmux.EncodeSessionCustodyPaths(paths)
+}
+
 func (m *Manager) revalidateSessionGenerationUnderLease(
 	generation tmux.SessionGeneration,
 	paneGeneration tmux.PaneProcessGeneration,
@@ -144,6 +261,9 @@ func (m *Manager) teardownSessionGeneration(
 	pollerGeneration nudge.PollerGeneration,
 	requireDead bool,
 ) error {
+	if err := m.retryPendingCleanups(); err != nil {
+		return fmt.Errorf("reconciling retained session cleanup ownership: %w", err)
+	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
 	defer cancelCleanup()
 	releaseDeliveryLease, err := m.tmux.AcquireNudgeLeaseContext(cleanupCtx, townRoot, sessionID)
@@ -157,7 +277,7 @@ func (m *Manager) teardownSessionGeneration(
 		if cleanup == nil {
 			return nil
 		}
-		err := cleanup.Close()
+		err := m.closeOrRetainCleanup(cleanup)
 		cleanup = nil
 		return err
 	}
@@ -455,6 +575,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	}
 	if custody != "" {
 		envVars[tmux.EnvSessionCustody] = custody
+		allowedPaths, err := witnessSessionCustodyPaths(witnessDir, runtimeConfigDir, witnessSettingsDir, runtimeConfig, envVars)
+		if err != nil {
+			return fmt.Errorf("preparing witness filesystem containment: %w", err)
+		}
+		envVars[tmux.EnvSessionCustodyPaths] = allowedPaths
 	}
 
 	// Create session with command and env vars via -e flags so the initial

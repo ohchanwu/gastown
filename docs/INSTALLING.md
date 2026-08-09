@@ -245,7 +245,10 @@ gt convoy list
 Agents run in tmux sessions. Daemon manages lifecycle automatically.
 
 ```bash
-# Start the daemon
+# Linux, once: install and start the delegated systemd user unit
+gt daemon enable-supervisor
+
+# Start the daemon (Linux reuses that delegated unit)
 gt daemon start
 
 # Create and assign work (workers spawn automatically)
@@ -260,6 +263,10 @@ gt convoy list
 gt mayor attach
 gt witness attach myproject
 ```
+
+On Linux, `gt daemon start` deliberately fails if the delegated systemd user
+unit is unavailable. An ordinary detached process cannot own the cgroup subtree
+used to contain Witness sessions.
 
 **When to use**: Production workflows with multiple concurrent agents.
 

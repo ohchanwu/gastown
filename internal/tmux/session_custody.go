@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,41 @@ import (
 	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/config"
 )
+
+const (
+	maxSessionCustodyPaths      = 64
+	maxSessionCustodyPathsBytes = 16 * 1024
+)
+
+// EncodeSessionCustodyPaths validates and serializes the trusted launcher's
+// filesystem allowlist. Linux consumes it inside the namespace init; keeping
+// the encoder platform-neutral lets lifecycle code remain portable.
+func EncodeSessionCustodyPaths(paths []string) (string, error) {
+	unique := make(map[string]struct{}, len(paths))
+	cleaned := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if !filepath.IsAbs(path) || path == string(filepath.Separator) {
+			return "", fmt.Errorf("session custody allowlist path is not a bounded absolute path: %q", path)
+		}
+		if _, exists := unique[path]; exists {
+			continue
+		}
+		unique[path] = struct{}{}
+		cleaned = append(cleaned, path)
+	}
+	if len(cleaned) == 0 || len(cleaned) > maxSessionCustodyPaths {
+		return "", fmt.Errorf("session custody allowlist has %d paths", len(cleaned))
+	}
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("encoding session custody allowlist: %w", err)
+	}
+	if len(encoded) > maxSessionCustodyPathsBytes {
+		return "", fmt.Errorf("session custody allowlist is %d bytes", len(encoded))
+	}
+	return string(encoded), nil
+}
 
 // ErrSessionCustodyUnsupported means that the pane was not launched inside a
 // verifiable OS-owned containment boundary. Destructive zombie replacement

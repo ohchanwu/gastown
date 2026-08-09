@@ -20,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -27,6 +28,14 @@ import (
 // outputPrimeContext outputs the role-specific context using templates or fallback.
 // Returns the rendered template content (empty string when using fallback path).
 func outputPrimeContext(ctx RoleContext) (string, error) {
+	if ctx.Role == RoleWitness && os.Getenv(tmux.EnvSessionBrokerWorker) == "1" {
+		output, err := containedWitnessPrimeOutput(ctx)
+		if err != nil {
+			return "", err
+		}
+		fmt.Print(output)
+		return output, nil
+	}
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
@@ -89,6 +98,37 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 
 	fmt.Print(output)
 	return output, nil
+}
+
+type containedWitnessPrimeCommand struct {
+	description string
+	args        []string
+}
+
+func containedWitnessPrimeOutput(ctx RoleContext) (string, error) {
+	commands := []containedWitnessPrimeCommand{
+		{"Inspect the current hook", []string{"hook", "show"}},
+		{"Inspect the current patrol step", []string{"mol", "current"}},
+		{"Close the current patrol step", []string{"mol", "step", "close"}},
+		{"Scan this rig", []string{"patrol", "scan", "--rig", ctx.Rig, "--json"}},
+		{"Check unread mail", []string{"mail", "inbox", "--unread"}},
+		{"List live agents", []string{"agents", "list"}},
+		{"List this rig's polecats", []string{"polecat", "list", ctx.Rig}},
+		{"Read town status", []string{"status", "--fast"}},
+	}
+	var output strings.Builder
+	fmt.Fprintf(&output, "# Contained Witness Context\n\n")
+	fmt.Fprintf(&output, "You are the **Witness** for rig: **%s**\n\n", ctx.Rig)
+	fmt.Fprintln(&output, "This session uses a trusted command broker. The commands below are derived from the broker's reviewed Cobra capabilities and are the complete actionable quick reference for this context.")
+	fmt.Fprintln(&output, "\n## Brokered Commands")
+	for _, command := range commands {
+		if err := IsBrokerSafeCommand(rootCmd, command.args); err != nil {
+			return "", fmt.Errorf("contained Witness guidance %q is unavailable: %w", strings.Join(command.args, " "), err)
+		}
+		fmt.Fprintf(&output, "- `%s %s` - %s\n", cli.Name(), strings.Join(command.args, " "), command.description)
+	}
+	fmt.Fprintf(&output, "\nRig: %s\n", ctx.Rig)
+	return output.String(), nil
 }
 
 func roleRigContext(ctx RoleContext) (defaultBranch string, isForkRig bool, upstreamURL string) {

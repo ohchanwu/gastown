@@ -14,6 +14,7 @@ const (
 	linuxX32SyscallBit   = uint32(0x40000000)
 	linuxCustodyBrokerFD = uint32(6)
 	linuxAMD64SysDup2    = uint32(33)
+	linuxSocketTypeMask  = uint32(0xf)
 )
 
 func buildLinuxCustodySeccompFilter(goarch string) ([]unix.SockFilter, error) {
@@ -93,12 +94,19 @@ func buildLinuxCustodySeccompFilter(goarch string) ([]unix.SockFilter, error) {
 		)
 	}
 	filter = append(filter,
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 2, K: uint32(unix.SYS_SOCKET)},
+		// Only ordinary IPv4/IPv6 stream and datagram sockets are reviewed.
+		// Namespace isolation is not a boundary for families such as AF_VSOCK,
+		// AF_NETLINK, or AF_PACKET, so reject every family and type not listed.
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 8, K: uint32(unix.SYS_SOCKET)},
 		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 4, Jf: 5, K: uint32(unix.AF_UNIX)},
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 2, K: uint32(unix.SYS_SOCKETPAIR)},
-		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 2, K: uint32(unix.AF_UNIX)},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 0, K: uint32(unix.AF_INET)},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 4, K: uint32(unix.AF_INET6)},
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 24},
+		unix.SockFilter{Code: unix.BPF_ALU | unix.BPF_AND | unix.BPF_K, K: linuxSocketTypeMask},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 5, Jf: 0, K: uint32(unix.SOCK_STREAM)},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 4, Jf: 0, K: uint32(unix.SOCK_DGRAM)},
+		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: deny},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 1, Jf: 0, K: uint32(unix.SYS_SOCKETPAIR)},
 		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 1, K: uint32(unix.SYS_IO_URING_SETUP)},
 		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: deny},
 		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},

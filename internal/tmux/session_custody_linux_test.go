@@ -266,6 +266,91 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	}
 }
 
+func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
+	source := []string{
+		"PATH=/usr/bin:/bin",
+		"TERM=xterm-256color",
+		"LANG=C.UTF-8",
+		"LC_ALL=C.UTF-8",
+		"GT_ROLE=testrig/witness",
+		"GT_INTERNAL_SESSION_CUSTODY_COMMAND=escape",
+		"BEADS_DOLT_SERVER_PORT=3306",
+		"BD_ACTOR=testrig/witness",
+		"OPENAI_API_KEY=reviewed-secret",
+		"NODE_OPTIONS=--require=/outer/escape.js",
+		"HOME=/outer/home",
+		"XDG_RUNTIME_DIR=/outer/runtime",
+		"LD_PRELOAD=/outer/escape.so",
+		"BASH_ENV=/outer/bash-env",
+		"PYTHONPATH=/outer/python",
+		"GT_TEST_FLOW_DIR=/fixture",
+		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
+		"GT_TEST_OUTER_SENTINEL=must-not-pass",
+	}
+	got := linuxCustodyWorkloadEnvironment(source, true)
+	joined := "\x00" + strings.Join(got, "\x00") + "\x00"
+	for _, want := range []string{
+		"PATH=/usr/bin:/bin",
+		"TERM=xterm-256color",
+		"LANG=C.UTF-8",
+		"LC_ALL=C.UTF-8",
+		"GT_ROLE=testrig/witness",
+		"BEADS_DOLT_SERVER_PORT=3306",
+		"BD_ACTOR=testrig/witness",
+		"OPENAI_API_KEY=reviewed-secret",
+		"NODE_OPTIONS=",
+		"GT_TEST_FLOW_DIR=/fixture",
+	} {
+		if !strings.Contains(joined, "\x00"+want+"\x00") {
+			t.Fatalf("allowlisted environment missing %q: %q", want, got)
+		}
+	}
+	for _, denied := range []string{
+		"GT_INTERNAL_SESSION_CUSTODY_COMMAND=escape",
+		"HOME=/outer/home",
+		"XDG_RUNTIME_DIR=/outer/runtime",
+		"LD_PRELOAD=/outer/escape.so",
+		"BASH_ENV=/outer/bash-env",
+		"PYTHONPATH=/outer/python",
+		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
+		"GT_TEST_OUTER_SENTINEL=must-not-pass",
+	} {
+		if strings.Contains(joined, "\x00"+denied+"\x00") {
+			t.Fatalf("unreviewed environment escaped containment: %q in %q", denied, got)
+		}
+	}
+}
+
+func TestDecodeLinuxCustodyAllowedPathsRejectsScratchOverlap(t *testing.T) {
+	root := t.TempDir()
+	allowed := filepath.Join(root, "witness")
+	if err := os.Mkdir(allowed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(root, linuxSessionScratchPrefix+"nonce")
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeSessionCustodyPaths([]string{allowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeLinuxCustodyAllowedPaths(encoded, scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != allowed {
+		t.Fatalf("decoded allowlist = %q", got)
+	}
+	overlap, err := EncodeSessionCustodyPaths([]string{filepath.Join(scratch, "escape")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeLinuxCustodyAllowedPaths(overlap, scratch); err == nil || !strings.Contains(err.Error(), "overlaps scratch") {
+		t.Fatalf("scratch-overlap error = %v", err)
+	}
+}
+
 func verifyContainedCgroupIsReadOnly() string {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -347,6 +432,32 @@ func TestLinuxSessionCustodySupervisorHelper(t *testing.T) {
 		return
 	}
 	t.Setenv(EnvSessionCustody, custody)
+	if os.Getenv(EnvSessionCustodyPaths) == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		executable, err := filepath.Abs(os.Args[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths := []string{cwd, filepath.Dir(executable)}
+		for _, entry := range os.Environ() {
+			key, value, ok := strings.Cut(entry, "=")
+			if !ok || !strings.HasPrefix(key, "GT_TEST_") || !filepath.IsAbs(value) {
+				continue
+			}
+			if info, err := os.Stat(value); err != nil || !info.IsDir() {
+				value = filepath.Dir(value)
+			}
+			paths = append(paths, value)
+		}
+		encoded, err := EncodeSessionCustodyPaths(paths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(EnvSessionCustodyPaths, encoded)
+	}
 	t.Setenv("GT_TEST_SESSION_CUSTODY_SUPERVISOR", strconv.Itoa(os.Getpid()))
 	command := os.Getenv("GT_TEST_SESSION_CUSTODY_COMMAND")
 	if command == "" {
@@ -782,7 +893,11 @@ func TestLinuxCustodySupervisorShutdownReapsAlreadyDeadInit(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	launch := &linuxCustodyLaunch{child: child, wait: wait, pidfd: -1}
+	scratch := filepath.Join(t.TempDir(), linuxSessionScratchPrefix+"shutdown")
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launch := &linuxCustodyLaunch{child: child, wait: wait, pidfd: -1, scratch: scratch}
 	serviceContext, cancelServices := context.WithCancel(context.Background())
 	results := make(chan linuxCustodyServiceResult)
 	go func() {
@@ -801,6 +916,9 @@ func TestLinuxCustodySupervisorShutdownReapsAlreadyDeadInit(t *testing.T) {
 	}
 	if _, err := os.Stat(fmt.Sprintf("/proc/%d", child.Process.Pid)); !os.IsNotExist(err) {
 		t.Fatalf("reaped init %d still has a proc entry: %v", child.Process.Pid, err)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("normal supervisor shutdown retained scratch receipt %q: %v", scratch, err)
 	}
 }
 

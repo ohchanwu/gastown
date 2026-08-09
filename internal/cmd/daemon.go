@@ -15,7 +15,6 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -182,23 +181,16 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("daemon already running (PID %d)", pid)
 	}
 
-	// Start daemon in background
-	// We use 'gt daemon run' as the actual daemon process
+	// Linux must enter through the delegated systemd user unit so daemon run
+	// owns the cgroup subtree required by contained sessions. Other platforms
+	// retain their native detached launch path.
 	gtPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	daemonCmd := exec.Command(gtPath, "daemon", "run")
-	daemonCmd.Dir = townRoot
-
-	// Detach from terminal
-	daemonCmd.Stdin = nil
-	daemonCmd.Stdout = nil
-	daemonCmd.Stderr = nil
-	util.SetDetachedProcessGroup(daemonCmd)
-
-	if err := daemonCmd.Start(); err != nil {
+	startedProcess, err := startDaemonBackground(townRoot, gtPath)
+	if err != nil {
 		return fmt.Errorf("starting daemon: %w", err)
 	}
 
@@ -216,8 +208,10 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !started {
-		if msg := readDaemonStartupFailure(townRoot, daemonCmd.Process.Pid); msg != "" {
-			return fmt.Errorf("daemon failed to start: %s", msg)
+		if startedProcess != nil {
+			if msg := readDaemonStartupFailure(townRoot, startedProcess.Pid); msg != "" {
+				return fmt.Errorf("daemon failed to start: %s", msg)
+			}
 		}
 		return fmt.Errorf("daemon failed to start (check logs with 'gt daemon logs')")
 	}
@@ -225,7 +219,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 	// Check if our spawned process is the one that won the race.
 	// If another concurrent start won, our process would have exited after
 	// failing to acquire the lock, and the PID file would have a different PID.
-	if pid != daemonCmd.Process.Pid {
+	if startedProcess != nil && pid != startedProcess.Pid {
 		// Another daemon won the race - that's fine, report it
 		fmt.Printf("%s Daemon already running (PID %d)\n", style.Bold.Render("●"), pid)
 		return nil

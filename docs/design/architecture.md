@@ -314,6 +314,15 @@ controllers; daemon startup provisions separate control and session leaves and
 preflights the session pool. Namespace, storage, or cgroup setup failure aborts
 startup rather than launching an uncontained agent.
 
+The Linux workload runs in a bounded tmpfs root rather than a read-only view of
+the host root. The trusted launcher bind-mounts only reviewed system runtime,
+Witness worktree, provider configuration, and executable paths read-only;
+original home, XDG runtime/data, and unrelated same-UID files are absent. A
+private minimal `/dev` exposes only null, zero, random, urandom, a fresh devpts
+instance, and bounded shared memory. The workload environment is constructed
+from an explicit allowlist, and seccomp permits only IPv4/IPv6 stream or
+datagram sockets while the broker descriptor remains immutable.
+
 Generation-aware cleanup retains the Linux namespace init, aggregate cgroup,
 bounded scratch mount, and prior supervisor cgroup alongside the exact tmux and
 pane-process identities. Failed cgroup removal retains its receipt for a later

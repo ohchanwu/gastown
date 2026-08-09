@@ -1888,10 +1888,38 @@ func TestSessionGenerationCleanupClose(t *testing.T) {
 			if !process.closed {
 				t.Fatal("retained process reference was not closed")
 			}
+			if tc.err != nil {
+				if len(cleanup.processes) != 1 {
+					t.Fatalf("failed process cleanup owners = %d, want retained owner", len(cleanup.processes))
+				}
+				process.closeErr = nil
+			}
 			if err := cleanup.Close(); err != nil {
 				t.Fatalf("second Close() error = %v", err)
 			}
+			if len(cleanup.processes) != 0 {
+				t.Fatalf("successful retry retained %d process owners", len(cleanup.processes))
+			}
 		})
+	}
+}
+
+func TestSessionGenerationCleanupCloseRetainsCustodyUntilSuccessfulRetry(t *testing.T) {
+	closeErr := errors.New("injected custody close failure")
+	custody := &mockSessionCustody{closeErr: closeErr}
+	cleanup := &SessionGenerationCleanup{custody: custody}
+	if err := cleanup.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("first Close() error = %v, want %v", err, closeErr)
+	}
+	if cleanup.custody == nil {
+		t.Fatal("failed custody close discarded the sole owner")
+	}
+	custody.closeErr = nil
+	if err := cleanup.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if cleanup.custody != nil {
+		t.Fatal("successful custody close retained a stale owner")
 	}
 }
 

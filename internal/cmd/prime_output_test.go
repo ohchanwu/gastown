@@ -181,6 +181,38 @@ func TestOutputRoleDirectives(t *testing.T) {
 	})
 }
 
+func TestContainedWitnessPrimeGuidanceIsExactlyBrokerSafe(t *testing.T) {
+	output, err := containedWitnessPrimeOutput(RoleContext{Role: RoleWitness, Rig: "testrig"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments := strings.Split(output, "`")
+	var commands []string
+	for index := 1; index < len(segments); index += 2 {
+		command := strings.Fields(segments[index])
+		if len(command) < 2 || command[0] != "gt" {
+			t.Fatalf("non-command actionable guidance %q", segments[index])
+		}
+		if err := IsBrokerSafeCommand(rootCmd, command[1:]); err != nil {
+			t.Fatalf("contained guidance %q is not broker-safe: %v", segments[index], err)
+		}
+		commands = append(commands, segments[index])
+	}
+	want := []string{
+		"gt hook show", "gt mol current", "gt mol step close",
+		"gt patrol scan --rig testrig --json", "gt mail inbox --unread",
+		"gt agents list", "gt polecat list testrig", "gt status --fast",
+	}
+	if strings.Join(commands, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("contained guidance commands = %q, want %q", commands, want)
+	}
+	for _, forbidden := range []string{"witness status", "hook attach", "bd close", "polecat nuke", "gt peek"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("contained guidance advertises unavailable path %q: %s", forbidden, output)
+		}
+	}
+}
+
 func TestOutputCommandQuickReferenceBootBlocksRawTmux(t *testing.T) {
 	output := captureStdout(t, func() {
 		outputCommandQuickReference(RoleContext{Role: RoleBoot})

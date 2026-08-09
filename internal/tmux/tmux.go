@@ -230,6 +230,16 @@ const EnvSessionGeneration = "GT_SESSION_GENERATION"
 // generation cleanup fail closed.
 const EnvSessionCustody = "GT_SESSION_CUSTODY"
 
+// EnvSessionCustodyPaths carries the trusted launcher's explicit filesystem
+// allowlist into the Linux namespace init. It is stripped before the workload
+// starts and must never be accepted from an untrusted runtime override.
+const EnvSessionCustodyPaths = "GT_INTERNAL_SESSION_CUSTODY_PATHS"
+
+// EnvSessionBrokerWorker is set only by the trusted outer broker on reviewed
+// command workers. It lets commands such as prime render the capabilities that
+// the contained caller can actually invoke.
+const EnvSessionBrokerWorker = "GT_INTERNAL_SESSION_BROKER_WORKER"
+
 // NewTmux creates a new Tmux wrapper using the initialized town socket.
 // Falls back to GT_TOWN_SOCKET env var (set by cross-socket tmux bindings).
 // Empty socket means use the default tmux server.
@@ -1301,15 +1311,21 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 	if cleanup.custody != nil {
 		if err := cleanup.custody.Close(); err != nil {
 			errs = append(errs, err)
+		} else {
+			cleanup.custody = nil
 		}
-		cleanup.custody = nil
 	}
+	remaining := make([]retainedProcess, 0, len(cleanup.processes))
 	for i := len(cleanup.processes) - 1; i >= 0; i-- {
 		if err := cleanup.processes[i].Close(); err != nil {
 			errs = append(errs, err)
+			remaining = append(remaining, cleanup.processes[i])
 		}
 	}
-	cleanup.processes = nil
+	for left, right := 0, len(remaining)-1; left < right; left, right = left+1, right-1 {
+		remaining[left], remaining[right] = remaining[right], remaining[left]
+	}
+	cleanup.processes = remaining
 	return errors.Join(errs...)
 }
 
