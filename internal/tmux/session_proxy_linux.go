@@ -29,6 +29,7 @@ const (
 	defaultProxyTotalTimeout   = 15 * time.Minute
 	defaultProxyMaxHeaderBytes = 16 * 1024
 	defaultProxyMaxConnections = 32
+	defaultProxyMaxTunnelBytes = 64 * 1024 * 1024
 )
 
 type linuxCustodyProxySet struct {
@@ -62,6 +63,7 @@ type httpsConnectConfig struct {
 	totalTimeout   time.Duration
 	maxHeaderBytes int
 	maxConnections int
+	maxTunnelBytes int64
 }
 
 var nonPublicHTTPSPrefixes = []netip.Prefix{
@@ -350,6 +352,7 @@ func serveHTTPSConnect(ctx context.Context, listener net.Listener) error {
 		totalTimeout:   defaultProxyTotalTimeout,
 		maxHeaderBytes: defaultProxyMaxHeaderBytes,
 		maxConnections: defaultProxyMaxConnections,
+		maxTunnelBytes: defaultProxyMaxTunnelBytes,
 	})
 }
 
@@ -372,7 +375,7 @@ func serveHTTPSConnectWithConfig(ctx context.Context, listener net.Listener, con
 	if config.headerTimeout <= 0 || config.dialTimeout <= 0 || config.idleTimeout <= 0 || config.totalTimeout <= 0 {
 		return errors.New("HTTPS proxy timeouts must be positive")
 	}
-	if config.maxHeaderBytes < 1 || config.maxConnections < 1 {
+	if config.maxHeaderBytes < 1 || config.maxConnections < 1 || config.maxTunnelBytes < 1 {
 		return errors.New("HTTPS proxy limits must be positive")
 	}
 	return serveBoundedProxy(ctx, listener, config.maxConnections, func(serverContext context.Context, client net.Conn) {
@@ -427,7 +430,7 @@ func handleHTTPSConnect(serverContext context.Context, client net.Conn, config h
 		return
 	}
 	_ = client.SetDeadline(time.Time{})
-	relayProxyConnections(connectionContext, client, upstream, clientReader, config.idleTimeout)
+	relayProxyConnections(connectionContext, client, upstream, clientReader, config.idleTimeout, config.maxTunnelBytes)
 }
 
 func readBoundedConnectRequest(connection net.Conn, maxBytes int) (*http.Request, *bufio.Reader, error) {
@@ -579,18 +582,19 @@ func relayProxyConnections(
 	upstream net.Conn,
 	clientReader io.Reader,
 	idleTimeout time.Duration,
+	maxBytes int64,
 ) {
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
 	touch := func() { lastActivity.Store(time.Now().UnixNano()) }
 	copyDone := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(proxyActivityWriter{Writer: upstream, touch: touch}, proxyActivityReader{Reader: clientReader, touch: touch})
+		_, _ = io.Copy(proxyActivityWriter{Writer: upstream, touch: touch}, proxyActivityReader{Reader: io.LimitReader(clientReader, maxBytes), touch: touch})
 		closeProxyWrite(upstream)
 		copyDone <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(proxyActivityWriter{Writer: client, touch: touch}, proxyActivityReader{Reader: upstream, touch: touch})
+		_, _ = io.Copy(proxyActivityWriter{Writer: client, touch: touch}, proxyActivityReader{Reader: io.LimitReader(upstream, maxBytes), touch: touch})
 		closeProxyWrite(client)
 		copyDone <- struct{}{}
 	}()

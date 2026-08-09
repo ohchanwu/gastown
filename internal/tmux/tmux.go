@@ -39,6 +39,7 @@ var sessionNudgeLocks sync.Map // map[string]chan struct{}
 const (
 	nudgeLockTimeout                 = 30 * time.Second
 	sessionGenerationTmuxKillTimeout = 2 * time.Second
+	envPinnedTmuxBinary              = "GT_INTERNAL_PINNED_TMUX_BINARY"
 )
 
 // validSessionNameRe validates session names to prevent shell injection
@@ -386,7 +387,11 @@ func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
 		allArgs = append(allArgs, "-L", t.socketName)
 	}
 	allArgs = append(allArgs, args...)
-	cmd := exec.CommandContext(ctx, "tmux", allArgs...)
+	binary := strings.TrimSpace(os.Getenv(envPinnedTmuxBinary))
+	if binary == "" {
+		binary = "tmux"
+	}
+	cmd := exec.CommandContext(ctx, binary, allArgs...)
 	if t.commandEnv != nil {
 		cmd.Env = t.commandEnv
 	}

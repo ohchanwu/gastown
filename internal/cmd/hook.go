@@ -60,7 +60,7 @@ var hookStatusCmd = &cobra.Command{
 	Use: "status [target]",
 	Annotations: map[string]string{
 		BrokerSafeAnnotation:      "true",
-		brokerSafeArgsAnnotation:  brokerSafeArgsCobra,
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
 		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Show what's on your hook",
@@ -81,7 +81,7 @@ var hookShowCmd = &cobra.Command{
 	Use: "show [agent]",
 	Annotations: map[string]string{
 		BrokerSafeAnnotation:      "true",
-		brokerSafeArgsAnnotation:  brokerSafeArgsCobra,
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
 		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Show what's on an agent's hook (compact)",

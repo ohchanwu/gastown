@@ -914,19 +914,27 @@ func showRecentTrailSummary() {
 		style.Dim.Render("📍"), totalCommits, strings.Join(parts, ", "))
 }
 
-func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
+func runMoleculeCurrent(_ *cobra.Command, args []string) error {
+	info, _, err := resolveMoleculeCurrent(args)
+	if err != nil {
+		return err
+	}
+	return outputMoleculeCurrent(info)
+}
+
+func resolveMoleculeCurrent(args []string) (MoleculeCurrentInfo, *beads.Beads, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("getting current directory: %w", err)
+		return MoleculeCurrentInfo{}, nil, fmt.Errorf("getting current directory: %w", err)
 	}
 
 	// Find town root
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
-		return fmt.Errorf("finding workspace: %w", err)
+		return MoleculeCurrentInfo{}, nil, fmt.Errorf("finding workspace: %w", err)
 	}
 	if townRoot == "" {
-		return fmt.Errorf("not in a Gas Town workspace")
+		return MoleculeCurrentInfo{}, nil, fmt.Errorf("not in a Gas Town workspace")
 	}
 
 	// Determine target agent identity
@@ -949,69 +957,84 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 		}
 		target = buildAgentIdentity(roleCtx)
 		if target == "" {
-			return fmt.Errorf("cannot determine agent identity (role: %s)", roleCtx.Role)
+			return MoleculeCurrentInfo{}, nil, fmt.Errorf("cannot determine agent identity (role: %s)", roleCtx.Role)
 		}
 	}
 
 	// Find beads directory
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
-		return fmt.Errorf("not in a beads workspace: %w", err)
+		return MoleculeCurrentInfo{}, nil, fmt.Errorf("not in a beads workspace: %w", err)
+	}
+	if !isTownLevelRole(target) {
+		workDir = resolveHookLookupWorkDir(workDir, target, townRoot)
 	}
 
 	b := beads.New(workDir)
-
-	// Extract role from target for handoff bead lookup
-	role := extractRoleFromIdentity(target)
-
-	// Find handoff bead for this identity
-	handoff, err := b.FindHandoffBead(role)
-	if err != nil {
-		return fmt.Errorf("finding handoff bead: %w", err)
-	}
 
 	// Build current info
 	info := MoleculeCurrentInfo{
 		Identity: target,
 	}
 
-	if handoff == nil {
-		info.Status = "naked"
-		return outputMoleculeCurrent(info)
+	// Hook status is the authoritative active-work source. Patrols are hooked
+	// molecule wisps and do not require a separate handoff attachment, so a
+	// current-step lookup must consult the hook before the legacy handoff bead.
+	active, err := listAssignedActiveWork(b, target)
+	if err != nil {
+		return MoleculeCurrentInfo{}, nil, fmt.Errorf("finding hooked work: %w", err)
 	}
-
-	info.HandoffID = handoff.ID
-	info.HandoffTitle = handoff.Title
-
-	// Check for attached molecule
-	attachment := beads.ParseAttachmentFields(handoff)
-	if attachment == nil || attachment.AttachedMolecule == "" {
-		info.Status = "naked"
-		return outputMoleculeCurrent(info)
+	if len(active) == 0 && isTownLevelRole(target) {
+		active = scanAllRigsForHookedBeads(townRoot, target)
 	}
-
-	info.MoleculeID = attachment.AttachedMolecule
+	if len(active) == 0 && !isTownLevelRole(target) {
+		townB := beads.New(filepath.Join(townRoot, ".beads"))
+		if townWork, townErr := listAssignedActiveWork(townB, target); townErr == nil && len(townWork) > 0 {
+			active = townWork
+			b = townB
+		}
+	}
+	if len(active) > 0 {
+		info.MoleculeID = active[0].ID
+		if attachment := beads.ParseAttachmentFields(active[0]); attachment != nil && attachment.AttachedMolecule != "" {
+			info.MoleculeID = attachment.AttachedMolecule
+		}
+	} else {
+		role := extractRoleFromIdentity(target)
+		handoff, findErr := b.FindHandoffBead(role)
+		if findErr != nil {
+			return MoleculeCurrentInfo{}, nil, fmt.Errorf("finding handoff bead: %w", findErr)
+		}
+		if handoff == nil {
+			info.Status = "naked"
+			return info, b, nil
+		}
+		info.HandoffID = handoff.ID
+		info.HandoffTitle = handoff.Title
+		attachment := beads.ParseAttachmentFields(handoff)
+		if attachment == nil || attachment.AttachedMolecule == "" {
+			info.Status = "naked"
+			return info, b, nil
+		}
+		info.MoleculeID = attachment.AttachedMolecule
+	}
 
 	// Get the molecule root to find its title and children
-	molRoot, err := b.Show(attachment.AttachedMolecule)
+	molRoot, err := b.Show(info.MoleculeID)
 	if err != nil {
 		// Molecule not found - might be a template ID, still report what we have
 		info.Status = "working"
-		return outputMoleculeCurrent(info)
+		return info, b, nil
 	}
 
 	info.MoleculeTitle = molRoot.Title
 
 	// Find all children (steps) of the molecule root
-	children, err := b.List(beads.ListOptions{
-		Parent:   attachment.AttachedMolecule,
-		Status:   "all",
-		Priority: -1,
-	})
+	children, err := listChildrenAcrossTables(b, info.MoleculeID)
 	if err != nil {
 		// No steps - just an issue, not a molecule instance
 		info.Status = "working"
-		return outputMoleculeCurrent(info)
+		return info, b, nil
 	}
 
 	info.StepsTotal = len(children)
@@ -1093,7 +1116,7 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 		info.Status = "working"
 	}
 
-	return outputMoleculeCurrent(info)
+	return info, b, nil
 }
 
 // outputMoleculeCurrent outputs the current info in the appropriate format.

@@ -130,7 +130,23 @@ func writeLinuxCgroupControl(path, value string) error {
 	return nil
 }
 
-func prepareLinuxSessionCgroup(pid int) (_ string, retErr error) {
+func prepareLinuxSessionCgroup(pids ...int) (_ string, retErr error) {
+	if len(pids) == 0 {
+		return "", errors.New("bounded session cgroup requires at least one process")
+	}
+	for _, pid := range pids {
+		if pid <= 0 {
+			return "", errors.New("bounded session cgroup process PID is invalid")
+		}
+	}
+	previous := make([]string, len(pids))
+	for index, pid := range pids {
+		path, err := linuxCgroupDirectoryForPID(pid)
+		if err != nil {
+			return "", fmt.Errorf("capturing prior cgroup for process %d: %w", pid, err)
+		}
+		previous[index] = path
+	}
 	root, err := resolveLinuxSessionCgroupRoot()
 	if err != nil {
 		return "", err
@@ -142,8 +158,12 @@ func prepareLinuxSessionCgroup(pid int) (_ string, retErr error) {
 	if err != nil {
 		return "", fmt.Errorf("creating bounded session cgroup: %w", err)
 	}
+	moved := 0
 	defer func() {
 		if retErr != nil {
+			for index := moved - 1; index >= 0; index-- {
+				retErr = errors.Join(retErr, restoreLinuxProcessCgroup(previous[index], pids[index]))
+			}
 			retErr = errors.Join(retErr, os.Remove(path))
 		}
 	}()
@@ -162,10 +182,34 @@ func prepareLinuxSessionCgroup(pid int) (_ string, retErr error) {
 			return "", err
 		}
 	}
-	if err := writeLinuxCgroupControl(filepath.Join(path, "cgroup.procs"), strconv.Itoa(pid)); err != nil {
-		return "", fmt.Errorf("moving trusted init into bounded session cgroup: %w", err)
+	for _, pid := range pids {
+		if err := writeLinuxCgroupControl(filepath.Join(path, "cgroup.procs"), strconv.Itoa(pid)); err != nil {
+			return "", fmt.Errorf("moving session process %d into bounded cgroup: %w", pid, err)
+		}
+		moved++
 	}
 	return path, nil
+}
+
+func restoreLinuxProcessCgroup(path string, pid int) error {
+	if path == "" || pid <= 0 {
+		return errors.New("invalid prior cgroup receipt")
+	}
+	return writeLinuxCgroupControl(filepath.Join(path, "cgroup.procs"), strconv.Itoa(pid))
+}
+
+func clearLinuxSessionCgroupReceipt(receipt *string, remove func(string, time.Duration) error) error {
+	if receipt == nil || *receipt == "" {
+		return nil
+	}
+	if remove == nil {
+		return errors.New("session cgroup remover is unavailable")
+	}
+	if err := remove(*receipt, linuxSessionCgroupRemoveWait); err != nil {
+		return err
+	}
+	*receipt = ""
+	return nil
 }
 
 func fileExists(path string) bool {

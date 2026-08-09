@@ -263,6 +263,23 @@ gt witness attach myproject
 
 **When to use**: Production workflows with multiple concurrent agents.
 
+#### Linux containment prerequisite
+
+The native Linux daemon must run in a cgroup v2 systemd service with delegated
+`cpu`, `memory`, and `pids` controllers. The generated
+`gastown-daemon.service` unit includes the required `Delegate=` and
+`TasksMax=` settings. At startup, `gt daemon run` creates separate daemon-control
+and contained-session leaves, enables the delegated controllers, and fails
+closed if that layout cannot be proven. Linux Witness containment also requires
+a kernel with recursive read-only `mount_setattr` support (Linux 5.12 or newer).
+
+Use the installed systemd user service for production Linux operation. Running
+`gt daemon run` directly from an ordinary shell is not a substitute because the
+shell normally has no delegated cgroup subtree. An explicitly provisioned
+`GT_SESSION_CGROUP_ROOT` is supported for isolated integration environments;
+it must be an absolute child of `/sys/fs/cgroup` with the required controllers
+available.
+
 ### Choosing Roles
 
 Gas Town is modular. Enable only what you need:

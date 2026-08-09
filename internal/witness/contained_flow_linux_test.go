@@ -144,6 +144,7 @@ func TestContainedWitnessFlow(t *testing.T) {
 	mgr.startPoller = func(townRoot, session string) (int, error) {
 		return nudge.StartPollerWithExecutable(townRoot, session, gtBinary, nil)
 	}
+	receiptRecorded := recordContainedFlowSubmission(townRoot, mayorSession, filepath.Join(flowDir, "mayor.input"), 60*time.Second)
 	if err := mgr.Start(false, "contained-flow", []string{
 		"PATH=" + filepath.Dir(gtBinary) + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"GT_TEST_FLOW_DIR=" + flowDir,
@@ -166,17 +167,28 @@ func TestContainedWitnessFlow(t *testing.T) {
 		}
 	})
 
-	primeOutput := waitContainedFlowFile(t, filepath.Join(flowDir, "prime.stdout"), 20*time.Second)
+	paneOutput := waitContainedFlowPane(t, transport, mgr.SessionName(), "GT_FLOW_DONE", 90*time.Second)
+	results := parseContainedFlowResults(t, paneOutput)
+	primeOutput := containedFlowResultNamed(t, results, "prime").Stdout
 	if !strings.Contains(primeOutput, "role:"+rigName+"/witness") || !strings.Contains(primeOutput, rigName) {
-		primeStderr := readContainedFlowOptional(filepath.Join(flowDir, "prime.stderr"))
-		primeCode := readContainedFlowOptional(filepath.Join(flowDir, "prime.code"))
-		t.Fatalf("contained gt prime did not prove Witness identity: stdout=%q stderr=%q code=%q", primeOutput, primeStderr, primeCode)
+		prime := containedFlowResultNamed(t, results, "prime")
+		t.Fatalf("contained gt prime did not prove Witness identity: stdout=%q stderr=%q code=%d", prime.Stdout, prime.Stderr, prime.Code)
 	}
-	receiptRecorded := recordContainedFlowSubmission(townRoot, mayorSession, filepath.Join(flowDir, "mayor.input"), 60*time.Second)
-	if err := os.WriteFile(filepath.Join(flowDir, "continue"), []byte(nonce+"\n"), 0o600); err != nil {
-		t.Fatalf("release contained flow barrier: %v", err)
+	if !strings.Contains(primeOutput, "gt hook show") {
+		t.Fatalf("contained prime omitted broker-scoped live follow-up: %q", primeOutput)
 	}
-	waitContainedFlowFile(t, filepath.Join(flowDir, "flow.done"), 90*time.Second)
+	for _, name := range []string{"prime_hook_show", "prime_current", "prime_step_close", "prime_after_close"} {
+		assertContainedFlowExit(t, results, name, true)
+	}
+	if shown := containedFlowResultNamed(t, results, "prime_hook_show").Stdout; !strings.Contains(shown, "[hooked]") {
+		t.Fatalf("contained live prime hook-show follow-up was not executed: %q", shown)
+	}
+	if current := containedFlowResultNamed(t, results, "prime_current").Stdout; !strings.Contains(current, "Current:") {
+		t.Fatalf("contained live prime current-step follow-up was not executed: %q", current)
+	}
+	if closed := containedFlowResultNamed(t, results, "prime_step_close").Stdout; !strings.Contains(closed, "Closed current step") {
+		t.Fatalf("contained live prime step-close follow-up was not executed: %q", closed)
+	}
 	generation, err := transport.CaptureSessionGeneration(mgr.SessionName())
 	if err != nil {
 		t.Fatalf("capture contained Witness generation after agent flow: %v", err)
@@ -201,35 +213,30 @@ func TestContainedWitnessFlow(t *testing.T) {
 		"nudge_queue", "nudge_immediate", "hook", "agents", "polecats", "status",
 		"https",
 	} {
-		assertContainedFlowExit(t, flowDir, name, true)
+		assertContainedFlowExit(t, results, name, true)
 	}
 	for _, name := range []string{
 		"raw_tmux", "host_loopback", "private_dolt", "public_non443", "bd_create", "bd_list", "formula",
 		"hidden", "shell", "env_bypass", "descriptor_bypass",
 	} {
-		assertContainedFlowExit(t, flowDir, name, false)
+		assertContainedFlowExit(t, results, name, false)
 	}
 	for _, name := range []string{"formula", "shell", "env_bypass", "descriptor_bypass"} {
-		assertContainedFlowBrokerDenial(t, flowDir, name)
+		assertContainedFlowBrokerDenial(t, results, name)
 	}
 	for _, name := range []string{"bd_create", "bd_list"} {
-		stderr := readContainedFlowOptional(filepath.Join(flowDir, name+".stderr"))
+		stderr := containedFlowResultNamed(t, results, name).Stderr
 		if !strings.Contains(stderr, "127.0.0.1:1") {
 			t.Fatalf("contained direct %s did not fail against the isolated deny endpoint: %q", name, stderr)
 		}
 	}
-	assertContainedFlowDenial(t, flowDir, "hidden", 1, "not requested by a trusted launcher")
-	for _, name := range []string{"shell.escape", "env.escape", "descriptor.escape"} {
-		if _, err := os.Stat(filepath.Join(flowDir, name)); !os.IsNotExist(err) {
-			t.Fatalf("contained denial proof %s exists: %v", name, err)
-		}
-	}
-	for _, name := range []string{"mail_inbox.stdout", "mail_read.stdout", "https.stdout"} {
-		if evidence := readContainedFlowOptional(filepath.Join(flowDir, name)); !strings.Contains(evidence, nonce) {
+	assertContainedFlowDenial(t, results, "hidden", 1, "not requested by a trusted launcher")
+	for _, name := range []string{"mail_inbox", "mail_read", "https"} {
+		if evidence := containedFlowResultNamed(t, results, name).Stdout; !strings.Contains(evidence, nonce) {
 			t.Fatalf("contained flow evidence %s lacks nonce %q: %q", name, nonce, evidence)
 		}
 	}
-	if outcomes := strings.ToLower(readContainedFlowOptional(filepath.Join(flowDir, "descriptor.outcomes"))); !strings.Contains(outcomes, "close=operation not permitted") ||
+	if outcomes := strings.ToLower(containedFlowResultNamed(t, results, "descriptor_bypass").Stderr); !strings.Contains(outcomes, "close=operation not permitted") ||
 		!strings.Contains(outcomes, "dup2=operation not permitted") ||
 		!strings.Contains(outcomes, "fcntl=allowed") {
 		t.Fatalf("broker descriptor hardening evidence incomplete: %q", outcomes)
@@ -321,36 +328,122 @@ func readContainedFlowOptional(path string) string {
 	return string(data)
 }
 
-func assertContainedFlowExit(t *testing.T, flowDir, name string, wantSuccess bool) {
-	t.Helper()
-	raw := strings.TrimSpace(waitContainedFlowFile(t, filepath.Join(flowDir, name+".code"), 3*time.Second))
-	code, err := strconv.Atoi(raw)
-	if err != nil {
-		t.Fatalf("contained %s exit code = %q: %v", name, raw, err)
+type containedFlowResult struct {
+	Code   int
+	Stdout string
+	Stderr string
+}
+
+func TestParseContainedFlowResults(t *testing.T) {
+	output := strings.Join([]string{
+		"noise",
+		"GT_FLOW_BEGIN:prime:0",
+		"stdout line",
+		"GT_FLOW_STDERR:prime",
+		"stderr line",
+		"GT_FLOW_END:prime",
+		"GT_FLOW_DONE",
+	}, "\n")
+	result := containedFlowResultNamed(t, parseContainedFlowResults(t, output), "prime")
+	if result.Code != 0 || result.Stdout != "stdout line" || result.Stderr != "stderr line" {
+		t.Fatalf("parsed contained result = %#v", result)
 	}
-	if wantSuccess && code != 0 || !wantSuccess && code == 0 {
+}
+
+func waitContainedFlowPane(t *testing.T, transport *tmux.Tmux, session, needle string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var output string
+	for time.Now().Before(deadline) {
+		captured, err := transport.CapturePaneAll(session)
+		if err == nil {
+			output = captured
+			if strings.Contains(output, needle) {
+				return output
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("contained pane did not emit %q: %q", needle, output)
+	return ""
+}
+
+func parseContainedFlowResults(t *testing.T, output string) map[string]containedFlowResult {
+	t.Helper()
+	results := make(map[string]containedFlowResult)
+	var name string
+	var code int
+	var stdout, stderr strings.Builder
+	inStderr := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "GT_FLOW_BEGIN:") {
+			parts := strings.Split(line, ":")
+			if len(parts) != 3 {
+				t.Fatalf("malformed contained flow begin marker %q", line)
+			}
+			name = parts[1]
+			var err error
+			code, err = strconv.Atoi(parts[2])
+			if err != nil {
+				t.Fatalf("malformed contained flow code %q: %v", line, err)
+			}
+			stdout.Reset()
+			stderr.Reset()
+			inStderr = false
+			continue
+		}
+		if name == "" {
+			continue
+		}
+		if line == "GT_FLOW_STDERR:"+name {
+			inStderr = true
+			continue
+		}
+		if line == "GT_FLOW_END:"+name {
+			results[name] = containedFlowResult{Code: code, Stdout: strings.TrimSpace(stdout.String()), Stderr: strings.TrimSpace(stderr.String())}
+			name = ""
+			continue
+		}
+		if inStderr {
+			stderr.WriteString(raw)
+			stderr.WriteByte('\n')
+		} else {
+			stdout.WriteString(raw)
+			stdout.WriteByte('\n')
+		}
+	}
+	return results
+}
+
+func containedFlowResultNamed(t *testing.T, results map[string]containedFlowResult, name string) containedFlowResult {
+	t.Helper()
+	result, ok := results[name]
+	if !ok {
+		t.Fatalf("contained flow omitted result %q", name)
+	}
+	return result
+}
+
+func assertContainedFlowExit(t *testing.T, results map[string]containedFlowResult, name string, wantSuccess bool) {
+	t.Helper()
+	result := containedFlowResultNamed(t, results, name)
+	if wantSuccess && result.Code != 0 || !wantSuccess && result.Code == 0 {
 		t.Fatalf("contained %s exit code = %d, want success=%v; stdout=%q stderr=%q",
-			name, code, wantSuccess,
-			readContainedFlowOptional(filepath.Join(flowDir, name+".stdout")),
-			readContainedFlowOptional(filepath.Join(flowDir, name+".stderr")))
+			name, result.Code, wantSuccess, result.Stdout, result.Stderr)
 	}
 }
 
-func assertContainedFlowBrokerDenial(t *testing.T, flowDir, name string) {
+func assertContainedFlowBrokerDenial(t *testing.T, results map[string]containedFlowResult, name string) {
 	t.Helper()
-	assertContainedFlowDenial(t, flowDir, name, 126, "not broker-safe")
+	assertContainedFlowDenial(t, results, name, 126, "not broker-safe")
 }
 
-func assertContainedFlowDenial(t *testing.T, flowDir, name string, wantCode int, wantStderr string) {
+func assertContainedFlowDenial(t *testing.T, results map[string]containedFlowResult, name string, wantCode int, wantStderr string) {
 	t.Helper()
-	raw := strings.TrimSpace(readContainedFlowOptional(filepath.Join(flowDir, name+".code")))
-	code, err := strconv.Atoi(raw)
-	if err != nil {
-		t.Fatalf("contained %s denial exit code = %q: %v", name, raw, err)
-	}
-	stderr := readContainedFlowOptional(filepath.Join(flowDir, name+".stderr"))
-	if code != wantCode || !strings.Contains(stderr, wantStderr) {
-		t.Fatalf("contained %s did not hit the expected denial: code=%d want=%d stderr=%q want substring=%q", name, code, wantCode, stderr, wantStderr)
+	result := containedFlowResultNamed(t, results, name)
+	if result.Code != wantCode || !strings.Contains(result.Stderr, wantStderr) {
+		t.Fatalf("contained %s did not hit the expected denial: code=%d want=%d stderr=%q want substring=%q", name, result.Code, wantCode, result.Stderr, wantStderr)
 	}
 }
 
@@ -466,6 +559,11 @@ func createContainedFlowPatrol(t *testing.T, bd *beads.Beads, molName, assignee 
 		Title: "inbox-check", Parent: root.ID, Priority: -1, Ephemeral: true, Actor: "witness",
 	}); err != nil {
 		t.Fatalf("create contained patrol child: %v", err)
+	}
+	if _, err := bd.Create(beads.CreateOptions{
+		Title: "cleanup-check", Parent: root.ID, Priority: -1, Ephemeral: true, Actor: "witness",
+	}); err != nil {
+		t.Fatalf("create contained patrol continuation child: %v", err)
 	}
 	return root.ID
 }
@@ -700,7 +798,21 @@ func waitContainedFlowProcessesGone(t *testing.T, pids []int, timeout time.Durat
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("contained process generations survived Stop: %v", pids)
+	var survivors []string
+	for _, pid := range pids {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err != nil {
+			continue
+		}
+		var fields []string
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "State:") || strings.HasPrefix(line, "PPid:") || strings.HasPrefix(line, "NSpid:") {
+				fields = append(fields, strings.TrimSpace(line))
+			}
+		}
+		survivors = append(survivors, fmt.Sprintf("%d{%s}", pid, strings.Join(fields, ", ")))
+	}
+	t.Fatalf("contained process generations survived Stop: %v", survivors)
 }
 
 func requireContainedFlowExecutable(t *testing.T, envKey string) string {
@@ -763,15 +875,23 @@ umask 077
 run_flow() {
   name=$1
   shift
-  "$@" >"$GT_TEST_FLOW_DIR/$name.stdout.tmp" 2>"$GT_TEST_FLOW_DIR/$name.stderr.tmp"
+  stdout="$TMPDIR/$name.stdout"
+  stderr="$TMPDIR/$name.stderr"
+  "$@" >"$stdout" 2>"$stderr"
   code=$?
-  mv "$GT_TEST_FLOW_DIR/$name.stdout.tmp" "$GT_TEST_FLOW_DIR/$name.stdout"
-  mv "$GT_TEST_FLOW_DIR/$name.stderr.tmp" "$GT_TEST_FLOW_DIR/$name.stderr"
-  printf '%s\n' "$code" >"$GT_TEST_FLOW_DIR/$name.code"
+  printf '\nGT_FLOW_BEGIN:%s:%s\n' "$name" "$code"
+  cat "$stdout"
+  printf '\nGT_FLOW_STDERR:%s\n' "$name"
+  cat "$stderr"
+  printf '\nGT_FLOW_END:%s\n' "$name"
+  rm -f "$stdout" "$stderr"
 }
 run_flow preset_env test "${GT_TEST_FLOW_PRESET_ENV:-}" = contained-preset-env
 run_flow prime "$GT_TEST_FLOW_GT" prime --hook
-while [ ! -f "$GT_TEST_FLOW_DIR/continue" ]; do sleep 0.05; done
+run_flow prime_hook_show "$GT_TEST_FLOW_GT" hook show
+run_flow prime_current "$GT_TEST_FLOW_GT" mol current
+run_flow prime_step_close "$GT_TEST_FLOW_GT" mol step close
+run_flow prime_after_close "$GT_TEST_FLOW_GT" mol current
 run_flow patrol_scan "$GT_TEST_FLOW_GT" patrol scan --rig testrig --json
 run_flow patrol_report "$GT_TEST_FLOW_GT" patrol report --summary "$GT_TEST_FLOW_NONCE" --steps inbox-check:OK
 run_flow mail_inbox "$GT_TEST_FLOW_GT" mail inbox --unread
@@ -792,8 +912,8 @@ run_flow private_dolt nc -z -w 1 "$GT_TEST_FLOW_PRIVATE_IP" 3306
 run_flow public_non443 curl --fail --silent --show-error --max-time 3 "http://contained-flow.test/$GT_TEST_FLOW_NONCE"
 run_flow formula "$GT_TEST_FLOW_GT" formula list
 run_flow hidden "$GT_TEST_FLOW_GT" session-custody-init
-run_flow shell "$GT_TEST_FLOW_GT" shell -c "touch $GT_TEST_FLOW_DIR/shell.escape"
-run_flow env_bypass env -u GT_ROLE -u GT_RIG -u GT_AGENT "$GT_TEST_FLOW_GT" shell -c "touch $GT_TEST_FLOW_DIR/env.escape"
+run_flow shell "$GT_TEST_FLOW_GT" shell -c true
+run_flow env_bypass env -u GT_ROLE -u GT_RIG -u GT_AGENT "$GT_TEST_FLOW_GT" shell -c true
 run_flow descriptor_bypass python3 -c 'import fcntl,os
 out=[]
 for name,operation in (("close",lambda: os.close(6)),("dup2",lambda: os.dup2(0,6)),("fcntl",lambda: fcntl.fcntl(6,fcntl.F_DUPFD,10))):
@@ -803,9 +923,9 @@ for name,operation in (("close",lambda: os.close(6)),("dup2",lambda: os.dup2(0,6
         out.append(name+"=allowed")
     except OSError as error:
         out.append(name+"="+error.strerror)
-open(os.environ["GT_TEST_FLOW_DIR"]+"/descriptor.outcomes","w").write("\n".join(out)+"\n")
-os.execve(os.environ["GT_TEST_FLOW_GT"],[os.environ["GT_TEST_FLOW_GT"],"shell","-c","touch "+os.environ["GT_TEST_FLOW_DIR"]+"/descriptor.escape"],os.environ)'
-printf '%s\n' "$GT_TEST_FLOW_NONCE" >"$GT_TEST_FLOW_DIR/flow.done"
+os.write(2,("\n".join(out)+"\n").encode())
+os.execve(os.environ["GT_TEST_FLOW_GT"],[os.environ["GT_TEST_FLOW_GT"],"shell","-c","true"],os.environ)'
+printf '\nGT_FLOW_DONE\n'
 while :; do sleep 60; done
 `
 	if err := os.WriteFile(agentPath, []byte(agent), 0o700); err != nil {

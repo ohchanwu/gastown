@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 type linuxProcessStat struct {
@@ -19,7 +20,7 @@ type linuxProcessStat struct {
 func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
 			return linuxProcessStat{}, errProcessNotFound
 		}
 		return linuxProcessStat{}, err

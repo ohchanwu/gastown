@@ -6,10 +6,10 @@ import (
 
 // Molecule command flags
 var (
-	moleculeJSON      bool
-	moleculeJitter    string // jitter duration for squash (e.g. "10s")
-	moleculeSummary   string // optional summary for squash digest
-	moleculeNoDigest  bool   // skip digest bead creation on squash
+	moleculeJSON     bool
+	moleculeJitter   string // jitter duration for squash (e.g. "10s")
+	moleculeSummary  string // optional summary for squash digest
+	moleculeNoDigest bool   // skip digest bead creation on squash
 )
 
 var moleculeCmd = &cobra.Command{
@@ -42,7 +42,6 @@ TO DISPATCH WORK (with molecules):
   gt sling mol-xxx target   # Pour formula + sling to agent
   gt formulas               # List available formulas`,
 }
-
 
 var moleculeProgressCmd = &cobra.Command{
 	Use:   "progress <root-issue-id>",
@@ -151,7 +150,12 @@ Examples:
 }
 
 var moleculeCurrentCmd = &cobra.Command{
-	Use:   "current [identity]",
+	Use: "current [identity]",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "json",
+	},
 	Short: "Show what agent should be working on",
 	Long: `Query what an agent is supposed to be working on via breadcrumb trail.
 
@@ -174,7 +178,6 @@ Examples:
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMoleculeCurrent,
 }
-
 
 var moleculeBurnCmd = &cobra.Command{
 	Use:   "burn [target]",
@@ -227,7 +230,6 @@ IMPORTANT: Always use 'gt mol step done' to complete steps. Do not manually
 close steps with 'bd close' - that skips the auto-continuation logic.`,
 }
 
-
 func init() {
 	// Progress flags
 	moleculeProgressCmd.Flags().BoolVar(&moleculeJSON, "json", false, "Output as JSON")
@@ -252,6 +254,7 @@ func init() {
 
 	// Add step subcommand with its children
 	moleculeStepCmd.AddCommand(moleculeStepDoneCmd)
+	moleculeStepCmd.AddCommand(moleculeStepCloseCmd)
 	moleculeCmd.AddCommand(moleculeStepCmd)
 
 	// Add subcommands (agent-specific operations only)

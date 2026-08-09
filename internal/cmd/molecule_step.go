@@ -43,6 +43,43 @@ Example:
 	RunE: runMoleculeStepDone,
 }
 
+// moleculeStepCloseCmd closes only the caller's currently active molecule step.
+// Unlike step done, it cannot select an arbitrary bead or respawn a session, so
+// it is safe to expose through the contained-session command broker.
+var moleculeStepCloseCmd = &cobra.Command{
+	Use:   "close",
+	Short: "Close the current molecule step without changing session lifecycle",
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "",
+	},
+	Args: cobra.NoArgs,
+	RunE: runMoleculeStepClose,
+}
+
+func runMoleculeStepClose(_ *cobra.Command, _ []string) error {
+	info, b, err := resolveMoleculeCurrent(nil)
+	if err != nil {
+		return err
+	}
+	if info.Status != "working" || info.CurrentStepID == "" {
+		return fmt.Errorf("current agent has no closable molecule step (status: %s)", info.Status)
+	}
+	step, err := b.Show(info.CurrentStepID)
+	if err != nil {
+		return fmt.Errorf("loading current molecule step: %w", err)
+	}
+	if step.Status == "closed" {
+		return fmt.Errorf("current molecule step %s is already closed", step.ID)
+	}
+	if err := b.Close(step.ID); err != nil {
+		return fmt.Errorf("closing current molecule step: %w", err)
+	}
+	fmt.Printf("%s Closed current step %s: %s\n", style.Bold.Render("✓"), step.ID, step.Title)
+	return nil
+}
+
 var (
 	moleculeStepDryRun bool
 )

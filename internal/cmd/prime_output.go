@@ -708,7 +708,7 @@ func outputContinuationDirective(hookedBead *beads.Issue, hasMolecule bool) {
 	fmt.Println()
 	fmt.Printf("  Hooked: %s — %s\n", style.Bold.Render(hookedBead.ID), hookedBead.Title)
 	if hasMolecule {
-		fmt.Println("  (Has attached molecule — check `bd mol current` for next step)")
+		fmt.Println("  (Has attached molecule — check `gt mol current` for next step)")
 	}
 	fmt.Println()
 }

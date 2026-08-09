@@ -22,21 +22,28 @@ import (
 )
 
 const (
-	linuxProcRoot                          = "/proc"
-	sessionCustodyReadyProbe               = 300 * time.Millisecond
-	linuxCustodyHandshakeTimeout           = 3 * time.Second
-	linuxCustodyReapTimeout                = 3 * time.Second
-	linuxCustodyInitExitTimeout            = 3 * time.Second
-	linuxCustodyBrokerShutdownTimeout      = 2 * time.Second
-	linuxCustodySupervisorExitTimeout      = 3 * time.Second
-	linuxCustodyReadyFD                    = 3
-	linuxCustodyPermitFD                   = 4
-	linuxCustodySupervisorLifeFD           = 5
-	envLinuxSessionCustodyInit             = "GT_INTERNAL_SESSION_CUSTODY_INIT"
-	envLinuxSessionCustodyCommand          = "GT_INTERNAL_SESSION_CUSTODY_COMMAND"
-	envLinuxSessionCustodyNamespaced       = "GT_INTERNAL_SESSION_CUSTODY_NAMESPACED"
-	linuxSessionCustodyReadyByte      byte = 'R'
-	linuxSessionCustodyHardenedByte   byte = 'H'
+	linuxProcRoot                               = "/proc"
+	sessionCustodyReadyProbe                    = 300 * time.Millisecond
+	linuxCustodyHandshakeTimeout                = 3 * time.Second
+	linuxCustodyReapTimeout                     = 3 * time.Second
+	linuxCustodyInitExitTimeout                 = 3 * time.Second
+	linuxCustodyBrokerShutdownTimeout           = 2 * time.Second
+	linuxCustodyCooperativeShutdownTimeout      = linuxCustodyReapTimeout + linuxCustodyBrokerShutdownTimeout + time.Second
+	linuxCustodySupervisorExitTimeout           = 10 * time.Second
+	linuxCustodyReadyFD                         = 3
+	linuxCustodyPermitFD                        = 4
+	linuxCustodySupervisorLifeFD                = 5
+	envLinuxSessionCustodyInit                  = "GT_INTERNAL_SESSION_CUSTODY_INIT"
+	envLinuxSessionCustodyCommand               = "GT_INTERNAL_SESSION_CUSTODY_COMMAND"
+	envLinuxSessionCustodyNamespaced            = "GT_INTERNAL_SESSION_CUSTODY_NAMESPACED"
+	envLinuxSessionScratch                      = "GT_INTERNAL_SESSION_SCRATCH"
+	linuxSessionScratchPrefix                   = "gastown-session-scratch-"
+	linuxSessionScratchBytes                    = 256 * 1024 * 1024
+	linuxSessionScratchInodes                   = 16 * 1024
+	linuxSessionSharedMemoryBytes               = 16 * 1024 * 1024
+	linuxSessionSharedMemoryInodes              = 1024
+	linuxSessionCustodyReadyByte           byte = 'R'
+	linuxSessionCustodyHardenedByte        byte = 'H'
 )
 
 type linuxSessionCustody struct {
@@ -59,9 +66,10 @@ type linuxCustodyKillBudgets struct {
 }
 
 type linuxCustodyKillOps struct {
-	revalidate func() (linuxProcessStat, error)
-	signal     func(int, unix.Signal) error
-	wait       func(context.Context, int, string) error
+	revalidate   func() (linuxProcessStat, error)
+	signal       func(int, unix.Signal) error
+	waitTerminal func(context.Context, int, string) error
+	waitGone     func(context.Context, int, string) error
 }
 
 type linuxCustodyServiceResult struct {
@@ -91,16 +99,19 @@ func withoutEnvironmentKeys(env []string, keys ...string) []string {
 }
 
 type linuxCustodyLaunch struct {
-	child         *exec.Cmd
-	wait          <-chan error
-	pidfd         int
-	ready         *os.File
-	permit        *os.File
-	life          *os.File
-	broker        *os.File
-	proxyExpected bool
-	proxies       linuxCustodyProxySet
-	cgroup        string
+	child          *exec.Cmd
+	wait           <-chan error
+	pidfd          int
+	ready          *os.File
+	permit         *os.File
+	life           *os.File
+	broker         *os.File
+	tmux           *os.File
+	proxyExpected  bool
+	proxies        linuxCustodyProxySet
+	cgroup         string
+	previousCgroup string
+	scratch        string
 }
 
 func startLinuxCustodyWait(child *exec.Cmd) <-chan error {
@@ -141,7 +152,45 @@ func newLinuxUncontainedCustodyCommand(command string) (*exec.Cmd, *int) {
 	return child, &pidfd
 }
 
+func pinLinuxSessionTmuxExecutable() (*os.File, error) {
+	path, err := exec.LookPath("tmux")
+	if err != nil {
+		return nil, fmt.Errorf("resolving trusted tmux executable: %w", err)
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalizing trusted tmux executable: %w", err)
+	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("pinning trusted tmux executable: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), "session-broker-tmux-executable")
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("pinning trusted tmux executable returned no file")
+	}
+	return file, nil
+}
+
 func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCustodyLaunch, retErr error) {
+	previousCgroup, err := linuxCgroupDirectoryForPID(os.Getpid())
+	if err != nil {
+		return nil, fmt.Errorf("capturing supervisor cgroup receipt: %w", err)
+	}
+	scratch, err := os.MkdirTemp("", linuxSessionScratchPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("creating bounded session scratch mountpoint: %w", err)
+	}
+	if err := os.Chmod(scratch, 0o700); err != nil {
+		_ = os.Remove(scratch)
+		return nil, fmt.Errorf("securing bounded session scratch mountpoint: %w", err)
+	}
+	defer func() {
+		if retErr != nil && scratch != "" {
+			_ = os.Remove(scratch)
+		}
+	}()
 	readyReader, readyWriter, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -192,15 +241,25 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	if err != nil {
 		return nil, err
 	}
+	tmuxExecutable, err := pinLinuxSessionTmuxExecutable()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil && tmuxExecutable != nil {
+			_ = tmuxExecutable.Close()
+		}
+	}()
 	child := exec.Command(executable, "session-custody-init")
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.ExtraFiles = []*os.File{readyWriter, permitReader, lifeReader, brokerClient}
 	child.Env = append(
-		withoutEnvironmentKeys(os.Environ(), envLinuxSessionCustodyInit, envLinuxSessionCustodyCommand, envLinuxSessionCustodyNamespaced),
+		withoutEnvironmentKeys(os.Environ(), envLinuxSessionCustodyInit, envLinuxSessionCustodyCommand, envLinuxSessionCustodyNamespaced, envLinuxSessionScratch),
 		envLinuxSessionCustodyInit+"=1",
 		envLinuxSessionCustodyCommand+"="+command,
+		envLinuxSessionScratch+"="+scratch,
 	)
 	if namespaced {
 		child.Env = append(child.Env, envLinuxSessionCustodyNamespaced+"=1")
@@ -210,7 +269,7 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 		PidFD: &pidfd,
 	}
 	if namespaced {
-		child.SysProcAttr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNS | unix.CLONE_NEWNET
+		child.SysProcAttr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNS | unix.CLONE_NEWNET | unix.CLONE_NEWIPC
 		child.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}}
 		child.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}}
 		child.SysProcAttr.GidMappingsEnableSetgroups = false
@@ -221,9 +280,14 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	launch := &linuxCustodyLaunch{
 		child: child, wait: startLinuxCustodyWait(child), pidfd: pidfd,
 		ready: readyReader, permit: permitWriter, life: lifeWriter, broker: brokerServer,
-		proxyExpected: namespaced,
+		tmux:           tmuxExecutable,
+		proxyExpected:  namespaced,
+		previousCgroup: previousCgroup,
+		scratch:        scratch,
 	}
 	brokerServer = nil
+	tmuxExecutable = nil
+	scratch = ""
 	_ = readyWriter.Close()
 	_ = permitReader.Close()
 	_ = lifeReader.Close()
@@ -232,7 +296,7 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	if pidfd < 0 {
 		return nil, errors.Join(errors.New("kernel did not return a pidfd for session custody"), closeLinuxCustodyLaunch(launch, true))
 	}
-	cgroup, err := prepareLinuxSessionCgroup(child.Process.Pid)
+	cgroup, err := prepareLinuxSessionCgroup(child.Process.Pid, os.Getpid())
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("preparing bounded session resources: %w", err), closeLinuxCustodyLaunch(launch, true))
 	}
@@ -292,6 +356,10 @@ func closeLinuxCustodyLaunchWithTimeout(launch *linuxCustodyLaunch, terminate bo
 		errs = append(errs, launch.broker.Close())
 		launch.broker = nil
 	}
+	if terminate && launch.tmux != nil {
+		errs = append(errs, launch.tmux.Close())
+		launch.tmux = nil
+	}
 	if terminate {
 		errs = append(errs, launch.proxies.Close())
 	}
@@ -300,8 +368,18 @@ func closeLinuxCustodyLaunchWithTimeout(launch *linuxCustodyLaunch, terminate bo
 		launch.pidfd = -1
 	}
 	if terminate && launch.cgroup != "" {
-		errs = append(errs, removeLinuxSessionCgroup(launch.cgroup, linuxSessionCgroupRemoveWait))
-		launch.cgroup = ""
+		if current, err := linuxCgroupDirectoryForPID(os.Getpid()); err == nil && current == launch.cgroup {
+			errs = append(errs, restoreLinuxProcessCgroup(launch.previousCgroup, os.Getpid()))
+		}
+		errs = append(errs, clearLinuxSessionCgroupReceipt(&launch.cgroup, removeLinuxSessionCgroup))
+	}
+	if terminate && launch.scratch != "" {
+		err := os.Remove(launch.scratch)
+		if err == nil || os.IsNotExist(err) {
+			launch.scratch = ""
+		} else {
+			errs = append(errs, fmt.Errorf("removing bounded session scratch receipt: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -414,7 +492,7 @@ func runSessionCustodyInit() (bool, error) {
 	}
 	var proxyPorts *linuxCustodyProxyPorts
 	if os.Getenv(envLinuxSessionCustodyNamespaced) == "1" {
-		if err := prepareLinuxCustodyNamespace(); err != nil {
+		if err := prepareLinuxCustodyNamespace(os.Getenv(envLinuxSessionScratch)); err != nil {
 			return true, err
 		}
 		ports, err := createAndSendLinuxCustodyProxyListeners(linuxSessionBrokerFD)
@@ -473,12 +551,26 @@ func runSessionCustodyInit() (bool, error) {
 	return true, runLinuxCustodyWorkload(command, proxyPorts)
 }
 
-func prepareLinuxCustodyNamespace() error {
+func prepareLinuxCustodyNamespace(scratch string) error {
+	if !filepath.IsAbs(scratch) || !strings.HasPrefix(filepath.Base(scratch), linuxSessionScratchPrefix) {
+		return errors.New("session custody scratch mountpoint is invalid")
+	}
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("making session custody mounts private: %w", err)
 	}
 	if err := unix.Mount("proc", linuxProcRoot, "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
 		return fmt.Errorf("mounting private session custody procfs: %w", err)
+	}
+	if err := unix.MountSetattr(unix.AT_FDCWD, "/", unix.AT_RECURSIVE, &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}); err != nil {
+		return fmt.Errorf("making session custody host mounts read-only: %w", err)
+	}
+	sharedMemoryOptions := fmt.Sprintf("mode=1777,size=%d,nr_inodes=%d", linuxSessionSharedMemoryBytes, linuxSessionSharedMemoryInodes)
+	if err := unix.Mount("tmpfs", "/dev/shm", "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, sharedMemoryOptions); err != nil {
+		return fmt.Errorf("mounting private bounded session shared memory: %w", err)
+	}
+	options := fmt.Sprintf("mode=0700,size=%d,nr_inodes=%d", linuxSessionScratchBytes, linuxSessionScratchInodes)
+	if err := unix.Mount("tmpfs", scratch, "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, options); err != nil {
+		return fmt.Errorf("mounting bounded session scratch storage: %w", err)
 	}
 	if err := bringUpLinuxCustodyLoopback(); err != nil {
 		return err
@@ -508,11 +600,23 @@ func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts)
 		envLinuxSessionCustodyCommand,
 		envLinuxSessionCustodyNamespaced,
 		envLinuxSessionCgroupRoot,
+		envLinuxSessionScratch,
+		envPinnedTmuxBinary,
 		"TMUX",
 		"TMUX_PANE",
 	)
 	if proxyPorts != nil {
 		env = rewriteLinuxCustodyNetworkEnvironment(env, *proxyPorts)
+	}
+	if scratch := strings.TrimSpace(os.Getenv(envLinuxSessionScratch)); scratch != "" {
+		env = append(env,
+			"HOME="+scratch,
+			"TMPDIR="+scratch,
+			"XDG_CACHE_HOME="+filepath.Join(scratch, "cache"),
+			"XDG_CONFIG_HOME="+filepath.Join(scratch, "config"),
+			"XDG_DATA_HOME="+filepath.Join(scratch, "data"),
+			"XDG_STATE_HOME="+filepath.Join(scratch, "state"),
+		)
 	}
 	_, err := syscall.ForkExec(
 		"/bin/sh",
@@ -551,7 +655,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 			runtime.KeepAlive(launch)
 		}
 	}
-	if launch.broker == nil || launch.proxies.HTTPS == nil {
+	if launch.broker == nil || launch.tmux == nil || launch.proxies.HTTPS == nil {
 		return errors.Join(errors.New("contained session is missing broker or proxy endpoints"), closeLinuxCustodyLaunch(launch, true))
 	}
 	brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
@@ -568,7 +672,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	defer cancelServices()
 	serviceDone := make(chan linuxCustodyServiceResult, 2)
 	go func() {
-		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: ServeSessionBroker(serviceContext, "/proc/self/exe", brokerFD, validate)}
+		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: serveSessionBrokerWithPinnedTmux(serviceContext, "/proc/self/exe", launch.tmux, brokerFD, validate)}
 	}()
 	go func() {
 		serviceDone <- linuxCustodyServiceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
@@ -602,7 +706,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 			closeLinuxCustodyLaunch(launch, true),
 		)
 	case <-shutdownSignals:
-		return shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout)
+		return shutdownLinuxCustodySupervisor(launch, cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout, linuxCustodyReapTimeout)
 	case <-timer.C:
 	}
 	for {
@@ -619,7 +723,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 				closeLinuxCustodyLaunch(launch, true),
 			)
 		case <-shutdownSignals:
-			return shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout)
+			return shutdownLinuxCustodySupervisor(launch, cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout, linuxCustodyReapTimeout)
 		case <-time.After(time.Hour):
 		}
 		if launch.life == nil {
@@ -669,6 +773,47 @@ func shutdownLinuxCustodyServices(
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func shutdownLinuxCustodySupervisor(
+	launch *linuxCustodyLaunch,
+	cancel context.CancelFunc,
+	results <-chan linuxCustodyServiceResult,
+	remaining int,
+	serviceTimeout time.Duration,
+	reapTimeout time.Duration,
+) error {
+	if cancel != nil {
+		cancel()
+	}
+	var reapErr error
+	if reapTimeout <= 0 {
+		reapErr = errors.New("session custody supervisor init reap timeout must be positive")
+	} else if launch == nil || launch.child == nil || launch.wait == nil {
+		reapErr = errors.New("session custody supervisor lost its init reap handle")
+	} else {
+		var signalErr error
+		if launch.pidfd >= 0 {
+			signalErr = unix.PidfdSendSignal(launch.pidfd, unix.SIGKILL, nil, 0)
+		} else if launch.child.Process != nil {
+			signalErr = launch.child.Process.Kill()
+		} else {
+			signalErr = errors.New("session custody init has no process handle")
+		}
+		if errors.Is(signalErr, unix.ESRCH) || errors.Is(signalErr, os.ErrProcessDone) {
+			signalErr = nil
+		}
+
+		waitErr := waitLinuxCustodyProcess(launch, reapTimeout)
+		var exitErr *exec.ExitError
+		if waitErr == nil || errors.As(waitErr, &exitErr) {
+			launch.child = nil
+			waitErr = nil
+		}
+		reapErr = errors.Join(signalErr, waitErr)
+	}
+	serviceErr := shutdownLinuxCustodyServices(cancel, results, remaining, serviceTimeout)
+	return errors.Join(reapErr, serviceErr)
 }
 
 func linuxDirectChildren(procRoot string, pid int) ([]int, error) {
@@ -887,7 +1032,7 @@ func (custody *linuxSessionCustody) Thaw() error {
 func waitLinuxProcessTerminal(ctx context.Context, pid int, identity string) error {
 	for {
 		stat, err := readLinuxProcessStat(pid)
-		if errors.Is(err, errProcessNotFound) {
+		if errors.Is(err, errProcessNotFound) || os.IsNotExist(err) {
 			return nil
 		}
 		if err != nil {
@@ -905,12 +1050,30 @@ func waitLinuxProcessTerminal(ctx context.Context, pid int, identity string) err
 	}
 }
 
+func waitLinuxProcessGone(ctx context.Context, pid int, identity string) error {
+	for {
+		stat, err := readLinuxProcessStat(pid)
+		if errors.Is(err, errProcessNotFound) || os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if stat.startTime != identity {
+			return ErrSessionGenerationChanged
+		}
+		if err := waitForContext(ctx, processExitPollInterval); err != nil {
+			return err
+		}
+	}
+}
+
 func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
 	return custody.killWithBudgets(
 		ctx,
 		linuxCustodyKillBudgets{
 			Init:       linuxCustodyInitExitTimeout,
-			Broker:     linuxCustodyBrokerShutdownTimeout,
+			Broker:     linuxCustodyCooperativeShutdownTimeout,
 			Supervisor: linuxCustodySupervisorExitTimeout,
 		},
 		linuxCustodyKillOps{
@@ -918,7 +1081,8 @@ func (custody *linuxSessionCustody) Kill(ctx context.Context) (bool, error) {
 			signal: func(fd int, signal unix.Signal) error {
 				return unix.PidfdSendSignal(fd, signal, nil, 0)
 			},
-			wait: waitLinuxProcessTerminal,
+			waitTerminal: waitLinuxProcessTerminal,
+			waitGone:     waitLinuxProcessGone,
 		},
 	)
 }
@@ -937,7 +1101,7 @@ func (custody *linuxSessionCustody) killWithBudgets(
 	if budgets.Init <= 0 || budgets.Broker <= 0 || budgets.Supervisor <= 0 {
 		return false, errors.New("session custody teardown budgets must be positive")
 	}
-	if ops.revalidate == nil || ops.signal == nil || ops.wait == nil {
+	if ops.revalidate == nil || ops.signal == nil || ops.waitTerminal == nil || ops.waitGone == nil {
 		return false, errors.New("session custody teardown operations are unavailable")
 	}
 	initStat, err := ops.revalidate()
@@ -945,10 +1109,10 @@ func (custody *linuxSessionCustody) killWithBudgets(
 		return false, err
 	}
 	var errs []error
-	waitPhase := func(timeout time.Duration, pid int, identity, phase string) error {
+	waitPhase := func(wait func(context.Context, int, string) error, timeout time.Duration, pid int, identity, phase string) error {
 		phaseCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if err := ops.wait(phaseCtx, pid, identity); err != nil {
+		if err := wait(phaseCtx, pid, identity); err != nil {
 			return fmt.Errorf("%s: %w", phase, err)
 		}
 		return nil
@@ -960,7 +1124,7 @@ func (custody *linuxSessionCustody) killWithBudgets(
 			}
 		} else {
 			custody.committed = true
-			errs = append(errs, waitPhase(budgets.Init, custody.initPID, custody.initIdentity, "verifying trusted namespace init exit"))
+			errs = append(errs, waitPhase(ops.waitTerminal, budgets.Init, custody.initPID, custody.initIdentity, "verifying trusted namespace init exit"))
 		}
 	}
 	forceSupervisor := false
@@ -971,7 +1135,7 @@ func (custody *linuxSessionCustody) killWithBudgets(
 		}
 	} else {
 		custody.committed = true
-		brokerErr := waitPhase(budgets.Broker, custody.supervisorPID, custody.supervisorIdentity, "waiting for session broker shutdown")
+		brokerErr := waitPhase(ops.waitTerminal, budgets.Broker, custody.supervisorPID, custody.supervisorIdentity, "waiting for session broker shutdown")
 		errs = append(errs, brokerErr)
 		forceSupervisor = brokerErr != nil
 	}
@@ -984,10 +1148,9 @@ func (custody *linuxSessionCustody) killWithBudgets(
 			custody.committed = true
 		}
 	}
-	errs = append(errs, waitPhase(budgets.Supervisor, custody.supervisorPID, custody.supervisorIdentity, "verifying session supervisor exit"))
+	errs = append(errs, waitPhase(ops.waitGone, budgets.Supervisor, custody.supervisorPID, custody.supervisorIdentity, "verifying session supervisor reap"))
 	if custody.cgroup != "" {
-		errs = append(errs, removeLinuxSessionCgroup(custody.cgroup, linuxSessionCgroupRemoveWait))
-		custody.cgroup = ""
+		errs = append(errs, clearLinuxSessionCgroupReceipt(&custody.cgroup, removeLinuxSessionCgroup))
 	}
 	if !custody.committed {
 		errs = append(errs, ErrSessionGenerationChanged)
@@ -1007,6 +1170,9 @@ func (custody *linuxSessionCustody) Close() error {
 	if custody.supervisorFD >= 0 {
 		errs = append(errs, unix.Close(custody.supervisorFD))
 		custody.supervisorFD = -1
+	}
+	if custody.cgroup != "" {
+		errs = append(errs, clearLinuxSessionCgroupReceipt(&custody.cgroup, removeLinuxSessionCgroup))
 	}
 	return errors.Join(errs...)
 }

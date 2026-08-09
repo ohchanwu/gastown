@@ -4,6 +4,7 @@ package tmux
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -17,6 +18,29 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestSessionBrokerStdinQuotaRejectsOverflow(t *testing.T) {
+	reader := &sessionBrokerQuotaReader{
+		reader:    bytes.NewReader(bytes.Repeat([]byte("x"), sessionBrokerMaxStdinBytes+1)),
+		remaining: sessionBrokerMaxStdinBytes,
+	}
+	payload, err := io.ReadAll(reader)
+	if !errors.Is(err, errSessionBrokerStdinLimit) {
+		t.Fatalf("overflow error = %v, want %v", err, errSessionBrokerStdinLimit)
+	}
+	if len(payload) != sessionBrokerMaxStdinBytes {
+		t.Fatalf("accepted stdin bytes = %d, want %d", len(payload), sessionBrokerMaxStdinBytes)
+	}
+}
+
+func TestTmuxCommandContextUsesPinnedBinaryWithHostilePATH(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv(envPinnedTmuxBinary, "/proc/self/fd/4")
+	command := (&Tmux{}).commandContext(context.Background(), "list-sessions")
+	if command.Path != "/proc/self/fd/4" {
+		t.Fatalf("tmux command path = %q, want pinned descriptor", command.Path)
+	}
+}
 
 func TestSessionBrokerRequestRoundTrip(t *testing.T) {
 	want := sessionBrokerRequest{
@@ -145,6 +169,38 @@ func TestSessionBrokerRejectsNonPipeCompletionBeforeValidation(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := validations.Load(); got != 0 {
 		t.Fatalf("validator calls = %d, want 0", got)
+	}
+}
+
+func TestSessionBrokerClientStdinReplacesTerminalLikeDeviceButPreservesPipe(t *testing.T) {
+	device, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	got, closeGot, err := sessionBrokerClientStdin(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == device || closeGot != got {
+		t.Fatal("character-device stdin was not replaced with an owned empty stream")
+	}
+	if err := closeGot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	got, closeGot, err = sessionBrokerClientStdin(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != reader || closeGot != nil {
+		t.Fatal("redirected pipe stdin was not preserved")
 	}
 }
 

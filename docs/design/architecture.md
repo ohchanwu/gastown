@@ -293,22 +293,35 @@ poller for both present and proven-absent sessions, and use process-aware sessio
 cleanup before replacing a live session.
 
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
-mount, user, network, and IPC namespaces. The workload can reach the outer
-control plane only through an immutable executable descriptor and a command
-broker whose leaf commands, positional arguments, and flags are explicitly
-reviewed. Public network access is limited to validated DNS-name HTTPS CONNECT
-requests on port 443; direct tmux, host-loopback, private-network, and Dolt
-connections fail closed. The trusted init also removes capabilities, applies
-seccomp and defensive rlimits, and joins a dedicated cgroup v2 with PID, memory,
-swap, and CPU bounds before releasing the workload. Namespace or cgroup setup
-failure aborts startup rather than launching an uncontained agent.
+mount, user, network, and IPC namespaces. Host mounts are read-only; the only
+writable areas are private, size- and inode-bounded scratch and shared-memory
+filesystems. The workload can reach the outer control plane only through an
+immutable executable descriptor and a command broker whose leaf commands,
+positional arguments, flags, request size, stdin, concurrency, and runtime are
+bounded and explicitly reviewed. The broker pins both `gt` and its trusted
+`tmux` dependency by descriptor before releasing the workload. `gt prime`
+continues through scoped `gt hook show`, `gt mol current`, and `gt mol step
+close` operations; direct `bd` and raw Dolt access remain unavailable.
 
-Generation-aware cleanup retains the Linux namespace init and cgroup alongside
-the exact tmux and pane-process identities. Automatic zombie replacement always
-requires that strong custody. Platforms without retained process handles may
-use a separately revalidated tmux-generation fallback only for an explicit Stop
-or cleanup of the caller's own failed start; uncertain automatic replacement
-continues to fail closed.
+Public network access is limited to validated DNS-name HTTPS CONNECT requests
+on port 443 with bounded headers, connections, duration, idle time, and tunnel
+bytes. Direct tmux, host-loopback, private-network, and Dolt connections fail
+closed. The trusted init also removes capabilities, applies seccomp and
+defensive rlimits, and joins the init, supervisor, broker, and proxy services to
+one dedicated cgroup v2 with PID, memory, swap, and CPU bounds before releasing
+the workload. The systemd daemon unit delegates the `cpu`, `memory`, and `pids`
+controllers; daemon startup provisions separate control and session leaves and
+preflights the session pool. Namespace, storage, or cgroup setup failure aborts
+startup rather than launching an uncontained agent.
+
+Generation-aware cleanup retains the Linux namespace init, aggregate cgroup,
+bounded scratch mount, and prior supervisor cgroup alongside the exact tmux and
+pane-process identities. Failed cgroup removal retains its receipt for a later
+owner-safe retry. Automatic zombie replacement always requires that strong
+custody. Platforms without retained process handles may use a separately
+revalidated tmux-generation fallback only for an explicit Stop or cleanup of
+the caller's own failed start; uncertain automatic replacement continues to
+fail closed.
 
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command

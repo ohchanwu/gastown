@@ -136,6 +136,7 @@ func TestServeHTTPSConnectPreservesTLSIdentity(t *testing.T) {
 			totalTimeout:   5 * time.Second,
 			maxHeaderBytes: 4 * 1024,
 			maxConnections: 4,
+			maxTunnelBytes: 1 * 1024 * 1024,
 		})
 	}()
 
@@ -179,6 +180,42 @@ func TestServeHTTPSConnectPreservesTLSIdentity(t *testing.T) {
 	}
 }
 
+func TestRelayProxyConnectionsEnforcesByteQuota(t *testing.T) {
+	clientSide, workloadSide := net.Pipe()
+	proxySide, upstreamSide := net.Pipe()
+	defer workloadSide.Close()
+	defer upstreamSide.Close()
+	done := make(chan struct{})
+	go func() {
+		relayProxyConnections(context.Background(), clientSide, proxySide, clientSide, time.Second, 4)
+		close(done)
+	}()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := workloadSide.Write([]byte("0123456789"))
+		_ = workloadSide.Close()
+		writeDone <- err
+	}()
+	payload, err := io.ReadAll(upstreamSide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "0123" {
+		t.Fatalf("relayed payload = %q, want byte-bounded prefix", payload)
+	}
+	_ = upstreamSide.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("quota-bounded relay did not stop")
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("quota-bounded workload writer did not stop")
+	}
+}
+
 func TestServeHTTPSConnectRejectsReboundPeer(t *testing.T) {
 	proxy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -197,7 +234,7 @@ func TestServeHTTPSConnectRejectsReboundPeer(t *testing.T) {
 				return &proxyRemoteAddrConn{Conn: client, remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}}, nil
 			},
 			headerTimeout: time.Second, dialTimeout: time.Second, idleTimeout: time.Second,
-			totalTimeout: time.Second, maxHeaderBytes: 4 * 1024, maxConnections: 2,
+			totalTimeout: time.Second, maxHeaderBytes: 4 * 1024, maxConnections: 2, maxTunnelBytes: 1 * 1024 * 1024,
 		})
 	}()
 	connection, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)
@@ -232,7 +269,7 @@ func TestServeHTTPSConnectClosesIdleTunnel(t *testing.T) {
 				return &proxyRemoteAddrConn{Conn: client, remote: &net.TCPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 443}}, nil
 			},
 			headerTimeout: time.Second, dialTimeout: time.Second, idleTimeout: 40 * time.Millisecond,
-			totalTimeout: time.Second, maxHeaderBytes: 4 * 1024, maxConnections: 2,
+			totalTimeout: time.Second, maxHeaderBytes: 4 * 1024, maxConnections: 2, maxTunnelBytes: 1 * 1024 * 1024,
 		})
 	}()
 	connection, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)
@@ -291,7 +328,7 @@ func TestServeHTTPSConnectBoundsHeadersAndConnections(t *testing.T) {
 			},
 			dial:          func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("unexpected dial") },
 			headerTimeout: time.Second, dialTimeout: time.Second, idleTimeout: time.Second,
-			totalTimeout: 2 * time.Second, maxHeaderBytes: 256, maxConnections: 1,
+			totalTimeout: 2 * time.Second, maxHeaderBytes: 256, maxConnections: 1, maxTunnelBytes: 1 * 1024 * 1024,
 		})
 	}()
 	first, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)
@@ -337,7 +374,7 @@ func TestServeHTTPSConnectRejectsOversizedHeaderBeforeResolution(t *testing.T) {
 				return nil, errors.New("unexpected dial")
 			},
 			headerTimeout: time.Second, dialTimeout: time.Second, idleTimeout: time.Second,
-			totalTimeout: 2 * time.Second, maxHeaderBytes: 256, maxConnections: 1,
+			totalTimeout: 2 * time.Second, maxHeaderBytes: 256, maxConnections: 1, maxTunnelBytes: 1 * 1024 * 1024,
 		})
 	}()
 	oversized, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)

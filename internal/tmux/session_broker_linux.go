@@ -26,7 +26,35 @@ const (
 	sessionBrokerBusyExitCode        = 75
 	sessionBrokerCanceledExitCode    = 125
 	sessionBrokerCompletionFrameSize = 4
+	sessionBrokerMaxStdinBytes       = 1 * 1024 * 1024
 )
+
+var errSessionBrokerStdinLimit = errors.New("session broker stdin exceeds byte limit")
+
+type sessionBrokerQuotaReader struct {
+	reader    io.Reader
+	remaining int64
+}
+
+func (reader *sessionBrokerQuotaReader) Read(buffer []byte) (int, error) {
+	if reader == nil || reader.reader == nil || reader.remaining < 0 {
+		return 0, errors.New("invalid session broker stdin quota")
+	}
+	if reader.remaining == 0 {
+		var extra [1]byte
+		count, err := reader.reader.Read(extra[:])
+		if count > 0 {
+			return 0, errSessionBrokerStdinLimit
+		}
+		return 0, err
+	}
+	if int64(len(buffer)) > reader.remaining {
+		buffer = buffer[:reader.remaining]
+	}
+	count, err := reader.reader.Read(buffer)
+	reader.remaining -= int64(count)
+	return count, err
+}
 
 // RunSessionBrokerClient routes this invocation through the inherited broker
 // when descriptor 6 is the live SOCK_SEQPACKET endpoint. Ordinary invocations
@@ -49,15 +77,44 @@ func RunSessionBrokerClient(args []string) (handled bool, exitCode int, err erro
 	if _, ok := peer.(*unix.SockaddrUnix); !ok {
 		return true, 1, errors.New("inherited session broker is not an AF_UNIX endpoint")
 	}
+	stdin, closeStdin, err := sessionBrokerClientStdin(os.Stdin)
+	if err != nil {
+		return true, 1, err
+	}
+	if closeStdin != nil {
+		defer closeStdin.Close()
+	}
 	exitCode, err = runSessionBrokerClientAtFD(
 		linuxSessionBrokerFD,
 		args,
-		os.Stdin,
+		stdin,
 		os.Stdout,
 		os.Stderr,
 		sessionBrokerDefaultDeadline,
 	)
 	return true, exitCode, err
+}
+
+// sessionBrokerClientStdin prevents an interactive terminal from keeping the
+// trusted broker worker's stdin copier alive after a non-interactive gt command
+// exits. Redirected files and pipes remain available, subject to the broker's
+// byte quota, while an ordinary terminal is represented by an empty stream.
+func sessionBrokerClientStdin(stdin *os.File) (*os.File, *os.File, error) {
+	if stdin == nil {
+		return nil, nil, errors.New("session broker stdin is unavailable")
+	}
+	info, err := stdin.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("checking session broker stdin: %w", err)
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return stdin, nil, nil
+	}
+	empty, err := os.Open(os.DevNull)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening empty session broker stdin: %w", err)
+	}
+	return empty, empty, nil
 }
 
 func validateLinuxSessionBrokerEndpoint(fd int) error {
@@ -152,9 +209,30 @@ func ServeSessionBroker(ctx context.Context, executable string, fd int, validate
 	return serveSessionBroker(ctx, executable, fd, validate, sessionBrokerMaxWorkers)
 }
 
+func serveSessionBrokerWithPinnedTmux(
+	ctx context.Context,
+	executable string,
+	tmuxExecutable *os.File,
+	fd int,
+	validate SessionBrokerValidator,
+) error {
+	return serveSessionBrokerWithTools(ctx, executable, tmuxExecutable, fd, validate, sessionBrokerMaxWorkers)
+}
+
 func serveSessionBroker(
 	ctx context.Context,
 	executable string,
+	fd int,
+	validate SessionBrokerValidator,
+	maxWorkers int,
+) error {
+	return serveSessionBrokerWithTools(ctx, executable, nil, fd, validate, maxWorkers)
+}
+
+func serveSessionBrokerWithTools(
+	ctx context.Context,
+	executable string,
+	tmuxExecutable *os.File,
 	fd int,
 	validate SessionBrokerValidator,
 	maxWorkers int,
@@ -211,7 +289,7 @@ func serveSessionBroker(
 			go func() {
 				defer workerGroup.Done()
 				defer func() { <-workers }()
-				handleSessionBrokerRequest(ctx, pinnedExecutable, validate, request, descriptors)
+				handleSessionBrokerRequest(ctx, pinnedExecutable, tmuxExecutable, validate, request, descriptors)
 			}()
 		default:
 			rejectSessionBrokerRequest(descriptors, sessionBrokerBusyExitCode, "session broker is busy")
@@ -301,6 +379,7 @@ func validateSessionBrokerDescriptors(descriptors []int) error {
 func handleSessionBrokerRequest(
 	serverContext context.Context,
 	executable *os.File,
+	tmuxExecutable *os.File,
 	validate SessionBrokerValidator,
 	request sessionBrokerRequest,
 	descriptors []int,
@@ -322,10 +401,14 @@ func handleSessionBrokerRequest(
 	defer cancel()
 	command := exec.CommandContext(requestContext, "/proc/self/fd/3", request.Args...)
 	command.ExtraFiles = []*os.File{executable}
-	command.Stdin = stdin
+	command.Stdin = &sessionBrokerQuotaReader{reader: stdin, remaining: sessionBrokerMaxStdinBytes}
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.Env = sanitizedSessionBrokerEnvironment(os.Environ())
+	if tmuxExecutable != nil {
+		command.ExtraFiles = append(command.ExtraFiles, tmuxExecutable)
+		command.Env = append(command.Env, envPinnedTmuxBinary+"=/proc/self/fd/4")
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = sessionBrokerWorkerStopTimeout
 	command.Cancel = func() error {
@@ -372,6 +455,7 @@ func sanitizedSessionBrokerEnvironment(env []string) []string {
 		envLinuxSessionCustodyInit,
 		envLinuxSessionCustodyCommand,
 		envLinuxSessionCustodyNamespaced,
+		envPinnedTmuxBinary,
 	)
 }
 

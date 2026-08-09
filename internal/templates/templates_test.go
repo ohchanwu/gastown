@@ -20,6 +20,19 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestSystemdDaemonTemplateDelegatesContainmentControllers(t *testing.T) {
+	data, err := supervisorFS.ReadFile("systemd/gastown-daemon.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := string(data)
+	for _, required := range []string{"Delegate=cpu memory pids", "TasksMax=infinity"} {
+		if !strings.Contains(service, required) {
+			t.Fatalf("systemd daemon template missing %q", required)
+		}
+	}
+}
+
 func TestRenderRole_Mayor(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {

@@ -3,6 +3,9 @@
 package tmux
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +14,116 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLinuxSessionCgroupProvisionHelper(t *testing.T) {
+	if os.Getenv("GT_TEST_SESSION_CGROUP_PROVISION_HELPER") != "1" {
+		return
+	}
+	var barrier [1]byte
+	if _, err := os.Stdin.Read(barrier[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv(envLinuxSessionCgroupRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionSessionCgroupRoot(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(os.Stdout, "GT_CGROUP_ROOT="+os.Getenv(envLinuxSessionCgroupRoot))
+}
+
+func TestProvisionSessionCgroupRootMatchesSystemdDelegationShape(t *testing.T) {
+	delegated := os.Getenv(envLinuxSessionCgroupRoot)
+	if delegated == "" {
+		t.Skip("requires an explicitly delegated GT_SESSION_CGROUP_ROOT")
+	}
+	if err := ensureLinuxSessionCgroupControllers(delegated); err != nil {
+		t.Fatal(err)
+	}
+	service := filepath.Join(delegated, "gastown-daemon-test")
+	if err := os.Mkdir(service, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(service)
+	command := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCgroupProvisionHelper$")
+	command.Env = append(os.Environ(), "GT_TEST_SESSION_CGROUP_PROVISION_HELPER=1")
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLinuxCgroupControl(filepath.Join(service, "cgroup.procs"), strconv.Itoa(command.Process.Pid)); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	if err := command.Wait(); err != nil {
+		t.Fatalf("provision helper: %v\n%s", err, output.String())
+	}
+	wantRoot := filepath.Join(service, linuxSessionCgroupPoolDir)
+	got, err := linuxCustodyOutputMarker(output.String(), "GT_CGROUP_ROOT=")
+	if err != nil {
+		t.Fatalf("provision helper omitted root marker: %v\n%s", err, output.String())
+	}
+	if got != wantRoot {
+		t.Fatalf("provisioned root = %q, want %q", got, wantRoot)
+	}
+	for _, root := range []string{service, wantRoot} {
+		controllers, err := os.ReadFile(filepath.Join(root, "cgroup.subtree_control"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, controller := range linuxSessionCgroupControllers {
+			if !containsString(strings.Fields(string(controllers)), controller) {
+				t.Fatalf("%s lacks delegated %s controller: %q", root, controller, controllers)
+			}
+		}
+	}
+	control := filepath.Join(service, linuxSessionCgroupControlDir)
+	if err := os.Remove(control); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(wantRoot); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClearLinuxSessionCgroupReceiptRetainsFailedRemoval(t *testing.T) {
+	receipt := "/sys/fs/cgroup/gastown-session-test"
+	removeErr := errors.New("busy")
+	calls := 0
+	remove := func(path string, timeout time.Duration) error {
+		calls++
+		if path != receipt || timeout != linuxSessionCgroupRemoveWait {
+			t.Fatalf("remove(%q, %v)", path, timeout)
+		}
+		if calls == 1 {
+			return removeErr
+		}
+		return nil
+	}
+	if err := clearLinuxSessionCgroupReceipt(&receipt, remove); !errors.Is(err, removeErr) {
+		t.Fatalf("first removal error = %v, want %v", err, removeErr)
+	}
+	if receipt == "" {
+		t.Fatal("failed cgroup removal cleared retry receipt")
+	}
+	if err := clearLinuxSessionCgroupReceipt(&receipt, remove); err != nil {
+		t.Fatal(err)
+	}
+	if receipt != "" {
+		t.Fatalf("successful cgroup removal retained receipt %q", receipt)
+	}
+}
 
 func TestParseLinuxUnifiedCgroupPath(t *testing.T) {
 	path, err := parseLinuxUnifiedCgroupPath([]byte("0::/delegated/session\n"))

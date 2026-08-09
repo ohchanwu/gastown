@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -377,6 +378,9 @@ func runDaemonRun(cmd *cobra.Command, args []string) error {
 		os.Unsetenv(k)
 	}
 	os.Setenv("BD_ACTOR", "daemon")
+	if err := tmux.ProvisionSessionCgroupRoot(); err != nil {
+		return fmt.Errorf("preflighting Linux session containment: %w", err)
+	}
 
 	config := daemon.DefaultConfig(townRoot)
 	d, err := daemon.New(config)

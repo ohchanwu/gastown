@@ -937,10 +937,41 @@ func TestOutputContinuationDirective(t *testing.T) {
 			outputContinuationDirective(bead, true)
 		})
 
-		if !strings.Contains(output, "bd mol current") {
+		if !strings.Contains(output, "gt mol current") {
 			t.Fatalf("expected molecule hint in output, got: %s", output)
 		}
+		if strings.Contains(output, "bd mol current") {
+			t.Fatalf("contained continuation must not require direct bd access, got: %s", output)
+		}
 	})
+}
+
+func TestOutputAutonomousDirectiveUsesBrokerScopedFollowups(t *testing.T) {
+	tests := []struct {
+		name        string
+		hasMolecule bool
+		want        []string
+	}{
+		{name: "plain hook", want: []string{"`gt hook show`"}},
+		{name: "molecule", hasMolecule: true, want: []string{"`gt mol step close`", "`gt mol current`"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output := captureStdout(t, func() {
+				outputAutonomousDirective(RoleContext{Role: RoleWitness, Rig: "gastown"}, &beads.Issue{ID: "gt-test", Title: "test"}, test.hasMolecule)
+			})
+			for _, want := range test.want {
+				if !strings.Contains(output, want) {
+					t.Fatalf("expected scoped follow-up %q in output:\n%s", want, output)
+				}
+			}
+			for _, forbidden := range []string{"bd show", "bd close", "bd mol current"} {
+				if strings.Contains(output, forbidden) {
+					t.Fatalf("autonomous directive requires direct bd command %q:\n%s", forbidden, output)
+				}
+			}
+		})
+	}
 }
 
 func TestCheckSlungWork_StandaloneFormulaUsesWorkflowOutput(t *testing.T) {
