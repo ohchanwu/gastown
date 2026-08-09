@@ -22,7 +22,11 @@ func TestPollerEnvironmentSurvivesCLIRegistryInitialization(t *testing.T) {
 		t.Skip("tmux unavailable")
 	}
 	socket := fmt.Sprintf("gt-test-poller-registry-%d", time.Now().UnixNano())
-	transport := tmux.NewTmuxWithSocketAndEnv(socket, []string{"PATH=" + os.Getenv("PATH")})
+	transportEnv := []string{"PATH=" + os.Getenv("PATH")}
+	if socketRoot, ok := os.LookupEnv("TMUX_TMPDIR"); ok {
+		transportEnv = append(transportEnv, "TMUX_TMPDIR="+socketRoot)
+	}
+	transport := tmux.NewTmuxWithSocketAndEnv(socket, transportEnv)
 	sessionName := "hq-mayor"
 	if err := transport.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 60"); err != nil {
 		t.Fatalf("create isolated poller target: %v", err)
