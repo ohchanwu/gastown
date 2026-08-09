@@ -41,10 +41,6 @@ func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
 	if cleanup.run != nil {
 		return cleanup.run(ctx)
 	}
-	if os.Getenv("FAKE_CLEANUP_WAIT_CONTEXT") != "" {
-		<-ctx.Done()
-		return ctx.Err()
-	}
 	logFile, err := os.OpenFile(cleanup.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -684,7 +680,16 @@ exit 2
 		t.Fatal(err)
 	}
 	mgr.cleanupTimeout = 50 * time.Millisecond
-	t.Setenv("FAKE_CLEANUP_WAIT_CONTEXT", "1")
+	mgr.prepareSessionCleanup = func(generation tmux.SessionGeneration, pane tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{
+			generation: generation,
+			pane:       pane,
+			prepare: func(ctx context.Context) (func(context.Context) (bool, error), error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		}, nil
+	}
 	started := time.Now()
 	err := mgr.Start(false, "", nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -993,6 +998,73 @@ exit 2
 	}
 }
 
+func TestManagerStopUsesExplicitFallbackWhenPlatformCustodyIsUnavailable(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=other"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	mgr.prepareSessionCleanup = func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		return nil, tmux.ErrSessionCustodyUnsupported
+	}
+	var explicitCalled bool
+	mgr.prepareExplicitCleanup = func(generation tmux.SessionGeneration, pane tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		explicitCalled = true
+		return &fakeSessionCleanup{generation: generation, pane: pane, logPath: logPath}, nil
+	}
+
+	if err := mgr.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if !explicitCalled {
+		t.Fatal("explicit Stop did not use the reviewed platform fallback")
+	}
+}
+
+func TestManagerZombieReplacementNeverUsesExplicitFallback(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	mgr.prepareSessionCleanup = func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		return nil, tmux.ErrSessionCustodyUnsupported
+	}
+	var explicitCalled bool
+	mgr.prepareExplicitCleanup = func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		explicitCalled = true
+		return &fakeSessionCleanup{}, nil
+	}
+
+	err := mgr.Start(false, "", nil)
+	if !errors.Is(err, tmux.ErrSessionCustodyUnsupported) {
+		t.Fatalf("Start() error = %v, want fail-closed custody error", err)
+	}
+	if explicitCalled {
+		t.Fatal("automatic zombie replacement used explicit Stop fallback")
+	}
+}
+
 func TestManagerFailedStartupRollbackUsesExactTransaction(t *testing.T) {
 	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
 case "$*" in
@@ -1039,6 +1111,60 @@ exit 2
 	}
 	if !strings.Contains(string(logData), "cleanup-run $1 fixture-generation-original fixture-pane-generation") {
 		t.Fatalf("startup rollback skipped exact generation cleanup:\n%s", logData)
+	}
+}
+
+func TestManagerFailedStartupRollbackUsesExplicitFallback(t *testing.T) {
+	mgr, pollerPath, logPath := newFakeTmuxManager(t, `
+case "$*" in
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=other"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	if err := os.Remove(pollerPath); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := mgr.tmux.CaptureSessionGeneration(mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	paneGeneration, err := mgr.capturePaneGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollerGeneration, err := nudge.CapturePollerGeneration(filepath.Dir(mgr.rig.Path), mgr.SessionName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.prepareSessionCleanup = func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		return nil, tmux.ErrProcessReferenceUnsupported
+	}
+	var explicitCalled bool
+	mgr.prepareExplicitCleanup = func(generation tmux.SessionGeneration, pane tmux.PaneProcessGeneration) (sessionGenerationCleanup, error) {
+		explicitCalled = true
+		return &fakeSessionCleanup{generation: generation, pane: pane, logPath: logPath}, nil
+	}
+
+	startupErr := errors.New("agent startup failed")
+	err = mgr.rollbackFailedStart(
+		filepath.Dir(mgr.rig.Path),
+		mgr.SessionName(),
+		generation,
+		paneGeneration,
+		pollerGeneration,
+		startupErr,
+		nil,
+	)
+	if !errors.Is(err, startupErr) {
+		t.Fatalf("rollbackFailedStart() error = %v, want startup cause", err)
+	}
+	if !explicitCalled {
+		t.Fatal("attempt-owned failed-start rollback did not use explicit fallback")
 	}
 }
 

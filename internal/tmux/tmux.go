@@ -1120,6 +1120,18 @@ type SessionGenerationCleanup struct {
 	custody      sessionCustodyHandle
 }
 
+// SessionGenerationExplicitCleanup is the narrow fallback for an explicit
+// operator Stop or an attempt-owned failed-start rollback on platforms that
+// cannot retain kernel process/custody handles. It never participates in
+// automatic zombie replacement: that path must keep failing closed.
+type SessionGenerationExplicitCleanup struct {
+	tmux         *Tmux
+	generation   SessionGeneration
+	panePID      int
+	paneIdentity string
+	identity     func(int) (string, error)
+}
+
 type sessionProcessCustodyOps struct {
 	readPane      func(SessionGeneration) (int, bool, error)
 	identity      func(int) (string, error)
@@ -1135,6 +1147,48 @@ func (t *Tmux) PrepareSessionGenerationProcessCleanup(
 	paneGeneration PaneProcessGeneration,
 ) (*SessionGenerationCleanup, error) {
 	return t.prepareSessionGenerationProcessCleanup(generation, paneGeneration, t.sessionProcessCustodyOps())
+}
+
+// PrepareSessionGenerationExplicitCleanup binds a deliberate Stop/rollback to
+// the exact tmux session ID, nonce, pane PID, and process-start identity. It is
+// intentionally weaker than retained custody because detached descendants are
+// not kernel-bound; callers must not use it for automatic zombie replacement.
+func (t *Tmux) PrepareSessionGenerationExplicitCleanup(
+	generation SessionGeneration,
+	paneGeneration PaneProcessGeneration,
+) (*SessionGenerationExplicitCleanup, error) {
+	if paneGeneration.PID <= 0 || paneGeneration.Identity == "" {
+		return nil, errors.New("invalid authoritative pane process generation")
+	}
+	panePID, exists, err := t.getPanePIDGeneration(generation)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || panePID != paneGeneration.PID {
+		return nil, ErrSessionGenerationChanged
+	}
+	identity, err := processGenerationIdentity(panePID)
+	if err != nil || identity != paneGeneration.Identity {
+		return nil, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	confirmedPID, exists, err := t.getPanePIDGeneration(generation)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || confirmedPID != panePID {
+		return nil, ErrSessionGenerationChanged
+	}
+	confirmedIdentity, err := processGenerationIdentity(panePID)
+	if err != nil || confirmedIdentity != identity {
+		return nil, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	return &SessionGenerationExplicitCleanup{
+		tmux:         t,
+		generation:   generation,
+		panePID:      panePID,
+		paneIdentity: identity,
+		identity:     processGenerationIdentity,
+	}, nil
 }
 
 func (t *Tmux) sessionProcessCustodyOps() sessionProcessCustodyOps {
@@ -1252,6 +1306,69 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 	}
 	cleanup.processes = nil
 	return errors.Join(errs...)
+}
+
+func (cleanup *SessionGenerationExplicitCleanup) Close() error { return nil }
+
+func (cleanup *SessionGenerationExplicitCleanup) PrepareCommit(ctx context.Context) (func(context.Context) (bool, error), error) {
+	if cleanup == nil || cleanup.tmux == nil || cleanup.identity == nil || cleanup.panePID <= 0 || cleanup.paneIdentity == "" {
+		return nil, errors.New("explicit tmux session cleanup has no exact generation custody")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	currentPID, exists, err := cleanup.tmux.getPanePIDGenerationContext(ctx, cleanup.generation)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || currentPID != cleanup.panePID {
+		return nil, ErrSessionGenerationChanged
+	}
+	identity, err := cleanup.identity(cleanup.panePID)
+	if err != nil || identity != cleanup.paneIdentity {
+		return nil, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	return func(commitCtx context.Context) (bool, error) {
+		if err := commitCtx.Err(); err != nil {
+			return false, err
+		}
+		if err := cleanup.tmux.runGuardedSessionGenerationPaneContext(
+			commitCtx,
+			cleanup.generation,
+			cleanup.panePID,
+			false,
+			"kill-session -t "+cleanup.generation.SessionID,
+		); err != nil {
+			return false, err
+		}
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), sessionGenerationTmuxKillTimeout)
+		defer cancel()
+		err := reconcileSessionGenerationContext(
+			reconcileCtx,
+			cleanup.generation,
+			cleanup.panePID,
+			sessionGenerationReconcileOps{
+				capture: cleanup.tmux.captureSessionGenerationContext,
+				readPane: func(ctx context.Context, generation SessionGeneration) (int, bool, error) {
+					return cleanup.tmux.getPanePIDGenerationContext(ctx, generation)
+				},
+				kill: func(ctx context.Context, generation SessionGeneration, panePID int) error {
+					return cleanup.tmux.runGuardedSessionGenerationPaneContext(
+						ctx,
+						generation,
+						panePID,
+						false,
+						"kill-session -t "+generation.SessionID,
+					)
+				},
+				wait: waitForContext,
+			},
+		)
+		if err != nil {
+			err = fmt.Errorf("reconciling exact tmux session after explicit cleanup: %w", err)
+		}
+		return true, err
+	}, nil
 }
 
 type sessionGenerationReconcileOps struct {

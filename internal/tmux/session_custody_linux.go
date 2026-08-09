@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -47,6 +47,7 @@ type linuxSessionCustody struct {
 	initIdentity       string
 	initNamespace      uint64
 	initFD             int
+	cgroup             string
 	prepared           bool
 	committed          bool
 }
@@ -99,6 +100,7 @@ type linuxCustodyLaunch struct {
 	broker        *os.File
 	proxyExpected bool
 	proxies       linuxCustodyProxySet
+	cgroup        string
 }
 
 func startLinuxCustodyWait(child *exec.Cmd) <-chan error {
@@ -230,6 +232,11 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	if pidfd < 0 {
 		return nil, errors.Join(errors.New("kernel did not return a pidfd for session custody"), closeLinuxCustodyLaunch(launch, true))
 	}
+	cgroup, err := prepareLinuxSessionCgroup(child.Process.Pid)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("preparing bounded session resources: %w", err), closeLinuxCustodyLaunch(launch, true))
+	}
+	launch.cgroup = cgroup
 	return launch, nil
 }
 
@@ -292,6 +299,10 @@ func closeLinuxCustodyLaunchWithTimeout(launch *linuxCustodyLaunch, terminate bo
 		errs = append(errs, unix.Close(launch.pidfd))
 		launch.pidfd = -1
 	}
+	if terminate && launch.cgroup != "" {
+		errs = append(errs, removeLinuxSessionCgroup(launch.cgroup, linuxSessionCgroupRemoveWait))
+		launch.cgroup = ""
+	}
 	return errors.Join(errs...)
 }
 
@@ -350,10 +361,6 @@ func writeLinuxCustodyProtocolByte(file *os.File, value byte) error {
 	return nil
 }
 
-func linuxNamespaceUnavailable(err error) bool {
-	return errors.Is(err, unix.EPERM) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOSYS)
-}
-
 func launchLinuxCustodyCommand(command string, start linuxCustodyStarter) (*linuxCustodyLaunch, bool, error) {
 	return launchLinuxCustodyCommandValidated(command, start, validateLinuxNamespaceInit)
 }
@@ -361,18 +368,7 @@ func launchLinuxCustodyCommand(command string, start linuxCustodyStarter) (*linu
 func launchLinuxCustodyCommandValidated(command string, start linuxCustodyStarter, validate linuxNamespaceValidator) (*linuxCustodyLaunch, bool, error) {
 	launch, err := start(command, true)
 	if err != nil {
-		if !linuxNamespaceUnavailable(err) {
-			return nil, false, err
-		}
-		// User namespaces may be disabled by the host. Preserve ordinary
-		// startup, but leave a directly observable non-namespace child so later
-		// destructive cleanup fails closed.
-		fmt.Fprintf(os.Stderr, "gt session-custody: PID namespace unavailable: %v\n", err)
-		launch, err = start(command, false)
-		if err != nil {
-			return nil, false, err
-		}
-		return launch, false, nil
+		return nil, false, fmt.Errorf("starting contained session custody: %w", err)
 	}
 	if launch.proxyExpected {
 		if launch.broker == nil {
@@ -465,6 +461,9 @@ func runSessionCustodyInit() (bool, error) {
 	if err := setLinuxCustodyNonDumpable(); err != nil {
 		return true, err
 	}
+	if err := applyLinuxSessionResourceLimits(); err != nil {
+		return true, err
+	}
 	if err := writeLinuxCustodyProtocolByte(ready, linuxSessionCustodyHardenedByte); err != nil {
 		return true, err
 	}
@@ -508,6 +507,7 @@ func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts)
 		envLinuxSessionCustodyInit,
 		envLinuxSessionCustodyCommand,
 		envLinuxSessionCustodyNamespaced,
+		envLinuxSessionCgroupRoot,
 		"TMUX",
 		"TMUX_PANE",
 	)
@@ -551,12 +551,8 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 			runtime.KeepAlive(launch)
 		}
 	}
-	if launch.broker == nil || launch.proxies.HTTPS == nil || launch.proxies.Dolt == nil {
+	if launch.broker == nil || launch.proxies.HTTPS == nil {
 		return errors.Join(errors.New("contained session is missing broker or proxy endpoints"), closeLinuxCustodyLaunch(launch, true))
-	}
-	doltHost, doltPort, err := captureConfiguredDoltEndpoint(os.Environ())
-	if err != nil {
-		return errors.Join(err, closeLinuxCustodyLaunch(launch, true))
 	}
 	brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
 	if dupErr != nil {
@@ -568,23 +564,14 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 		return errors.Join(fmt.Errorf("closing original session broker endpoint: %w", closeErr), closeLinuxCustodyLaunch(launch, true))
 	}
 	launch.broker = nil
-	executable, executableErr := os.Executable()
-	if executableErr != nil {
-		_ = unix.Close(brokerFD)
-		return errors.Join(executableErr, closeLinuxCustodyLaunch(launch, true))
-	}
 	serviceContext, cancelServices := context.WithCancel(context.Background())
 	defer cancelServices()
-	serviceDone := make(chan linuxCustodyServiceResult, 3)
+	serviceDone := make(chan linuxCustodyServiceResult, 2)
 	go func() {
-		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: ServeSessionBroker(serviceContext, executable, brokerFD, validate)}
+		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: ServeSessionBroker(serviceContext, "/proc/self/exe", brokerFD, validate)}
 	}()
 	go func() {
 		serviceDone <- linuxCustodyServiceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
-	}()
-	go func() {
-		upstream := net.JoinHostPort(doltHost, strconv.Itoa(int(doltPort)))
-		serviceDone <- linuxCustodyServiceResult{name: "Dolt proxy", err: serveDoltProxy(serviceContext, launch.proxies.Dolt, upstream)}
 	}()
 	shutdownSignals := make(chan os.Signal, 1)
 	signal.Notify(shutdownSignals, syscall.SIGTERM)
@@ -604,35 +591,35 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	}
 	select {
 	case processErr := <-launch.wait:
-		return initStopped(processErr, 3, "before readiness")
+		return initStopped(processErr, 2, "before readiness")
 	case stopped := <-serviceDone:
 		if stopped.err == nil {
 			stopped.err = errors.New("service stopped without an error")
 		}
 		return errors.Join(
 			fmt.Errorf("session %s stopped before readiness: %w", stopped.name, stopped.err),
-			shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout),
+			shutdownLinuxCustodyServices(cancelServices, serviceDone, 1, linuxCustodyBrokerShutdownTimeout),
 			closeLinuxCustodyLaunch(launch, true),
 		)
 	case <-shutdownSignals:
-		return shutdownLinuxCustodyServices(cancelServices, serviceDone, 3, linuxCustodyBrokerShutdownTimeout)
+		return shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout)
 	case <-timer.C:
 	}
 	for {
 		select {
 		case processErr := <-launch.wait:
-			return initStopped(processErr, 3, "during service")
+			return initStopped(processErr, 2, "during service")
 		case stopped := <-serviceDone:
 			if stopped.err == nil {
 				stopped.err = errors.New("service stopped without an error")
 			}
 			return errors.Join(
 				fmt.Errorf("session %s stopped: %w", stopped.name, stopped.err),
-				shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout),
+				shutdownLinuxCustodyServices(cancelServices, serviceDone, 1, linuxCustodyBrokerShutdownTimeout),
 				closeLinuxCustodyLaunch(launch, true),
 			)
 		case <-shutdownSignals:
-			return shutdownLinuxCustodyServices(cancelServices, serviceDone, 3, linuxCustodyBrokerShutdownTimeout)
+			return shutdownLinuxCustodyServices(cancelServices, serviceDone, 2, linuxCustodyBrokerShutdownTimeout)
 		case <-time.After(time.Hour):
 		}
 		if launch.life == nil {
@@ -846,6 +833,10 @@ func retainSessionCustody(custody string, panePID int) (sessionCustodyHandle, er
 	if err != nil || confirmedIdentity != initIdentity || confirmedNamespace != namespace {
 		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
 	}
+	cgroup, err := linuxCgroupDirectoryForPID(initPID)
+	if err != nil || !strings.HasPrefix(filepath.Base(cgroup), linuxSessionCgroupPrefix) {
+		return reject(errors.Join(ErrSessionCustodyUnsupported, errors.New("trusted namespace init lacks bounded session cgroup"), err), initFD)
+	}
 	return &linuxSessionCustody{
 		supervisorPID:      panePID,
 		supervisorIdentity: supervisorStat.startTime,
@@ -854,6 +845,7 @@ func retainSessionCustody(custody string, panePID int) (sessionCustodyHandle, er
 		initIdentity:       initIdentity,
 		initNamespace:      namespace,
 		initFD:             initFD,
+		cgroup:             cgroup,
 	}, nil
 }
 
@@ -993,6 +985,10 @@ func (custody *linuxSessionCustody) killWithBudgets(
 		}
 	}
 	errs = append(errs, waitPhase(budgets.Supervisor, custody.supervisorPID, custody.supervisorIdentity, "verifying session supervisor exit"))
+	if custody.cgroup != "" {
+		errs = append(errs, removeLinuxSessionCgroup(custody.cgroup, linuxSessionCgroupRemoveWait))
+		custody.cgroup = ""
+	}
 	if !custody.committed {
 		errs = append(errs, ErrSessionGenerationChanged)
 	}

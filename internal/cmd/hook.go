@@ -23,9 +23,10 @@ var hookCmd = &cobra.Command{
 	Aliases: []string{"work"},
 	GroupID: GroupWork,
 	Annotations: map[string]string{
-		AnnotationPolecatSafe:    "true",
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+		AnnotationPolecatSafe:     "true",
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Show or attach work on a hook",
 	Long: `Show what's on your hook, or attach new work.
@@ -58,8 +59,9 @@ Related commands:
 var hookStatusCmd = &cobra.Command{
 	Use: "status [target]",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsCobra,
+		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Show what's on your hook",
 	Long: `Show what's slung on your hook.
@@ -78,8 +80,9 @@ Examples:
 var hookShowCmd = &cobra.Command{
 	Use: "show [agent]",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsCobra,
+		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Show what's on an agent's hook (compact)",
 	Long: `Show what's on any agent's hook in compact one-line format.

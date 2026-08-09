@@ -21,7 +21,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -95,36 +94,6 @@ func TestNormalizeHTTPSResolverAddressesUnmapsLinuxARecord(t *testing.T) {
 	}
 	if err := validatePublicHTTPSDestination("contained-flow.test", 443, answers); err != nil {
 		t.Fatalf("normalized resolver answers rejected: %v", err)
-	}
-}
-
-func TestCaptureConfiguredDoltEndpoint(t *testing.T) {
-	tests := []struct {
-		name     string
-		env      []string
-		wantHost string
-		wantPort uint16
-		wantErr  bool
-	}{
-		{name: "defaults", wantHost: "127.0.0.1", wantPort: 3307},
-		{name: "gt canonical overrides stale beads", env: []string{"GT_DOLT_HOST=127.0.0.2", "GT_DOLT_PORT=5507", "BEADS_DOLT_SERVER_HOST=stale", "BEADS_DOLT_SERVER_PORT=9999", "BEADS_DOLT_PORT=9998"}, wantHost: "127.0.0.2", wantPort: 5507},
-		{name: "beads server fallback", env: []string{"BEADS_DOLT_SERVER_HOST=dolt.internal", "BEADS_DOLT_SERVER_PORT=4407"}, wantHost: "dolt.internal", wantPort: 4407},
-		{name: "beads legacy fallback", env: []string{"BEADS_DOLT_PORT=4307"}, wantHost: "127.0.0.1", wantPort: 4307},
-		{name: "invalid zero", env: []string{"GT_DOLT_PORT=0"}, wantErr: true},
-		{name: "invalid range", env: []string{"GT_DOLT_PORT=65536"}, wantErr: true},
-		{name: "invalid text", env: []string{"GT_DOLT_PORT=not-a-port"}, wantErr: true},
-		{name: "invalid host scheme", env: []string{"GT_DOLT_HOST=http://127.0.0.1", "GT_DOLT_PORT=3307"}, wantErr: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			host, port, err := captureConfiguredDoltEndpoint(test.env)
-			if (err != nil) != test.wantErr {
-				t.Fatalf("captureConfiguredDoltEndpoint(%v) error = %v, wantErr %v", test.env, err, test.wantErr)
-			}
-			if err == nil && (host != test.wantHost || port != test.wantPort) {
-				t.Fatalf("captureConfiguredDoltEndpoint(%v) = %s:%d, want %s:%d", test.env, host, port, test.wantHost, test.wantPort)
-			}
-		})
 	}
 }
 
@@ -387,45 +356,6 @@ func TestServeHTTPSConnectRejectsOversizedHeaderBeforeResolution(t *testing.T) {
 	}
 }
 
-func TestServeDoltProxyUsesOnlyCapturedEndpoint(t *testing.T) {
-	upstream, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upstream.Close()
-	go func() {
-		connection, acceptErr := upstream.Accept()
-		if acceptErr != nil {
-			return
-		}
-		defer connection.Close()
-		_, _ = io.Copy(connection, connection)
-	}()
-	proxy, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = serveDoltProxy(ctx, proxy, upstream.Addr().String()) }()
-	connection, err := net.DialTimeout("tcp", proxy.Addr().String(), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(time.Second))
-	if _, err := connection.Write([]byte("dolt-exact-endpoint")); err != nil {
-		t.Fatal(err)
-	}
-	response := make([]byte, len("dolt-exact-endpoint"))
-	if _, err := io.ReadFull(connection, response); err != nil {
-		t.Fatal(err)
-	}
-	if got := string(response); got != "dolt-exact-endpoint" {
-		t.Fatalf("echo = %q", got)
-	}
-}
-
 func TestLinuxCustodyProxyDescriptorHandoff(t *testing.T) {
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -442,33 +372,25 @@ func TestLinuxCustodyProxyDescriptorHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listeners.Close()
-	for _, endpoint := range []struct {
-		name     string
-		listener net.Listener
-		port     uint16
-	}{{"HTTPS", listeners.HTTPS, ports.HTTPS}, {"Dolt", listeners.Dolt, ports.Dolt}} {
-		t.Run(endpoint.name, func(t *testing.T) {
-			address, ok := endpoint.listener.Addr().(*net.TCPAddr)
-			if !ok || !address.IP.IsLoopback() || address.Port != int(endpoint.port) {
-				t.Fatalf("listener address = %v, want isolated loopback port %d", endpoint.listener.Addr(), endpoint.port)
-			}
-			accepted := make(chan error, 1)
-			go func() {
-				connection, acceptErr := endpoint.listener.Accept()
-				if acceptErr == nil {
-					_ = connection.Close()
-				}
-				accepted <- acceptErr
-			}()
-			connection, dialErr := net.DialTimeout("tcp", endpoint.listener.Addr().String(), time.Second)
-			if dialErr != nil {
-				t.Fatal(dialErr)
-			}
+	address, ok := listeners.HTTPS.Addr().(*net.TCPAddr)
+	if !ok || !address.IP.IsLoopback() || address.Port != int(ports.HTTPS) {
+		t.Fatalf("listener address = %v, want isolated loopback port %d", listeners.HTTPS.Addr(), ports.HTTPS)
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listeners.HTTPS.Accept()
+		if acceptErr == nil {
 			_ = connection.Close()
-			if acceptErr := <-accepted; acceptErr != nil {
-				t.Fatal(acceptErr)
-			}
-		})
+		}
+		accepted <- acceptErr
+	}()
+	connection, dialErr := net.DialTimeout("tcp", listeners.HTTPS.Addr().String(), time.Second)
+	if dialErr != nil {
+		t.Fatal(dialErr)
+	}
+	_ = connection.Close()
+	if acceptErr := <-accepted; acceptErr != nil {
+		t.Fatal(acceptErr)
 	}
 }
 
@@ -511,7 +433,8 @@ func TestRewriteLinuxCustodyNetworkEnvironment(t *testing.T) {
 		"BEADS_DOLT_SERVER_HOST=stale",
 		"BEADS_DOLT_SERVER_PORT=9999",
 		"BEADS_DOLT_PORT=9998",
-	}, linuxCustodyProxyPorts{HTTPS: 41001, Dolt: 41002})
+		"BEADS_DOLT_AUTO_START=1",
+	}, linuxCustodyProxyPorts{HTTPS: 41001})
 	values := make(map[string]string)
 	for _, entry := range environment {
 		key, value, found := strings.Cut(entry, "=")
@@ -539,9 +462,12 @@ func TestRewriteLinuxCustodyNetworkEnvironment(t *testing.T) {
 		}
 	}
 	for _, key := range []string{"GT_DOLT_PORT", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
-		if values[key] != strconv.Itoa(41002) {
-			t.Fatalf("%s = %q, want isolated Dolt port", key, values[key])
+		if values[key] != "1" {
+			t.Fatalf("%s = %q, want unreachable fail-closed Dolt port", key, values[key])
 		}
+	}
+	if values["BEADS_DOLT_AUTO_START"] != "0" {
+		t.Fatalf("BEADS_DOLT_AUTO_START = %q, want 0", values["BEADS_DOLT_AUTO_START"])
 	}
 	if strings.Contains(strings.Join(environment, "\n"), "host-side-secret") || strings.Contains(strings.Join(environment, "\n"), "33327") {
 		t.Fatalf("captured upstream leaked into workload environment: %v", environment)

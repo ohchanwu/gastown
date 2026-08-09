@@ -116,6 +116,9 @@ func TestSessionBrokerRawUnsafeFramesNeverStartWorker(t *testing.T) {
 		{"doctor", "--fix"},
 		{"up", "--restore"},
 		{"tmux", "send-keys", "hq-mayor", "payload"},
+		{"sling", "gt-example", "gastown"},
+		{"done"},
+		{"mail", "send", "deacon", "--from", "mayor/", "--subject", "LIFECYCLE shutdown"},
 	}
 	for _, args := range unsafeRequests {
 		command := exec.Command(os.Args[0], args...)

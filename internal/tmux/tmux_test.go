@@ -1791,6 +1791,84 @@ func TestSessionGenerationCleanupRunAndCloseSuccess(t *testing.T) {
 	}
 }
 
+func TestSessionGenerationExplicitCleanupStopsExactLiveSession(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-explicit-cleanup-%d", time.Now().UnixNano()))
+	session := "gt-explicit-cleanup"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := tm.PrepareSessionGenerationExplicitCleanup(generation, pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup.Close()
+	commit, err := cleanup.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := commit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed {
+		t.Fatal("explicit cleanup did not report the exact tmux mutation")
+	}
+	running, err := tm.HasSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running {
+		t.Fatal("exact explicit cleanup left the session running")
+	}
+}
+
+func TestSessionGenerationExplicitCleanupPreservesReplacement(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-explicit-replacement-%d", time.Now().UnixNano()))
+	session := "gt-explicit-replacement"
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := tm.PrepareSessionGenerationExplicitCleanup(generation, pane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup.Close()
+	if err := tm.KillServer(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cleanup.PrepareCommit(context.Background()); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("PrepareCommit() error = %v, want generation change", err)
+	}
+	running, err := tm.HasSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !running {
+		t.Fatal("explicit cleanup removed the replacement session")
+	}
+}
+
 func TestSessionGenerationCleanupClose(t *testing.T) {
 	closeErr := errors.New("injected close failure")
 	for _, tc := range []struct {

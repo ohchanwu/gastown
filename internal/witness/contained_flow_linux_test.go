@@ -199,12 +199,12 @@ func TestContainedWitnessFlow(t *testing.T) {
 	for _, name := range []string{
 		"preset_env", "prime", "patrol_scan", "patrol_report", "mail_inbox", "mail_read", "mail_send",
 		"nudge_queue", "nudge_immediate", "hook", "agents", "polecats", "status",
-		"bd_create", "bd_list", "https",
+		"https",
 	} {
 		assertContainedFlowExit(t, flowDir, name, true)
 	}
 	for _, name := range []string{
-		"raw_tmux", "host_loopback", "private_dolt", "public_non443", "formula",
+		"raw_tmux", "host_loopback", "private_dolt", "public_non443", "bd_create", "bd_list", "formula",
 		"hidden", "shell", "env_bypass", "descriptor_bypass",
 	} {
 		assertContainedFlowExit(t, flowDir, name, false)
@@ -212,13 +212,19 @@ func TestContainedWitnessFlow(t *testing.T) {
 	for _, name := range []string{"formula", "shell", "env_bypass", "descriptor_bypass"} {
 		assertContainedFlowBrokerDenial(t, flowDir, name)
 	}
+	for _, name := range []string{"bd_create", "bd_list"} {
+		stderr := readContainedFlowOptional(filepath.Join(flowDir, name+".stderr"))
+		if !strings.Contains(stderr, "127.0.0.1:1") {
+			t.Fatalf("contained direct %s did not fail against the isolated deny endpoint: %q", name, stderr)
+		}
+	}
 	assertContainedFlowDenial(t, flowDir, "hidden", 1, "not requested by a trusted launcher")
 	for _, name := range []string{"shell.escape", "env.escape", "descriptor.escape"} {
 		if _, err := os.Stat(filepath.Join(flowDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("contained denial proof %s exists: %v", name, err)
 		}
 	}
-	for _, name := range []string{"mail_inbox.stdout", "mail_read.stdout", "bd_list.stdout", "https.stdout"} {
+	for _, name := range []string{"mail_inbox.stdout", "mail_read.stdout", "https.stdout"} {
 		if evidence := readContainedFlowOptional(filepath.Join(flowDir, name)); !strings.Contains(evidence, nonce) {
 			t.Fatalf("contained flow evidence %s lacks nonce %q: %q", name, nonce, evidence)
 		}
@@ -260,6 +266,15 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 	if reportedPatrol.Status != "closed" || !strings.Contains(reportedPatrol.Description, nonce) {
 		t.Fatalf("reported contained patrol = status %q description %q", reportedPatrol.Status, reportedPatrol.Description)
+	}
+	openIssues, err := bd.List(beads.ListOptions{Status: string(beads.StatusOpen), Priority: -1})
+	if err != nil {
+		t.Fatalf("list disposable town after contained direct-bd denial: %v", err)
+	}
+	for _, issue := range openIssues {
+		if strings.Contains(issue.Title, nonce+" bd custody") {
+			t.Fatalf("contained direct bd mutation escaped the deny endpoint: %#v", issue)
+		}
 	}
 	newPatrolID := findContainedFlowPatrol(t, bd, constants.MolWitnessPatrol, rigName+"/witness")
 	if newPatrolID == oldPatrolID {

@@ -26,9 +26,7 @@ var slingCmd = &cobra.Command{
 	Use:     "sling <bead-or-formula> [target]",
 	GroupID: GroupWork,
 	Annotations: map[string]string{
-		AnnotationPolecatSafe:    "true",
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+		AnnotationPolecatSafe: "true",
 	},
 	Short: "Assign work to an agent (THE unified work dispatch command)",
 	Long: `Sling work onto an agent's hook and start working immediately.

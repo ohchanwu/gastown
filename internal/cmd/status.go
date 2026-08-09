@@ -42,9 +42,10 @@ var statusCmd = &cobra.Command{
 	Aliases: []string{"stat"},
 	GroupID: GroupDiag,
 	Annotations: map[string]string{
-		AnnotationPolecatSafe:    "true",
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+		AnnotationPolecatSafe:     "true",
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "json,fast,verbose",
 	},
 	Short: "Show overall town status",
 	Long: `Display the current status of the Gas Town workspace.

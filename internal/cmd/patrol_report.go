@@ -21,8 +21,9 @@ var (
 var patrolReportCmd = &cobra.Command{
 	Use: "report",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "summary,steps",
 	},
 	Short: "Close patrol cycle with summary and start next cycle",
 	Long: `Close the current patrol cycle, recording a summary of observations,

@@ -325,6 +325,75 @@ func TestSessionBrokerRunsWorkerWithPassedStdio(t *testing.T) {
 	}
 }
 
+func TestSessionBrokerPinsExecutableBeforeServingRequests(t *testing.T) {
+	dir := t.TempDir()
+	executable := filepath.Join(dir, "broker-worker")
+	writeWorker := func(output string) {
+		t.Helper()
+		if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf '"+output+"'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWorker("trusted")
+
+	serverFD, clientFD := newSessionBrokerSocketPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveSessionBroker(ctx, executable, serverFD, func([]string) error { return nil }, 1)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = unix.Close(clientFD)
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("serveSessionBroker() cleanup error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("serveSessionBroker() did not stop")
+		}
+	})
+
+	run := func() string {
+		t.Helper()
+		stdoutReader, stdoutWriter, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderr, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, runErr := runSessionBrokerClientAtFD(clientFD, []string{"ignored"}, os.Stdin, stdoutWriter, stderr, time.Second)
+		_ = stdoutWriter.Close()
+		_ = stderr.Close()
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		if code != 0 {
+			t.Fatalf("worker exit code = %d, want 0", code)
+		}
+		output, readErr := io.ReadAll(stdoutReader)
+		_ = stdoutReader.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return string(output)
+	}
+
+	if got := run(); got != "trusted" {
+		t.Fatalf("first worker output = %q, want trusted", got)
+	}
+	if err := os.Rename(executable, executable+".trusted"); err != nil {
+		t.Fatal(err)
+	}
+	writeWorker("replaced")
+	if got := run(); got != "trusted" {
+		t.Fatalf("worker followed replaced executable path: output = %q", got)
+	}
+}
+
 func TestSessionBrokerRejectsWrongDescriptorCountBeforeValidation(t *testing.T) {
 	serverFD, clientFD := newSessionBrokerSocketPair(t)
 	ctx, cancel := context.WithCancel(context.Background())

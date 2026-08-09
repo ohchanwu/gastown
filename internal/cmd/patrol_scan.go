@@ -25,8 +25,9 @@ var (
 var patrolScanCmd = &cobra.Command{
 	Use: "scan",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsNone,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "json,notify,rig,verbose",
 	},
 	Short: "Scan polecats for zombies, stalls, and completions",
 	Long: `Run proactive detection across all polecats in a rig.

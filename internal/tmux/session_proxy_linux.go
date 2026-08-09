@@ -33,7 +33,6 @@ const (
 
 type linuxCustodyProxySet struct {
 	HTTPS net.Listener
-	Dolt  net.Listener
 }
 
 func (proxies *linuxCustodyProxySet) Close() error {
@@ -47,18 +46,11 @@ func (proxies *linuxCustodyProxySet) Close() error {
 		}
 		proxies.HTTPS = nil
 	}
-	if proxies.Dolt != nil {
-		if err := proxies.Dolt.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errs = append(errs, err)
-		}
-		proxies.Dolt = nil
-	}
 	return errors.Join(errs...)
 }
 
 type linuxCustodyProxyPorts struct {
 	HTTPS uint16
-	Dolt  uint16
 }
 
 type httpsConnectConfig struct {
@@ -69,14 +61,6 @@ type httpsConnectConfig struct {
 	idleTimeout    time.Duration
 	totalTimeout   time.Duration
 	maxHeaderBytes int
-	maxConnections int
-}
-
-type doltProxyConfig struct {
-	dial           func(context.Context, string, string) (net.Conn, error)
-	dialTimeout    time.Duration
-	idleTimeout    time.Duration
-	totalTimeout   time.Duration
 	maxConnections int
 }
 
@@ -149,61 +133,6 @@ func validateProxyHostname(host string) error {
 	return nil
 }
 
-func captureConfiguredDoltEndpoint(env []string) (host string, port uint16, err error) {
-	values := make(map[string]string)
-	for _, entry := range env {
-		key, value, found := strings.Cut(entry, "=")
-		if found {
-			values[key] = value
-		}
-	}
-	host = values["GT_DOLT_HOST"]
-	if host == "" {
-		host = values["BEADS_DOLT_SERVER_HOST"]
-	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	if err := validateConfiguredDoltHost(host); err != nil {
-		return "", 0, err
-	}
-
-	portText := values["GT_DOLT_PORT"]
-	if portText == "" {
-		portText = values["BEADS_DOLT_SERVER_PORT"]
-	}
-	if portText == "" {
-		portText = values["BEADS_DOLT_PORT"]
-	}
-	if portText == "" {
-		portText = "3307"
-	}
-	parsed, err := strconv.ParseUint(portText, 10, 16)
-	if err != nil || parsed == 0 {
-		return "", 0, fmt.Errorf("invalid configured Dolt port %q", portText)
-	}
-	return host, uint16(parsed), nil
-}
-
-func validateConfiguredDoltHost(host string) error {
-	if host == "" || strings.ContainsAny(host, "/@ 	\r\n") || strings.Contains(host, "://") {
-		return fmt.Errorf("invalid configured Dolt host %q", host)
-	}
-	if address := net.ParseIP(host); address != nil {
-		if address.IsUnspecified() || address.IsMulticast() {
-			return fmt.Errorf("invalid configured Dolt address %q", host)
-		}
-		return nil
-	}
-	if strings.Contains(host, ":") {
-		return fmt.Errorf("invalid configured Dolt host %q", host)
-	}
-	if err := validateProxyHostname(host); err != nil {
-		return fmt.Errorf("invalid configured Dolt host %q: %w", host, err)
-	}
-	return nil
-}
-
 func bringUpLinuxCustodyLoopback() error {
 	socket, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -230,20 +159,15 @@ func createAndSendLinuxCustodyProxyListeners(brokerFD int) (linuxCustodyProxyPor
 		return linuxCustodyProxyPorts{}, err
 	}
 	defer unix.Close(httpsFD)
-	doltFD, doltPort, err := createLinuxCustodyLoopbackListener()
-	if err != nil {
-		return linuxCustodyProxyPorts{}, err
-	}
-	defer unix.Close(doltFD)
 	frame := []byte{'P', 'X', 1}
-	written, err := unix.SendmsgN(brokerFD, frame, unix.UnixRights(httpsFD, doltFD), nil, unix.MSG_NOSIGNAL)
+	written, err := unix.SendmsgN(brokerFD, frame, unix.UnixRights(httpsFD), nil, unix.MSG_NOSIGNAL)
 	if err != nil {
 		return linuxCustodyProxyPorts{}, fmt.Errorf("sending session proxy listeners: %w", err)
 	}
 	if written != len(frame) {
 		return linuxCustodyProxyPorts{}, io.ErrShortWrite
 	}
-	return linuxCustodyProxyPorts{HTTPS: httpsPort, Dolt: doltPort}, nil
+	return linuxCustodyProxyPorts{HTTPS: httpsPort}, nil
 }
 
 func createLinuxCustodyLoopbackListener() (int, uint16, error) {
@@ -280,7 +204,7 @@ func createLinuxCustodyLoopbackListener() (int, uint16, error) {
 
 func receiveLinuxCustodyProxySet(brokerFD int) (_ linuxCustodyProxySet, retErr error) {
 	frame := make([]byte, 3)
-	rightsBuffer := make([]byte, unix.CmsgSpace(2*4))
+	rightsBuffer := make([]byte, unix.CmsgSpace(4))
 	frameBytes, rightsBytes, flags, _, err := unix.Recvmsg(brokerFD, frame, rightsBuffer, unix.MSG_CMSG_CLOEXEC)
 	if err != nil {
 		return linuxCustodyProxySet{}, fmt.Errorf("receiving session proxy listeners: %w", err)
@@ -297,10 +221,10 @@ func receiveLinuxCustodyProxySet(brokerFD int) (_ linuxCustodyProxySet, retErr e
 	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || frameBytes != len(frame) || !bytes.Equal(frame, []byte{'P', 'X', 1}) {
 		return linuxCustodyProxySet{}, errors.New("session proxy descriptor frame was invalid or truncated")
 	}
-	if len(descriptors) != 2 {
-		return linuxCustodyProxySet{}, fmt.Errorf("session proxy descriptor frame contained %d descriptors; want 2", len(descriptors))
+	if len(descriptors) != 1 {
+		return linuxCustodyProxySet{}, fmt.Errorf("session proxy descriptor frame contained %d descriptors; want 1", len(descriptors))
 	}
-	listeners := make([]net.Listener, 0, 2)
+	listeners := make([]net.Listener, 0, 1)
 	for index, fd := range descriptors {
 		if err := validateLinuxCustodyProxyListenerFD(fd); err != nil {
 			for _, listener := range listeners {
@@ -320,7 +244,7 @@ func receiveLinuxCustodyProxySet(brokerFD int) (_ linuxCustodyProxySet, retErr e
 		}
 		listeners = append(listeners, listener)
 	}
-	return linuxCustodyProxySet{HTTPS: listeners[0], Dolt: listeners[1]}, nil
+	return linuxCustodyProxySet{HTTPS: listeners[0]}, nil
 }
 
 func waitLinuxCustodyProxySet(launch *linuxCustodyLaunch, timeout time.Duration) error {
@@ -387,10 +311,9 @@ func rewriteLinuxCustodyNetworkEnvironment(env []string, ports linuxCustodyProxy
 	filtered := withoutEnvironmentKeys(
 		env,
 		"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
-		"GT_DOLT_HOST", "GT_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT",
+		"GT_DOLT_HOST", "GT_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT", "BEADS_DOLT_AUTO_START",
 	)
 	proxyURL := "http://127.0.0.1:" + strconv.Itoa(int(ports.HTTPS))
-	doltPort := strconv.Itoa(int(ports.Dolt))
 	return append(filtered,
 		"HTTPS_PROXY="+proxyURL,
 		"https_proxy="+proxyURL,
@@ -401,10 +324,11 @@ func rewriteLinuxCustodyNetworkEnvironment(env []string, ports linuxCustodyProxy
 		"NO_PROXY=",
 		"no_proxy=",
 		"GT_DOLT_HOST=127.0.0.1",
-		"GT_DOLT_PORT="+doltPort,
+		"GT_DOLT_PORT=1",
 		"BEADS_DOLT_SERVER_HOST=127.0.0.1",
-		"BEADS_DOLT_SERVER_PORT="+doltPort,
-		"BEADS_DOLT_PORT="+doltPort,
+		"BEADS_DOLT_SERVER_PORT=1",
+		"BEADS_DOLT_PORT=1",
+		"BEADS_DOLT_AUTO_START=0",
 	)
 }
 
@@ -574,39 +498,6 @@ func validatedHTTPSRemote(remote net.Addr, resolved []net.IP) bool {
 func writeHTTPProxyFailure(connection net.Conn, status int) {
 	_ = connection.SetWriteDeadline(time.Now().Add(time.Second))
 	_, _ = fmt.Fprintf(connection, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
-}
-
-func serveDoltProxy(ctx context.Context, listener net.Listener, upstream string) error {
-	dialer := &net.Dialer{}
-	return serveDoltProxyWithConfig(ctx, listener, upstream, doltProxyConfig{
-		dial:           dialer.DialContext,
-		dialTimeout:    defaultProxyDialTimeout,
-		idleTimeout:    defaultProxyIdleTimeout,
-		totalTimeout:   defaultProxyTotalTimeout,
-		maxConnections: defaultProxyMaxConnections,
-	})
-}
-
-func serveDoltProxyWithConfig(ctx context.Context, listener net.Listener, upstream string, config doltProxyConfig) error {
-	if config.dial == nil || config.dialTimeout <= 0 || config.idleTimeout <= 0 || config.totalTimeout <= 0 || config.maxConnections < 1 {
-		return errors.New("Dolt proxy configuration is invalid")
-	}
-	if host, port, err := net.SplitHostPort(upstream); err != nil || host == "" || port == "" {
-		return fmt.Errorf("invalid captured Dolt endpoint %q", upstream)
-	}
-	return serveBoundedProxy(ctx, listener, config.maxConnections, func(serverContext context.Context, client net.Conn) {
-		defer client.Close()
-		connectionContext, cancel := context.WithTimeout(serverContext, config.totalTimeout)
-		defer cancel()
-		dialContext, cancelDial := context.WithTimeout(connectionContext, config.dialTimeout)
-		upstreamConnection, err := config.dial(dialContext, "tcp", upstream)
-		cancelDial()
-		if err != nil {
-			return
-		}
-		defer upstreamConnection.Close()
-		relayProxyConnections(connectionContext, client, upstreamConnection, client, config.idleTimeout)
-	})
 }
 
 func serveBoundedProxy(

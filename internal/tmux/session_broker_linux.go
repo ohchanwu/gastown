@@ -169,6 +169,16 @@ func serveSessionBroker(
 	if maxWorkers < 1 {
 		return errors.New("session broker worker limit must be positive")
 	}
+	executableFD, err := unix.Open(executable, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("pinning session broker executable: %w", err)
+	}
+	pinnedExecutable := os.NewFile(uintptr(executableFD), "session-broker-executable")
+	if pinnedExecutable == nil {
+		_ = unix.Close(executableFD)
+		return errors.New("pinning session broker executable returned no file")
+	}
+	defer pinnedExecutable.Close()
 	unix.CloseOnExec(fd)
 
 	stopReceiver := make(chan struct{})
@@ -201,7 +211,7 @@ func serveSessionBroker(
 			go func() {
 				defer workerGroup.Done()
 				defer func() { <-workers }()
-				handleSessionBrokerRequest(ctx, executable, validate, request, descriptors)
+				handleSessionBrokerRequest(ctx, pinnedExecutable, validate, request, descriptors)
 			}()
 		default:
 			rejectSessionBrokerRequest(descriptors, sessionBrokerBusyExitCode, "session broker is busy")
@@ -290,7 +300,7 @@ func validateSessionBrokerDescriptors(descriptors []int) error {
 
 func handleSessionBrokerRequest(
 	serverContext context.Context,
-	executable string,
+	executable *os.File,
 	validate SessionBrokerValidator,
 	request sessionBrokerRequest,
 	descriptors []int,
@@ -310,7 +320,8 @@ func handleSessionBrokerRequest(
 
 	requestContext, cancel := context.WithTimeout(serverContext, time.Duration(request.DeadlineMS)*time.Millisecond)
 	defer cancel()
-	command := exec.CommandContext(requestContext, executable, request.Args...)
+	command := exec.CommandContext(requestContext, "/proc/self/fd/3", request.Args...)
+	command.ExtraFiles = []*os.File{executable}
 	command.Stdin = stdin
 	command.Stdout = stdout
 	command.Stderr = stderr

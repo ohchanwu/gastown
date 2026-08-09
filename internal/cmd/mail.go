@@ -98,8 +98,9 @@ COMMANDS:
 var mailSendCmd = &cobra.Command{
 	Use: "send <address>",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsExactOne,
+		brokerSafeFlagsAnnotation: "subject,message,body,stdin,priority,urgent,type,reply-to,notify,no-notify,pinned,wisp,permanent",
 	},
 	Short: "Send a message",
 	Long: `Send a message to an agent.
@@ -152,8 +153,9 @@ Examples:
 var mailInboxCmd = &cobra.Command{
 	Use: "inbox [address]",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsCobra,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsNone,
+		brokerSafeFlagsAnnotation: "json,unread,all",
 	},
 	Short: "Check inbox",
 	Long: `Check messages in an inbox.
@@ -178,8 +180,9 @@ Examples:
 var mailReadCmd = &cobra.Command{
 	Use: "read <message-id|index>",
 	Annotations: map[string]string{
-		BrokerSafeAnnotation:     "true",
-		brokerSafeArgsAnnotation: brokerSafeArgsExactOne,
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsExactOne,
+		brokerSafeFlagsAnnotation: "json",
 	},
 	Short: "Read a message",
 	Long: `Read a specific message (does not mark as read).

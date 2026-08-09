@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	BrokerSafeAnnotation     = "gastown.io/session-broker-safe"
-	brokerSafeArgsAnnotation = "gastown.io/session-broker-args"
-	brokerSafeArgsCobra      = "cobra"
-	brokerSafeArgsNone       = "none"
-	brokerSafeArgsExactOne   = "exact:1"
-	brokerSafeArgsMaximumOne = "maximum:1"
+	BrokerSafeAnnotation      = "gastown.io/session-broker-safe"
+	brokerSafeArgsAnnotation  = "gastown.io/session-broker-args"
+	brokerSafeFlagsAnnotation = "gastown.io/session-broker-flags"
+	brokerSafeArgsCobra       = "cobra"
+	brokerSafeArgsNone        = "none"
+	brokerSafeArgsExactOne    = "exact:1"
+	brokerSafeArgsMaximumOne  = "maximum:1"
 )
 
 var brokerPolicyMu sync.Mutex
@@ -91,6 +92,10 @@ func validateBrokerCommandArguments(command *cobra.Command, args []string) (retE
 			state.isSlice = true
 		}
 		states = append(states, state)
+		// Cobra commands are process-global and other in-process callers may
+		// leave Changed set. Broker validation must authorize only the flags in
+		// this request, then restore the caller's exact prior state below.
+		flag.Changed = false
 	})
 	defer func() {
 		var restoreErrors []error
@@ -114,6 +119,31 @@ func validateBrokerCommandArguments(command *cobra.Command, args []string) (retE
 			return nil
 		}
 		return fmt.Errorf("parsing broker command flags: %w", err)
+	}
+	allowedFlags := make(map[string]struct{})
+	for _, name := range strings.Split(command.Annotations[brokerSafeFlagsAnnotation], ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			allowedFlags[name] = struct{}{}
+		}
+	}
+	var forbiddenFlag string
+	// FlagSet.Visit walks pflag's process-global "actual" cache, which retains
+	// flags parsed by earlier in-process Cobra executions even after Changed is
+	// restored. Inspect the freshly reset Changed bits directly so authorization
+	// covers only this broker request.
+	flags.VisitAll(func(flag *pflag.Flag) {
+		if forbiddenFlag != "" {
+			return
+		}
+		if !flag.Changed {
+			return
+		}
+		if _, ok := allowedFlags[flag.Name]; !ok {
+			forbiddenFlag = flag.Name
+		}
+	})
+	if forbiddenFlag != "" {
+		return fmt.Errorf("broker command flag --%s is not allowed", forbiddenFlag)
 	}
 	positionals := command.Flags().Args()
 	switch policy := command.Annotations[brokerSafeArgsAnnotation]; policy {

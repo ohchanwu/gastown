@@ -58,11 +58,23 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 			break
 		}
 	}
-	hardening := make([]string, 0, 3)
+	hardening := make([]string, 0, 7)
 	for _, line := range strings.Split(string(status), "\n") {
 		if strings.HasPrefix(line, "CapEff:") || strings.HasPrefix(line, "CapBnd:") || strings.HasPrefix(line, "NoNewPrivs:") {
 			hardening = append(hardening, line)
 		}
+	}
+	for name, resource := range map[string]int{
+		"RlimitNOFILE": unix.RLIMIT_NOFILE,
+		"RlimitFSIZE":  unix.RLIMIT_FSIZE,
+		"RlimitAS":     unix.RLIMIT_AS,
+		"RlimitCORE":   unix.RLIMIT_CORE,
+	} {
+		var limit unix.Rlimit
+		if err := unix.Getrlimit(resource, &limit); err != nil {
+			t.Fatal(err)
+		}
+		hardening = append(hardening, fmt.Sprintf("%s:%d:%d", name, limit.Cur, limit.Max))
 	}
 	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_HARDENING"), []byte(strings.Join(hardening, "\n")), 0o600); err != nil {
 		t.Fatal(err)
@@ -146,19 +158,10 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 	doltEndpoint := net.JoinHostPort(os.Getenv("GT_DOLT_HOST"), os.Getenv("GT_DOLT_PORT"))
 	doltConnection, doltErr := net.DialTimeout("tcp", doltEndpoint, time.Second)
 	if doltErr != nil {
-		proxyEvidence = append(proxyEvidence, "dolt="+doltErr.Error())
+		proxyEvidence = append(proxyEvidence, "dolt=denied")
 	} else {
-		_ = doltConnection.SetDeadline(time.Now().Add(time.Second))
-		payload := []byte("isolated-dolt-proxy")
-		_, writeErr := doltConnection.Write(payload)
-		response := make([]byte, len(payload))
-		_, readErr := io.ReadFull(doltConnection, response)
 		_ = doltConnection.Close()
-		if writeErr == nil && readErr == nil && string(response) == string(payload) {
-			proxyEvidence = append(proxyEvidence, "dolt=exact-echo")
-		} else {
-			proxyEvidence = append(proxyEvidence, fmt.Sprintf("dolt=failed:%v:%v:%q", writeErr, readErr, response))
-		}
+		proxyEvidence = append(proxyEvidence, "dolt=connected")
 	}
 	httpsProxy, parseErr := url.Parse(os.Getenv("HTTPS_PROXY"))
 	if parseErr != nil || httpsProxy.Host == "" {
@@ -184,7 +187,7 @@ func TestLinuxSessionCustodyWorkloadHelper(t *testing.T) {
 			proxyEvidence = append(proxyEvidence, "direct="+target+":denied")
 		}
 	}
-	for _, key := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "GT_DOLT_HOST", "GT_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+	for _, key := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "GT_DOLT_HOST", "GT_DOLT_PORT", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT", "BEADS_DOLT_AUTO_START"} {
 		proxyEvidence = append(proxyEvidence, key+"="+os.Getenv(key))
 	}
 	if err := os.WriteFile(os.Getenv("GT_TEST_SESSION_CUSTODY_PROXY"), []byte(strings.Join(proxyEvidence, "\n")), 0o600); err != nil {
@@ -316,29 +319,20 @@ func TestLinuxDirectChildrenIncludesNonLeaderThreadChildren(t *testing.T) {
 	t.Fatalf("non-leader thread %d child %d missing from %v", result.tid, result.cmd.Process.Pid, children)
 }
 
-func TestLaunchLinuxCustodyFallsBackButLaterCleanupFailsClosed(t *testing.T) {
+func TestLaunchLinuxCustodyFailsClosedWhenNamespacesAreUnavailable(t *testing.T) {
 	var attempts []bool
 	launch, contained, err := launchLinuxCustodyCommand("sleep 60", func(command string, namespaced bool) (*linuxCustodyLaunch, error) {
 		attempts = append(attempts, namespaced)
-		if namespaced {
-			return nil, unix.EPERM
-		}
-		return startLinuxCustodyCommand(command, false)
+		return nil, unix.EPERM
 	})
-	if err != nil {
-		t.Fatal(err)
+	if launch != nil || contained {
+		t.Fatalf("launch = %v, contained %v, want no uncontained child", launch, contained)
 	}
-	t.Cleanup(func() {
-		_ = closeLinuxCustodyLaunch(launch, true)
-	})
-	if contained {
-		t.Fatal("fallback launch reported generation-bound containment")
+	if !errors.Is(err, unix.EPERM) {
+		t.Fatalf("launch error = %v, want EPERM", err)
 	}
-	if len(attempts) != 2 || !attempts[0] || attempts[1] {
-		t.Fatalf("launch attempts = %v, want [true false]", attempts)
-	}
-	if _, err := retainSessionCustody(uuid.NewString(), os.Getpid()); !errors.Is(err, ErrSessionCustodyUnsupported) {
-		t.Fatalf("retainSessionCustody() error = %v, want ErrSessionCustodyUnsupported", err)
+	if len(attempts) != 1 || !attempts[0] {
+		t.Fatalf("launch attempts = %v, want one contained attempt", attempts)
 	}
 }
 
@@ -672,23 +666,6 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	doltListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer doltListener.Close()
-	go func() {
-		connection, acceptErr := doltListener.Accept()
-		if acceptErr != nil {
-			return
-		}
-		defer connection.Close()
-		_, _ = io.Copy(connection, connection)
-	}()
-	doltHost, doltPort, err := net.SplitHostPort(doltListener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCustodySupervisorHelper$")
 	cmd.Env = append(os.Environ(),
 		"GT_TEST_SESSION_CUSTODY_HELPER="+custody,
@@ -702,8 +679,8 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 		"GT_TEST_SESSION_CUSTODY_PROXY="+proxyPath,
 		"GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK="+hostListener.Addr().String(),
 		"GT_TEST_SESSION_CUSTODY_BROKER_PROOF="+brokerProofPath,
-		"GT_DOLT_HOST="+doltHost,
-		"GT_DOLT_PORT="+doltPort,
+		"GT_DOLT_HOST=127.0.0.1",
+		"GT_DOLT_PORT=33327",
 	)
 	var output synchronizedStringBuilder
 	cmd.Stdout = &output
@@ -772,6 +749,10 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 				"capeff:\t0000000000000000",
 				"capbnd:\t0000000000000000",
 				"nonewprivs:\t1",
+				fmt.Sprintf("rlimitnofile:%d:%d", linuxSessionNoFileLimit, linuxSessionNoFileLimit),
+				fmt.Sprintf("rlimitfsize:%d:%d", linuxSessionFileLimit, linuxSessionFileLimit),
+				fmt.Sprintf("rlimitas:%d:%d", linuxSessionASLimit, linuxSessionASLimit),
+				"rlimitcore:0:0",
 			} {
 				if !strings.Contains(hardeningEvidence, field) {
 					t.Fatalf("contained workload lacks hardening %q: %q", field, hardeningResult)
@@ -785,19 +766,23 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 			}
 			proxyEvidence := string(proxyResult)
 			for _, field := range []string{
-				"dolt=exact-echo",
+				"dolt=denied",
 				"https_proxy=HTTP/1.1 403 Forbidden",
 				"direct=10.0.0.1:443:denied",
 				"direct=8.8.8.8:80:denied",
 				"GT_DOLT_HOST=127.0.0.1",
+				"GT_DOLT_PORT=1",
 				"BEADS_DOLT_SERVER_HOST=127.0.0.1",
+				"BEADS_DOLT_SERVER_PORT=1",
+				"BEADS_DOLT_PORT=1",
+				"BEADS_DOLT_AUTO_START=0",
 			} {
 				if !strings.Contains(proxyEvidence, field) {
 					t.Fatalf("contained workload proxy evidence missing %q: %q", field, proxyResult)
 				}
 			}
-			if strings.Contains(proxyEvidence, doltListener.Addr().String()) {
-				t.Fatalf("captured Dolt upstream leaked into contained environment: %q", proxyResult)
+			if strings.Contains(proxyEvidence, "33327") {
+				t.Fatalf("outer Dolt endpoint leaked into contained environment: %q", proxyResult)
 			}
 			brokerEvidence := string(brokerProof)
 			for _, field := range []string{

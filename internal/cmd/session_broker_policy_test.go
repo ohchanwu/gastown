@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"slices"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -24,8 +23,6 @@ func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 		{"agents", "list"},
 		{"polecat", "list", "gastown"},
 		{"polecat", "status", "gastown/example"},
-		{"sling", "gt-example", "gastown"},
-		{"done"},
 		{"health", "--json"},
 		{"status", "--fast"},
 	}
@@ -39,14 +36,9 @@ func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 }
 
 func TestBrokerSafeCommandValidationRestoresFlagState(t *testing.T) {
-	beforeVars := append([]string(nil), slingVars...)
 	beforeState := primeState
 	beforeSubject := mailSubject
-	beforeVarChanged := slingCmd.Flags().Lookup("var").Changed
 
-	if err := IsBrokerSafeCommand(rootCmd, []string{"sling", "gt-example", "gastown", "--var", "key=value"}); err != nil {
-		t.Fatal(err)
-	}
 	if err := IsBrokerSafeCommand(rootCmd, []string{"prime", "--state"}); err != nil {
 		t.Fatal(err)
 	}
@@ -54,17 +46,53 @@ func TestBrokerSafeCommandValidationRestoresFlagState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !slices.Equal(slingVars, beforeVars) {
-		t.Fatalf("slingVars after validation = %q, want %q", slingVars, beforeVars)
-	}
 	if primeState != beforeState {
 		t.Fatalf("primeState after validation = %v, want %v", primeState, beforeState)
 	}
 	if mailSubject != beforeSubject {
 		t.Fatalf("mailSubject after validation = %q, want %q", mailSubject, beforeSubject)
 	}
-	if got := slingCmd.Flags().Lookup("var").Changed; got != beforeVarChanged {
-		t.Fatalf("sling --var Changed after validation = %v, want %v", got, beforeVarChanged)
+}
+
+func TestBrokerSafeCommandIgnoresAndRestoresPreexistingChangedFlags(t *testing.T) {
+	fromFlag := mailSendCmd.Flags().Lookup("from")
+	if fromFlag == nil {
+		t.Fatal("mail send --from flag is unavailable")
+	}
+	beforeValue := fromFlag.Value.String()
+	beforeChanged := fromFlag.Changed
+	if err := fromFlag.Value.Set("bridge/"); err != nil {
+		t.Fatal(err)
+	}
+	fromFlag.Changed = true
+	t.Cleanup(func() {
+		_ = fromFlag.Value.Set(beforeValue)
+		fromFlag.Changed = beforeChanged
+	})
+
+	if err := IsBrokerSafeCommand(rootCmd, []string{"mail", "send", "mayor/", "--subject", "status"}); err != nil {
+		t.Fatalf("pre-existing Cobra state contaminated broker request: %v", err)
+	}
+	if got := fromFlag.Value.String(); got != "bridge/" || !fromFlag.Changed {
+		t.Fatalf("pre-existing --from state = %q changed=%v, want bridge/ changed=true", got, fromFlag.Changed)
+	}
+}
+
+func TestBrokerSafeCommandDeniesUnreviewedMutationsAndFlags(t *testing.T) {
+	tests := [][]string{
+		{"sling", "gt-example", "gastown"},
+		{"done"},
+		{"mail", "send", "deacon", "--from", "mayor/", "--subject", "LIFECYCLE shutdown"},
+		{"status", "--watch"},
+		{"status", "--interval", "1"},
+		{"hook", "--force"},
+	}
+	for _, args := range tests {
+		t.Run(commandTestName(args), func(t *testing.T) {
+			if err := IsBrokerSafeCommand(rootCmd, args); err == nil {
+				t.Fatalf("IsBrokerSafeCommand(%q) unexpectedly allowed mutation", args)
+			}
+		})
 	}
 }
 
@@ -80,6 +108,8 @@ func TestBrokerSafeCommandDeniesUnsafeOrMalformedPaths(t *testing.T) {
 		{"agents", "fix"},
 		{"polecat", "nuke", "gastown/example", "--force"},
 		{"sling", "respawn-reset", "gt-example"},
+		{"sling", "gt-example", "gastown"},
+		{"done"},
 		{"session-custody-init"},
 		{"session-custody", "--id", "00000000-0000-0000-0000-000000000000", "--", "true"},
 		{"shell", "-c", "touch /tmp/escaped"},

@@ -54,15 +54,16 @@ var witnessTeardownBudgets = teardownBudgets{
 // Manager handles witness lifecycle and monitoring operations.
 // ZFC-compliant: tmux session is the source of truth for running state.
 type Manager struct {
-	rig                   *rig.Rig
-	tmux                  *tmux.Tmux
-	capturePaneGeneration func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error)
-	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
-	wrapSessionCommand    func(string) (string, string, error)
-	startPoller           func(string, string) (int, error)
-	cleanupTimeout        time.Duration
-	teardownBudgets       teardownBudgets
-	zombieKillGrace       time.Duration
+	rig                    *rig.Rig
+	tmux                   *tmux.Tmux
+	capturePaneGeneration  func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error)
+	prepareSessionCleanup  func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
+	prepareExplicitCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
+	wrapSessionCommand     func(string) (string, string, error)
+	startPoller            func(string, string) (int, error)
+	cleanupTimeout         time.Duration
+	teardownBudgets        teardownBudgets
+	zombieKillGrace        time.Duration
 }
 
 type sessionGenerationCleanup interface {
@@ -90,6 +91,12 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 			paneGeneration tmux.PaneProcessGeneration,
 		) (sessionGenerationCleanup, error) {
 			return t.PrepareSessionGenerationProcessCleanup(generation, paneGeneration)
+		},
+		prepareExplicitCleanup: func(
+			generation tmux.SessionGeneration,
+			paneGeneration tmux.PaneProcessGeneration,
+		) (sessionGenerationCleanup, error) {
+			return t.PrepareSessionGenerationExplicitCleanup(generation, paneGeneration)
 		},
 		wrapSessionCommand: func(command string) (string, string, error) {
 			executable, err := os.Executable()
@@ -167,6 +174,10 @@ func (m *Manager) teardownSessionGeneration(
 			}
 			var err error
 			cleanup, err = m.prepareSessionCleanup(generation, paneGeneration)
+			if err != nil && !requireDead &&
+				(errors.Is(err, tmux.ErrSessionCustodyUnsupported) || errors.Is(err, tmux.ErrProcessReferenceUnsupported)) {
+				cleanup, err = m.prepareExplicitCleanup(generation, paneGeneration)
+			}
 			if err != nil {
 				return nil, errors.Join(err, closeCleanup())
 			}
