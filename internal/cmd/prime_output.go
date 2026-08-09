@@ -104,27 +104,12 @@ func isContainedWitnessContext(ctx RoleContext) bool {
 	return ctx.Role == RoleWitness && os.Getenv(tmux.EnvSessionBrokerWorker) == "1"
 }
 
-type containedWitnessPrimeCommand struct {
-	description string
-	args        []string
-}
-
 func containedWitnessPrimeOutput(ctx RoleContext) (string, error) {
-	commands := []containedWitnessPrimeCommand{
-		{"Inspect the current hook", []string{"hook", "show"}},
-		{"Inspect the current patrol step", []string{"mol", "current"}},
-		{"Close the current patrol step", []string{"mol", "step", "close"}},
-		{"Scan this rig", []string{"patrol", "scan", "--rig", ctx.Rig, "--json"}},
-		{"Report this patrol cycle", []string{"patrol", "report", "--summary", "<brief summary of observations>"}},
-		{"Check unread mail", []string{"mail", "inbox", "--unread"}},
-		{"List live agents", []string{"agents", "list"}},
-		{"List this rig's polecats", []string{"polecat", "list", ctx.Rig}},
-		{"Read town status", []string{"status", "--fast"}},
-	}
+	commands := containedWitnessBrokerGuidance(ctx.Rig)
 	var output strings.Builder
 	fmt.Fprintf(&output, "# Contained Witness Context\n\n")
 	fmt.Fprintf(&output, "You are the **Witness** for rig: **%s**\n\n", ctx.Rig)
-	fmt.Fprintln(&output, "This session uses a trusted command broker. The commands below are derived from the broker's reviewed Cobra capabilities and are the complete actionable quick reference for this context.")
+	fmt.Fprintln(&output, "This session uses a trusted command broker. The patrol commands below are rendered from the same reviewed capability registry used for broker authorization.")
 	fmt.Fprintln(&output, "\n## Brokered Commands")
 	for _, command := range commands {
 		if err := IsBrokerSafeCommand(rootCmd, command.args); err != nil {

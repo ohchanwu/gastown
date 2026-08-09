@@ -58,6 +58,72 @@ func TestWitnessSessionCustodyPathsIgnoresTestOverrides(t *testing.T) {
 	}
 }
 
+func TestWitnessSessionCustodyPathsRejectsConfiguredSymlinkToRoot(t *testing.T) {
+	witnessDir := t.TempDir()
+	witnessSettingsDir := t.TempDir()
+	rootLink := filepath.Join(t.TempDir(), "configured-root")
+	if err := os.Symlink(string(filepath.Separator), rootLink); err != nil {
+		t.Fatal(err)
+	}
+	_, err := witnessSessionCustodyPaths(
+		witnessDir,
+		"",
+		witnessSettingsDir,
+		&config.RuntimeConfig{Command: "/bin/sh"},
+		map[string]string{"CODEX_HOME": rootLink, "PATH": os.Getenv("PATH")},
+	)
+	if err == nil {
+		t.Fatal("configured custody symlink widened to the host root")
+	}
+}
+
+func TestWitnessSessionCustodyPathsCanonicalizesConfiguredEnvironment(t *testing.T) {
+	witnessDir := t.TempDir()
+	witnessSettingsDir := t.TempDir()
+	realHome := t.TempDir()
+	canonicalHome, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeLink := filepath.Join(t.TempDir(), "configured-home")
+	if err := os.Symlink(realHome, homeLink); err != nil {
+		t.Fatal(err)
+	}
+	envVars := map[string]string{"CODEX_HOME": homeLink, "PATH": os.Getenv("PATH")}
+	encoded, err := witnessSessionCustodyPaths(
+		witnessDir,
+		"",
+		witnessSettingsDir,
+		&config.RuntimeConfig{Command: "/bin/sh"},
+		envVars,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envVars["CODEX_HOME"] != canonicalHome {
+		t.Fatalf("contained CODEX_HOME = %q, want canonical %q", envVars["CODEX_HOME"], canonicalHome)
+	}
+	var paths []string
+	if err := json.Unmarshal([]byte(encoded), &paths); err != nil {
+		t.Fatal(err)
+	}
+	var hasCanonical, hasLink bool
+	for _, path := range paths {
+		hasCanonical = hasCanonical || path == canonicalHome
+		hasLink = hasLink || path == homeLink
+	}
+	if !hasCanonical || hasLink {
+		t.Fatalf("canonical custody paths = %q, want %q without %q", paths, canonicalHome, homeLink)
+	}
+}
+
+func TestAppendWitnessCustodyExecutableIncludesExactOptDirectory(t *testing.T) {
+	paths := appendWitnessCustodyExecutable(nil, "/opt/example/bin/codex", "")
+	if len(paths) != 1 || paths[0] != "/opt/example/bin" {
+		t.Fatalf("exact /opt executable directory = %q, want [/opt/example/bin]", paths)
+	}
+}
+
 func TestManagerStartForegroundDeprecated(t *testing.T) {
 	mgr := NewManager(&rig.Rig{Name: "testrig", Path: t.TempDir()})
 	err := mgr.Start(true, "", nil)
@@ -124,7 +190,7 @@ func (cleanup *fakeSessionCleanup) Close() error {
 	return nil
 }
 
-func TestManagerRetainsCommittedCleanupOwnerUntilCloseRetrySucceeds(t *testing.T) {
+func TestManagerRetainsCommittedCleanupOwnerAcrossManagerLifetimes(t *testing.T) {
 	closeErr := errors.New("injected committed cleanup close failure")
 	closeCalls := 0
 	cleanup := &fakeSessionCleanup{
@@ -148,25 +214,27 @@ func TestManagerRetainsCommittedCleanupOwnerUntilCloseRetrySucceeds(t *testing.T
 		t.Fatalf("commit = %v, err %v; want committed success", committed, err)
 	}
 
-	mgr := &Manager{}
-	if err := mgr.closeOrRetainCleanup(cleanup); !errors.Is(err, closeErr) {
+	sharedRig := &rig.Rig{Name: "testrig", Path: t.TempDir()}
+	first := NewManagerWithTmux(sharedRig, tmux.NewTmux())
+	second := NewManagerWithTmux(sharedRig, tmux.NewTmux())
+	if err := first.closeOrRetainCleanup(cleanup); !errors.Is(err, closeErr) {
 		t.Fatalf("initial Close error = %v, want %v", err, closeErr)
 	}
-	mgr.pendingCleanupMu.Lock()
-	pending := len(mgr.pendingCleanups)
-	mgr.pendingCleanupMu.Unlock()
+	first.cleanupRegistry.mu.Lock()
+	pending := len(first.cleanupRegistry.pending)
+	first.cleanupRegistry.mu.Unlock()
 	if pending != 1 {
 		t.Fatalf("pending cleanup owners = %d, want 1", pending)
 	}
-	if err := mgr.retryPendingCleanups(); err != nil {
-		t.Fatalf("retrying retained cleanup: %v", err)
+	if err := second.Start(true, "", nil); err == nil || !strings.Contains(err.Error(), "foreground mode is deprecated") {
+		t.Fatalf("fresh Manager Start after cleanup retry = %v, want foreground stop boundary", err)
 	}
 	if closeCalls != 2 {
 		t.Fatalf("Close calls = %d, want 2", closeCalls)
 	}
-	mgr.pendingCleanupMu.Lock()
-	pending = len(mgr.pendingCleanups)
-	mgr.pendingCleanupMu.Unlock()
+	first.cleanupRegistry.mu.Lock()
+	pending = len(first.cleanupRegistry.pending)
+	first.cleanupRegistry.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("successful cleanup retry retained %d owners", pending)
 	}

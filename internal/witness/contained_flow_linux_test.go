@@ -136,7 +136,7 @@ func TestContainedWitnessFlow(t *testing.T) {
 	copyContainedFlowExecutable(t, gtBinary, containedGT)
 	writeContainedFlowAgent(t, agentPath, containedFlowAgentFixture{
 		GT: containedGT, BD: bdPath, MailID: incomingID, Nonce: nonce,
-		Socket: socket, CA: caPath, PrivateDoltIP: privateDoltIP,
+		Socket: socket, CA: caPath, PrivateDoltIP: privateDoltIP, PrivateDoltPort: port,
 		OuterSentinel: outerSentinel,
 	})
 	sshListener, err := net.Listen("tcp4", "127.0.0.1:22")
@@ -185,12 +185,17 @@ func TestContainedWitnessFlow(t *testing.T) {
 		t.Fatalf("contained prime omitted broker-scoped live follow-up: %q", primeOutput)
 	}
 	primeCommandResults := map[string]string{
+		"gt hook":                             "hook",
 		"gt hook show":                        "prime_hook_show",
 		"gt mol current":                      "prime_current",
 		"gt mol step close":                   "prime_step_close",
 		"gt patrol scan --rig testrig --json": "patrol_scan",
 		"gt patrol report --summary '<brief summary of observations>'": "patrol_report",
-		"gt mail inbox --unread":  "mail_inbox",
+		"gt mail inbox --unread":      "mail_inbox",
+		"gt mail read '<message-id>'": "mail_read",
+		"gt mail send mayor/ --subject '<subject>' --message '<body>' --no-notify": "mail_send",
+		"gt nudge mayor '<message>' --mode queue":                                  "nudge_queue",
+		"gt nudge mayor '<message>' --mode immediate":                              "nudge_immediate",
 		"gt agents list":          "agents",
 		"gt polecat list testrig": "polecats",
 		"gt status --fast":        "status",
@@ -932,14 +937,15 @@ done
 }
 
 type containedFlowAgentFixture struct {
-	GT            string
-	BD            string
-	MailID        string
-	Nonce         string
-	Socket        string
-	CA            string
-	PrivateDoltIP string
-	OuterSentinel string
+	GT              string
+	BD              string
+	MailID          string
+	Nonce           string
+	Socket          string
+	CA              string
+	PrivateDoltIP   string
+	PrivateDoltPort int
+	OuterSentinel   string
 }
 
 func writeContainedFlowAgent(t *testing.T, path string, fixture containedFlowAgentFixture) {
@@ -952,6 +958,7 @@ func writeContainedFlowAgent(t *testing.T, path string, fixture containedFlowAge
 		"flow_socket=" + config.ShellQuote(fixture.Socket),
 		"flow_ca=" + config.ShellQuote(fixture.CA),
 		"flow_private_dolt_ip=" + config.ShellQuote(fixture.PrivateDoltIP),
+		"flow_private_dolt_port=" + config.ShellQuote(strconv.Itoa(fixture.PrivateDoltPort)),
 		"flow_outer_sentinel=" + config.ShellQuote(fixture.OuterSentinel),
 	}, "\n")
 	agent := `#!/bin/sh
@@ -1011,7 +1018,7 @@ run_flow bd_list "$flow_bd" list --status open --json
 run_flow https curl --fail --silent --show-error --max-time 5 --cacert "$flow_ca" "https://contained-flow.test/$flow_nonce"
 run_flow raw_tmux timeout 5 tmux -L "$flow_socket" list-sessions
 run_flow host_loopback nc -z -w 1 127.0.0.1 22
-run_flow private_dolt nc -z -w 1 "$flow_private_dolt_ip" 3306
+run_flow private_dolt nc -z -w 1 "$flow_private_dolt_ip" "$flow_private_dolt_port"
 run_flow public_non443 curl --fail --silent --show-error --max-time 3 "http://contained-flow.test/$flow_nonce"
 run_flow formula "$flow_gt" formula list
 run_flow hidden "$flow_gt" session-custody-init
@@ -1033,6 +1040,28 @@ while :; do sleep 60; done
 `
 	if err := os.WriteFile(path, []byte(agent), 0o700); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWriteContainedFlowAgentUsesConfiguredPrivateDoltPort(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent")
+	writeContainedFlowAgent(t, path, containedFlowAgentFixture{
+		GT: "/witness/gt", BD: "/usr/bin/bd", MailID: "mail-id", Nonce: "nonce",
+		Socket: "socket", CA: "/witness/ca.pem", PrivateDoltIP: "10.20.30.40",
+		PrivateDoltPort: 15432, OuterSentinel: "/outer/sentinel",
+	})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"flow_private_dolt_port=15432",
+		`run_flow private_dolt nc -z -w 1 "$flow_private_dolt_ip" "$flow_private_dolt_port"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("contained agent omitted configured private Dolt port %q:\n%s", want, script)
+		}
 	}
 }
 

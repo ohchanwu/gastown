@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -130,6 +132,51 @@ func writeLinuxCgroupControl(path, value string) error {
 	return nil
 }
 
+func acquireLinuxSessionCgroupRootLock(root string) (func(), error) {
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening delegated session cgroup root lock: %w", err)
+	}
+	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("locking delegated session cgroup root: %w", err)
+	}
+	return func() {
+		_ = unix.Flock(fd, unix.LOCK_UN)
+		_ = unix.Close(fd)
+	}, nil
+}
+
+func reconcileLinuxSessionCgroupReceipts(root string, remove func(string, time.Duration) error) error {
+	if remove == nil {
+		return errors.New("session cgroup receipt remover is unavailable")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("scanning delegated session cgroup receipts: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), linuxSessionCgroupPrefix) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		processes, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("reading retained session cgroup receipt %q: %w", entry.Name(), err)
+		}
+		if strings.TrimSpace(string(processes)) != "" {
+			continue
+		}
+		if err := remove(path, linuxSessionCgroupRemoveWait); err != nil {
+			return fmt.Errorf("reconciling empty session cgroup receipt %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
 func prepareLinuxSessionCgroup(pids ...int) (_ string, retErr error) {
 	if len(pids) == 0 {
 		return "", errors.New("bounded session cgroup requires at least one process")
@@ -151,7 +198,15 @@ func prepareLinuxSessionCgroup(pids ...int) (_ string, retErr error) {
 	if err != nil {
 		return "", err
 	}
+	releaseRootLock, err := acquireLinuxSessionCgroupRootLock(root)
+	if err != nil {
+		return "", err
+	}
+	defer releaseRootLock()
 	if err := ensureLinuxSessionCgroupControllers(root); err != nil {
+		return "", err
+	}
+	if err := reconcileLinuxSessionCgroupReceipts(root, removeLinuxSessionCgroup); err != nil {
 		return "", err
 	}
 	path, err := os.MkdirTemp(root, linuxSessionCgroupPrefix)

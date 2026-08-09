@@ -1,10 +1,49 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 )
+
+func TestBrokerCapabilityRegistryMatchesAnnotatedCommands(t *testing.T) {
+	registered := make(map[string]bool, len(containedWitnessBrokerCapabilities))
+	for _, capability := range containedWitnessBrokerCapabilities {
+		key := strings.Join(capability.path, " ")
+		if registered[key] {
+			t.Fatalf("duplicate broker capability %q", key)
+		}
+		registered[key] = true
+		command, _, err := rootCmd.Find(capability.path)
+		if err != nil {
+			t.Fatalf("registered broker capability %q does not resolve: %v", key, err)
+		}
+		resolved, err := exactBrokerCommandPath(rootCmd, command)
+		if err != nil || strings.Join(resolved, " ") != key {
+			t.Fatalf("registered broker capability %q resolved as %q: %v", key, strings.Join(resolved, " "), err)
+		}
+		if command.Hidden || command.Annotations[BrokerSafeAnnotation] != "true" {
+			t.Fatalf("registered broker capability %q is not an annotated visible command", key)
+		}
+	}
+
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		for _, child := range command.Commands() {
+			if child.Annotations[BrokerSafeAnnotation] == "true" {
+				path, err := exactBrokerCommandPath(rootCmd, child)
+				if err != nil {
+					t.Errorf("resolve annotated broker command %q: %v", child.CommandPath(), err)
+				} else if key := strings.Join(path, " "); !registered[key] {
+					t.Errorf("annotated broker command %q is absent from capability registry", key)
+				}
+			}
+			visit(child)
+		}
+	}
+	visit(rootCmd)
+}
 
 func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 	tests := [][]string{

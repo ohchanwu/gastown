@@ -32,6 +32,126 @@ func TestLinuxSessionCgroupProvisionHelper(t *testing.T) {
 	fmt.Fprintln(os.Stdout, "GT_CGROUP_ROOT="+os.Getenv(envLinuxSessionCgroupRoot))
 }
 
+func TestLinuxSessionCgroupReceiptRecoveryHelper(t *testing.T) {
+	if os.Getenv("GT_TEST_SESSION_CGROUP_RECEIPT_RECOVERY_HELPER") != "1" {
+		return
+	}
+	root, err := resolveLinuxSessionCgroupRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireLinuxSessionCgroupRootLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := reconcileLinuxSessionCgroupReceipts(root, removeLinuxSessionCgroup); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLinuxSessionCgroupReceiptRecoverySurvivesProcessLifetime(t *testing.T) {
+	if os.Getenv(envLinuxSessionCgroupRoot) == "" {
+		t.Skip("requires an explicitly delegated GT_SESSION_CGROUP_ROOT")
+	}
+	root, err := resolveLinuxSessionCgroupRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireLinuxSessionCgroupRootLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLinuxSessionCgroupControllers(root); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	stale, err := os.MkdirTemp(root, linuxSessionCgroupPrefix)
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	active, err := os.MkdirTemp(root, linuxSessionCgroupPrefix)
+	if err != nil {
+		release()
+		_ = removeLinuxSessionCgroup(stale, linuxSessionCgroupRemoveWait)
+		t.Fatal(err)
+	}
+	worker := exec.Command("/bin/sh", "-c", "exec sleep 60")
+	if err := worker.Start(); err != nil {
+		release()
+		_ = removeLinuxSessionCgroup(stale, linuxSessionCgroupRemoveWait)
+		_ = removeLinuxSessionCgroup(active, linuxSessionCgroupRemoveWait)
+		t.Fatal(err)
+	}
+	if err := writeLinuxCgroupControl(filepath.Join(active, "cgroup.procs"), strconv.Itoa(worker.Process.Pid)); err != nil {
+		release()
+		_ = worker.Process.Kill()
+		_ = worker.Wait()
+		_ = removeLinuxSessionCgroup(stale, linuxSessionCgroupRemoveWait)
+		_ = removeLinuxSessionCgroup(active, linuxSessionCgroupRemoveWait)
+		t.Fatal(err)
+	}
+	release()
+	cleaned := false
+	t.Cleanup(func() {
+		_ = worker.Process.Kill()
+		_ = worker.Wait()
+		_ = removeLinuxSessionCgroup(active, linuxSessionCgroupRemoveWait)
+		if !cleaned {
+			_ = removeLinuxSessionCgroup(stale, linuxSessionCgroupRemoveWait)
+		}
+	})
+
+	helper := exec.Command(os.Args[0], "-test.run=^TestLinuxSessionCgroupReceiptRecoveryHelper$")
+	helper.Env = append(os.Environ(), "GT_TEST_SESSION_CGROUP_RECEIPT_RECOVERY_HELPER=1")
+	output, err := helper.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process cgroup receipt recovery: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("fresh process retained empty cgroup receipt: %v", err)
+	}
+	cleaned = true
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("fresh process touched active cgroup: %v", err)
+	}
+}
+
+func TestReconcileLinuxSessionCgroupReceiptsRemovesOnlyEmptyOwnedEntries(t *testing.T) {
+	root := t.TempDir()
+	empty := filepath.Join(root, linuxSessionCgroupPrefix+"empty")
+	active := filepath.Join(root, linuxSessionCgroupPrefix+"active")
+	foreign := filepath.Join(root, "foreign-empty")
+	for _, path := range []string{empty, active, foreign} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(empty, "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(active, "cgroup.procs"), []byte("4242\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var removed []string
+	err := reconcileLinuxSessionCgroupReceipts(root, func(path string, _ time.Duration) error {
+		removed = append(removed, path)
+		return os.RemoveAll(path)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != empty {
+		t.Fatalf("reconciled cgroups = %q, want only %q", removed, empty)
+	}
+	for _, path := range []string{active, foreign} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("reconciliation touched preserved path %q: %v", path, err)
+		}
+	}
+}
+
 func TestProvisionSessionCgroupRootMatchesSystemdDelegationShape(t *testing.T) {
 	delegated := os.Getenv(envLinuxSessionCgroupRoot)
 	if delegated == "" {

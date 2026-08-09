@@ -66,8 +66,7 @@ type Manager struct {
 	cleanupTimeout         time.Duration
 	teardownBudgets        teardownBudgets
 	zombieKillGrace        time.Duration
-	pendingCleanupMu       sync.Mutex
-	pendingCleanups        []sessionGenerationCleanup
+	cleanupRegistry        *sessionCleanupRegistry
 }
 
 type sessionGenerationCleanup interface {
@@ -75,24 +74,46 @@ type sessionGenerationCleanup interface {
 	Close() error
 }
 
+type sessionCleanupRegistry struct {
+	mu      sync.Mutex
+	pending []sessionGenerationCleanup
+}
+
+var sessionCleanupRegistries sync.Map
+
+func sessionCleanupRegistryForRig(r *rig.Rig) *sessionCleanupRegistry {
+	if r == nil || strings.TrimSpace(r.Path) == "" {
+		return &sessionCleanupRegistry{}
+	}
+	key, err := filepath.Abs(r.Path)
+	if err != nil {
+		key = filepath.Clean(r.Path)
+	}
+	if canonical, canonicalErr := filepath.EvalSymlinks(key); canonicalErr == nil {
+		key = canonical
+	}
+	registry, _ := sessionCleanupRegistries.LoadOrStore(key, &sessionCleanupRegistry{})
+	return registry.(*sessionCleanupRegistry)
+}
+
 func (m *Manager) closeOrRetainCleanup(cleanup sessionGenerationCleanup) error {
 	if cleanup == nil {
 		return nil
 	}
 	if err := cleanup.Close(); err != nil {
-		m.pendingCleanupMu.Lock()
-		m.pendingCleanups = append(m.pendingCleanups, cleanup)
-		m.pendingCleanupMu.Unlock()
+		m.cleanupRegistry.mu.Lock()
+		m.cleanupRegistry.pending = append(m.cleanupRegistry.pending, cleanup)
+		m.cleanupRegistry.mu.Unlock()
 		return err
 	}
 	return nil
 }
 
 func (m *Manager) retryPendingCleanups() error {
-	m.pendingCleanupMu.Lock()
-	pending := m.pendingCleanups
-	m.pendingCleanups = nil
-	m.pendingCleanupMu.Unlock()
+	m.cleanupRegistry.mu.Lock()
+	pending := m.cleanupRegistry.pending
+	m.cleanupRegistry.pending = nil
+	m.cleanupRegistry.mu.Unlock()
 	if len(pending) == 0 {
 		return nil
 	}
@@ -106,9 +127,9 @@ func (m *Manager) retryPendingCleanups() error {
 		}
 	}
 	if len(failed) != 0 {
-		m.pendingCleanupMu.Lock()
-		m.pendingCleanups = append(failed, m.pendingCleanups...)
-		m.pendingCleanupMu.Unlock()
+		m.cleanupRegistry.mu.Lock()
+		m.cleanupRegistry.pending = append(failed, m.cleanupRegistry.pending...)
+		m.cleanupRegistry.mu.Unlock()
 	}
 	return errors.Join(errs...)
 }
@@ -128,6 +149,7 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 		cleanupTimeout:        witnessCleanupTimeout,
 		teardownBudgets:       witnessTeardownBudgets,
 		zombieKillGrace:       constants.ZombieKillGracePeriod,
+		cleanupRegistry:       sessionCleanupRegistryForRig(r),
 		prepareSessionCleanup: func(
 			generation tmux.SessionGeneration,
 			paneGeneration tmux.PaneProcessGeneration,
@@ -177,7 +199,7 @@ func appendWitnessCustodyExecutable(paths []string, command, pathEnv string) []s
 	if canonical, err := filepath.EvalSymlinks(resolved); err == nil {
 		resolved = canonical
 	}
-	for _, systemRoot := range []string{"/bin", "/sbin", "/usr", "/opt"} {
+	for _, systemRoot := range []string{"/bin", "/sbin", "/usr"} {
 		if resolved == systemRoot || strings.HasPrefix(resolved, systemRoot+string(filepath.Separator)) {
 			return paths
 		}
@@ -185,7 +207,32 @@ func appendWitnessCustodyExecutable(paths []string, command, pathEnv string) []s
 	return append(paths, filepath.Dir(resolved))
 }
 
+func canonicalWitnessCustodyPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolving Witness custody path %q: %w", path, err)
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("canonicalizing Witness custody path %q: %w", path, err)
+	}
+	if canonical == string(filepath.Separator) {
+		return "", fmt.Errorf("Witness custody path %q resolves to the host root", path)
+	}
+	return canonical, nil
+}
+
 func witnessSessionCustodyPaths(witnessDir, runtimeConfigDir, witnessSettingsDir string, runtimeConfig *config.RuntimeConfig, envVars map[string]string) (string, error) {
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GT_CONTEXT_FILE"} {
+		if strings.TrimSpace(envVars[key]) == "" {
+			continue
+		}
+		canonical, err := canonicalWitnessCustodyPath(envVars[key])
+		if err != nil {
+			return "", err
+		}
+		envVars[key] = canonical
+	}
 	paths := []string{witnessDir, witnessSettingsDir}
 	for _, path := range []string{runtimeConfigDir, envVars["CLAUDE_CONFIG_DIR"], envVars["CODEX_HOME"], envVars["GT_CONTEXT_FILE"]} {
 		if strings.TrimSpace(path) != "" {
@@ -207,7 +254,15 @@ func witnessSessionCustodyPaths(witnessDir, runtimeConfigDir, witnessSettingsDir
 		paths = appendWitnessCustodyExecutable(paths, executable, pathEnv)
 	}
 
-	return tmux.EncodeSessionCustodyPaths(paths)
+	canonicalPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		canonical, err := canonicalWitnessCustodyPath(path)
+		if err != nil {
+			return "", err
+		}
+		canonicalPaths = append(canonicalPaths, canonical)
+	}
+	return tmux.EncodeSessionCustodyPaths(canonicalPaths)
 }
 
 func (m *Manager) revalidateSessionGenerationUnderLease(
@@ -425,6 +480,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	t := m.tmux
 	sessionID := m.SessionName()
 	townRoot := m.townRoot()
+	if err := m.retryPendingCleanups(); err != nil {
+		return fmt.Errorf("reconciling retained session cleanup ownership: %w", err)
+	}
 
 	if foreground {
 		// Foreground mode is deprecated - patrol logic moved to mol-witness-patrol

@@ -198,10 +198,13 @@ func TestContainedWitnessPrimeGuidanceIsExactlyBrokerSafe(t *testing.T) {
 		commands = append(commands, command)
 	}
 	want := []string{
-		"gt hook show", "gt mol current", "gt mol step close",
+		"gt hook", "gt hook show", "gt mol current", "gt mol step close",
+		"gt mail inbox --unread", "gt mail read '<message-id>'",
+		"gt mail send mayor/ --subject '<subject>' --message '<body>' --no-notify",
+		"gt nudge mayor '<message>' --mode queue",
+		"gt nudge mayor '<message>' --mode immediate",
 		"gt patrol scan --rig testrig --json",
 		"gt patrol report --summary '<brief summary of observations>'",
-		"gt mail inbox --unread",
 		"gt agents list", "gt polecat list testrig", "gt status --fast",
 	}
 	if strings.Join(commands, "\n") != strings.Join(want, "\n") {

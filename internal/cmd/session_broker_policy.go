@@ -23,6 +23,104 @@ const (
 
 var brokerPolicyMu sync.Mutex
 
+const containedWitnessRigToken = "{rig}"
+
+type containedWitnessPrimeCommand struct {
+	description string
+	args        []string
+}
+
+type containedWitnessBrokerCapability struct {
+	path     []string
+	guidance []containedWitnessPrimeCommand
+}
+
+// containedWitnessBrokerCapabilities is the single reviewed registry for both
+// broker authorization and contained Witness guidance. A capability without a
+// guidance entry remains usable by a caller that already knows its operands,
+// but is not presented as a generally actionable patrol command.
+var containedWitnessBrokerCapabilities = []containedWitnessBrokerCapability{
+	{path: []string{"prime"}},
+	{path: []string{"hook"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Inspect the current hook", args: []string{"hook"}},
+	}},
+	{path: []string{"hook", "status"}},
+	{path: []string{"hook", "show"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Show the current hooked work", args: []string{"hook", "show"}},
+	}},
+	{path: []string{"mol", "current"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Inspect the current patrol step", args: []string{"mol", "current"}},
+	}},
+	{path: []string{"mol", "step", "close"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Close the current patrol step", args: []string{"mol", "step", "close"}},
+	}},
+	{path: []string{"mail", "inbox"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Check unread mail", args: []string{"mail", "inbox", "--unread"}},
+	}},
+	{path: []string{"mail", "read"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Read one stored message", args: []string{"mail", "read", "<message-id>"}},
+	}},
+	{path: []string{"mail", "send"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Send durable mail to the Mayor", args: []string{"mail", "send", "mayor/", "--subject", "<subject>", "--message", "<body>", "--no-notify"}},
+	}},
+	{path: []string{"nudge"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Queue a routine Mayor nudge", args: []string{"nudge", "mayor", "<message>", "--mode", "queue"}},
+		{description: "Send an immediate Mayor nudge", args: []string{"nudge", "mayor", "<message>", "--mode", "immediate"}},
+	}},
+	{path: []string{"patrol", "scan"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Scan this rig", args: []string{"patrol", "scan", "--rig", containedWitnessRigToken, "--json"}},
+	}},
+	{path: []string{"patrol", "report"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Report this patrol cycle", args: []string{"patrol", "report", "--summary", "<brief summary of observations>"}},
+	}},
+	{path: []string{"agents", "list"}, guidance: []containedWitnessPrimeCommand{
+		{description: "List live agents", args: []string{"agents", "list"}},
+	}},
+	{path: []string{"polecat", "list"}, guidance: []containedWitnessPrimeCommand{
+		{description: "List this rig's polecats", args: []string{"polecat", "list", containedWitnessRigToken}},
+	}},
+	{path: []string{"polecat", "status"}},
+	{path: []string{"health"}},
+	{path: []string{"status"}, guidance: []containedWitnessPrimeCommand{
+		{description: "Read town status", args: []string{"status", "--fast"}},
+	}},
+}
+
+func containedWitnessBrokerGuidance(rigName string) []containedWitnessPrimeCommand {
+	var result []containedWitnessPrimeCommand
+	for _, capability := range containedWitnessBrokerCapabilities {
+		for _, command := range capability.guidance {
+			copy := containedWitnessPrimeCommand{description: command.description, args: append([]string(nil), command.args...)}
+			for index, arg := range copy.args {
+				if arg == containedWitnessRigToken {
+					copy.args[index] = rigName
+				}
+			}
+			result = append(result, copy)
+		}
+	}
+	return result
+}
+
+func isContainedWitnessBrokerCapability(path []string) bool {
+	for _, capability := range containedWitnessBrokerCapabilities {
+		if len(path) != len(capability.path) {
+			continue
+		}
+		match := true
+		for index := range path {
+			if path[index] != capability.path[index] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // IsBrokerSafeCommand resolves and validates one exact reviewed Cobra leaf.
 // Prefixes, aliases, hidden commands, unannotated commands, malformed flags,
 // and invalid positional arguments are denied before the broker starts a
@@ -45,6 +143,9 @@ func IsBrokerSafeCommand(root *cobra.Command, args []string) error {
 	path, err := exactBrokerCommandPath(root, command)
 	if err != nil {
 		return err
+	}
+	if !isContainedWitnessBrokerCapability(path) {
+		return fmt.Errorf("command %q is not in the reviewed broker capability registry", strings.Join(path, " "))
 	}
 	if len(args) < len(path) {
 		return errors.New("broker command path is truncated")

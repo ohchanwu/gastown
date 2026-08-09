@@ -286,6 +286,10 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"GT_TEST_FLOW_DIR=/fixture",
 		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
 		"GT_TEST_OUTER_SENTINEL=must-not-pass",
+		"GT_FUTURE_CREDENTIAL=must-not-pass",
+		"BD_FUTURE_CREDENTIAL=must-not-pass",
+		"BEADS_FUTURE_CREDENTIAL=must-not-pass",
+		"LC_FUTURE_CREDENTIAL=must-not-pass",
 	}
 	got := linuxCustodyWorkloadEnvironment(source)
 	joined := "\x00" + strings.Join(got, "\x00") + "\x00"
@@ -314,6 +318,10 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"GT_TEST_FLOW_DIR=/fixture",
 		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
 		"GT_TEST_OUTER_SENTINEL=must-not-pass",
+		"GT_FUTURE_CREDENTIAL=must-not-pass",
+		"BD_FUTURE_CREDENTIAL=must-not-pass",
+		"BEADS_FUTURE_CREDENTIAL=must-not-pass",
+		"LC_FUTURE_CREDENTIAL=must-not-pass",
 	} {
 		if strings.Contains(joined, "\x00"+denied+"\x00") {
 			t.Fatalf("unreviewed environment escaped containment: %q in %q", denied, got)
@@ -339,8 +347,9 @@ func TestDecodeLinuxCustodyAllowedPathsRejectsScratchOverlap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != allowed {
-		t.Fatalf("decoded allowlist = %q", got)
+	defer closeLinuxCustodyMountSources(got)
+	if len(got) != 1 || got[0].path != allowed || got[0].fd < 0 {
+		t.Fatalf("decoded allowlist = %v", got)
 	}
 	overlap, err := EncodeSessionCustodyPaths([]string{filepath.Join(scratch, "escape")})
 	if err != nil {
@@ -348,6 +357,156 @@ func TestDecodeLinuxCustodyAllowedPathsRejectsScratchOverlap(t *testing.T) {
 	}
 	if _, err := decodeLinuxCustodyAllowedPaths(overlap, scratch); err == nil || !strings.Contains(err.Error(), "overlaps scratch") {
 		t.Fatalf("scratch-overlap error = %v", err)
+	}
+	ancestor, err := EncodeSessionCustodyPaths([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeLinuxCustodyAllowedPaths(ancestor, scratch); err == nil || !strings.Contains(err.Error(), "overlaps scratch") {
+		t.Fatalf("scratch-ancestor-overlap error = %v", err)
+	}
+}
+
+func TestDecodeLinuxCustodyAllowedPathsRejectsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(root, linuxSessionScratchPrefix+"nonce")
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	terminalLink := filepath.Join(root, "terminal-link")
+	if err := os.Symlink(realDir, terminalLink); err != nil {
+		t.Fatal(err)
+	}
+	ancestorLink := filepath.Join(root, "ancestor-link")
+	if err := os.Symlink(root, ancestorLink); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{terminalLink, filepath.Join(ancestorLink, "real")} {
+		encoded, err := EncodeSessionCustodyPaths([]string{path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeLinuxCustodyAllowedPaths(encoded, scratch); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("symlink path %q error = %v", path, err)
+		}
+	}
+}
+
+func TestBindLinuxCustodyPathUsesPinnedInodeAfterPathReplacement(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("mount namespace unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	sourcePath := filepath.Join(parent, "allowed")
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "marker"), []byte("pinned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := pinLinuxCustodyMountSource(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLinuxCustodyMountSources([]linuxCustodyMountSource{source})
+
+	movedPath := filepath.Join(parent, "original")
+	if err := os.Rename(sourcePath, movedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "marker"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	if err := bindLinuxCustodyPathReadOnly(root, source); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, strings.TrimPrefix(sourcePath, string(filepath.Separator)))
+	defer unix.Unmount(target, unix.MNT_DETACH)
+	data, err := os.ReadFile(filepath.Join(target, "marker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "pinned" {
+		t.Fatalf("mounted source after path replacement = %q, want pinned inode", data)
+	}
+}
+
+func TestBindLinuxCustodyPathUsesPinnedInodeAfterAncestorReplacement(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("mount namespace unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	ancestor := filepath.Join(parent, "approved")
+	sourcePath := filepath.Join(ancestor, "allowed")
+	if err := os.MkdirAll(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "marker"), []byte("pinned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := pinLinuxCustodyMountSource(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLinuxCustodyMountSources([]linuxCustodyMountSource{source})
+
+	if err := os.Rename(ancestor, filepath.Join(parent, "original-ancestor")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "marker"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	if err := bindLinuxCustodyPathReadOnly(root, source); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, strings.TrimPrefix(sourcePath, string(filepath.Separator)))
+	defer unix.Unmount(target, unix.MNT_DETACH)
+	data, err := os.ReadFile(filepath.Join(target, "marker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "pinned" {
+		t.Fatalf("mounted source after ancestor replacement = %q, want pinned inode", data)
+	}
+}
+
+func TestLinuxCustodyDefaultReadOnlyPathsExcludeBroadOpt(t *testing.T) {
+	for _, path := range linuxCustodyDefaultReadOnlyPaths() {
+		if path == "/opt" || linuxCustodyPathContains(path, "/opt/unrelated-secret") {
+			t.Fatalf("default containment exposes broad /opt path %q", path)
+		}
 	}
 }
 
@@ -442,16 +601,6 @@ func TestLinuxSessionCustodySupervisorHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 		paths := []string{cwd, filepath.Dir(executable)}
-		for _, entry := range os.Environ() {
-			key, value, ok := strings.Cut(entry, "=")
-			if !ok || !strings.HasPrefix(key, "GT_TEST_") || !filepath.IsAbs(value) {
-				continue
-			}
-			if info, err := os.Stat(value); err != nil || !info.IsDir() {
-				value = filepath.Dir(value)
-			}
-			paths = append(paths, value)
-		}
 		encoded, err := EncodeSessionCustodyPaths(paths)
 		if err != nil {
 			t.Fatal(err)
@@ -461,7 +610,20 @@ func TestLinuxSessionCustodySupervisorHelper(t *testing.T) {
 	t.Setenv("GT_TEST_SESSION_CUSTODY_SUPERVISOR", strconv.Itoa(os.Getpid()))
 	command := os.Getenv("GT_TEST_SESSION_CUSTODY_COMMAND")
 	if command == "" {
-		command = config.ShellQuote(os.Args[0]) + " -test.run=^TestLinuxSessionCustodyWorkloadHelper$"
+		var assignments []string
+		for _, key := range []string{
+			"GT_TEST_SESSION_CUSTODY_WORKLOAD",
+			"GT_TEST_SESSION_CUSTODY_SUPERVISOR",
+			"GT_TEST_SESSION_CUSTODY_SYSV_KEY",
+			"GT_TEST_SESSION_CUSTODY_POSIX_SHM",
+			"GT_TEST_SESSION_CUSTODY_HOST_LOOPBACK",
+			"GT_TEST_SESSION_CUSTODY_BROKER_PROOF",
+		} {
+			if value := os.Getenv(key); value != "" {
+				assignments = append(assignments, key+"="+config.ShellQuote(value))
+			}
+		}
+		command = strings.Join(assignments, " ") + " exec " + config.ShellQuote(os.Args[0]) + " -test.run=^TestLinuxSessionCustodyWorkloadHelper$"
 	}
 	validator := SessionBrokerValidator(func([]string) error {
 		return errors.New("test session broker command denied")
@@ -587,6 +749,15 @@ func TestLaunchLinuxCustodyValidationFailureNeverExecutesWorkload(t *testing.T) 
 }
 
 func TestLinuxSessionCustodyRetainsEmptyNamespaceInit(t *testing.T) {
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedPaths, err := EncodeSessionCustodyPaths([]string{"/usr", workingDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvSessionCustodyPaths, allowedPaths)
 	launch, contained, err := launchLinuxCustodyCommand("sleep 0.1; exit 7", startLinuxCustodyCommand)
 	if errors.Is(err, ErrSessionCustodyUnsupported) {
 		t.Skipf("nested PID namespace setup unavailable: %v", err)
@@ -640,12 +811,17 @@ func TestLaunchLinuxCustodyRequiresHardeningAckBeforeLiveness(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lifeReader.Close()
+	scratch := filepath.Join(t.TempDir(), "scratch-receipt")
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	launch := &linuxCustodyLaunch{
-		child:  &exec.Cmd{Process: &os.Process{Pid: 424242}},
-		pidfd:  -1,
-		ready:  readyReader,
-		permit: permitWriter,
-		life:   lifeWriter,
+		child:   &exec.Cmd{Process: &os.Process{Pid: 424242}},
+		pidfd:   -1,
+		ready:   readyReader,
+		permit:  permitWriter,
+		life:    lifeWriter,
+		scratch: scratch,
 	}
 	permitObserved := make(chan struct{})
 	sendHardeningAck := make(chan struct{})
@@ -670,6 +846,9 @@ func TestLaunchLinuxCustodyRequiresHardeningAckBeforeLiveness(t *testing.T) {
 	case <-permitObserved:
 	case <-time.After(time.Second):
 		t.Fatal("launch did not send validation permit")
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("scratch mountpoint still had a host path before workload permit: %v", err)
 	}
 	lifeResult := make(chan error, 1)
 	go func() {
@@ -1104,10 +1283,13 @@ func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testin
 				t.Fatalf("outer Dolt endpoint leaked into contained environment: %q", proxyResult)
 			}
 			cgroupEvidence := strings.ToLower(evidence.Cgroup)
-			for _, field := range []string{"control=open", "sibling=mkdir", "read-only file system"} {
+			for _, field := range []string{"control=open", "sibling=mkdir"} {
 				if !strings.Contains(cgroupEvidence, field) {
 					t.Fatalf("contained workload can alter cgroup custody, missing %q: %q", field, evidence.Cgroup)
 				}
+			}
+			if strings.Count(cgroupEvidence, "read-only file system") < 2 && strings.Count(cgroupEvidence, "no such file or directory") < 2 {
+				t.Fatalf("contained workload can reach a writable cgroup hierarchy: %q", evidence.Cgroup)
 			}
 			storageEvidence := strings.ToLower(evidence.Storage)
 			for _, field := range []string{fmt.Sprintf("capacity=%d", linuxSessionScratchBytes), fmt.Sprintf("inodes=%d", linuxSessionScratchInodes), "first=<nil>", "second=no space left on device", "host=open", "read-only file system"} {

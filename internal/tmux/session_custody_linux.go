@@ -80,6 +80,12 @@ type linuxCustodyServiceResult struct {
 	err  error
 }
 
+type linuxCustodyMountSource struct {
+	path      string
+	fd        int
+	directory bool
+}
+
 func sessionCustodyLaunchSupported() bool {
 	return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
 }
@@ -451,6 +457,21 @@ func launchLinuxCustodyCommandValidated(command string, start linuxCustodyStarte
 	if err != nil {
 		return nil, false, fmt.Errorf("starting contained session custody: %w", err)
 	}
+	if err := waitLinuxCustodyReady(launch); err != nil {
+		return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
+	}
+	if _, _, err := validate(linuxProcRoot, os.Getpid(), launch.child.Process.Pid); err != nil {
+		return nil, false, errors.Join(err, closeLinuxCustodyLaunch(launch, true))
+	}
+	if launch.scratch != "" {
+		if err := os.Remove(launch.scratch); err != nil && !os.IsNotExist(err) {
+			return nil, false, errors.Join(fmt.Errorf("unlinking hardened session scratch mountpoint: %w", err), closeLinuxCustodyLaunch(launch, true))
+		}
+		launch.scratch = ""
+	}
+	if err := writeLinuxCustodyProtocolByte(launch.permit, 1); err != nil {
+		return nil, false, errors.Join(err, closeLinuxCustodyLaunch(launch, true))
+	}
 	if launch.proxyExpected {
 		if launch.broker == nil {
 			return nil, false, errors.Join(errors.New("session custody proxy handoff has no broker endpoint"), closeLinuxCustodyLaunch(launch, true))
@@ -458,15 +479,6 @@ func launchLinuxCustodyCommandValidated(command string, start linuxCustodyStarte
 		if err := waitLinuxCustodyProxySet(launch, linuxCustodyHandshakeTimeout); err != nil {
 			return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
 		}
-	}
-	if err := waitLinuxCustodyReady(launch); err != nil {
-		return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
-	}
-	if _, _, err := validate(linuxProcRoot, os.Getpid(), launch.child.Process.Pid); err != nil {
-		return nil, false, errors.Join(err, closeLinuxCustodyLaunch(launch, true))
-	}
-	if err := writeLinuxCustodyProtocolByte(launch.permit, 1); err != nil {
-		return nil, false, errors.Join(err, closeLinuxCustodyLaunch(launch, true))
 	}
 	if err := waitLinuxCustodyHardened(launch); err != nil {
 		return nil, false, errors.Join(ErrSessionCustodyUnsupported, err, closeLinuxCustodyLaunch(launch, true))
@@ -493,11 +505,30 @@ func runSessionCustodyInit() (bool, error) {
 	if err := validateLinuxSessionBrokerEndpoint(linuxSessionBrokerFD); err != nil {
 		return true, err
 	}
+	ready := os.NewFile(linuxCustodyReadyFD, "session-custody-ready")
+	permit := os.NewFile(linuxCustodyPermitFD, "session-custody-permit")
+	life := os.NewFile(linuxCustodySupervisorLifeFD, "session-custody-supervisor-life")
+	if ready == nil || permit == nil || life == nil {
+		return true, errors.New("session custody init protocol descriptors are unavailable")
+	}
+	unix.CloseOnExec(int(life.Fd()))
 	var proxyPorts *linuxCustodyProxyPorts
 	if os.Getenv(envLinuxSessionCustodyNamespaced) == "1" {
 		if err := prepareLinuxCustodyNamespace(os.Getenv(envLinuxSessionScratch)); err != nil {
 			return true, err
 		}
+	}
+	if err := writeLinuxCustodyProtocolByte(ready, linuxSessionCustodyReadyByte); err != nil {
+		return true, err
+	}
+	var permission [1]byte
+	if _, err := io.ReadFull(permit, permission[:]); err != nil {
+		return true, fmt.Errorf("waiting for session custody launch permit: %w", err)
+	}
+	if err := permit.Close(); err != nil {
+		return true, err
+	}
+	if os.Getenv(envLinuxSessionCustodyNamespaced) == "1" {
 		ports, err := createAndSendLinuxCustodyProxyListeners(linuxSessionBrokerFD)
 		if err != nil {
 			return true, err
@@ -510,13 +541,6 @@ func runSessionCustodyInit() (bool, error) {
 	if err := installLinuxCustodySeccomp(); err != nil {
 		return true, err
 	}
-	ready := os.NewFile(linuxCustodyReadyFD, "session-custody-ready")
-	permit := os.NewFile(linuxCustodyPermitFD, "session-custody-permit")
-	life := os.NewFile(linuxCustodySupervisorLifeFD, "session-custody-supervisor-life")
-	if ready == nil || permit == nil || life == nil {
-		return true, errors.New("session custody init protocol descriptors are unavailable")
-	}
-	unix.CloseOnExec(int(life.Fd()))
 	go func() {
 		var value [1]byte
 		for {
@@ -529,16 +553,6 @@ func runSessionCustodyInit() (bool, error) {
 			}
 		}
 	}()
-	if err := writeLinuxCustodyProtocolByte(ready, linuxSessionCustodyReadyByte); err != nil {
-		return true, err
-	}
-	var permission [1]byte
-	if _, err := io.ReadFull(permit, permission[:]); err != nil {
-		return true, fmt.Errorf("waiting for session custody launch permit: %w", err)
-	}
-	if err := permit.Close(); err != nil {
-		return true, err
-	}
 	if err := setLinuxCustodyNonDumpable(); err != nil {
 		return true, err
 	}
@@ -554,7 +568,7 @@ func runSessionCustodyInit() (bool, error) {
 	return true, runLinuxCustodyWorkload(command, proxyPorts)
 }
 
-func decodeLinuxCustodyAllowedPaths(raw, scratch string) ([]string, error) {
+func decodeLinuxCustodyAllowedPaths(raw, scratch string) (_ []linuxCustodyMountSource, retErr error) {
 	if len(raw) == 0 || len(raw) > maxSessionCustodyPathsBytes {
 		return nil, errors.New("session custody filesystem allowlist is missing or oversized")
 	}
@@ -566,28 +580,34 @@ func decodeLinuxCustodyAllowedPaths(raw, scratch string) ([]string, error) {
 		return nil, fmt.Errorf("session custody filesystem allowlist has %d paths", len(paths))
 	}
 	unique := make(map[string]struct{}, len(paths))
-	validated := make([]string, 0, len(paths))
+	validated := make([]linuxCustodyMountSource, 0, len(paths))
+	defer func() {
+		if retErr != nil {
+			closeLinuxCustodyMountSources(validated)
+		}
+	}()
 	for _, path := range paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
 			return nil, fmt.Errorf("session custody filesystem allowlist path is invalid: %q", path)
 		}
-		if path == scratch || strings.HasPrefix(path, scratch+string(filepath.Separator)) {
+		if linuxCustodyPathContains(path, scratch) || linuxCustodyPathContains(scratch, path) {
 			return nil, fmt.Errorf("session custody filesystem allowlist overlaps scratch storage: %q", path)
 		}
 		if _, exists := unique[path]; exists {
 			continue
 		}
-		if _, err := os.Stat(path); err != nil {
-			return nil, fmt.Errorf("stat session custody allowlist path %q: %w", path, err)
+		source, err := pinLinuxCustodyMountSource(path)
+		if err != nil {
+			return nil, fmt.Errorf("pinning no-symlink session custody allowlist path %q: %w", path, err)
 		}
 		unique[path] = struct{}{}
-		validated = append(validated, path)
+		validated = append(validated, source)
 	}
 	sort.Slice(validated, func(i, j int) bool {
-		if len(validated[i]) == len(validated[j]) {
-			return validated[i] < validated[j]
+		if len(validated[i].path) == len(validated[j].path) {
+			return validated[i].path < validated[j].path
 		}
-		return len(validated[i]) < len(validated[j])
+		return len(validated[i].path) < len(validated[j].path)
 	})
 	return validated, nil
 }
@@ -596,46 +616,87 @@ func linuxCustodyPathContains(parent, child string) bool {
 	return child == parent || strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
-func linuxCustodyMountTarget(root, source string) (string, os.FileInfo, error) {
-	info, err := os.Stat(source)
-	if err != nil {
-		return "", nil, err
+func linuxCustodyDefaultReadOnlyPaths() []string {
+	return []string{
+		"/bin", "/sbin", "/usr", "/lib", "/lib64",
+		"/etc/alternatives", "/etc/ca-certificates", "/etc/pki", "/etc/ssl",
+		"/etc/group", "/etc/hosts", "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/resolv.conf",
 	}
-	target := filepath.Join(root, strings.TrimPrefix(source, string(filepath.Separator)))
-	if info.IsDir() {
+}
+
+func pinLinuxCustodyMountSource(path string) (linuxCustodyMountSource, error) {
+	rootFD, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return linuxCustodyMountSource{}, err
+	}
+	defer unix.Close(rootFD)
+	how := &unix.OpenHow{
+		Flags:   uint64(unix.O_PATH | unix.O_CLOEXEC),
+		Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_SYMLINKS),
+	}
+	fd, err := unix.Openat2(rootFD, strings.TrimPrefix(path, "/"), how)
+	if err != nil {
+		return linuxCustodyMountSource{}, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = unix.Close(fd)
+		return linuxCustodyMountSource{}, err
+	}
+	mode := stat.Mode & unix.S_IFMT
+	if mode != unix.S_IFDIR && mode != unix.S_IFREG {
+		_ = unix.Close(fd)
+		return linuxCustodyMountSource{}, fmt.Errorf("unsupported mount source mode %#o", mode)
+	}
+	return linuxCustodyMountSource{path: path, fd: fd, directory: mode == unix.S_IFDIR}, nil
+}
+
+func closeLinuxCustodyMountSources(sources []linuxCustodyMountSource) {
+	for index := range sources {
+		if sources[index].fd >= 0 {
+			_ = unix.Close(sources[index].fd)
+			sources[index].fd = -1
+		}
+	}
+}
+
+func linuxCustodyMountTarget(root string, source linuxCustodyMountSource) (string, error) {
+	target := filepath.Join(root, strings.TrimPrefix(source.path, string(filepath.Separator)))
+	if source.directory {
 		if err := os.MkdirAll(target, 0o755); err != nil {
-			return "", nil, err
+			return "", err
 		}
 	} else {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return "", nil, err
+			return "", err
 		}
 		file, err := os.OpenFile(target, os.O_CREATE|os.O_RDONLY, 0o600)
 		if err != nil {
-			return "", nil, err
+			return "", err
 		}
 		if err := file.Close(); err != nil {
-			return "", nil, err
+			return "", err
 		}
 	}
-	return target, info, nil
+	return target, nil
 }
 
-func bindLinuxCustodyPathReadOnly(root, source string) error {
-	target, info, err := linuxCustodyMountTarget(root, source)
+func bindLinuxCustodyPathReadOnly(root string, source linuxCustodyMountSource) error {
+	target, err := linuxCustodyMountTarget(root, source)
 	if err != nil {
-		return fmt.Errorf("preparing session custody bind target for %q: %w", source, err)
+		return fmt.Errorf("preparing session custody bind target for %q: %w", source.path, err)
 	}
 	flags := uintptr(unix.MS_BIND)
-	if info.IsDir() {
+	if source.directory {
 		flags |= unix.MS_REC
 	}
-	if err := unix.Mount(source, target, "", flags, ""); err != nil {
-		return fmt.Errorf("binding session custody allowlist path %q: %w", source, err)
+	pinned := fmt.Sprintf("/proc/self/fd/%d", source.fd)
+	if err := unix.Mount(pinned, target, "", flags, ""); err != nil {
+		return fmt.Errorf("binding pinned session custody allowlist path %q: %w", source.path, err)
 	}
 	attr := &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY | unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV}
 	if err := unix.MountSetattr(unix.AT_FDCWD, target, unix.AT_RECURSIVE, attr); err != nil {
-		return fmt.Errorf("hardening session custody allowlist path %q: %w", source, err)
+		return fmt.Errorf("hardening session custody allowlist path %q: %w", source.path, err)
 	}
 	return nil
 }
@@ -712,13 +773,14 @@ func prepareLinuxCustodyNamespace(scratch string) error {
 	if err != nil {
 		return err
 	}
+	defer closeLinuxCustodyMountSources(allowedPaths)
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("capturing session custody working directory: %w", err)
 	}
 	cwdAllowed := false
 	for _, path := range allowedPaths {
-		if linuxCustodyPathContains(path, cwd) {
+		if linuxCustodyPathContains(path.path, cwd) {
 			cwdAllowed = true
 			break
 		}
@@ -737,19 +799,24 @@ func prepareLinuxCustodyNamespace(scratch string) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("creating session custody private root: %w", err)
 	}
-	defaultPaths := []string{
-		"/bin", "/sbin", "/usr", "/lib", "/lib64", "/opt",
-		"/etc/alternatives", "/etc/ca-certificates", "/etc/pki", "/etc/ssl",
-		"/etc/group", "/etc/hosts", "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/resolv.conf",
-	}
+	defaultPaths := linuxCustodyDefaultReadOnlyPaths()
 	mounted := make([]string, 0, len(defaultPaths)+len(allowedPaths))
-	for _, path := range append(defaultPaths, allowedPaths...) {
-		if _, err := os.Stat(path); err != nil {
+	for _, path := range defaultPaths {
+		if _, err := os.Lstat(path); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return fmt.Errorf("stat session custody mount source %q: %w", path, err)
 		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("canonicalizing default session custody path %q: %w", path, err)
+		}
+		source, err := pinLinuxCustodyMountSource(resolved)
+		if err != nil {
+			return fmt.Errorf("pinning no-symlink default session custody path %q: %w", path, err)
+		}
+		source.path = path
 		covered := false
 		for _, parent := range mounted {
 			if linuxCustodyPathContains(parent, path) {
@@ -757,13 +824,30 @@ func prepareLinuxCustodyNamespace(scratch string) error {
 				break
 			}
 		}
+		if !covered {
+			if err := bindLinuxCustodyPathReadOnly(root, source); err != nil {
+				_ = unix.Close(source.fd)
+				return err
+			}
+			mounted = append(mounted, path)
+		}
+		_ = unix.Close(source.fd)
+	}
+	for _, source := range allowedPaths {
+		covered := false
+		for _, parent := range mounted {
+			if linuxCustodyPathContains(parent, source.path) {
+				covered = true
+				break
+			}
+		}
 		if covered {
 			continue
 		}
-		if err := bindLinuxCustodyPathReadOnly(root, path); err != nil {
+		if err := bindLinuxCustodyPathReadOnly(root, source); err != nil {
 			return err
 		}
-		mounted = append(mounted, path)
+		mounted = append(mounted, source.path)
 	}
 	proc := filepath.Join(root, "proc")
 	if err := os.MkdirAll(proc, 0o555); err != nil {
@@ -808,12 +892,23 @@ func dropLinuxCustodyCapabilities() error {
 
 var linuxCustodyAllowedEnvironment = map[string]struct{}{
 	"PATH": {}, "SHELL": {}, "TERM": {}, "COLORTERM": {}, "LANG": {}, "LANGUAGE": {}, "TZ": {},
+	"LC_ALL": {}, "LC_COLLATE": {}, "LC_CTYPE": {}, "LC_MESSAGES": {}, "LC_MONETARY": {}, "LC_NUMERIC": {}, "LC_TIME": {},
 	"NO_COLOR": {}, "FORCE_COLOR": {},
-	"BD_ACTOR": {}, "BD_BACKUP_ENABLED": {}, "BD_DOLT_AUTO_COMMIT": {}, "BEADS_AGENT_NAME": {},
+	"BD_ACTOR": {}, "BD_BACKUP_ENABLED": {}, "BD_DOLT_AUTO_COMMIT": {}, "BD_OTEL_LOGS_URL": {}, "BD_OTEL_METRICS_URL": {},
+	"BEADS_AGENT_NAME": {}, "BEADS_DOLT_AUTO_START": {}, "BEADS_DOLT_PORT": {}, "BEADS_DOLT_SERVER_HOST": {}, "BEADS_DOLT_SERVER_PORT": {},
 	"GIT_AUTHOR_NAME": {}, "GIT_AUTHOR_EMAIL": {}, "GIT_COMMITTER_NAME": {}, "GIT_COMMITTER_EMAIL": {}, "GIT_CEILING_DIRECTORIES": {},
 	"CLAUDE_CONFIG_DIR": {}, "CODEX_HOME": {}, "GEMINI_CONFIG_DIR": {}, "COPILOT_HOME": {},
-	"ANTHROPIC_API_KEY": {}, "OPENAI_API_KEY": {}, "GEMINI_API_KEY": {}, "GOOGLE_API_KEY": {}, "GH_TOKEN": {}, "GITHUB_TOKEN": {},
-	"NODE_OPTIONS": {},
+	"ANTHROPIC_API_KEY": {}, "ANTHROPIC_AUTH_TOKEN": {}, "ANTHROPIC_CUSTOM_HEADERS": {},
+	"ANTHROPIC_MODEL": {}, "ANTHROPIC_DEFAULT_HAIKU_MODEL": {}, "ANTHROPIC_DEFAULT_SONNET_MODEL": {}, "ANTHROPIC_DEFAULT_OPUS_MODEL": {},
+	"OPENAI_API_KEY": {}, "GEMINI_API_KEY": {}, "GOOGLE_API_KEY": {}, "GH_TOKEN": {}, "GITHUB_TOKEN": {},
+	"GT_AGENT": {}, "GT_CONTEXT_FILE": {}, "GT_DOLT_HOST": {}, "GT_DOLT_PORT": {}, "GT_NO_EMOJI": {}, "GT_NO_PAGER": {},
+	"GT_PROCESS_NAMES": {}, "GT_READY_PROMPT_PREFIX": {}, "GT_RIG": {}, "GT_ROLE": {}, "GT_ROOT": {}, "GT_RUN": {}, "GT_SCOPE": {}, "GT_SESSION": {}, "GT_THEME": {},
+	"CLAUDECODE": {}, "CLAUDE_CODE_EFFORT_LEVEL": {}, "CLAUDE_CODE_SUBAGENT_MODEL": {},
+	"CLAUDE_CODE_ENABLE_TELEMETRY": {}, "OTEL_METRICS_EXPORTER": {}, "OTEL_METRIC_EXPORT_INTERVAL": {},
+	"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": {}, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": {}, "OTEL_LOGS_EXPORTER": {},
+	"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": {}, "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": {}, "OTEL_LOG_TOOL_DETAILS": {},
+	"OTEL_LOG_TOOL_CONTENT": {}, "OTEL_LOG_USER_PROMPTS": {}, "OTEL_RESOURCE_ATTRIBUTES": {},
+	"OPENCODE_PERMISSION": {}, "OPENCODE_CONFIG_CONTENT": {}, "NODE_OPTIONS": {},
 }
 
 func linuxCustodyWorkloadEnvironment(source []string) []string {
@@ -823,15 +918,7 @@ func linuxCustodyWorkloadEnvironment(source []string) []string {
 		if !ok || key == "" {
 			continue
 		}
-		_, exact := linuxCustodyAllowedEnvironment[key]
-		allowed := exact || strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "BD_") || strings.HasPrefix(key, "BEADS_")
-		if strings.HasPrefix(key, "GT_") && !strings.HasPrefix(key, "GT_INTERNAL_") && !strings.HasPrefix(key, "GT_TEST_") {
-			allowed = true
-		}
-		if key == "GT_TEST_OUTER_SENTINEL" {
-			allowed = false
-		}
-		if !allowed {
+		if _, allowed := linuxCustodyAllowedEnvironment[key]; !allowed {
 			continue
 		}
 		if key == "NODE_OPTIONS" {
