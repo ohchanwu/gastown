@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -80,6 +81,20 @@ func TestValidatePublicHTTPSDestination(t *testing.T) {
 				t.Fatalf("validatePublicHTTPSDestination(%q, %d, %v) error = %v, wantErr %v", test.host, test.port, test.resolved, err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestNormalizeHTTPSResolverAddressesUnmapsLinuxARecord(t *testing.T) {
+	resolved := []netip.Addr{
+		netip.MustParseAddr("::ffff:1.1.1.2"),
+		netip.MustParseAddr("2606:4700:4700::1111"),
+	}
+	answers := normalizeHTTPSResolverAddresses(resolved)
+	if len(answers) != 2 || answers[0].String() != "1.1.1.2" || answers[1].String() != "2606:4700:4700::1111" {
+		t.Fatalf("normalized resolver answers = %v", answers)
+	}
+	if err := validatePublicHTTPSDestination("contained-flow.test", 443, answers); err != nil {
+		t.Fatalf("normalized resolver answers rejected: %v", err)
 	}
 }
 

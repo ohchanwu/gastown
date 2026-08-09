@@ -54,7 +54,10 @@ func (p *Proxy) terminateProcess() {
 		}
 
 		time.AfterFunc(2*time.Second, func() {
-			if p.cmd.ProcessState == nil || !p.cmd.ProcessState.Exited() {
+			// os.Process methods are safe to call concurrently with Wait. Reading
+			// exec.Cmd.ProcessState here is not: Wait publishes that field while
+			// this delayed callback may still be running.
+			if p.isProcessAlive() {
 				if pgid == 0 {
 					pgid, _ = syscall.Getpgid(p.cmd.Process.Pid)
 				}

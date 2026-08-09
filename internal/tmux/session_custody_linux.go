@@ -595,7 +595,16 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	// PID-1 process or a signal-disposition-dependent zombie.
 	timer := time.NewTimer(sessionCustodyReadyProbe)
 	defer timer.Stop()
+	initStopped := func(processErr error, remainingServices int, phase string) error {
+		shutdownErr := shutdownLinuxCustodyServices(cancelServices, serviceDone, remainingServices, linuxCustodyBrokerShutdownTimeout)
+		return errors.Join(
+			finalizeLinuxCustodyInitExit(launch, processErr, phase),
+			shutdownErr,
+		)
+	}
 	select {
+	case processErr := <-launch.wait:
+		return initStopped(processErr, 3, "before readiness")
 	case stopped := <-serviceDone:
 		if stopped.err == nil {
 			stopped.err = errors.New("service stopped without an error")
@@ -611,6 +620,8 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	}
 	for {
 		select {
+		case processErr := <-launch.wait:
+			return initStopped(processErr, 3, "during service")
 		case stopped := <-serviceDone:
 			if stopped.err == nil {
 				stopped.err = errors.New("service stopped without an error")
@@ -629,6 +640,21 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 		}
 		runtime.KeepAlive(launch)
 	}
+}
+
+func finalizeLinuxCustodyInitExit(launch *linuxCustodyLaunch, processErr error, phase string) error {
+	if launch == nil {
+		return errors.New("session custody init exit has no launch state")
+	}
+	launch.wait = nil
+	launch.child = nil
+	if processErr == nil {
+		processErr = errors.New("process exited without an error")
+	}
+	return errors.Join(
+		fmt.Errorf("session custody init stopped %s: %w", phase, processErr),
+		closeLinuxCustodyLaunch(launch, true),
+	)
 }
 
 func shutdownLinuxCustodyServices(

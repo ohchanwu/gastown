@@ -610,6 +610,48 @@ func TestLinuxCustodyServiceShutdownBoundsIgnoredBrokerWorker(t *testing.T) {
 	}
 }
 
+func TestFinalizeLinuxCustodyInitExitReleasesRetainedState(t *testing.T) {
+	ready, readyPeer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyPeer.Close()
+	permit, permitPeer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permitPeer.Close()
+	life, lifePeer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lifePeer.Close()
+	broker, brokerPeer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer brokerPeer.Close()
+
+	wait := make(chan error, 1)
+	launch := &linuxCustodyLaunch{
+		child:  &exec.Cmd{},
+		wait:   wait,
+		pidfd:  -1,
+		ready:  ready,
+		permit: permit,
+		life:   life,
+		broker: broker,
+	}
+	processErr := errors.New("test init exit")
+	err = finalizeLinuxCustodyInitExit(launch, processErr, "during test")
+	if !errors.Is(err, processErr) || !strings.Contains(err.Error(), "session custody init stopped during test") {
+		t.Fatalf("finalize error = %v, want wrapped process exit", err)
+	}
+	if launch.child != nil || launch.wait != nil || launch.ready != nil || launch.permit != nil || launch.life != nil || launch.broker != nil || launch.pidfd != -1 {
+		t.Fatalf("retained launch state survived init exit: %#v", launch)
+	}
+}
+
 func TestLinuxSessionCustodyContainsDoubleForkAndDeniesParentNamespace(t *testing.T) {
 	custody := uuid.NewString()
 	testDir := t.TempDir()

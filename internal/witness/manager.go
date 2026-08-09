@@ -59,6 +59,7 @@ type Manager struct {
 	capturePaneGeneration func(tmux.SessionGeneration) (tmux.PaneProcessGeneration, error)
 	prepareSessionCleanup func(tmux.SessionGeneration, tmux.PaneProcessGeneration) (sessionGenerationCleanup, error)
 	wrapSessionCommand    func(string) (string, string, error)
+	startPoller           func(string, string) (int, error)
 	cleanupTimeout        time.Duration
 	teardownBudgets       teardownBudgets
 	zombieKillGrace       time.Duration
@@ -80,6 +81,7 @@ func NewManagerWithTmux(r *rig.Rig, t *tmux.Tmux) *Manager {
 		rig:                   r,
 		tmux:                  t,
 		capturePaneGeneration: t.CapturePaneProcessGeneration,
+		startPoller:           nudge.StartPoller,
 		cleanupTimeout:        witnessCleanupTimeout,
 		teardownBudgets:       witnessTeardownBudgets,
 		zombieKillGrace:       constants.ZombieKillGracePeriod,
@@ -426,14 +428,16 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		}
 	}
 
-	// Build startup command. The command also embeds env vars via 'exec env'
-	// for WaitForCommand detection — belt-and-suspenders alongside -e flags.
+	// Build the runtime invocation without repeating env vars inline. The tmux
+	// session environment is authoritative; containment may rewrite its network
+	// endpoint values before the runtime starts.
 	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically.
 	// Pass m.rig.Path so rig agent settings are honored (not town-level defaults)
-	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, sessionID, agentOverride, roleConfig, runtimeConfigDir)
+	command, resolvedEnv, err := buildWitnessStartCommandWithEnv(m.rig.Path, m.rig.Name, townRoot, sessionID, agentOverride, roleConfig, runtimeConfigDir, envVars)
 	if err != nil {
 		return err
 	}
+	envVars = resolvedEnv
 	command, custody, err := m.wrapSessionCommand(command)
 	if err != nil {
 		return fmt.Errorf("preparing witness session containment: %w", err)
@@ -487,7 +491,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// Start nudge-queue poller (gt-dgf). Claude's UserPromptSubmit hook only
 	// drains when the agent submits a prompt. Idle agents never submit, so
 	// queued nudges deadlock. The poller breaks the cycle by polling every 10s.
-	if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
+	startPoller := m.startPoller
+	if startPoller == nil {
+		startPoller = nudge.StartPoller
+	}
+	if _, pollerErr := startPoller(townRoot, sessionID); pollerErr != nil {
 		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
 	}
 
@@ -550,6 +558,11 @@ func roleConfigEnvVars(roleConfig *beads.RoleConfig, townRoot, rigName string) m
 }
 
 func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOverride string, roleConfig *beads.RoleConfig, runtimeConfigDir string) (string, error) {
+	command, _, err := buildWitnessStartCommandWithEnv(rigPath, rigName, townRoot, sessionName, agentOverride, roleConfig, runtimeConfigDir, nil)
+	return command, err
+}
+
+func buildWitnessStartCommandWithEnv(rigPath, rigName, townRoot, sessionName, agentOverride string, roleConfig *beads.RoleConfig, runtimeConfigDir string, envVars map[string]string) (string, map[string]string, error) {
 	if agentOverride != "" {
 		roleConfig = nil
 	}
@@ -569,7 +582,7 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOver
 			} else {
 				cmd = "env -u CLAUDECODE NODE_OPTIONS='' " + cmd
 			}
-			return cmd, nil
+			return cmd, envVars, nil
 		}
 		// Non-Claude agent OR Claude with built-in start_command: fall
 		// through to BuildStartupCommandFromConfig for proper agent and
@@ -580,19 +593,22 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOver
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
-	command, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
-		Role:             "witness",
-		Rig:              rigName,
-		TownRoot:         townRoot,
-		RuntimeConfigDir: runtimeConfigDir,
-		Prompt:           initialPrompt,
-		Topic:            "patrol",
-		SessionName:      sessionName,
-	}, rigPath, initialPrompt, agentOverride)
-	if err != nil {
-		return "", fmt.Errorf("building startup command: %w", err)
+	if envVars == nil {
+		envVars = config.AgentEnv(config.AgentEnvConfig{
+			Role:             "witness",
+			Rig:              rigName,
+			TownRoot:         townRoot,
+			RuntimeConfigDir: runtimeConfigDir,
+			Prompt:           initialPrompt,
+			Topic:            "patrol",
+			SessionName:      sessionName,
+		})
 	}
-	return command, nil
+	command, resolvedEnv, err := config.BuildStartupCommandWithAgentOverrideInheritedEnv(envVars, rigPath, initialPrompt, agentOverride)
+	if err != nil {
+		return "", nil, fmt.Errorf("building startup command: %w", err)
+	}
+	return command, resolvedEnv, nil
 }
 
 // isBuiltinClaudeStartCommand returns true if the start_command is the

@@ -24,6 +24,7 @@ import (
 const (
 	envSessionBrokerReexecHelper = "GT_TEST_CMD_REEXEC_HELPER"
 	envSessionBrokerReexecStage  = "GT_TEST_CMD_REEXEC_STAGE"
+	envSessionBrokerReexecClose  = "GT_TEST_CMD_REEXEC_CLOSE_BROKER"
 	envSessionBrokerRawClient    = "GT_TEST_CMD_BROKER_RAW_CLIENT"
 )
 
@@ -39,8 +40,16 @@ func runSessionBrokerReexecHelper() bool {
 			panic(err)
 		}
 	}
+	if os.Getenv(envSessionBrokerReexecClose) == "1" {
+		if err := unix.Close(6); err != nil {
+			fmt.Fprintf(os.Stderr, "broker-close=%v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "broker-close=allowed")
+		}
+	}
 	_ = os.Unsetenv(envSessionBrokerReexecHelper)
 	_ = os.Unsetenv(envSessionBrokerReexecStage)
+	_ = os.Unsetenv(envSessionBrokerReexecClose)
 	return true
 }
 
@@ -130,12 +139,20 @@ func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 	unsafeProofPath := filepath.Join(testDir, "unsafe-proof")
 	deniedCodePath := filepath.Join(testDir, "denied-code")
 	deniedCodeTempPath := deniedCodePath + ".tmp"
+	closeOutputPath := filepath.Join(testDir, "close-output")
+	closeProofPath := filepath.Join(testDir, "close-proof")
+	closeCodePath := filepath.Join(testDir, "close-code")
+	closeCodeTempPath := closeCodePath + ".tmp"
 	reexecGT := envSessionBrokerReexecHelper + "=1 " + config.ShellQuote(os.Args[0])
+	closeBrokerGT := envSessionBrokerReexecClose + "=1 " + reexecGT
 	command := strings.Join([]string{
 		reexecGT + " prime --help >" + config.ShellQuote(safeOutputPath) + " 2>&1",
 		reexecGT + " shell -c " + config.ShellQuote("touch "+unsafeProofPath) + " >" + config.ShellQuote(deniedOutputPath) + " 2>&1",
 		"printf '%s' $? >" + config.ShellQuote(deniedCodeTempPath),
 		"mv " + config.ShellQuote(deniedCodeTempPath) + " " + config.ShellQuote(deniedCodePath),
+		closeBrokerGT + " shell -c " + config.ShellQuote("touch "+closeProofPath) + " >" + config.ShellQuote(closeOutputPath) + " 2>&1",
+		"printf '%s' $? >" + config.ShellQuote(closeCodeTempPath),
+		"mv " + config.ShellQuote(closeCodeTempPath) + " " + config.ShellQuote(closeCodePath),
 		"while :; do sleep 60; done",
 	}, "; ")
 	custody := uuid.NewString()
@@ -175,7 +192,9 @@ func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 		safeOutput, safeErr := os.ReadFile(safeOutputPath)
 		deniedOutput, deniedErr := os.ReadFile(deniedOutputPath)
 		deniedCode, codeErr := os.ReadFile(deniedCodePath)
-		if safeErr == nil && deniedErr == nil && codeErr == nil {
+		closeOutput, closeOutputErr := os.ReadFile(closeOutputPath)
+		closeCode, closeCodeErr := os.ReadFile(closeCodePath)
+		if safeErr == nil && deniedErr == nil && codeErr == nil && closeOutputErr == nil && closeCodeErr == nil {
 			if !strings.Contains(string(safeOutput), "Usage:\n  gt prime") {
 				t.Fatalf("brokered safe command output = %q", safeOutput)
 			}
@@ -191,6 +210,20 @@ func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 			}
 			if _, err := os.Stat(unsafeProofPath); !os.IsNotExist(err) {
 				t.Fatalf("unsafe contained gt invocation executed; stat error = %v", err)
+			}
+			code, err = strconv.Atoi(strings.TrimSpace(string(closeCode)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code != 126 {
+				t.Fatalf("descriptor-bypass gt command exit code = %d, want 126; output %q", code, closeOutput)
+			}
+			if !strings.Contains(string(closeOutput), "broker-close=operation not permitted") ||
+				!strings.Contains(string(closeOutput), "not broker-safe") {
+				t.Fatalf("descriptor-bypass denial output = %q", closeOutput)
+			}
+			if _, err := os.Stat(closeProofPath); !os.IsNotExist(err) {
+				t.Fatalf("descriptor-bypass gt invocation executed; stat error = %v", err)
 			}
 			return
 		}

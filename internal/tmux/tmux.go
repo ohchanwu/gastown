@@ -840,6 +840,14 @@ func (g PaneProcessGeneration) Equal(other PaneProcessGeneration) bool {
 func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 	parts := strings.Split(output, "\t")
 	if len(parts) != 3 && len(parts) != 4 {
+		// tmux display-message exits successfully for a missing target when the
+		// server still has other sessions, returning only the server PID after
+		// output trimming. Classify that exact shape as terminal absence.
+		if len(parts) == 1 {
+			if serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && serverPID > 0 {
+				return SessionGeneration{}, ErrSessionNotFound
+			}
+		}
 		return SessionGeneration{}, fmt.Errorf("reading tmux session generation: unexpected field count %d", len(parts))
 	}
 	serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0]))

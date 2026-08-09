@@ -147,6 +147,9 @@ func TestLinuxCustodySeccompProtectsBrokerDescriptor(t *testing.T) {
 		{name: "close range covers broker", syscall: uint32(unix.SYS_CLOSE_RANGE), args: []uint64{3, 99}, want: wantDeny},
 		{name: "close range below broker", syscall: uint32(unix.SYS_CLOSE_RANGE), args: []uint64{3, 5}, want: wantAllow},
 		{name: "dup3 over broker", syscall: uint32(unix.SYS_DUP3), args: []uint64{7, brokerFD}, want: wantDeny},
+		{name: "dup broker source", syscall: uint32(unix.SYS_DUP), args: []uint64{brokerFD}, want: wantAllow},
+		{name: "fcntl dup broker source", syscall: uint32(unix.SYS_FCNTL), args: []uint64{brokerFD, unix.F_DUPFD, 0}, want: wantAllow},
+		{name: "fcntl dup cloexec broker source", syscall: uint32(unix.SYS_FCNTL), args: []uint64{brokerFD, unix.F_DUPFD_CLOEXEC, 0}, want: wantAllow},
 		{name: "fcntl cloexec broker", syscall: uint32(unix.SYS_FCNTL), args: []uint64{brokerFD, unix.F_SETFD, unix.FD_CLOEXEC}, want: wantDeny},
 		{name: "fcntl clear cloexec broker", syscall: uint32(unix.SYS_FCNTL), args: []uint64{brokerFD, unix.F_SETFD, 0}, want: wantAllow},
 	}

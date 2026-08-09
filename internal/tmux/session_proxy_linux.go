@@ -417,11 +417,7 @@ func serveHTTPSConnect(ctx context.Context, listener net.Listener) error {
 			if err != nil {
 				return nil, err
 			}
-			answers := make([]net.IP, 0, len(resolved))
-			for _, address := range resolved {
-				answers = append(answers, net.IP(address.AsSlice()))
-			}
-			return answers, nil
+			return normalizeHTTPSResolverAddresses(resolved), nil
 		},
 		dial:           dialer.DialContext,
 		headerTimeout:  defaultProxyHeaderTimeout,
@@ -431,6 +427,18 @@ func serveHTTPSConnect(ctx context.Context, listener net.Listener) error {
 		maxHeaderBytes: defaultProxyMaxHeaderBytes,
 		maxConnections: defaultProxyMaxConnections,
 	})
+}
+
+func normalizeHTTPSResolverAddresses(resolved []netip.Addr) []net.IP {
+	answers := make([]net.IP, 0, len(resolved))
+	for _, address := range resolved {
+		// Linux's resolver may represent an ordinary A record as ::ffff:a.b.c.d.
+		// Normalize that resolver artifact before strict destination validation;
+		// validatePublicHTTPSDestination still rejects mapped inputs supplied by
+		// any other boundary.
+		answers = append(answers, net.IP(address.Unmap().AsSlice()))
+	}
+	return answers
 }
 
 func serveHTTPSConnectWithConfig(ctx context.Context, listener net.Listener, config httpsConnectConfig) error {

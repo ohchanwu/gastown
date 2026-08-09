@@ -68,6 +68,9 @@ func buildLinuxCustodySeccompFilter(goarch string) ([]unix.SockFilter, error) {
 	filter = append(filter,
 		// fcntl(fd, F_SETFD, flags): prevent setting FD_CLOEXEC while
 		// permitting the exec runtime to clear it on the inherited endpoint.
+		// Source duplication remains safe because the original endpoint still
+		// cannot be closed, overwritten, or marked close-on-exec; shells need
+		// that duplication while arranging ordinary command redirections.
 		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 7, K: uint32(unix.SYS_FCNTL)},
 		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
 		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, Jt: 0, Jf: 5, K: linuxCustodyBrokerFD},

@@ -1196,11 +1196,53 @@ func TestBuildWitnessStartCommand_DefaultsToRuntime(t *testing.T) {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
 	}
 
-	if !strings.Contains(got, "GT_ROLE=gastown/witness") {
-		t.Errorf("expected GT_ROLE=gastown/witness in command, got %q", got)
+	if !strings.HasPrefix(got, "exec ") {
+		t.Errorf("expected direct runtime exec command, got %q", got)
 	}
-	if !strings.Contains(got, "BD_ACTOR=gastown/witness") {
-		t.Errorf("expected BD_ACTOR=gastown/witness in command, got %q", got)
+	for _, inline := range []string{"GT_ROLE=", "BD_ACTOR=", "GT_DOLT_HOST=", "GT_DOLT_PORT="} {
+		if strings.Contains(got, inline) {
+			t.Errorf("startup command repeated session environment %q inline: %q", inline, got)
+		}
+	}
+}
+
+func TestBuildWitnessStartCommandWithEnvReturnsResolvedPresetEnvironment(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	baseEnv := map[string]string{
+		"GT_ROLE":      "gastown/witness",
+		"GT_DOLT_HOST": "127.0.0.1",
+		"GT_DOLT_PORT": "41000",
+	}
+
+	command, resolvedEnv, err := buildWitnessStartCommandWithEnv(
+		rigPath, "gastown", townRoot, "gastown-witness", "opencode", nil, "", baseEnv,
+	)
+	if err != nil {
+		t.Fatalf("buildWitnessStartCommandWithEnv: %v", err)
+	}
+	for _, inline := range []string{"GT_DOLT_HOST=", "GT_DOLT_PORT=", "OPENCODE_PERMISSION="} {
+		if strings.Contains(command, inline) {
+			t.Fatalf("startup command repeated authoritative environment %q inline: %q", inline, command)
+		}
+	}
+	if got := resolvedEnv["GT_DOLT_HOST"]; got != "127.0.0.1" {
+		t.Fatalf("resolved GT_DOLT_HOST = %q", got)
+	}
+	if got := resolvedEnv["GT_DOLT_PORT"]; got != "41000" {
+		t.Fatalf("resolved GT_DOLT_PORT = %q", got)
+	}
+	if got := resolvedEnv["GT_AGENT"]; got != "opencode" {
+		t.Fatalf("resolved GT_AGENT = %q, want opencode", got)
+	}
+	if got := resolvedEnv["OPENCODE_PERMISSION"]; got != `{"*":"allow"}` {
+		t.Fatalf("resolved OPENCODE_PERMISSION = %q", got)
+	}
+	if _, mutated := baseEnv["OPENCODE_PERMISSION"]; mutated {
+		t.Fatal("startup environment resolution mutated caller map")
 	}
 }
 
@@ -1233,15 +1275,15 @@ func TestRoleConfigEnvVars_NilConfig(t *testing.T) {
 	}
 }
 
-func TestBuildWitnessStartCommand_IncludesConfigDir(t *testing.T) {
+func TestBuildWitnessStartCommand_DoesNotInlineConfigDir(t *testing.T) {
 	t.Parallel()
 	got, err := buildWitnessStartCommand("/town/rig", "gastown", "/town", "", "", nil, "/home/user/.claude-accounts/work")
 	if err != nil {
 		t.Fatalf("buildWitnessStartCommand: %v", err)
 	}
 
-	if !strings.Contains(got, "CLAUDE_CONFIG_DIR=/home/user/.claude-accounts/work") {
-		t.Errorf("expected CLAUDE_CONFIG_DIR in command, got %q", got)
+	if strings.Contains(got, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("startup command repeated authoritative tmux environment inline: %q", got)
 	}
 }
 
@@ -1258,7 +1300,7 @@ func TestBuildWitnessStartCommand_AgentOverrideWins(t *testing.T) {
 	if strings.Contains(got, "exec run") {
 		t.Fatalf("expected agent override to bypass role start_command, got %q", got)
 	}
-	if !strings.Contains(got, "GT_ROLE=gastown/witness") {
-		t.Errorf("expected GT_ROLE=gastown/witness in command, got %q", got)
+	if !strings.Contains(got, "codex") || strings.Contains(got, "GT_ROLE=") {
+		t.Errorf("expected direct codex exec without inline session environment, got %q", got)
 	}
 }

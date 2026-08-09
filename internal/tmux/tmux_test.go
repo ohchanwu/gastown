@@ -916,6 +916,23 @@ func TestKillSessionGenerationRejectsSameIDAfterServerRestart(t *testing.T) {
 	}
 }
 
+func TestCaptureSessionGenerationClassifiesMissingTargetWhileServerLives(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-missing-%d", time.Now().UnixNano()))
+	defer func() { _ = tm.KillServer() }()
+	if err := tm.NewSessionWithCommand("gt-generation-keep", "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tm.NewSessionWithCommand("gt-generation-gone", "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tm.run("kill-session", "-t", "gt-generation-gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tm.CaptureSessionGeneration("gt-generation-gone"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("CaptureSessionGeneration() error = %v, want session not found", err)
+	}
+}
+
 func TestKillSessionGenerationRejectsServerIdentityMismatch(t *testing.T) {
 	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-identity-%d", time.Now().UnixNano()))
 	session := "gt-generation-identity"

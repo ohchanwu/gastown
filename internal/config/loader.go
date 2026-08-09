@@ -2484,6 +2484,19 @@ func PrependEnv(command string, envVars map[string]string) string {
 //  2. role_agents[GT_ROLE] (if GT_ROLE is in envVars)
 //  3. Default agent resolution (rig's Agent → town's DefaultAgent → "claude")
 func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, prompt, agentOverride string) (string, error) {
+	command, _, err := buildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride, true)
+	return command, err
+}
+
+// BuildStartupCommandWithAgentOverrideInheritedEnv builds only the exec-side
+// runtime invocation and returns the complete resolved environment separately.
+// Callers must pass that returned map through their process/session API so
+// inline assignments cannot override a later containment-layer rewrite.
+func BuildStartupCommandWithAgentOverrideInheritedEnv(envVars map[string]string, rigPath, prompt, agentOverride string) (string, map[string]string, error) {
+	return buildStartupCommandWithAgentOverride(envVars, rigPath, prompt, agentOverride, false)
+}
+
+func buildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, prompt, agentOverride string, embedEnvironment bool) (string, map[string]string, error) {
 	var rc *RuntimeConfig
 	var townRoot string
 
@@ -2496,7 +2509,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 			var err error
 			rc, _, err = ResolveAgentConfigWithOverride(townRoot, rigPath, agentOverride)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 		} else if role == "crew" && envVars["GT_CREW"] != "" {
 			// Per-worker agent resolution: check worker_agents before role_agents
@@ -2523,7 +2536,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 					if preset := GetAgentPresetByName(agentOverride); preset != nil {
 						rc = RuntimeConfigFromPreset(AgentPreset(agentOverride))
 					} else {
-						return "", fmt.Errorf("agent '%s' not found", agentOverride)
+						return "", nil, fmt.Errorf("agent '%s' not found", agentOverride)
 					}
 				} else {
 					rc = DefaultRuntimeConfig()
@@ -2535,7 +2548,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 				var resolveErr error
 				rc, _, resolveErr = ResolveAgentConfigWithOverride(townRoot, "", agentOverride)
 				if resolveErr != nil {
-					return "", resolveErr
+					return "", nil, resolveErr
 				}
 			} else if role != "" {
 				rc = ResolveRoleAgentConfig(role, townRoot, "")
@@ -2596,8 +2609,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		// send-keys line length limits in psmux.
 		var scriptLines []string
 		keys := make([]string, 0, len(resolvedEnv))
-		for k := range resolvedEnv {
-			keys = append(keys, k)
+		if embedEnvironment {
+			for k := range resolvedEnv {
+				keys = append(keys, k)
+			}
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
@@ -2636,13 +2651,17 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	} else {
 		// Build environment export prefix (POSIX shell)
 		var exports []string
-		for k, v := range resolvedEnv {
-			exports = append(exports, fmt.Sprintf("%s=%s", k, ShellQuote(v)))
+		if embedEnvironment {
+			for k, v := range resolvedEnv {
+				exports = append(exports, fmt.Sprintf("%s=%s", k, ShellQuote(v)))
+			}
 		}
 		sort.Strings(exports)
 
 		if len(exports) > 0 {
 			cmd = "exec env " + strings.Join(exports, " ") + " "
+		} else {
+			cmd = "exec "
 		}
 
 		if len(rc.ExecWrapper) > 0 {
@@ -2656,7 +2675,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		}
 	}
 
-	return cmd, nil
+	return cmd, resolvedEnv, nil
 }
 
 // BuildStartupCommandFromConfig builds a startup command from a complete AgentEnvConfig.

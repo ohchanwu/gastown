@@ -73,6 +73,19 @@ func StartPollerWithEnv(townRoot, session string, env []string) (int, error) {
 	return startPoller(townRoot, session, env)
 }
 
+// StartPollerWithExecutable launches a poller from the exact executable supplied
+// by an isolated caller. This keeps the recorded process identity stable when
+// the caller itself is a test binary rather than gt.
+func StartPollerWithExecutable(townRoot, session, executable string, env []string) (int, error) {
+	if strings.TrimSpace(executable) == "" {
+		return 0, errors.New("poller executable is empty")
+	}
+	launcher := func(townRoot, session string, env []string) (pollerLaunch, error) {
+		return launchPollerExecutable(executable, townRoot, session, env)
+	}
+	return startPollerWithLauncher(townRoot, session, env, launcher, os.WriteFile)
+}
+
 // StopRequested reports whether the session's cooperative stop generation is set.
 func StopRequested(townRoot, session string) bool {
 	data, err := os.ReadFile(pollerStopFile(townRoot, session))
@@ -258,7 +271,10 @@ func launchPoller(townRoot, session string, env []string) (pollerLaunch, error) 
 	if err != nil {
 		return pollerLaunch{}, fmt.Errorf("finding gt binary: %w", err)
 	}
+	return launchPollerExecutable(gtBin, townRoot, session, env)
+}
 
+func launchPollerExecutable(gtBin, townRoot, session string, env []string) (pollerLaunch, error) {
 	cmd := buildPollerCommand(gtBin, townRoot, session, env)
 	var generation [16]byte
 	if _, err := rand.Read(generation[:]); err != nil {
