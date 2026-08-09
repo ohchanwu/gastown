@@ -2,6 +2,7 @@ package witness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -12,10 +13,50 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestWitnessSessionCustodyPathsIgnoresTestOverrides(t *testing.T) {
+	witnessRoot := t.TempDir()
+	witnessDir := filepath.Join(witnessRoot, "witness")
+	witnessSettingsDir := filepath.Join(witnessRoot, "settings")
+	for _, path := range []string{witnessDir, witnessSettingsDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	testFileRoot := t.TempDir()
+	testExecutable := filepath.Join(testFileRoot, "gt")
+	if err := os.WriteFile(testExecutable, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := witnessSessionCustodyPaths(
+		witnessDir,
+		"",
+		witnessSettingsDir,
+		&config.RuntimeConfig{Command: "/bin/sh"},
+		map[string]string{"GT_TEST_FLOW_GT": testExecutable, "PATH": os.Getenv("PATH")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	if err := json.Unmarshal([]byte(encoded), &paths); err != nil {
+		t.Fatal(err)
+	}
+	var hasFile, hasParent bool
+	for _, path := range paths {
+		hasFile = hasFile || path == testExecutable
+		hasParent = hasParent || path == testFileRoot
+	}
+	if hasFile || hasParent {
+		t.Fatalf("test override expanded production custody: paths=%q file=%t parent=%t", paths, hasFile, hasParent)
+	}
+}
 
 func TestManagerStartForegroundDeprecated(t *testing.T) {
 	mgr := NewManager(&rig.Rig{Name: "testrig", Path: t.TempDir()})

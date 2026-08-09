@@ -228,6 +228,18 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	// started with. Only emitted when GT telemetry is active (GT_OTEL_LOGS_URL set).
 	telemetry.RecordPrimeContext(context.Background(), formula, os.Getenv("GT_ROLE"), primeHookMode)
 
+	// A contained Witness gets a capability-complete, broker-reviewed prime
+	// response from outputRoleContext. Preserve the stateful patrol auto-bond,
+	// but do not append normal role directives, handoff content, formula steps,
+	// checkpoint guidance, or startup text: those sources can advertise commands
+	// that the contained broker intentionally denies.
+	if isContainedWitnessContext(ctx) {
+		if err := ensureContainedWitnessPatrol(ctx); err != nil {
+			return fmt.Errorf("ensuring contained Witness patrol: %w", err)
+		}
+		return nil
+	}
+
 	hasSlungWork, err := checkSlungWork(ctx, hookedBead)
 	if err != nil {
 		return err
@@ -540,6 +552,9 @@ func outputRoleContext(ctx RoleContext) (string, error) {
 	formula, err := outputPrimeContext(ctx)
 	if err != nil {
 		return "", err
+	}
+	if isContainedWitnessContext(ctx) {
+		return formula, nil
 	}
 
 	outputRoleDirectives(ctx, os.Stdout, primeExplain)

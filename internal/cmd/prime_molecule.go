@@ -358,8 +358,14 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 		fmt.Printf("\n⏸️  Rig %s is %s — skipping patrol wisp generation.\n", ctx.Rig, reason)
 		return
 	}
+	cfg := witnessPatrolConfig(ctx)
+	outputPatrolContext(cfg)
+	showFormulaSteps(constants.MolWitnessPatrol, "Patrol Steps", ctx.TownRoot, ctx.Rig, cfg.ExtraVars)
+}
+
+func witnessPatrolConfig(ctx RoleContext) PatrolConfig {
 	extraVars := buildWitnessPatrolVars(ctx)
-	cfg := PatrolConfig{
+	return PatrolConfig{
 		RoleName:      "witness",
 		PatrolMolName: constants.MolWitnessPatrol,
 		BeadsDir:      ctx.TownRoot,
@@ -372,8 +378,31 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
 		},
 	}
-	outputPatrolContext(cfg)
-	showFormulaSteps(constants.MolWitnessPatrol, "Patrol Steps", ctx.TownRoot, ctx.Rig, extraVars)
+}
+
+// ensureContainedWitnessPatrol preserves Witness auto-bond without rendering
+// the normal patrol playbook. The contained prime output is a capability
+// boundary: every actionable command it advertises must be broker-reviewed.
+func ensureContainedWitnessPatrol(ctx RoleContext) error {
+	if stopped, _ := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
+		return nil
+	}
+	cfg := witnessPatrolConfig(ctx)
+	_, _, found, err := findActivePatrol(cfg)
+	if err != nil {
+		return fmt.Errorf("discovering active patrol: %w", err)
+	}
+	if found {
+		return nil
+	}
+	patrolID, err := autoSpawnPatrol(cfg)
+	if err != nil {
+		return err
+	}
+	if patrolID == "" {
+		return fmt.Errorf("created patrol without an ID")
+	}
+	return nil
 }
 
 // outputRefineryPatrolContext shows patrol molecule status for the Refinery.

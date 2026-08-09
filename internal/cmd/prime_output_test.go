@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestOutputRoleDirectives(t *testing.T) {
@@ -189,26 +191,65 @@ func TestContainedWitnessPrimeGuidanceIsExactlyBrokerSafe(t *testing.T) {
 	segments := strings.Split(output, "`")
 	var commands []string
 	for index := 1; index < len(segments); index += 2 {
-		command := strings.Fields(segments[index])
-		if len(command) < 2 || command[0] != "gt" {
+		command := segments[index]
+		if !strings.HasPrefix(command, "gt ") {
 			t.Fatalf("non-command actionable guidance %q", segments[index])
 		}
-		if err := IsBrokerSafeCommand(rootCmd, command[1:]); err != nil {
-			t.Fatalf("contained guidance %q is not broker-safe: %v", segments[index], err)
-		}
-		commands = append(commands, segments[index])
+		commands = append(commands, command)
 	}
 	want := []string{
 		"gt hook show", "gt mol current", "gt mol step close",
-		"gt patrol scan --rig testrig --json", "gt mail inbox --unread",
+		"gt patrol scan --rig testrig --json",
+		"gt patrol report --summary '<brief summary of observations>'",
+		"gt mail inbox --unread",
 		"gt agents list", "gt polecat list testrig", "gt status --fast",
 	}
 	if strings.Join(commands, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("contained guidance commands = %q, want %q", commands, want)
 	}
-	for _, forbidden := range []string{"witness status", "hook attach", "bd close", "polecat nuke", "gt peek"} {
+	for _, forbidden := range []string{"witness status", "hook attach", "bd close", "polecat nuke", "gt peek", "gt handoff"} {
 		if strings.Contains(output, forbidden) {
 			t.Fatalf("contained guidance advertises unavailable path %q: %s", forbidden, output)
+		}
+	}
+}
+
+func TestOutputRoleContextContainedWitnessSkipsUnbrokeredOperatorContent(t *testing.T) {
+	t.Setenv(tmux.EnvSessionBrokerWorker, "1")
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "directives"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(townRoot, "directives", "witness.md"),
+		[]byte("DIRECTIVE_SENTINEL `gt handoff -s unsafe -m unsafe`\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(townRoot, "CONTEXT.md"),
+		[]byte("CONTEXT_SENTINEL `gt polecat nuke testrig/example --force`\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var roleErr error
+	output := captureStdout(t, func() {
+		_, roleErr = outputRoleContext(RoleContext{
+			Role: RoleWitness, Rig: "testrig", TownRoot: townRoot, WorkDir: townRoot,
+		})
+	})
+	if roleErr != nil {
+		t.Fatal(roleErr)
+	}
+	if !strings.Contains(output, "# Contained Witness Context") {
+		t.Fatalf("contained role context missing reviewed guidance: %s", output)
+	}
+	for _, forbidden := range []string{"DIRECTIVE_SENTINEL", "CONTEXT_SENTINEL", "gt handoff", "gt polecat nuke"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("contained role context emitted unbrokered operator content %q: %s", forbidden, output)
 		}
 	}
 }

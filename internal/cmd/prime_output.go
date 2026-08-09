@@ -28,7 +28,7 @@ import (
 // outputPrimeContext outputs the role-specific context using templates or fallback.
 // Returns the rendered template content (empty string when using fallback path).
 func outputPrimeContext(ctx RoleContext) (string, error) {
-	if ctx.Role == RoleWitness && os.Getenv(tmux.EnvSessionBrokerWorker) == "1" {
+	if isContainedWitnessContext(ctx) {
 		output, err := containedWitnessPrimeOutput(ctx)
 		if err != nil {
 			return "", err
@@ -100,6 +100,10 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	return output, nil
 }
 
+func isContainedWitnessContext(ctx RoleContext) bool {
+	return ctx.Role == RoleWitness && os.Getenv(tmux.EnvSessionBrokerWorker) == "1"
+}
+
 type containedWitnessPrimeCommand struct {
 	description string
 	args        []string
@@ -111,6 +115,7 @@ func containedWitnessPrimeOutput(ctx RoleContext) (string, error) {
 		{"Inspect the current patrol step", []string{"mol", "current"}},
 		{"Close the current patrol step", []string{"mol", "step", "close"}},
 		{"Scan this rig", []string{"patrol", "scan", "--rig", ctx.Rig, "--json"}},
+		{"Report this patrol cycle", []string{"patrol", "report", "--summary", "<brief summary of observations>"}},
 		{"Check unread mail", []string{"mail", "inbox", "--unread"}},
 		{"List live agents", []string{"agents", "list"}},
 		{"List this rig's polecats", []string{"polecat", "list", ctx.Rig}},
@@ -125,7 +130,11 @@ func containedWitnessPrimeOutput(ctx RoleContext) (string, error) {
 		if err := IsBrokerSafeCommand(rootCmd, command.args); err != nil {
 			return "", fmt.Errorf("contained Witness guidance %q is unavailable: %w", strings.Join(command.args, " "), err)
 		}
-		fmt.Fprintf(&output, "- `%s %s` - %s\n", cli.Name(), strings.Join(command.args, " "), command.description)
+		renderedArgs := make([]string, len(command.args))
+		for index, arg := range command.args {
+			renderedArgs[index] = config.ShellQuote(arg)
+		}
+		fmt.Fprintf(&output, "- `%s %s` - %s\n", cli.Name(), strings.Join(renderedArgs, " "), command.description)
 	}
 	fmt.Fprintf(&output, "\nRig: %s\n", ctx.Rig)
 	return output.String(), nil

@@ -287,7 +287,7 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
 		"GT_TEST_OUTER_SENTINEL=must-not-pass",
 	}
-	got := linuxCustodyWorkloadEnvironment(source, true)
+	got := linuxCustodyWorkloadEnvironment(source)
 	joined := "\x00" + strings.Join(got, "\x00") + "\x00"
 	for _, want := range []string{
 		"PATH=/usr/bin:/bin",
@@ -299,7 +299,6 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"BD_ACTOR=testrig/witness",
 		"OPENAI_API_KEY=reviewed-secret",
 		"NODE_OPTIONS=",
-		"GT_TEST_FLOW_DIR=/fixture",
 	} {
 		if !strings.Contains(joined, "\x00"+want+"\x00") {
 			t.Fatalf("allowlisted environment missing %q: %q", want, got)
@@ -312,6 +311,7 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"LD_PRELOAD=/outer/escape.so",
 		"BASH_ENV=/outer/bash-env",
 		"PYTHONPATH=/outer/python",
+		"GT_TEST_FLOW_DIR=/fixture",
 		"GT_TEST_FLOW_PRESET_ENV=must-not-pass",
 		"GT_TEST_OUTER_SENTINEL=must-not-pass",
 	} {

@@ -816,7 +816,7 @@ var linuxCustodyAllowedEnvironment = map[string]struct{}{
 	"NODE_OPTIONS": {},
 }
 
-func linuxCustodyWorkloadEnvironment(source []string, testBinary bool) []string {
+func linuxCustodyWorkloadEnvironment(source []string) []string {
 	filtered := make([]string, 0, len(source))
 	for _, entry := range source {
 		key, value, ok := strings.Cut(entry, "=")
@@ -827,9 +827,6 @@ func linuxCustodyWorkloadEnvironment(source []string, testBinary bool) []string 
 		allowed := exact || strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "BD_") || strings.HasPrefix(key, "BEADS_")
 		if strings.HasPrefix(key, "GT_") && !strings.HasPrefix(key, "GT_INTERNAL_") && !strings.HasPrefix(key, "GT_TEST_") {
 			allowed = true
-		}
-		if testBinary && (strings.HasPrefix(key, "GT_TEST_SESSION_CUSTODY_") || strings.HasPrefix(key, "GT_TEST_FLOW_") || strings.HasPrefix(key, "GT_TEST_CONTAINED_")) {
-			allowed = key != "GT_TEST_FLOW_PRESET_ENV"
 		}
 		if key == "GT_TEST_OUTER_SENTINEL" {
 			allowed = false
@@ -846,7 +843,7 @@ func linuxCustodyWorkloadEnvironment(source []string, testBinary bool) []string 
 }
 
 func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts) error {
-	env := linuxCustodyWorkloadEnvironment(os.Environ(), strings.HasSuffix(os.Args[0], ".test"))
+	env := linuxCustodyWorkloadEnvironment(os.Environ())
 	if proxyPorts != nil {
 		env = rewriteLinuxCustodyNetworkEnvironment(env, *proxyPorts)
 	}

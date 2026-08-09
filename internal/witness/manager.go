@@ -207,21 +207,6 @@ func witnessSessionCustodyPaths(witnessDir, runtimeConfigDir, witnessSettingsDir
 		paths = appendWitnessCustodyExecutable(paths, executable, pathEnv)
 	}
 
-	// Privileged contained-flow tests use disposable executables and evidence
-	// paths outside witnessDir. Admit only their absolute test-scoped values;
-	// production runtime overrides cannot expand this allowlist.
-	if strings.HasSuffix(os.Args[0], ".test") {
-		for key, value := range envVars {
-			if (strings.HasPrefix(key, "GT_TEST_FLOW_") || key == "BD_PATH") && key != "GT_TEST_FLOW_OUTER_PATH" && filepath.IsAbs(value) {
-				info, err := os.Stat(value)
-				if err == nil && !info.IsDir() {
-					value = filepath.Dir(value)
-				}
-				paths = append(paths, value)
-			}
-		}
-	}
-
 	return tmux.EncodeSessionCustodyPaths(paths)
 }
 

@@ -52,7 +52,7 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 	gtBinary := requireContainedFlowExecutable(t, envContainedFlowGT)
 	t.Setenv("PATH", filepath.Dir(gtBinary)+string(os.PathListSeparator)+os.Getenv("PATH"))
-	requireContainedFlowExecutable(t, "BD_PATH")
+	bdPath := requireContainedFlowExecutable(t, "BD_PATH")
 	host := strings.TrimSpace(os.Getenv(envContainedFlowDoltHost))
 	if host == "" {
 		t.Fatal("GT_TEST_CONTAINED_DOLT_HOST is required")
@@ -71,8 +71,10 @@ func TestContainedWitnessFlow(t *testing.T) {
 	townRoot := t.TempDir()
 	rigName := "testrig"
 	rigPath := filepath.Join(townRoot, rigName)
-	flowDir := filepath.Join(townRoot, "flow")
-	agentPath := filepath.Join(townRoot, "contained-flow-agent")
+	witnessDir := filepath.Join(rigPath, "witness")
+	flowDir := filepath.Join(witnessDir, ".contained-flow")
+	agentPath := filepath.Join(witnessDir, ".contained-flow-agent")
+	containedGT := filepath.Join(witnessDir, ".contained-gt")
 	mayorAgentPath := filepath.Join(townRoot, "contained-flow-mayor")
 	outerSentinel := filepath.Join(t.TempDir(), "must-stay-outside-contained-root")
 	if err := os.WriteFile(outerSentinel, []byte("outer-only"), 0o600); err != nil {
@@ -95,6 +97,7 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 	t.Cleanup(func() { dropContainedFlowDatabase(t, host, port, database) })
 	oldPatrolID := createContainedFlowPatrol(t, bd, constants.MolWitnessPatrol, rigName+"/witness")
+	requireContainedFlowHTTPSHost(t)
 
 	socket := "gt-contained-flow-" + uuid.NewString()
 	t.Setenv("GT_TMUX_SOCKET", socket)
@@ -130,6 +133,12 @@ func TestContainedWitnessFlow(t *testing.T) {
 	caPath, httpsSeen := startContainedFlowHTTPS(t, flowDir, nonce)
 	non443Seen := startContainedFlowHTTP(t, nonce)
 	privateDoltIP := requireContainedFlowPrivateIP(t, host)
+	copyContainedFlowExecutable(t, gtBinary, containedGT)
+	writeContainedFlowAgent(t, agentPath, containedFlowAgentFixture{
+		GT: containedGT, BD: bdPath, MailID: incomingID, Nonce: nonce,
+		Socket: socket, CA: caPath, PrivateDoltIP: privateDoltIP,
+		OuterSentinel: outerSentinel,
+	})
 	sshListener, err := net.Listen("tcp4", "127.0.0.1:22")
 	if err != nil {
 		t.Fatalf("reserve outer loopback SSH endpoint: %v", err)
@@ -151,16 +160,7 @@ func TestContainedWitnessFlow(t *testing.T) {
 	receiptRecorded := recordContainedFlowSubmission(townRoot, mayorSession, filepath.Join(flowDir, "mayor.input"), 60*time.Second)
 	if err := mgr.Start(false, "contained-flow", []string{
 		"PATH=" + filepath.Dir(gtBinary) + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"GT_TEST_FLOW_DIR=" + flowDir,
-		"GT_TEST_FLOW_GT=" + gtBinary,
-		"GT_TEST_FLOW_MAIL_ID=" + incomingID,
-		"GT_TEST_FLOW_NONCE=" + nonce,
-		"GT_TEST_FLOW_SOCKET=" + socket,
-		"GT_TEST_FLOW_CA=" + caPath,
-		"GT_TEST_FLOW_PRIVATE_IP=" + privateDoltIP,
-		"GT_TEST_FLOW_OUTER_PATH=" + outerSentinel,
 		"GT_TEST_OUTER_SENTINEL=must-not-pass",
-		"BD_PATH=" + os.Getenv("BD_PATH"),
 	}); err != nil {
 		t.Fatalf("start contained Witness: %v", err)
 	}
@@ -189,23 +189,28 @@ func TestContainedWitnessFlow(t *testing.T) {
 		"gt mol current":                      "prime_current",
 		"gt mol step close":                   "prime_step_close",
 		"gt patrol scan --rig testrig --json": "patrol_scan",
-		"gt mail inbox --unread":              "mail_inbox",
-		"gt agents list":                      "agents",
-		"gt polecat list testrig":             "polecats",
-		"gt status --fast":                    "status",
+		"gt patrol report --summary '<brief summary of observations>'": "patrol_report",
+		"gt mail inbox --unread":  "mail_inbox",
+		"gt agents list":          "agents",
+		"gt polecat list testrig": "polecats",
+		"gt status --fast":        "status",
 	}
 	containedContext := primeOutput[strings.Index(primeOutput, "# Contained Witness Context"):]
 	segments := strings.Split(containedContext, "`")
+	advertisedCommands := make(map[string]bool, len(primeCommandResults))
 	for index := 1; index < len(segments); index += 2 {
-		resultName, ok := primeCommandResults[segments[index]]
+		command := strings.TrimSpace(strings.ReplaceAll(segments[index], "\n", ""))
+		resultName, ok := primeCommandResults[command]
 		if !ok {
-			t.Fatalf("contained prime emitted unexercised actionable command %q", segments[index])
+			t.Fatalf("contained prime emitted unexercised actionable command %q", command)
 		}
 		assertContainedFlowExit(t, results, resultName, true)
-		delete(primeCommandResults, segments[index])
+		advertisedCommands[command] = true
 	}
-	if len(primeCommandResults) != 0 {
-		t.Fatalf("contained prime omitted reviewed command evidence: %#v", primeCommandResults)
+	for command := range primeCommandResults {
+		if !advertisedCommands[command] {
+			t.Fatalf("contained prime omitted reviewed command evidence for %q", command)
+		}
 	}
 	for _, name := range []string{"prime_hook_show", "prime_current", "prime_step_close", "prime_after_close"} {
 		assertContainedFlowExit(t, results, name, true)
@@ -257,8 +262,8 @@ func TestContainedWitnessFlow(t *testing.T) {
 	}
 	for _, name := range []string{"bd_create", "bd_list"} {
 		stderr := containedFlowResultNamed(t, results, name).Stderr
-		if !strings.Contains(stderr, "127.0.0.1:1") {
-			t.Fatalf("contained direct %s did not fail against the isolated deny endpoint: %q", name, stderr)
+		if !strings.Contains(stderr, "127.0.0.1:1") && !strings.Contains(stderr, "no beads database found") {
+			t.Fatalf("contained direct %s was denied by neither the filesystem boundary nor isolated endpoint: %q", name, stderr)
 		}
 	}
 	assertContainedFlowDenial(t, results, "hidden", 1, "not requested by a trusted launcher")
@@ -614,6 +619,19 @@ func requireContainedFlowPrivateIP(t *testing.T, host string) string {
 	return ""
 }
 
+func requireContainedFlowHTTPSHost(t *testing.T) {
+	t.Helper()
+	addresses, err := net.LookupHost("contained-flow.test")
+	if err == nil {
+		for _, address := range addresses {
+			if address == "1.1.1.2" {
+				return
+			}
+		}
+	}
+	t.Fatalf("contained-flow.test must resolve to 1.1.1.2 in the disposable runner (Docker: --add-host contained-flow.test:1.1.1.2); got %v (%v)", addresses, err)
+}
+
 func startContainedFlowHTTPS(t *testing.T, flowDir, nonce string) (string, <-chan string) {
 	t.Helper()
 	now := time.Now()
@@ -900,9 +918,46 @@ func setupContainedFlowTown(t *testing.T, townRoot, rigName, rigPath, flowDir, a
 			},
 		},
 	})
+	mayorAgent := `#!/bin/sh
+umask 077
+printf '› '
+while IFS= read -r line; do
+  printf '%s\n' "$line" >>"$GT_TEST_FLOW_DIR/mayor.input"
+  printf 'received:%s\n› ' "$line"
+done
+`
+	if err := os.WriteFile(mayorAgentPath, []byte(mayorAgent), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type containedFlowAgentFixture struct {
+	GT            string
+	BD            string
+	MailID        string
+	Nonce         string
+	Socket        string
+	CA            string
+	PrivateDoltIP string
+	OuterSentinel string
+}
+
+func writeContainedFlowAgent(t *testing.T, path string, fixture containedFlowAgentFixture) {
+	t.Helper()
+	bindings := strings.Join([]string{
+		"flow_gt=" + config.ShellQuote(fixture.GT),
+		"flow_bd=" + config.ShellQuote(fixture.BD),
+		"flow_mail_id=" + config.ShellQuote(fixture.MailID),
+		"flow_nonce=" + config.ShellQuote(fixture.Nonce),
+		"flow_socket=" + config.ShellQuote(fixture.Socket),
+		"flow_ca=" + config.ShellQuote(fixture.CA),
+		"flow_private_dolt_ip=" + config.ShellQuote(fixture.PrivateDoltIP),
+		"flow_outer_sentinel=" + config.ShellQuote(fixture.OuterSentinel),
+	}, "\n")
 	agent := `#!/bin/sh
 set -u
 umask 077
+` + bindings + `
 run_flow() {
   name=$1
   shift
@@ -919,7 +974,7 @@ run_flow() {
 }
 run_flow preset_env test -z "${GT_TEST_FLOW_PRESET_ENV:-}"
 run_flow outer_env test -z "${GT_TEST_OUTER_SENTINEL:-}"
-run_flow outer_file test ! -r "$GT_TEST_FLOW_OUTER_PATH"
+run_flow outer_file test ! -r "$flow_outer_sentinel"
 run_flow device_null sh -c 'test -c /dev/null && printf ok >/dev/null'
 run_flow device_full test ! -e /dev/full
 run_flow private_pts python3 -c 'import os,sys; sys.exit(0 if sorted(os.listdir("/dev/pts")) == ["ptmx"] else 1)'
@@ -935,34 +990,34 @@ for family,socktype in ((40,socket.SOCK_STREAM),(16,socket.SOCK_RAW),(17,socket.
     value.close()
     print("socket family allowed",family,file=sys.stderr)
     sys.exit(1)'
-run_flow prime "$GT_TEST_FLOW_GT" prime --hook
-run_flow prime_hook_show "$GT_TEST_FLOW_GT" hook show
-run_flow prime_current "$GT_TEST_FLOW_GT" mol current
-run_flow prime_step_close "$GT_TEST_FLOW_GT" mol step close
-run_flow prime_after_close "$GT_TEST_FLOW_GT" mol current
-run_flow patrol_scan "$GT_TEST_FLOW_GT" patrol scan --rig testrig --json
-run_flow patrol_report "$GT_TEST_FLOW_GT" patrol report --summary "$GT_TEST_FLOW_NONCE" --steps inbox-check:OK
-run_flow mail_inbox "$GT_TEST_FLOW_GT" mail inbox --unread
-run_flow mail_read "$GT_TEST_FLOW_GT" mail read "$GT_TEST_FLOW_MAIL_ID"
-run_flow mail_send "$GT_TEST_FLOW_GT" mail send mayor/ --subject "contained outbound $GT_TEST_FLOW_NONCE" --message "contained outbound body $GT_TEST_FLOW_NONCE" --no-notify
-run_flow nudge_queue "$GT_TEST_FLOW_GT" nudge mayor "$GT_TEST_FLOW_NONCE-queued" --mode queue
-run_flow nudge_immediate "$GT_TEST_FLOW_GT" nudge mayor "$GT_TEST_FLOW_NONCE-immediate" --mode immediate
-run_flow hook "$GT_TEST_FLOW_GT" hook
-run_flow agents "$GT_TEST_FLOW_GT" agents list
-run_flow polecats "$GT_TEST_FLOW_GT" polecat list testrig
-run_flow status "$GT_TEST_FLOW_GT" status --fast
-run_flow bd_create "$BD_PATH" create --title "$GT_TEST_FLOW_NONCE bd custody" --type task
-run_flow bd_list "$BD_PATH" list --status open --json
-run_flow https curl --fail --silent --show-error --max-time 5 --cacert "$GT_TEST_FLOW_CA" "https://contained-flow.test/$GT_TEST_FLOW_NONCE"
-run_flow raw_tmux timeout 5 tmux -L "$GT_TEST_FLOW_SOCKET" list-sessions
+run_flow prime "$flow_gt" prime --hook
+run_flow prime_hook_show "$flow_gt" hook show
+run_flow prime_current "$flow_gt" mol current
+run_flow prime_step_close "$flow_gt" mol step close
+run_flow prime_after_close "$flow_gt" mol current
+run_flow patrol_scan "$flow_gt" patrol scan --rig testrig --json
+run_flow patrol_report "$flow_gt" patrol report --summary "$flow_nonce" --steps inbox-check:OK
+run_flow mail_inbox "$flow_gt" mail inbox --unread
+run_flow mail_read "$flow_gt" mail read "$flow_mail_id"
+run_flow mail_send "$flow_gt" mail send mayor/ --subject "contained outbound $flow_nonce" --message "contained outbound body $flow_nonce" --no-notify
+run_flow nudge_queue "$flow_gt" nudge mayor "$flow_nonce-queued" --mode queue
+run_flow nudge_immediate "$flow_gt" nudge mayor "$flow_nonce-immediate" --mode immediate
+run_flow hook "$flow_gt" hook
+run_flow agents "$flow_gt" agents list
+run_flow polecats "$flow_gt" polecat list testrig
+run_flow status "$flow_gt" status --fast
+run_flow bd_create "$flow_bd" create --title "$flow_nonce bd custody" --type task
+run_flow bd_list "$flow_bd" list --status open --json
+run_flow https curl --fail --silent --show-error --max-time 5 --cacert "$flow_ca" "https://contained-flow.test/$flow_nonce"
+run_flow raw_tmux timeout 5 tmux -L "$flow_socket" list-sessions
 run_flow host_loopback nc -z -w 1 127.0.0.1 22
-run_flow private_dolt nc -z -w 1 "$GT_TEST_FLOW_PRIVATE_IP" 3306
-run_flow public_non443 curl --fail --silent --show-error --max-time 3 "http://contained-flow.test/$GT_TEST_FLOW_NONCE"
-run_flow formula "$GT_TEST_FLOW_GT" formula list
-run_flow hidden "$GT_TEST_FLOW_GT" session-custody-init
-run_flow shell "$GT_TEST_FLOW_GT" shell -c true
-run_flow env_bypass env -u GT_ROLE -u GT_RIG -u GT_AGENT "$GT_TEST_FLOW_GT" shell -c true
-run_flow descriptor_bypass python3 -c 'import fcntl,os
+run_flow private_dolt nc -z -w 1 "$flow_private_dolt_ip" 3306
+run_flow public_non443 curl --fail --silent --show-error --max-time 3 "http://contained-flow.test/$flow_nonce"
+run_flow formula "$flow_gt" formula list
+run_flow hidden "$flow_gt" session-custody-init
+run_flow shell "$flow_gt" shell -c true
+run_flow env_bypass env -u GT_ROLE -u GT_RIG -u GT_AGENT "$flow_gt" shell -c true
+run_flow descriptor_bypass python3 -c 'import fcntl,os,sys
 out=[]
 for name,operation in (("close",lambda: os.close(6)),("dup2",lambda: os.dup2(0,6)),("fcntl",lambda: fcntl.fcntl(6,fcntl.F_DUPFD,10))):
     try:
@@ -972,22 +1027,31 @@ for name,operation in (("close",lambda: os.close(6)),("dup2",lambda: os.dup2(0,6
     except OSError as error:
         out.append(name+"="+error.strerror)
 os.write(2,("\n".join(out)+"\n").encode())
-os.execve(os.environ["GT_TEST_FLOW_GT"],[os.environ["GT_TEST_FLOW_GT"],"shell","-c","true"],os.environ)'
+os.execve(sys.argv[1],[sys.argv[1],"shell","-c","true"],os.environ)' "$flow_gt"
 printf '\nGT_FLOW_DONE\n'
 while :; do sleep 60; done
 `
-	if err := os.WriteFile(agentPath, []byte(agent), 0o700); err != nil {
+	if err := os.WriteFile(path, []byte(agent), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	mayorAgent := `#!/bin/sh
-umask 077
-printf '› '
-while IFS= read -r line; do
-  printf '%s\n' "$line" >>"$GT_TEST_FLOW_DIR/mayor.input"
-  printf 'received:%s\n› ' "$line"
-done
-`
-	if err := os.WriteFile(mayorAgentPath, []byte(mayorAgent), 0o700); err != nil {
+}
+
+func copyContainedFlowExecutable(t *testing.T, source, target string) {
+	t.Helper()
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
