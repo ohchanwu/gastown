@@ -135,6 +135,114 @@ func TestSessionBrokerRawUnsafeFramesNeverStartWorker(t *testing.T) {
 	}
 }
 
+func TestSessionBrokerMailReadDeniesForeignMailboxBead(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(townRoot, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	bdLog := filepath.Join(t.TempDir(), "bd.log")
+	readProofPrefix := filepath.Join(t.TempDir(), "read-label-")
+	fakeBD := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_LOG"
+if [ "$1" = "show" ] && [ "$2" = "foreign-mail" ]; then
+  printf '%s\n' '[{"id":"foreign-mail","title":"Foreign","description":"foreign private body","status":"open","priority":2,"assignee":"gastown/other","created_at":"2026-08-09T00:00:00Z","labels":["gt:message","from:mayor/","msg-type:notification"]}]'
+  exit 0
+fi
+if [ "$1" = "show" ] && [ "$2" = "foreign-hook" ]; then
+  printf '%s\n' '[{"id":"foreign-hook","title":"Hook","description":"foreign hook body","status":"hooked","priority":2,"assignee":"gastown/other","created_at":"2026-08-09T00:00:01Z","labels":["gt:hook","from:mayor/"]}]'
+  exit 0
+fi
+if [ "$1" = "label" ] && [ "$2" = "add" ] && [ "$4" = "read" ]; then
+  : > "$READ_PROOF_PREFIX$3"
+  exit 0
+fi
+printf 'unexpected bd args: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(fakeBD, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_LOG", bdLog)
+	t.Setenv("READ_PROOF_PREFIX", readProofPrefix)
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+	t.Setenv("GT_ROLE", "witness")
+	t.Setenv("GT_RIG", "gastown")
+	t.Setenv("GT_TEST_CMD_EXECUTE_HELPER", "1")
+
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientEndpoint := os.NewFile(uintptr(pair[1]), "mail-read-broker-client")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- tmux.ServeSessionBroker(ctx, os.Args[0], pair[0], func(args []string) error {
+			return IsBrokerSafeCommand(rootCmd, args)
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = clientEndpoint.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Errorf("ServeSessionBroker() cleanup error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeSessionBroker() did not stop")
+		}
+	})
+
+	nullFiles := make([]*os.File, 3)
+	for index := range nullFiles {
+		nullFiles[index], err = os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nullFiles[index].Close()
+	}
+	for _, test := range []struct {
+		id   string
+		body string
+	}{
+		{id: "foreign-mail", body: "foreign private body"},
+		{id: "foreign-hook", body: "foreign hook body"},
+	} {
+		command := exec.Command(os.Args[0], "mail", "read", test.id)
+		command.Env = os.Environ()
+		command.ExtraFiles = []*os.File{nullFiles[0], nullFiles[1], nullFiles[2], clientEndpoint}
+		output, err := command.CombinedOutput()
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+			t.Fatalf("brokered mail read %q error = %v, output = %q; want nonzero exit", test.id, err, output)
+		}
+		if strings.Contains(string(output), test.body) {
+			t.Fatalf("brokered mail read %q disclosed body: %q", test.id, output)
+		}
+		if _, err := os.Stat(readProofPrefix + test.id); !os.IsNotExist(err) {
+			t.Fatalf("brokered mail read %q added read label; stat error = %v", test.id, err)
+		}
+	}
+	logData, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"foreign-mail", "foreign-hook"} {
+		if !strings.Contains(string(logData), "show "+id+" --json") {
+			t.Fatalf("brokered mail read %q did not reach recipient-scoped lookup: %q", id, logData)
+		}
+	}
+}
+
 func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 	testDir := t.TempDir()
 	safeOutputPath := filepath.Join(testDir, "safe-output")

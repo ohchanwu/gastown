@@ -550,7 +550,36 @@ func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
 	}
 
 	// Wisp status comes from beads issue.wisp field via ToMessage()
-	return bms[0].ToMessage(), nil
+	msg := bms[0].ToMessage()
+	if !mailboxCanReadMessage(m.identity, bms[0].Labels, msg) {
+		return nil, ErrMessageNotFound
+	}
+	return msg, nil
+}
+
+func mailboxCanReadMessage(identity string, labels []string, msg *Message) bool {
+	if msg == nil || !hasExactString(labels, "gt:message") {
+		return false
+	}
+	want := AddressToIdentity(identity)
+	if AddressToIdentity(msg.To) == want {
+		return true
+	}
+	for _, cc := range msg.CC {
+		if AddressToIdentity(cc) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExactString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Mailbox) getLegacy(id string) (*Message, error) {

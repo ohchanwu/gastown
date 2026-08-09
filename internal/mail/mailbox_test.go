@@ -439,6 +439,63 @@ func TestNewMailboxWithBeadsDir(t *testing.T) {
 	}
 }
 
+func TestMailboxGetBeadsOnlyReturnsOwnedMail(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	binDir := t.TempDir()
+	fakeBD := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+if [ "$1" != "show" ]; then
+  printf 'unexpected bd args: %s\n' "$*" >&2
+  exit 1
+fi
+case "$2" in
+  direct-owned)
+    printf '%s\n' '[{"id":"direct-owned","title":"Direct","description":"direct body","status":"open","priority":2,"assignee":"gastown/synth","created_at":"2026-08-09T00:00:00Z","labels":["gt:message","from:mayor/","msg-type:notification"]}]'
+    ;;
+  cc-owned)
+    printf '%s\n' '[{"id":"cc-owned","title":"CC","description":"cc body","status":"open","priority":2,"assignee":"mayor/","created_at":"2026-08-09T00:00:01Z","labels":["gt:message","from:deacon/","cc:gastown/synth","msg-type:notification"]}]'
+    ;;
+  foreign-mail)
+    printf '%s\n' '[{"id":"foreign-mail","title":"Foreign","description":"private body","status":"open","priority":2,"assignee":"gastown/other","created_at":"2026-08-09T00:00:02Z","labels":["gt:message","from:mayor/","msg-type:notification"]}]'
+    ;;
+  owned-hook)
+    printf '%s\n' '[{"id":"owned-hook","title":"Hook","description":"work body","status":"hooked","priority":2,"assignee":"gastown/synth","created_at":"2026-08-09T00:00:03Z","labels":["gt:hook","from:mayor/"]}]'
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeBD, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mailbox := NewMailboxWithBeadsDir("gastown/synth", t.TempDir(), t.TempDir())
+	for _, test := range []struct {
+		id      string
+		wantErr error
+	}{
+		{id: "direct-owned"},
+		{id: "cc-owned"},
+		{id: "foreign-mail", wantErr: ErrMessageNotFound},
+		{id: "owned-hook", wantErr: ErrMessageNotFound},
+	} {
+		t.Run(test.id, func(t *testing.T) {
+			message, err := mailbox.Get(test.id)
+			if err != test.wantErr {
+				t.Fatalf("Get(%q) error = %v, want %v", test.id, err, test.wantErr)
+			}
+			if test.wantErr == nil && (message == nil || message.ID != test.id) {
+				t.Fatalf("Get(%q) message = %#v", test.id, message)
+			}
+		})
+	}
+}
+
 func TestMailboxListFromDirConvergesWispQueryAndFiltersStatuses(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fake bd is POSIX-only")

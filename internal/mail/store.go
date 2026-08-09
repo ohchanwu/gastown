@@ -110,7 +110,11 @@ func (m *Mailbox) storeGetFromDir(id string) (*Message, error) {
 		return nil, fmt.Errorf("store get message: %w", err)
 	}
 
-	return sdkIssueToMessage(si), nil
+	msg := sdkIssueToMessage(si)
+	if !mailboxCanReadMessage(m.identity, si.Labels, msg) {
+		return nil, ErrMessageNotFound
+	}
+	return msg, nil
 }
 
 // storeCloseInDir closes a message using the in-process store.
