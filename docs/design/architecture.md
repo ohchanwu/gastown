@@ -292,6 +292,24 @@ They fail closed when tmux state or poller ownership is unknown, retire the
 poller for both present and proven-absent sessions, and use process-aware session
 cleanup before replacing a live session.
 
+On Linux, the Witness runs behind a trusted session supervisor in private PID,
+mount, user, network, and IPC namespaces. The workload can reach the outer
+control plane only through an immutable executable descriptor and a command
+broker whose leaf commands, positional arguments, and flags are explicitly
+reviewed. Public network access is limited to validated DNS-name HTTPS CONNECT
+requests on port 443; direct tmux, host-loopback, private-network, and Dolt
+connections fail closed. The trusted init also removes capabilities, applies
+seccomp and defensive rlimits, and joins a dedicated cgroup v2 with PID, memory,
+swap, and CPU bounds before releasing the workload. Namespace or cgroup setup
+failure aborts startup rather than launching an uncontained agent.
+
+Generation-aware cleanup retains the Linux namespace init and cgroup alongside
+the exact tmux and pane-process identities. Automatic zombie replacement always
+requires that strong custody. Platforms without retained process handles may
+use a separately revalidated tmux-generation fallback only for an explicit Stop
+or cleanup of the caller's own failed start; uncertain automatic replacement
+continues to fail closed.
+
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
 deadline. Lookup uncertainty is isolated per convoy and fails closed: a convoy
