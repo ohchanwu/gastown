@@ -1083,6 +1083,12 @@ func TestLinuxSessionCustodyFinalReapCgroupRemovalUsesRemainingCallerDeadline(t 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
 	defer cancel()
+	wantDeadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("caller context lacks deadline")
+	}
+	removeCalls := 0
+	var gotDeadline time.Time
 	started := time.Now()
 	err := custody.finalizeAfterParentReleaseWithOps(
 		ctx,
@@ -1090,8 +1096,14 @@ func TestLinuxSessionCustodyFinalReapCgroupRemovalUsesRemainingCallerDeadline(t 
 			return waitForContext(ctx, 80*time.Millisecond)
 		},
 		func(ctx context.Context, path string, _ time.Duration) error {
+			removeCalls++
 			if path != "/fixture/session" {
 				t.Fatalf("remove cgroup path = %q", path)
+			}
+			var ok bool
+			gotDeadline, ok = ctx.Deadline()
+			if !ok {
+				t.Fatal("cgroup remover context lacks caller deadline")
 			}
 			<-ctx.Done()
 			return ctx.Err()
@@ -1099,6 +1111,12 @@ func TestLinuxSessionCustodyFinalReapCgroupRemovalUsesRemainingCallerDeadline(t 
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("finalize error = %v, want caller deadline", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("cgroup removal calls = %d, want exactly one", removeCalls)
+	}
+	if !gotDeadline.Equal(wantDeadline) {
+		t.Fatalf("cgroup removal deadline = %v, want caller deadline %v", gotDeadline, wantDeadline)
 	}
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("cgroup removal escaped caller deadline: %v", elapsed)

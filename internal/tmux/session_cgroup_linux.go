@@ -254,6 +254,9 @@ func restoreLinuxProcessCgroup(path string, pid int) error {
 }
 
 func clearLinuxSessionCgroupReceipt(receipt *string, remove func(string, time.Duration) error) error {
+	if receipt == nil || *receipt == "" {
+		return nil
+	}
 	if remove == nil {
 		return errors.New("session cgroup remover is unavailable")
 	}
@@ -286,6 +289,9 @@ func clearLinuxSessionCgroupReceiptWithContext(
 	if err := remove(ctx, *receipt, linuxSessionCgroupRemoveWait); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	*receipt = ""
 	return nil
 }
@@ -300,11 +306,23 @@ func removeLinuxSessionCgroup(path string, timeout time.Duration) error {
 }
 
 func removeLinuxSessionCgroupWithContext(ctx context.Context, path string, timeout time.Duration) error {
+	return removeLinuxSessionCgroupWithContextAndRemove(ctx, path, timeout, os.Remove)
+}
+
+func removeLinuxSessionCgroupWithContextAndRemove(
+	ctx context.Context,
+	path string,
+	timeout time.Duration,
+	remove func(string) error,
+) error {
 	if path == "" {
 		return nil
 	}
 	if ctx == nil {
 		return errors.New("session cgroup removal context is unavailable")
+	}
+	if remove == nil {
+		return errors.New("session cgroup removal operation is unavailable")
 	}
 	clean := filepath.Clean(path)
 	if !strings.HasPrefix(filepath.Base(clean), linuxSessionCgroupPrefix) ||
@@ -315,8 +333,23 @@ func removeLinuxSessionCgroupWithContext(ctx context.Context, path string, timeo
 	defer cancel()
 	var lastErr error
 	for {
-		err := os.Remove(clean)
+		// Context cancellation is cooperative, so it cannot be atomic with the
+		// syscall. Check at the last possible point before every destructive
+		// attempt and never begin a subsequent attempt after the caller expires.
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return errors.Join(fmt.Errorf("removing bounded session cgroup: %w", lastErr), err)
+			}
+			return err
+		}
+		err := remove(clean)
 		if err == nil || os.IsNotExist(err) {
+			// A deadline can land while the syscall is in flight. The removal
+			// itself cannot be rolled back, but do not clear custody until a
+			// subsequent bounded pass confirms success under a live context.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return nil
 		}
 		lastErr = err

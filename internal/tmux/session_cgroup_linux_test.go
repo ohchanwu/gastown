@@ -256,6 +256,13 @@ func TestClearLinuxSessionCgroupReceiptRetainsFailedRemoval(t *testing.T) {
 	}
 }
 
+func TestClearLinuxSessionCgroupReceiptEmptyReceiptRemainsNoOpWithoutRemover(t *testing.T) {
+	receipt := ""
+	if err := clearLinuxSessionCgroupReceipt(&receipt, nil); err != nil {
+		t.Fatalf("empty receipt clear = %v, want legacy no-op", err)
+	}
+}
+
 func TestClearLinuxSessionCgroupReceiptWithContextRetainsReceiptAfterDeadline(t *testing.T) {
 	receipt := "/sys/fs/cgroup/gastown-session-test"
 	ctx, cancel := context.WithCancel(context.Background())
@@ -274,6 +281,91 @@ func TestClearLinuxSessionCgroupReceiptWithContextRetainsReceiptAfterDeadline(t 
 	}
 	if removeCalls != 0 || receipt == "" {
 		t.Fatalf("expired removal = calls %d, receipt %q; want retained ownership without removal", removeCalls, receipt)
+	}
+}
+
+func TestRemoveLinuxSessionCgroupWithContextSkipsRemovalAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	removeCalls := 0
+	err := removeLinuxSessionCgroupWithContextAndRemove(
+		ctx,
+		filepath.Join(linuxCgroupMount, linuxSessionCgroupPrefix+"cancelled"),
+		linuxSessionCgroupRemoveWait,
+		func(string) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("removal error = %v, want canceled context", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removal calls = %d, want no destructive attempt after cancellation", removeCalls)
+	}
+}
+
+func TestClearLinuxSessionCgroupReceiptRetainsReceiptWhenCancellationLandsDuringRemoval(t *testing.T) {
+	receipt := "/sys/fs/cgroup/gastown-session-test"
+	ctx, cancel := context.WithCancel(context.Background())
+	removeCalls := 0
+	err := clearLinuxSessionCgroupReceiptWithContext(
+		ctx,
+		&receipt,
+		func(context.Context, string, time.Duration) error {
+			removeCalls++
+			cancel()
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("removal error = %v, want cancellation that landed during removal", err)
+	}
+	if removeCalls != 1 || receipt == "" {
+		t.Fatalf("canceled removal = calls %d, receipt %q; want retained custody", removeCalls, receipt)
+	}
+}
+
+func TestRemoveLinuxSessionCgroupWithContextReportsCancellationDuringRemoval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	removeCalls := 0
+	err := removeLinuxSessionCgroupWithContextAndRemove(
+		ctx,
+		filepath.Join(linuxCgroupMount, linuxSessionCgroupPrefix+"cancel-in-flight"),
+		linuxSessionCgroupRemoveWait,
+		func(string) error {
+			removeCalls++
+			cancel()
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("removal error = %v, want cancellation that landed during removal", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removal calls = %d, want exactly one in-flight attempt", removeCalls)
+	}
+}
+
+func TestRemoveLinuxSessionCgroupWithContextStopsRetryAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	removeCalls := 0
+	removeErr := errors.New("busy")
+	err := removeLinuxSessionCgroupWithContextAndRemove(
+		ctx,
+		filepath.Join(linuxCgroupMount, linuxSessionCgroupPrefix+"cancel-retry"),
+		linuxSessionCgroupRemoveWait,
+		func(string) error {
+			removeCalls++
+			cancel()
+			return removeErr
+		},
+	)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, removeErr) {
+		t.Fatalf("removal error = %v, want busy evidence joined with cancellation", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removal calls = %d, want no second destructive attempt after cancellation", removeCalls)
 	}
 }
 
