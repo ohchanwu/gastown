@@ -316,7 +316,10 @@ add_polecat_in_rig() {
 }
 
 run_script() {
-  bash "$SCRIPT" > "$TEST_STATE/output.log" 2>&1
+  if ! bash "$SCRIPT" > "$TEST_STATE/output.log" 2>&1; then
+    sed 's/^/  dog output: /' "$TEST_STATE/output.log" >&2
+    return 1
+  fi
 }
 
 test_healthy_runtime() {
