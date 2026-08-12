@@ -1423,7 +1423,7 @@ func (custody *linuxSessionCustody) KillBeforeParentRelease(ctx context.Context)
 }
 
 func (custody *linuxSessionCustody) FinalizeAfterParentRelease(ctx context.Context) error {
-	return custody.finalizeAfterParentReleaseWithOps(ctx, waitLinuxProcessGone, removeLinuxSessionCgroup)
+	return custody.finalizeAfterParentReleaseWithOps(ctx, waitLinuxProcessGone, removeLinuxSessionCgroupWithContext)
 }
 
 func (custody *linuxSessionCustody) ParentReleaseFinalizationPending() bool {
@@ -1438,7 +1438,7 @@ func (custody *linuxSessionCustody) killWithBudgets(
 	committed, killErr := custody.killBeforeParentReleaseWithBudgets(ctx, budgets, ops)
 	finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), budgets.Supervisor)
 	defer cancelFinalize()
-	finalizeErr := custody.finalizeAfterParentReleaseWithOps(finalizeCtx, ops.waitGone, removeLinuxSessionCgroup)
+	finalizeErr := custody.finalizeAfterParentReleaseWithOps(finalizeCtx, ops.waitGone, removeLinuxSessionCgroupWithContext)
 	return committed, errors.Join(killErr, finalizeErr)
 }
 
@@ -1512,7 +1512,7 @@ func (custody *linuxSessionCustody) killBeforeParentReleaseWithBudgets(
 func (custody *linuxSessionCustody) finalizeAfterParentReleaseWithOps(
 	ctx context.Context,
 	waitGone func(context.Context, int, string) error,
-	removeCgroup func(string, time.Duration) error,
+	removeCgroup func(context.Context, string, time.Duration) error,
 ) error {
 	if custody == nil || !custody.prepared || !custody.committed {
 		return errors.New("session PID namespace custody has not committed teardown")
@@ -1527,7 +1527,7 @@ func (custody *linuxSessionCustody) finalizeAfterParentReleaseWithOps(
 		return fmt.Errorf("verifying session supervisor reap: %w", err)
 	}
 	if custody.cgroup != "" {
-		if err := clearLinuxSessionCgroupReceipt(&custody.cgroup, removeCgroup); err != nil {
+		if err := clearLinuxSessionCgroupReceiptWithContext(ctx, &custody.cgroup, removeCgroup); err != nil {
 			return err
 		}
 	}

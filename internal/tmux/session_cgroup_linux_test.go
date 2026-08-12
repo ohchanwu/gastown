@@ -4,6 +4,7 @@ package tmux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -252,6 +253,27 @@ func TestClearLinuxSessionCgroupReceiptRetainsFailedRemoval(t *testing.T) {
 	}
 	if receipt != "" {
 		t.Fatalf("successful cgroup removal retained receipt %q", receipt)
+	}
+}
+
+func TestClearLinuxSessionCgroupReceiptWithContextRetainsReceiptAfterDeadline(t *testing.T) {
+	receipt := "/sys/fs/cgroup/gastown-session-test"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	removeCalls := 0
+	err := clearLinuxSessionCgroupReceiptWithContext(
+		ctx,
+		&receipt,
+		func(context.Context, string, time.Duration) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("removal error = %v, want canceled context", err)
+	}
+	if removeCalls != 0 || receipt == "" {
+		t.Fatalf("expired removal = calls %d, receipt %q; want retained ownership without removal", removeCalls, receipt)
 	}
 }
 

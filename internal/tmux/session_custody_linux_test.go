@@ -1035,7 +1035,7 @@ func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T
 	err := custody.finalizeAfterParentReleaseWithOps(
 		context.Background(),
 		func(context.Context, int, string) error { return reapErr },
-		func(string, time.Duration) error {
+		func(context.Context, string, time.Duration) error {
 			removeCalls++
 			return nil
 		},
@@ -1053,7 +1053,7 @@ func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T
 	if err := custody.finalizeAfterParentReleaseWithOps(
 		context.Background(),
 		func(context.Context, int, string) error { return nil },
-		func(path string, _ time.Duration) error {
+		func(_ context.Context, path string, _ time.Duration) error {
 			removeCalls++
 			if path != "/fixture/session" {
 				t.Fatalf("remove cgroup path = %q", path)
@@ -1068,6 +1068,43 @@ func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T
 	}
 	if err := custody.Close(); err != nil {
 		t.Fatalf("Close() after confirmed finalization: %v", err)
+	}
+}
+
+func TestLinuxSessionCustodyFinalReapCgroupRemovalUsesRemainingCallerDeadline(t *testing.T) {
+	custody := &linuxSessionCustody{
+		supervisorPID:      101,
+		supervisorIdentity: "supervisor",
+		supervisorFD:       -1,
+		initFD:             -1,
+		cgroup:             "/fixture/session",
+		prepared:           true,
+		committed:          true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := custody.finalizeAfterParentReleaseWithOps(
+		ctx,
+		func(ctx context.Context, _ int, _ string) error {
+			return waitForContext(ctx, 80*time.Millisecond)
+		},
+		func(ctx context.Context, path string, _ time.Duration) error {
+			if path != "/fixture/session" {
+				t.Fatalf("remove cgroup path = %q", path)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("finalize error = %v, want caller deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cgroup removal escaped caller deadline: %v", elapsed)
+	}
+	if custody.finalized || custody.cgroup != "/fixture/session" {
+		t.Fatalf("expired finalization = finalized %v, cgroup %q; want retained ownership", custody.finalized, custody.cgroup)
 	}
 }
 

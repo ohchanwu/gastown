@@ -254,13 +254,36 @@ func restoreLinuxProcessCgroup(path string, pid int) error {
 }
 
 func clearLinuxSessionCgroupReceipt(receipt *string, remove func(string, time.Duration) error) error {
+	if remove == nil {
+		return errors.New("session cgroup remover is unavailable")
+	}
+	return clearLinuxSessionCgroupReceiptWithContext(
+		context.Background(),
+		receipt,
+		func(_ context.Context, path string, timeout time.Duration) error {
+			return remove(path, timeout)
+		},
+	)
+}
+
+func clearLinuxSessionCgroupReceiptWithContext(
+	ctx context.Context,
+	receipt *string,
+	remove func(context.Context, string, time.Duration) error,
+) error {
 	if receipt == nil || *receipt == "" {
 		return nil
+	}
+	if ctx == nil {
+		return errors.New("session cgroup removal context is unavailable")
 	}
 	if remove == nil {
 		return errors.New("session cgroup remover is unavailable")
 	}
-	if err := remove(*receipt, linuxSessionCgroupRemoveWait); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := remove(ctx, *receipt, linuxSessionCgroupRemoveWait); err != nil {
 		return err
 	}
 	*receipt = ""
@@ -273,15 +296,22 @@ func fileExists(path string) bool {
 }
 
 func removeLinuxSessionCgroup(path string, timeout time.Duration) error {
+	return removeLinuxSessionCgroupWithContext(context.Background(), path, timeout)
+}
+
+func removeLinuxSessionCgroupWithContext(ctx context.Context, path string, timeout time.Duration) error {
 	if path == "" {
 		return nil
+	}
+	if ctx == nil {
+		return errors.New("session cgroup removal context is unavailable")
 	}
 	clean := filepath.Clean(path)
 	if !strings.HasPrefix(filepath.Base(clean), linuxSessionCgroupPrefix) ||
 		!strings.HasPrefix(clean, linuxCgroupMount+string(os.PathSeparator)) {
 		return errors.New("refusing to remove unrecognized session cgroup")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var lastErr error
 	for {
