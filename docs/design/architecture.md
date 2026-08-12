@@ -332,6 +332,16 @@ revalidated tmux-generation fallback only for an explicit Stop or cleanup of
 the caller's own failed start; uncertain automatic replacement continues to
 fail closed.
 
+A retained-cleanup pass has one caller-owned deadline for the entire registry,
+including each final reap and cgroup removal. It never grants a fresh timeout to
+each entry: when the caller expires, the current entry and every unprocessed
+entry remain in their original order for a later owner-safe pass. Cgroup
+removal checks the caller context before every destructive syscall and again
+after a successful syscall. Cancellation during an in-flight removal cannot
+undo the kernel operation, so the receipt remains owned until a later live,
+bounded pass confirms success. Cleanup therefore remains both time-bounded and
+truthful about custody.
+
 Global convoy checking and stranded detection use bounded worker pools, a
 per-run tracked-issue cache, deterministic output, and a 30-second command
 deadline. Lookup uncertainty is isolated per convoy and fails closed: a convoy
