@@ -1305,17 +1305,30 @@ func (t *Tmux) prepareSessionGenerationProcessCleanup(
 
 // Close releases the retained kernel process references without signaling.
 func (cleanup *SessionGenerationCleanup) Close() error {
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), sessionGenerationParentReleaseTimeout)
+	defer cancelClose()
+	return cleanup.CloseContext(closeCtx)
+}
+
+// CloseContext releases retained kernel process references within the caller's
+// operation budget. If pending parent-release finalization exhausts that budget,
+// the cleanup retains every ownership handle for a later retry.
+func (cleanup *SessionGenerationCleanup) CloseContext(ctx context.Context) error {
 	if cleanup == nil {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	var errs []error
 	if cleanup.custody != nil {
 		if parentReleaseCustody, ok := cleanup.custody.(sessionCustodyParentReleaseHandle); ok && parentReleaseCustody.ParentReleaseFinalizationPending() {
-			finalReapCtx, cancelFinalReap := context.WithTimeout(context.Background(), sessionGenerationParentReleaseTimeout)
-			if err := parentReleaseCustody.FinalizeAfterParentRelease(finalReapCtx); err != nil {
+			if err := parentReleaseCustody.FinalizeAfterParentRelease(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("retrying session containment after tmux parent release: %w", err))
+				if ctx.Err() != nil {
+					return errors.Join(errs...)
+				}
 			}
-			cancelFinalReap()
 		}
 		if err := cleanup.custody.Close(); err != nil {
 			errs = append(errs, err)
@@ -1338,6 +1351,10 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 }
 
 func (cleanup *SessionGenerationExplicitCleanup) Close() error { return nil }
+
+func (cleanup *SessionGenerationExplicitCleanup) CloseContext(ctx context.Context) error {
+	return nil
+}
 
 func (cleanup *SessionGenerationExplicitCleanup) PrepareCommit(ctx context.Context) (func(context.Context) (bool, error), error) {
 	if cleanup == nil || cleanup.tmux == nil || cleanup.identity == nil || cleanup.panePID <= 0 || cleanup.paneIdentity == "" {

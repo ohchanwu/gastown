@@ -72,6 +72,7 @@ type Manager struct {
 type sessionGenerationCleanup interface {
 	PrepareCommit(context.Context) (func(context.Context) (bool, error), error)
 	Close() error
+	CloseContext(context.Context) error
 }
 
 type sessionCleanupRegistry struct {
@@ -96,11 +97,11 @@ func sessionCleanupRegistryForRig(r *rig.Rig) *sessionCleanupRegistry {
 	return registry.(*sessionCleanupRegistry)
 }
 
-func (m *Manager) closeOrRetainCleanup(cleanup sessionGenerationCleanup) error {
+func (m *Manager) closeOrRetainCleanup(ctx context.Context, cleanup sessionGenerationCleanup) error {
 	if cleanup == nil {
 		return nil
 	}
-	if err := cleanup.Close(); err != nil {
+	if err := cleanup.CloseContext(ctx); err != nil {
 		m.cleanupRegistry.mu.Lock()
 		m.cleanupRegistry.pending = append(m.cleanupRegistry.pending, cleanup)
 		m.cleanupRegistry.mu.Unlock()
@@ -109,7 +110,7 @@ func (m *Manager) closeOrRetainCleanup(cleanup sessionGenerationCleanup) error {
 	return nil
 }
 
-func (m *Manager) retryPendingCleanups() error {
+func (m *Manager) retryPendingCleanups(ctx context.Context) error {
 	m.cleanupRegistry.mu.Lock()
 	pending := m.cleanupRegistry.pending
 	m.cleanupRegistry.pending = nil
@@ -120,10 +121,19 @@ func (m *Manager) retryPendingCleanups() error {
 
 	var errs []error
 	var failed []sessionGenerationCleanup
-	for _, cleanup := range pending {
-		if err := cleanup.Close(); err != nil {
+	for index, cleanup := range pending {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			failed = append(failed, pending[index:]...)
+			break
+		}
+		if err := cleanup.CloseContext(ctx); err != nil {
 			errs = append(errs, err)
 			failed = append(failed, cleanup)
+			if ctx.Err() != nil {
+				failed = append(failed, pending[index+1:]...)
+				break
+			}
 		}
 	}
 	if len(failed) != 0 {
@@ -301,11 +311,11 @@ func (m *Manager) teardownSessionGeneration(
 	pollerGeneration nudge.PollerGeneration,
 	requireDead bool,
 ) error {
-	if err := m.retryPendingCleanups(); err != nil {
-		return fmt.Errorf("reconciling retained session cleanup ownership: %w", err)
-	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
 	defer cancelCleanup()
+	if err := m.retryPendingCleanups(cleanupCtx); err != nil {
+		return fmt.Errorf("reconciling retained session cleanup ownership: %w", err)
+	}
 	releaseDeliveryLease, err := m.tmux.AcquireNudgeLeaseContext(cleanupCtx, townRoot, sessionID)
 	if err != nil {
 		return fmt.Errorf("acquiring session teardown delivery lease: %w", err)
@@ -317,7 +327,7 @@ func (m *Manager) teardownSessionGeneration(
 		if cleanup == nil {
 			return nil
 		}
-		err := m.closeOrRetainCleanup(cleanup)
+		err := m.closeOrRetainCleanup(cleanupCtx, cleanup)
 		cleanup = nil
 		return err
 	}
@@ -480,7 +490,10 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	t := m.tmux
 	sessionID := m.SessionName()
 	townRoot := m.townRoot()
-	if err := m.retryPendingCleanups(); err != nil {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), m.cleanupTimeout)
+	err := m.retryPendingCleanups(cleanupCtx)
+	cancelCleanup()
+	if err != nil {
 		return fmt.Errorf("reconciling retained session cleanup ownership: %w", err)
 	}
 

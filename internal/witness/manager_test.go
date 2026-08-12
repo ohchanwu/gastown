@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -136,12 +137,13 @@ func TestManagerStartForegroundDeprecated(t *testing.T) {
 }
 
 type fakeSessionCleanup struct {
-	generation tmux.SessionGeneration
-	pane       tmux.PaneProcessGeneration
-	logPath    string
-	run        func(context.Context) error
-	prepare    func(context.Context) (func(context.Context) (bool, error), error)
-	close      func() error
+	generation   tmux.SessionGeneration
+	pane         tmux.PaneProcessGeneration
+	logPath      string
+	run          func(context.Context) error
+	prepare      func(context.Context) (func(context.Context) (bool, error), error)
+	close        func() error
+	closeContext func(context.Context) error
 }
 
 func (cleanup *fakeSessionCleanup) Run(ctx context.Context) error {
@@ -190,6 +192,70 @@ func (cleanup *fakeSessionCleanup) Close() error {
 	return nil
 }
 
+func (cleanup *fakeSessionCleanup) CloseContext(ctx context.Context) error {
+	if cleanup.closeContext != nil {
+		return cleanup.closeContext(ctx)
+	}
+	return cleanup.Close()
+}
+
+func TestManagerRetryPendingCleanupsUsesOneSharedDeadline(t *testing.T) {
+	t.Parallel()
+
+	legacyCloseCalls := 0
+	contextCloseCalls := make([]int, 3)
+	cleanups := make([]sessionGenerationCleanup, 3)
+	for i := range cleanups {
+		index := i
+		cleanups[i] = &fakeSessionCleanup{
+			close: func() error {
+				legacyCloseCalls++
+				return errors.New("legacy unbounded cleanup path called")
+			},
+			closeContext: func(ctx context.Context) error {
+				contextCloseCalls[index]++
+				if index == 0 {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			},
+		}
+	}
+
+	mgr := NewManagerWithTmux(
+		&rig.Rig{Name: "testrig", Path: t.TempDir()},
+		tmux.NewTmux(),
+	)
+	mgr.cleanupTimeout = 20 * time.Millisecond
+	mgr.cleanupRegistry.pending = append(mgr.cleanupRegistry.pending, cleanups...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), mgr.cleanupTimeout)
+	defer cancel()
+	started := time.Now()
+	err := mgr.retryPendingCleanups(ctx)
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retryPendingCleanups() error = %v, want deadline exceeded", err)
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("retryPendingCleanups() elapsed = %v, want one bounded cleanup pass", elapsed)
+	}
+	if legacyCloseCalls != 0 {
+		t.Fatalf("legacy Close calls = %d, want 0", legacyCloseCalls)
+	}
+	if want := []int{1, 0, 0}; !reflect.DeepEqual(contextCloseCalls, want) {
+		t.Fatalf("context Close calls = %v, want %v", contextCloseCalls, want)
+	}
+
+	mgr.cleanupRegistry.mu.Lock()
+	retained := append([]sessionGenerationCleanup(nil), mgr.cleanupRegistry.pending...)
+	mgr.cleanupRegistry.mu.Unlock()
+	if len(retained) != len(cleanups) || !reflect.DeepEqual(retained, cleanups) {
+		t.Fatalf("retained cleanup owners = %d entries, want all %d original current and unprocessed owners in order", len(retained), len(cleanups))
+	}
+}
+
 func TestManagerRetainsCommittedCleanupOwnerAcrossManagerLifetimes(t *testing.T) {
 	closeErr := errors.New("injected committed cleanup close failure")
 	closeCalls := 0
@@ -217,7 +283,7 @@ func TestManagerRetainsCommittedCleanupOwnerAcrossManagerLifetimes(t *testing.T)
 	sharedRig := &rig.Rig{Name: "testrig", Path: t.TempDir()}
 	first := NewManagerWithTmux(sharedRig, tmux.NewTmux())
 	second := NewManagerWithTmux(sharedRig, tmux.NewTmux())
-	if err := first.closeOrRetainCleanup(cleanup); !errors.Is(err, closeErr) {
+	if err := first.closeOrRetainCleanup(context.Background(), cleanup); !errors.Is(err, closeErr) {
 		t.Fatalf("initial Close error = %v, want %v", err, closeErr)
 	}
 	first.cleanupRegistry.mu.Lock()

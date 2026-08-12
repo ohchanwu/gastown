@@ -2056,6 +2056,43 @@ func TestSessionGenerationCleanupCloseRetriesPendingParentReleaseFinalization(t 
 	}
 }
 
+func TestSessionGenerationCleanupCloseContextRetainsCustodyAfterDeadline(t *testing.T) {
+	t.Parallel()
+
+	finalizeCalls := 0
+	custody := &mockParentReleaseSessionCustody{
+		mockSessionCustody: &mockSessionCustody{},
+		beforeParentRelease: func(context.Context) (bool, error) {
+			return true, nil
+		},
+		afterParentRelease: func(ctx context.Context) error {
+			finalizeCalls++
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	if committed, err := custody.KillBeforeParentRelease(context.Background()); !committed || err != nil {
+		t.Fatalf("KillBeforeParentRelease() = %v, %v", committed, err)
+	}
+	cleanup := &SessionGenerationCleanup{custody: custody}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := cleanup.CloseContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("CloseContext() elapsed = %v, want caller-bounded final reap", elapsed)
+	}
+	if finalizeCalls != 1 {
+		t.Fatalf("final reap calls = %d, want 1", finalizeCalls)
+	}
+	if cleanup.custody == nil || !custody.ParentReleaseFinalizationPending() {
+		t.Fatal("deadline-expired final reap discarded retained custody")
+	}
+}
+
 func TestCleanupRetainedProcessesSignalsCapturedHandleAfterPIDReuse(t *testing.T) {
 	old := &mockRetainedProcess{pid: 123, parent: 1, generation: "old", alive: true}
 	err := cleanupRetainedProcesses(context.Background(), []retainedProcess{old}, func(context.Context, time.Duration) error { return nil })
