@@ -134,6 +134,7 @@ func NewTownSettings() *TownSettings {
 		DefaultAgent: "claude",
 		Agents:       make(map[string]*RuntimeConfig),
 		RoleAgents:   make(map[string]string),
+		Convoy:       DefaultConvoyConfig(),
 	}
 }
 
@@ -509,8 +510,14 @@ func DefaultOperationalConfig() *OperationalConfig {
 // ConvoyConfig configures convoy behavior settings.
 type ConvoyConfig struct {
 	// NotifyOnComplete controls whether convoy completion pushes a notification
-	// into the active Mayor session (in addition to mail). Opt-in; default false.
+	// into the active Mayor session (in addition to mail). Default true; set false
+	// explicitly to keep completion mail durable but silent.
 	NotifyOnComplete bool `json:"notify_on_complete,omitempty"`
+}
+
+// DefaultConvoyConfig returns convoy behavior defaults for new and legacy towns.
+func DefaultConvoyConfig() *ConvoyConfig {
+	return &ConvoyConfig{NotifyOnComplete: true}
 }
 
 // PolecatConfig configures per-polecat behavior. Added for hq-x0v7v

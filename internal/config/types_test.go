@@ -295,7 +295,8 @@ func TestTownSettings_WithoutNewFields_LoadsDefaults(t *testing.T) {
 		t.Fatalf("LoadOrCreateTownSettings: %v", err)
 	}
 
-	// All new fields should be nil (omitempty means absent in JSON → nil pointer)
+	// Optional tuning fields stay nil, while the legacy-absent convoy block picks
+	// up the safe completion-wake default.
 	if ts.WebTimeouts != nil {
 		t.Errorf("WebTimeouts should be nil for legacy config, got %+v", ts.WebTimeouts)
 	}
@@ -304,6 +305,9 @@ func TestTownSettings_WithoutNewFields_LoadsDefaults(t *testing.T) {
 	}
 	if ts.FeedCurator != nil {
 		t.Errorf("FeedCurator should be nil for legacy config, got %+v", ts.FeedCurator)
+	}
+	if ts.Convoy == nil || !ts.Convoy.NotifyOnComplete {
+		t.Errorf("Convoy completion notification should default on for legacy config, got %+v", ts.Convoy)
 	}
 
 	// Existing fields should still load correctly
@@ -468,7 +472,7 @@ func TestTownSettings_MissingFile_ReturnsDefaults(t *testing.T) {
 	if ts.Version != CurrentTownSettingsVersion {
 		t.Errorf("Version = %d, want %d", ts.Version, CurrentTownSettingsVersion)
 	}
-	// New config sections should be nil (NewTownSettings doesn't set them)
+	// Optional tuning sections stay nil; convoy completion wakes default on.
 	if ts.WebTimeouts != nil {
 		t.Errorf("WebTimeouts should be nil for defaults")
 	}
@@ -477,6 +481,30 @@ func TestTownSettings_MissingFile_ReturnsDefaults(t *testing.T) {
 	}
 	if ts.FeedCurator != nil {
 		t.Errorf("FeedCurator should be nil for defaults")
+	}
+	if ts.Convoy == nil || !ts.Convoy.NotifyOnComplete {
+		t.Errorf("Convoy completion notification should default on, got %+v", ts.Convoy)
+	}
+}
+
+func TestTownSettings_ExplicitlyDisablesConvoyCompletionNotification(t *testing.T) {
+	t.Parallel()
+	settingsPath := filepath.Join(t.TempDir(), "config.json")
+	settingsJSON := `{
+		"type": "town-settings",
+		"version": 1,
+		"convoy": {"notify_on_complete": false}
+	}`
+	if err := os.WriteFile(settingsPath, []byte(settingsJSON), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ts, err := LoadOrCreateTownSettings(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadOrCreateTownSettings: %v", err)
+	}
+	if ts.Convoy == nil || ts.Convoy.NotifyOnComplete {
+		t.Errorf("explicit convoy notification opt-out was not preserved: %+v", ts.Convoy)
 	}
 }
 

@@ -166,6 +166,19 @@ gt convoy create "Feature X" gt-abc --notify gastown/joe
 gt convoy create "Feature X" gt-abc --notify mayor/ --notify --human
 ```
 
+Gas Town also stores a durable completion message for the Mayor and, by default,
+sends a nudge so an idle Mayor session can resume dependent work. Towns with a
+legacy settings file inherit this wake behavior. To keep the durable message but
+silence the session nudge, opt out explicitly in `settings/config.json`:
+
+```json
+{
+  "convoy": {
+    "notify_on_complete": false
+  }
+}
+```
+
 Notification content:
 ```
 🚚 Convoy Landed: Deploy v2.0 (hq-cv-abc)

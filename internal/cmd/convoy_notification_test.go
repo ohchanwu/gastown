@@ -104,7 +104,6 @@ exit 0
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("GT_ROLE", "overseer")
 	settings := config.NewTownSettings()
-	settings.Convoy = &config.ConvoyConfig{NotifyOnComplete: true}
 	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
 		t.Fatalf("save town settings: %v", err)
 	}

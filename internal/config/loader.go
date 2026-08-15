@@ -1084,6 +1084,11 @@ func LoadOrCreateTownSettings(path string) (*TownSettings, error) {
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return nil, err
 	}
+	// Legacy settings predate the convoy block. Treat absence as the safe default
+	// while preserving an explicit notify_on_complete: false opt-out.
+	if settings.Convoy == nil {
+		settings.Convoy = DefaultConvoyConfig()
+	}
 	return &settings, nil
 }
 
