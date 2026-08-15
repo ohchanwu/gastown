@@ -16,6 +16,12 @@ A comprehensive catalog of all cleanup-related commands in the gastown/beads eco
 
 ## Polecat (Agent Sandbox) Cleanup
 
+> **Known control-plane hazards:** stale agent identity state can prevent safe
+> recovery reconciliation, and `gt polecat nuke` currently performs an
+> implicit best-effort push that its dry run does not preview. Read
+> [Polecat cleanup control-plane defects](operations/agents/260816-polecat-cleanup-control-plane-defects.md)
+> before retiring recovered polecats or operating under a no-push policy.
+
 | Command | What it does |
 |---------|-------------|
 | `gt polecat remove <rig>/<polecat>` | Removes polecat worktree/directory (fails if session running) |
