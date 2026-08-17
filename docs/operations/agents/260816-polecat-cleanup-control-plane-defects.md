@@ -1,11 +1,12 @@
-# Polecat cleanup control-plane defects
+# Lifecycle cleanup control-plane defects
 
-Status: open
+Status: repair candidate implemented; independent exact-SHA review pending
 
-This note records two control-plane defects observed during narrow polecat
-recovery on 2026-08-16. Both affect whether routine cleanup can preserve exact
-custody and publication policy. Until they are repaired, treat the workarounds
-below as operational requirements.
+This note records three control-plane defects observed during narrow agent
+recovery on 2026-08-16 and 2026-08-17. They affect whether routine cleanup can
+preserve exact custody, publication policy, and truthful work/runtime state.
+The source candidate implements the repairs described below, but an installed
+binary that predates its acceptance still requires the operator workarounds.
 
 ## 1. Stale identity state can deadlock safe recovery
 
@@ -68,6 +69,16 @@ identity records until a narrow repair exists.
 - Tests reproduce `agent_state=stuck` plus stale `cleanup_status` with safe live
   predicates, as well as generation replacement during reconciliation.
 
+### Candidate repair
+
+`check-recovery --reconcile-cleanup` now immediately rechecks the polecat
+identity, tmux absence, hook ownership, terminal work, active merge request,
+worktree state, stash state, branch identity, and patch preservation. It then
+uses `CompareAndUpdateAgentDescriptionFields` to change `agent_state` and
+`cleanup_status` together only if the expected agent-bead fields are unchanged.
+Any evidence error or compare-and-set mismatch returns a stable
+`NEEDS_RECOVERY` result and leaves the durable record conservative.
+
 ## 2. `gt polecat nuke` can push implicitly
 
 ### Symptom
@@ -108,10 +119,72 @@ leave an unwanted remote branch that requires separate authorization to delete.
 - Tests prove that ordinary `nuke` cannot create or update a remote ref and that
   push rejection does not weaken local custody checks.
 
+### Candidate repair
+
+Ordinary `gt polecat nuke` no longer calls either the direct push helper or the
+manager's historical push-before-remove path. Preservation is proved against
+the polecat's named branch rather than whichever branch happens to be checked
+out. Dynamic bare-origin tests reject any attempted receive and prove both that
+the remote ref set is unchanged and that local custody gates still apply.
+
+## 3. Dog closeout can target a reusable session name
+
+### Symptom
+
+`gt dog done` and `gt dog done <name>` could fail before reaching their dog
+handler with `gt done is for polecats only (BD_ACTOR=dog)`. When closeout did
+run, it cleared work first and scheduled a delayed kill of `hq-dog-<name>`.
+That name could identify a replacement generation by the time the delayed kill
+executed. Status separately probed the reusable name and did not report whether
+the running session was the generation that owned the durable dog work.
+
+### Cause
+
+The root persistent pre-run guard classified a command by the leaf name
+`done`, so nested `gt dog done` inherited the top-level polecat publication
+guard. Dog state also persisted work and start time but not an exact tmux
+generation. Closeout therefore had no durable tuple with which to compare the
+tmux session ID, random nonce, tmux-server process identity, and optional
+containment custody before mutation or teardown.
+
+### Consequence
+
+The routing collision makes ordinary dog completion unusable. The missing
+generation record creates a more serious custody ambiguity: a stale completion
+can mark newer work idle or kill a replacement session, while a failed delayed
+kill can leave durable work state and runtime state disagreeing.
+
+### Required operator behavior
+
+- On an installed binary that still rejects dog actors, do not reinterpret the
+  error as successful closeout. Preserve the live session and escalate for a
+  narrow dog-specific recovery.
+- Do not kill `hq-dog-<name>` from its name alone when a replacement may have
+  started.
+- Treat a live legacy dog with no persisted generation as unknown custody. A
+  proven-absent legacy session may be reconciled idempotently.
+
+### Candidate repair
+
+- The root guard recognizes only top-level `gt done`; nested `gt dog done`
+  reaches the dog lifecycle handler.
+- Dog state stores an optional, JSON-compatible `session_generation` record.
+  Session start captures and persists the exact tmux generation; a persistence
+  failure tears down only that captured generation.
+- Closeout compare-and-sets the expected work, start time, and session
+  generation before calling exact-generation teardown, then compare-clears the
+  generation record. Substitution and unknown tmux state fail closed.
+- Human and JSON status report work state separately from `running`, `absent`,
+  `stale`, or `unknown` session state. Existing JSON consumers retain the old
+  dog fields while the new diagnostics are additive.
+- Real Cobra subprocess tests cover both dog completion entry points and use
+  dedicated tmux sockets to prove the installed routing shape.
+
 ## Relationship between the defects
 
-These defects pull in opposite unsafe directions. The stale identity deadlock
-prevents a provably clean polecat from retiring, while implicit push makes a
-successful retirement broader than the operator authorized. A complete repair
-must preserve the conservative recovery gate without coupling local cleanup to
-remote publication.
+These defects pull in different unsafe directions. The stale identity deadlock
+prevents a provably clean polecat from retiring, implicit push makes a
+successful retirement broader than the operator authorized, and name-based dog
+closeout can mutate the wrong generation. A complete repair must keep recovery
+conservative, keep local cleanup separate from publication, and bind runtime
+teardown to the exact durable owner.

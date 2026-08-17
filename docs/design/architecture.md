@@ -292,6 +292,26 @@ They fail closed when tmux state or poller ownership is unknown, retire the
 poller for both present and proven-absent sessions, and use process-aware session
 cleanup before replacing a live session.
 
+Polecat recovery keeps durable identity repair separate from ordinary state
+updates. After proving a stopped session, safe hook, terminal work, no pending
+merge request, clean Git state, the named branch, and preserved patches,
+`check-recovery --reconcile-cleanup` repeats those observations and
+compare-and-sets `agent_state=idle` with `cleanup_status=clean`. A changed
+identity or agent field remains `NEEDS_RECOVERY`; the command never retries
+against the replacement state. `gt polecat nuke` is strictly local: it verifies
+the named branch but neither its direct command path nor its manager removal
+path publishes a ref.
+
+Dogs persist an optional exact tmux session-generation record alongside work
+state. Starting a dog captures the created session generation and records it
+before claiming successful runtime custody. Completion compare-and-sets the
+expected work, start time, and generation, tears down only that exact session,
+and compare-clears the record. A live legacy session without a record, a tmux
+lookup error, or generation substitution fails closed. Dog status exposes work
+state independently from `running`, `absent`, `stale`, or `unknown` runtime
+state, and nested `gt dog done` is routed separately from the top-level polecat
+`gt done` publication workflow.
+
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
 mount, user, network, and IPC namespaces. Host mounts are read-only; the only
 writable areas are private, size- and inode-bounded scratch and shared-memory
