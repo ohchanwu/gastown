@@ -147,6 +147,47 @@ func TestCleanupFailedSessionGenerationPreservesSameNameReplacement(t *testing.T
 	}
 }
 
+func TestProcessCleanupGenerationChangeRequiresTmuxReplacement(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-process-change-classification"
+	_ = tm.KillSession(session)
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+
+	original, err := tm.NewSessionWithCommandAndEnvGeneration(session, t.TempDir(), "sleep 10", nil)
+	if err != nil {
+		t.Fatalf("create original generation: %v", err)
+	}
+	for _, cleanupErr := range []error{ErrSessionGenerationChanged, ErrSessionNotFound, ErrNoServer} {
+		terminal, classifiedErr := tm.classifyProcessCleanupResult(
+			context.Background(),
+			original,
+			cleanupErr,
+		)
+		if terminal || !errors.Is(classifiedErr, cleanupErr) {
+			t.Fatalf("live exact generation with %v classified terminal=%v err=%v", cleanupErr, terminal, classifiedErr)
+		}
+	}
+
+	if err := tm.KillSessionGeneration(original); err != nil {
+		t.Fatalf("retire original generation: %v", err)
+	}
+	replacement, err := tm.NewSessionWithCommandAndEnvGeneration(session, t.TempDir(), "sleep 10", nil)
+	if err != nil {
+		t.Fatalf("create replacement generation: %v", err)
+	}
+	if replacement.Equal(original) {
+		t.Fatal("replacement unexpectedly reused original generation")
+	}
+	terminal, classifiedErr := tm.classifyProcessCleanupResult(
+		context.Background(),
+		original,
+		ErrSessionGenerationChanged,
+	)
+	if !terminal || !errors.Is(classifiedErr, ErrSessionGenerationChanged) {
+		t.Fatalf("replacement classified terminal=%v err=%v", terminal, classifiedErr)
+	}
+}
+
 func TestNewSessionWithCommandAndEnvContext_EntersWorkDirWhenServerCWDIsUnlinked(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unlinking a process working directory is a Unix-specific regression")
@@ -214,13 +255,13 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansCreatedSession(t *
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("creation error = %v, want context deadline exceeded", err)
 	}
-	// The caller deadline, exec.Cmd WaitDelay, and bounded cleanup all remain
-	// sub-second, but starting the tmux and ps helper processes can occasionally
-	// exceed 300ms under host scheduler pressure. Keep the regression ceiling
-	// well below the former multi-second graceful-wait path without making the
-	// assertion depend on sub-300ms process scheduling.
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("cancellation took %v, want <= 1s", elapsed)
+	// Exact process-aware cleanup owns an independent bounded budget after the
+	// caller expires. This may include the normal graceful process-exit period,
+	// so assert the cleanup budget plus scheduler allowance rather than the old
+	// name-only sub-second teardown contract.
+	maxElapsed := failedSessionCreationCleanupTimeout + time.Second
+	if elapsed := time.Since(started); elapsed > maxElapsed {
+		t.Fatalf("cancellation took %v, want <= %v", elapsed, maxElapsed)
 	}
 	if running, err := tm.HasSession(session); err != nil || running {
 		t.Fatalf("cancelled creation left session behind: running=%v err=%v", running, err)

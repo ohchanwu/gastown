@@ -344,7 +344,7 @@ case "$*" in
         ;;
     esac
     : "${nonce:=fixture-generation-original}"
-    printf '%s\t$1\t%s\n' "$FAKE_TMUX_SERVER_PID" "$nonce"
+    printf '%s\t$1\t%s\t\t19\n' "$FAKE_TMUX_SERVER_PID" "$nonce"
     exit 0
     ;;
 esac

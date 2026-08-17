@@ -562,6 +562,37 @@ func sessionGenerationCleanupTerminal(err error) bool {
 		errors.Is(err, ErrSessionGenerationChanged)
 }
 
+// classifyProcessCleanupResult distinguishes tmux generation substitution from
+// pane-process churn inside the same live generation. Process custody helpers
+// use ErrSessionGenerationChanged for both cases, but only the former proves
+// that the attempt-owned generation is terminal and must be preserved.
+func (t *Tmux) classifyProcessCleanupResult(
+	ctx context.Context,
+	generation SessionGeneration,
+	cleanupErr error,
+) (bool, error) {
+	switch {
+	case cleanupErr == nil:
+		return true, nil
+	case !errors.Is(cleanupErr, ErrSessionNotFound) &&
+		!errors.Is(cleanupErr, ErrNoServer) &&
+		!errors.Is(cleanupErr, ErrSessionGenerationChanged):
+		return false, cleanupErr
+	}
+
+	current, err := t.captureSessionGenerationContext(ctx, generation.Name)
+	switch {
+	case errors.Is(err, ErrSessionNotFound), errors.Is(err, ErrNoServer):
+		return true, nil
+	case err != nil:
+		return false, errors.Join(cleanupErr, fmt.Errorf("confirming tmux generation after process custody change: %w", err))
+	case !current.Equal(generation):
+		return true, ErrSessionGenerationChanged
+	default:
+		return false, cleanupErr
+	}
+}
+
 // CleanupFailedSessionGeneration performs bounded process-aware teardown of a
 // generation created by a startup attempt. Any uncertainty is reported with
 // ErrSessionCleanupUnreconciled so callers retain durable ownership instead of
@@ -582,7 +613,8 @@ func (t *Tmux) CleanupFailedSessionGeneration(generation SessionGeneration) erro
 // the caller so a surrounding lifecycle transaction can preserve a replacement.
 func (t *Tmux) KillSessionGenerationWithProcessesPortableContext(ctx context.Context, generation SessionGeneration) error {
 	processErr := t.KillSessionGenerationWithProcessesContext(ctx, generation)
-	if sessionGenerationCleanupTerminal(processErr) {
+	processTerminal, processErr := t.classifyProcessCleanupResult(ctx, generation, processErr)
+	if processTerminal {
 		return processErr
 	}
 	// Deliberate failed-start rollback may use the weaker explicit path on a
@@ -590,7 +622,8 @@ func (t *Tmux) KillSessionGenerationWithProcessesPortableContext(ctx context.Con
 	// signal to the exact tmux generation and process-start identity. Automatic
 	// zombie replacement must never use this fallback.
 	explicitErr := t.killSessionGenerationExplicitWithProcessesContext(ctx, generation)
-	if sessionGenerationCleanupTerminal(explicitErr) {
+	explicitTerminal, explicitErr := t.classifyProcessCleanupResult(ctx, generation, explicitErr)
+	if explicitTerminal {
 		return explicitErr
 	}
 	fallbackErr := t.KillSessionGeneration(generation)
