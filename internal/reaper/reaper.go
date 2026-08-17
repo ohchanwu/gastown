@@ -367,14 +367,18 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	// Count stale issue candidates.
 	// Same caveat: issues/dependencies tables may live on a separate Dolt instance.
-	// Convoys excluded to mirror AutoClose (hq-jnap): convoy lifecycle is
-	// tracked-bead-status driven, never staleness driven.
+	// Convoys and control-plane identities are excluded to mirror AutoClose:
+	// neither tracked work nor reusable agent records are staleness-owned.
 	staleQuery := `
 		SELECT COUNT(*) FROM issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
-		AND i.issue_type NOT IN ('epic', 'convoy')
+		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
+		AND i.id NOT IN (
+			SELECT DISTINCT l.issue_id FROM labels l
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
+		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
 			INNER JOIN issues dep ON d.depends_on_issue_id = dep.id
@@ -745,8 +749,8 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 }
 
 // AutoClose closes issues that have been open with no updates past staleAge.
-// Excludes P0/P1 priority, epics, hooked/pinned issues, standing-order labels,
-// and issues with active dependencies.
+// Excludes P0/P1 priority, epics, convoys, control-plane identity records,
+// standing-order labels, and issues with active dependencies.
 func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
@@ -760,14 +764,16 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	// below do NOT protect a convoy with open tracked issues. Stale-closing a
 	// convoy while its tracked beads are open orphans them from dispatch
 	// tracking and causes duplicate dispatches (hq-qouv/hq-shb1 incident).
+	// Agent records are equally lifecycle-owned: closing a gt:agent identity
+	// makes exact role resolution fail even when its session is healthy.
 	whereClause := fmt.Sprintf(`
 		i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
-		AND i.issue_type NOT IN ('epic', 'convoy')
+		AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d

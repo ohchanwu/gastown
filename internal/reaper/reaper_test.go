@@ -463,13 +463,15 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	}
 }
 
-func TestAutoCloseExcludesConvoyLabel(t *testing.T) {
+func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		issues: map[string]*fakeIssue{
 			"stale-task":         {id: "stale-task", title: "Stale task", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
 			"labeled-convoy":     {id: "labeled-convoy", title: "Tracked by convoy", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:convoy"}},
 			"typed-convoy":       {id: "typed-convoy", title: "Convoy", status: "open", issueType: "convoy", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"typed-agent":        {id: "typed-agent", title: "Agent", status: "open", issueType: "agent", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"protected-agent":    {id: "protected-agent", title: "Refinery identity", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:agent"}},
 			"protected-standing": {id: "protected-standing", title: "Standing order", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:standing-orders"}},
 			"protected-keep":     {id: "protected-keep", title: "Keep", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:keep"}},
 			"protected-role":     {id: "protected-role", title: "Role", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour), labels: []string{"gt:role"}},
@@ -594,7 +596,9 @@ type fakeReaperState struct {
 func (s *fakeReaperState) autoCloseCandidatesLocked(query string, cutoff time.Time) []*fakeIssue {
 	var candidates []*fakeIssue
 	for _, issue := range s.issues {
-		if (issue.status != "open" && issue.status != "in_progress") || !issue.updatedAt.Before(cutoff) || issue.issueType == "epic" || issue.issueType == "convoy" {
+		if (issue.status != "open" && issue.status != "in_progress") || !issue.updatedAt.Before(cutoff) ||
+			issue.issueType == "epic" || issue.issueType == "convoy" ||
+			(issue.issueType == "agent" && strings.Contains(query, "'agent'")) {
 			continue
 		}
 		protected := false
