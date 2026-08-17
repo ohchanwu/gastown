@@ -89,6 +89,10 @@ type Daemon struct {
 	// Boot spawn cooldown: prevents Boot from spawning on every heartbeat tick.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	bootLastSpawned time.Time
+	// bootSpawner is a logical spawn seam for daemon tests. Production uses
+	// Boot.Spawn; tests must not infer logical spawns from tmux's internal
+	// generation-receipt commands.
+	bootSpawner func(*boot.Boot) error
 
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
@@ -1384,7 +1388,11 @@ func (d *Daemon) ensureBootRunning() {
 
 	// Spawn Boot in a fresh tmux session
 	d.logger.Println("Spawning Boot for triage...")
-	if err := b.Spawn(""); err != nil {
+	spawnBoot := d.bootSpawner
+	if spawnBoot == nil {
+		spawnBoot = func(candidate *boot.Boot) error { return candidate.Spawn("") }
+	}
+	if err := spawnBoot(b); err != nil {
 		d.logger.Printf("Error spawning Boot: %v, falling back to direct Deacon check", err)
 		// Fallback: ensure Deacon is running directly
 		d.ensureDeaconRunning()

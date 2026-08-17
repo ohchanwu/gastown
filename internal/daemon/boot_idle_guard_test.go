@@ -6,13 +6,12 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/boot"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -111,7 +110,7 @@ func TestHasActiveWork(t *testing.T) {
 		{
 			name: "active work in second store only",
 			stores: map[string]beadsdk.Storage{
-				"hq":  &searchStorage{results: map[string][]*beadsdk.Issue{}},
+				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
 				"rig": &searchStorage{results: map[string][]*beadsdk.Issue{
 					"in_progress": {{ID: "nw-xyz"}},
 				}},
@@ -203,14 +202,9 @@ func TestEnsureBootRunning_IdleGuard(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			townRoot := t.TempDir()
 			fakeBinDir := t.TempDir()
-			tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
-			if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {
-				t.Fatalf("create tmux log: %v", err)
-			}
 
 			writeFakeTmux(t, fakeBinDir) // reuse helper from boot_spawn_frequency_test.go
 			t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv("TMUX_LOG", tmuxLog)
 			t.Setenv("GT_DEGRADED", "false")
 
 			if tc.heartbeatAge > 0 {
@@ -218,19 +212,13 @@ func TestEnsureBootRunning_IdleGuard(t *testing.T) {
 			}
 
 			d := newTestDaemonWithStores(t, townRoot, tc.stores)
+			spawns := 0
+			d.bootSpawner = func(*boot.Boot) error {
+				spawns++
+				return nil
+			}
 			d.ensureBootRunning()
 
-			data, err := os.ReadFile(tmuxLog)
-			if err != nil {
-				t.Fatalf("read tmux log: %v", err)
-			}
-
-			spawns := 0
-			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-				if strings.HasPrefix(line, "new-session ") {
-					spawns++
-				}
-			}
 			if spawns != tc.wantSpawns {
 				t.Errorf("%s\ngot %d spawn(s), want %d", tc.desc, spawns, tc.wantSpawns)
 			}

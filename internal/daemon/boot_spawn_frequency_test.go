@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -67,39 +66,27 @@ func TestEnsureBootRunning_DoesNotSpawnEveryTick(t *testing.T) {
 	}
 	townRoot := t.TempDir()
 	fakeBinDir := t.TempDir()
-	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
-	if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {
-		t.Fatalf("create tmux log: %v", err)
-	}
 
 	writeFakeTmux(t, fakeBinDir)
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("TMUX_LOG", tmuxLog)
 	t.Setenv("GT_DEGRADED", "false")
 
+	spawns := 0
 	d := &Daemon{
 		config: &Config{TownRoot: townRoot},
 		logger: log.New(io.Discard, "", 0),
 		tmux:   tmux.NewTmux(),
+		bootSpawner: func(*boot.Boot) error {
+			spawns++
+			return nil
+		},
 	}
 
 	// Simulate two adjacent heartbeats.
 	d.ensureBootRunning()
 	d.ensureBootRunning()
 
-	data, err := os.ReadFile(tmuxLog)
-	if err != nil {
-		t.Fatalf("read tmux log: %v", err)
-	}
-
 	// Desired behavior (cooldown): single spawn in this short interval.
-	// Current behavior: two spawns (fails here).
-	spawns := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if strings.HasPrefix(line, "new-session ") {
-			spawns++
-		}
-	}
 	if spawns != 1 {
 		t.Fatalf("boot spawn count = %d, want 1 (avoid spawning every daemon tick)", spawns)
 	}
@@ -113,14 +100,9 @@ func TestEnsureBootRunning_SuppressesWhenDeaconHealthy(t *testing.T) {
 	}
 	townRoot := t.TempDir()
 	fakeBinDir := t.TempDir()
-	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
-	if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {
-		t.Fatalf("create tmux log: %v", err)
-	}
 
 	writeFakeTmux(t, fakeBinDir)
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("TMUX_LOG", tmuxLog)
 	t.Setenv("GT_DEGRADED", "false")
 
 	// Write a boot-status.json indicating deacon was healthy ("nothing") recently.
@@ -133,27 +115,21 @@ func TestEnsureBootRunning_SuppressesWhenDeaconHealthy(t *testing.T) {
 		t.Fatalf("save boot status: %v", err)
 	}
 
+	spawns := 0
 	d := &Daemon{
 		config: &Config{TownRoot: townRoot},
 		logger: log.New(io.Discard, "", 0),
 		tmux:   tmux.NewTmux(),
+		bootSpawner: func(*boot.Boot) error {
+			spawns++
+			return nil
+		},
 	}
 
 	// Even though cooldown has expired (bootLastSpawned is zero),
 	// idle suppression should prevent spawning.
 	d.ensureBootRunning()
 
-	data, err := os.ReadFile(tmuxLog)
-	if err != nil {
-		t.Fatalf("read tmux log: %v", err)
-	}
-
-	spawns := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if strings.HasPrefix(line, "new-session ") {
-			spawns++
-		}
-	}
 	if spawns != 0 {
 		t.Fatalf("boot spawn count = %d, want 0 (should suppress when deacon healthy)", spawns)
 	}
@@ -166,14 +142,9 @@ func TestEnsureBootRunning_SpawnsWhenDeaconUnhealthy(t *testing.T) {
 	}
 	townRoot := t.TempDir()
 	fakeBinDir := t.TempDir()
-	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
-	if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {
-		t.Fatalf("create tmux log: %v", err)
-	}
 
 	writeFakeTmux(t, fakeBinDir)
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("TMUX_LOG", tmuxLog)
 	t.Setenv("GT_DEGRADED", "false")
 
 	// Write a boot-status.json indicating Boot had to wake deacon recently.
@@ -187,26 +158,20 @@ func TestEnsureBootRunning_SpawnsWhenDeaconUnhealthy(t *testing.T) {
 		t.Fatalf("save boot status: %v", err)
 	}
 
+	spawns := 0
 	d := &Daemon{
 		config: &Config{TownRoot: townRoot},
 		logger: log.New(io.Discard, "", 0),
 		tmux:   tmux.NewTmux(),
+		bootSpawner: func(*boot.Boot) error {
+			spawns++
+			return nil
+		},
 	}
 
 	// When last action was "wake" (not "nothing"), Boot should still spawn.
 	d.ensureBootRunning()
 
-	data, err := os.ReadFile(tmuxLog)
-	if err != nil {
-		t.Fatalf("read tmux log: %v", err)
-	}
-
-	spawns := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if strings.HasPrefix(line, "new-session ") {
-			spawns++
-		}
-	}
 	if spawns != 1 {
 		t.Fatalf("boot spawn count = %d, want 1 (should spawn when deacon was unhealthy)", spawns)
 	}
