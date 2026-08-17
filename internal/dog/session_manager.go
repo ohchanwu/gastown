@@ -221,7 +221,6 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 
 // Stop terminates a dog session.
 func (m *SessionManager) Stop(dogName string, force bool) error {
-	sessionID := m.SessionName(dogName)
 	if m.mgr == nil {
 		return errors.New("dog session generation store is unavailable")
 	}
@@ -229,6 +228,20 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 	if err != nil {
 		return fmt.Errorf("reading dog state before stop: %w", err)
 	}
+	return m.StopIfMatches(snapshot, force)
+}
+
+// StopIfMatches stops only the exact durable dog snapshot supplied by the
+// caller. Daemon patrols must use this form because a reusable dog name may be
+// reassigned between their List snapshot and cleanup attempt.
+func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
+	if m.mgr == nil {
+		return errors.New("dog session generation store is unavailable")
+	}
+	if snapshot == nil || snapshot.Name == "" {
+		return errors.New("dog stop snapshot is unavailable")
+	}
+	sessionID := m.SessionName(snapshot.Name)
 	current, captureErr := m.captureSessionGeneration(sessionID)
 
 	if snapshot.SessionGeneration == nil {
@@ -241,7 +254,7 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 		if snapshot.State == StateIdle && snapshot.Work == "" {
 			return ErrSessionNotFound
 		}
-		cleared, err := m.mgr.ClearWorkIfMatches(dogName, snapshot.Work, snapshot.WorkStartedAt)
+		cleared, err := m.mgr.ClearWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt)
 		if err != nil {
 			return fmt.Errorf("clearing work after proven session absence: %w", err)
 		}
@@ -267,12 +280,15 @@ func (m *SessionManager) Stop(dogName string, force bool) error {
 		return fmt.Errorf("checking exact dog session: %w", captureErr)
 	}
 
-	var stopped bool
+	var (
+		stopped bool
+		err     error
+	)
 	if snapshot.State == StateIdle && snapshot.Work == "" {
-		stopped, err = m.mgr.RetireSessionWithTeardownIfMatches(dogName, expected, teardown)
+		stopped, err = m.mgr.RetireSessionWithTeardownIfMatches(snapshot.Name, expected, teardown)
 	} else {
 		stopped, err = m.mgr.CompleteWorkWithTeardownIfMatches(
-			dogName,
+			snapshot.Name,
 			snapshot.Work,
 			snapshot.WorkStartedAt,
 			expected,

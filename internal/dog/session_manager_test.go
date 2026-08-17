@@ -188,3 +188,84 @@ func TestDogStopTeardownFailurePreservesAssignment(t *testing.T) {
 		t.Fatalf("failed stop mutated custody: %+v", stored)
 	}
 }
+
+func TestDogStopIfMatchesRejectsSameNameReplacement(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work-old")
+	oldGeneration := testDogTmuxGeneration("$old", "nonce-old")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", initial.Work, initial.WorkStartedAt, nil, oldGeneration,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist old generation = %v, %v", set, err)
+	}
+	oldSnapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacementGeneration := testDogTmuxGeneration("$replacement", "nonce-replacement")
+	fl, err := mgr.lockDog("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementState, err := mgr.loadState("alpha")
+	if err != nil {
+		_ = fl.Unlock()
+		t.Fatal(err)
+	}
+	replacementState.Work = "work-replacement"
+	replacementState.WorkStartedAt = initial.WorkStartedAt.Add(time.Second)
+	replacementState.SessionGeneration = SessionGenerationFromTmux(replacementGeneration)
+	if err := mgr.saveState("alpha", replacementState); err != nil {
+		_ = fl.Unlock()
+		t.Fatal(err)
+	}
+	_ = fl.Unlock()
+
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-replacement-%d", os.Getpid())), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return replacementGeneration, nil }
+	killed := 0
+	sm.killSessionGeneration = func(tmux.SessionGeneration) error { killed++; return nil }
+
+	if err := sm.StopIfMatches(oldSnapshot, true); !errors.Is(err, tmux.ErrSessionGenerationChanged) {
+		t.Fatalf("StopIfMatches error = %v, want ErrSessionGenerationChanged", err)
+	}
+	if killed != 0 {
+		t.Fatalf("same-name replacement received %d kill(s)", killed)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Work != replacementState.Work || current.SessionGeneration == nil || !current.SessionGeneration.EqualTmux(replacementGeneration) {
+		t.Fatalf("replacement custody changed: %+v", current)
+	}
+}
+
+func TestDogStopIfMatchesPreservesLiveLegacySession(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "legacy-work")
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveGeneration := testDogTmuxGeneration("$legacy", "nonce-legacy")
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-legacy-%d", os.Getpid())), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return liveGeneration, nil }
+	killed := 0
+	sm.killSessionGeneration = func(tmux.SessionGeneration) error { killed++; return nil }
+
+	err = sm.StopIfMatches(snapshot, true)
+	if err == nil || !strings.Contains(err.Error(), "live legacy dog session") {
+		t.Fatalf("StopIfMatches error = %v, want live legacy preservation", err)
+	}
+	if killed != 0 {
+		t.Fatalf("live legacy session received %d kill(s)", killed)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != StateWorking || current.Work != initial.Work || current.SessionGeneration != nil {
+		t.Fatalf("legacy custody changed: %+v", current)
+	}
+}

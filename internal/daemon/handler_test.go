@@ -94,6 +94,48 @@ func testSetupWorkingDogState(t *testing.T, townRoot, name, work string, lastAct
 	}
 }
 
+func testPersistDogSessionGeneration(t *testing.T, townRoot string, mgr *dog.Manager, tm *tmux.Tmux, name string) tmux.SessionGeneration {
+	t.Helper()
+	snapshot, err := mgr.Get(name)
+	if err != nil {
+		t.Fatalf("Get(%q): %v", name, err)
+	}
+	generation, err := tm.CaptureSessionGeneration("hq-dog-" + name)
+	if err != nil {
+		t.Fatalf("CaptureSessionGeneration(%q): %v", name, err)
+	}
+	persisted, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		name,
+		snapshot.Work,
+		snapshot.WorkStartedAt,
+		nil,
+		generation,
+	)
+	if err != nil || !persisted {
+		t.Fatalf("persist session generation for %q = %v, %v", name, persisted, err)
+	}
+	// Generation persistence is lifecycle activity in production. Tests that
+	// model an already-stale session must retain their captured LastActive age.
+	statePath := filepath.Join(townRoot, "deacon", "dogs", name, ".dog.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read dog state for %q: %v", name, err)
+	}
+	var state dog.DogState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode dog state for %q: %v", name, err)
+	}
+	state.LastActive = snapshot.LastActive
+	data, err = json.MarshalIndent(&state, "", "  ")
+	if err != nil {
+		t.Fatalf("encode dog state for %q: %v", name, err)
+	}
+	if err := os.WriteFile(statePath, data, 0o644); err != nil {
+		t.Fatalf("restore dog activity for %q: %v", name, err)
+	}
+	return generation
+}
+
 func TestDetectStaleWorkingDogs_ClearsStaleWorkers(t *testing.T) {
 	requireTmux(t)
 
@@ -145,6 +187,7 @@ func TestDetectStaleWorkingDogs_KillsSessionBeforeClearing(t *testing.T) {
 		t.Fatalf("NewSession(%q): %v", sessionName, err)
 	}
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	testPersistDogSessionGeneration(t, townRoot, mgr, tm, "stale")
 
 	d.detectStaleWorkingDogs(mgr, sm, &config.DaemonThresholds{})
 
@@ -162,6 +205,39 @@ func TestDetectStaleWorkingDogs_KillsSessionBeforeClearing(t *testing.T) {
 		t.Fatalf("HasSession(%q): %v", sessionName, err)
 	} else if has {
 		t.Errorf("stale dog session %q still exists after cleanup", sessionName)
+	}
+}
+
+func TestDetectStaleWorkingDogs_PreservesLiveLegacySession(t *testing.T) {
+	requireTmux(t)
+	oldSocket := tmux.GetDefaultSocket()
+	socketName := fmt.Sprintf("gt-test-dog-stale-legacy-%d", time.Now().UnixNano())
+	tmux.SetDefaultSocket(socketName)
+	t.Cleanup(func() { tmux.SetDefaultSocket(oldSocket) })
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	tm := tmux.NewTmux()
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
+	testSetupWorkingDogState(t, townRoot, "legacy", constants.MolConvoyFeed, time.Now().Add(-3*time.Hour))
+	sessionName := sm.SessionName("legacy")
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession(%q): %v", sessionName, err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	d.detectStaleWorkingDogs(mgr, sm, &config.DaemonThresholds{})
+
+	current, err := mgr.Get("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != dog.StateWorking || current.Work != constants.MolConvoyFeed || current.SessionGeneration != nil {
+		t.Fatalf("legacy dog custody changed: %+v", current)
+	}
+	if running, err := tm.HasSession(sessionName); err != nil || !running {
+		t.Fatalf("live legacy session was not preserved: running=%v err=%v", running, err)
 	}
 }
 
@@ -318,6 +394,38 @@ func TestReapIdleDogs_RemovesLongIdleDogsWhenPoolOversized(t *testing.T) {
 	}
 	if testDogExists(townRoot, "old-2") {
 		t.Error("old-2 should have been removed")
+	}
+}
+
+func TestReapIdleDogs_PreservesLiveLegacySessionAndKennel(t *testing.T) {
+	requireTmux(t)
+	oldSocket := tmux.GetDefaultSocket()
+	socketName := fmt.Sprintf("gt-test-dog-reap-legacy-%d", time.Now().UnixNano())
+	tmux.SetDefaultSocket(socketName)
+	t.Cleanup(func() { tmux.SetDefaultSocket(oldSocket) })
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	tm := tmux.NewTmux()
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
+	for i := 0; i < maxDogPoolSize; i++ {
+		testSetupDogState(t, townRoot, fmt.Sprintf("recent-%d", i), dog.StateIdle, time.Now())
+	}
+	testSetupDogState(t, townRoot, "legacy", dog.StateIdle, time.Now().Add(-6*time.Hour))
+	sessionName := sm.SessionName("legacy")
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession(%q): %v", sessionName, err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	d.reapIdleDogs(mgr, sm, &config.DaemonThresholds{})
+
+	if !testDogExists(townRoot, "legacy") {
+		t.Fatal("live legacy dog kennel was removed after exact stop refusal")
+	}
+	if running, err := tm.HasSession(sessionName); err != nil || !running {
+		t.Fatalf("live legacy idle session was not preserved: running=%v err=%v", running, err)
 	}
 }
 
@@ -551,6 +659,7 @@ func TestCleanupStuckDogs_ClearsAgentDeadWorker(t *testing.T) {
 		t.Fatalf("NewSession(%q): %v", sessionName, err)
 	}
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	testPersistDogSessionGeneration(t, townRoot, mgr, tm, "alpha")
 	time.Sleep(200 * time.Millisecond)
 
 	d.cleanupStuckDogs(mgr, sm)
@@ -569,6 +678,40 @@ func TestCleanupStuckDogs_ClearsAgentDeadWorker(t *testing.T) {
 		t.Fatalf("HasSession(%q): %v", sessionName, err)
 	} else if has {
 		t.Errorf("agent-dead session %q still exists after cleanup", sessionName)
+	}
+}
+
+func TestCleanupStuckDogs_PreservesAgentDeadLegacySession(t *testing.T) {
+	requireTmux(t)
+	oldSocket := tmux.GetDefaultSocket()
+	socketName := fmt.Sprintf("gt-test-dog-cleanup-legacy-%d", time.Now().UnixNano())
+	tmux.SetDefaultSocket(socketName)
+	t.Cleanup(func() { tmux.SetDefaultSocket(oldSocket) })
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	tm := tmux.NewTmux()
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
+	testSetupWorkingDogState(t, townRoot, "legacy", constants.MolDogReaper, time.Now())
+	sessionName := sm.SessionName("legacy")
+	if err := tm.NewSession(sessionName, ""); err != nil {
+		t.Fatalf("NewSession(%q): %v", sessionName, err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	time.Sleep(200 * time.Millisecond)
+
+	d.cleanupStuckDogs(mgr, sm)
+
+	current, err := mgr.Get("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != dog.StateWorking || current.Work != constants.MolDogReaper || current.SessionGeneration != nil {
+		t.Fatalf("legacy dog custody changed: %+v", current)
+	}
+	if running, err := tm.HasSession(sessionName); err != nil || !running {
+		t.Fatalf("agent-dead legacy session was not preserved: running=%v err=%v", running, err)
 	}
 }
 

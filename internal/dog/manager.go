@@ -221,6 +221,60 @@ func (m *Manager) Remove(name string) error {
 	if !m.exists(name) {
 		return ErrDogNotFound
 	}
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+	return m.removeLocked(name)
+}
+
+// RemoveIfMatches removes only the exact idle lifecycle snapshot supplied by
+// the caller. State, assignment activity, and session generation are compared
+// under the same per-dog lock that guards dispatch and closeout, so a stale
+// reaper cannot delete a replacement assignment or runtime generation.
+func (m *Manager) RemoveIfMatches(snapshot *Dog) (bool, error) {
+	if snapshot == nil {
+		return false, errors.New("dog removal snapshot is unavailable")
+	}
+	if err := validateDogName(snapshot.Name); err != nil {
+		return false, err
+	}
+	if !m.exists(snapshot.Name) {
+		return false, ErrDogNotFound
+	}
+	fl, err := m.lockDog(snapshot.Name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(snapshot.Name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if !dogStateMatchesRemovalSnapshot(state, snapshot) {
+		return false, nil
+	}
+	if err := m.removeLocked(snapshot.Name); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func dogStateMatchesRemovalSnapshot(state *DogState, snapshot *Dog) bool {
+	if state == nil || snapshot == nil || snapshot.State != StateIdle || snapshot.Work != "" || snapshot.SessionGeneration != nil {
+		return false
+	}
+	return state.Name == snapshot.Name &&
+		state.State == snapshot.State &&
+		state.Work == snapshot.Work &&
+		state.WorkStartedAt.Equal(snapshot.WorkStartedAt) &&
+		state.LastActive.Equal(snapshot.LastActive) &&
+		state.SessionGeneration == nil
+}
+
+func (m *Manager) removeLocked(name string) error {
 
 	dogPath := m.dogDir(name)
 

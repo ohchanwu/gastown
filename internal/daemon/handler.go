@@ -104,7 +104,9 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 
 		if !running {
 			d.logger.Printf("Handler: dog %s is working but session is dead, clearing work", dg.Name)
-			d.clearDogWorkIfMatches(mgr, dg, "dead session")
+			if err := sm.StopIfMatches(dg, true); err != nil {
+				d.logger.Printf("Handler: failed exact dead-session cleanup for dog %s: %v", dg.Name, err)
+			}
 			continue
 		}
 
@@ -114,22 +116,10 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 		}
 
 		d.logger.Printf("Handler: dog %s (%s) is working but agent is dead, killing session and clearing work", dg.Name, sessionID)
-		if err := t.KillSessionWithProcesses(sessionID); err != nil {
-			d.logger.Printf("Handler: failed to kill agent-dead session for dog %s (%s): %v", dg.Name, sessionID, err)
+		if err := sm.StopIfMatches(dg, true); err != nil {
+			d.logger.Printf("Handler: failed exact agent-dead cleanup for dog %s (%s): %v", dg.Name, sessionID, err)
 			continue
 		}
-		d.clearDogWorkIfMatches(mgr, dg, "dead agent")
-	}
-}
-
-func (d *Daemon) clearDogWorkIfMatches(mgr *dog.Manager, dg *dog.Dog, reason string) {
-	cleared, err := mgr.ClearWorkIfMatches(dg.Name, dg.Work, dg.WorkStartedAt)
-	if err != nil {
-		d.logger.Printf("Handler: failed to clear work for dog %s (%s): %v", dg.Name, reason, err)
-		return
-	}
-	if !cleared {
-		d.logger.Printf("Handler: skipped clearing dog %s (%s): work assignment changed", dg.Name, reason)
 	}
 }
 
@@ -146,7 +136,6 @@ func (d *Daemon) detectStaleWorkingDogs(mgr *dog.Manager, sm *dog.SessionManager
 
 	threshold := daemonCfg.StaleWorkingTimeoutD()
 	now := time.Now()
-	t := tmux.NewTmux()
 	for _, dg := range dogs {
 		if dg.State != dog.StateWorking {
 			continue
@@ -160,21 +149,12 @@ func (d *Daemon) detectStaleWorkingDogs(mgr *dog.Manager, sm *dog.SessionManager
 		d.logger.Printf("Handler: dog %s stuck in working state (inactive %v, work: %s), clearing",
 			dg.Name, staleDuration.Truncate(time.Minute), dg.Work)
 
-		running, err := sm.IsRunning(dg.Name)
-		if err != nil {
-			d.logger.Printf("Handler: error checking session for stale dog %s: %v", dg.Name, err)
-			continue
+		// StopIfMatches handles both exact live teardown and exact absent-session
+		// state reconciliation. It refuses live legacy or same-name replacement
+		// sessions instead of mutating them by reusable name.
+		if err := sm.StopIfMatches(dg, true); err != nil {
+			d.logger.Printf("Handler: failed exact stale-working cleanup for dog %s: %v", dg.Name, err)
 		}
-		if running {
-			// Kill the tmux session before clearing state so a failed kill does not
-			// return the dog to the idle pool with stale work still running.
-			if err := t.KillSessionWithProcesses(sm.SessionName(dg.Name)); err != nil {
-				d.logger.Printf("Handler: failed to stop session for stale dog %s: %v", dg.Name, err)
-				continue
-			}
-		}
-
-		d.clearDogWorkIfMatches(mgr, dg, "stale working")
 	}
 }
 
@@ -208,11 +188,15 @@ func (d *Daemon) reapIdleDogs(mgr *dog.Manager, sm *dog.SessionManager, daemonCf
 				d.logger.Printf("Handler: error checking session for idle dog %s: %v", dg.Name, err)
 				continue
 			}
-			if running {
+			if running || dg.SessionGeneration != nil {
 				d.logger.Printf("Handler: reaping idle dog %s session (idle %v)", dg.Name, idleDuration.Truncate(time.Minute))
-				if err := sm.Stop(dg.Name, true); err != nil {
+				if err := sm.StopIfMatches(dg, true); err != nil {
 					d.logger.Printf("Handler: failed to stop session for idle dog %s: %v", dg.Name, err)
+					continue
 				}
+				// Exact stop refreshes lifecycle activity. Do not remove the same dog
+				// from the kennel using the stale pre-stop List snapshot.
+				continue
 			}
 		}
 
@@ -222,13 +206,25 @@ func (d *Daemon) reapIdleDogs(mgr *dog.Manager, sm *dog.SessionManager, daemonCf
 				dg.Name, idleDuration.Truncate(time.Minute), poolSize, poolMax)
 
 			// Ensure session is dead before removing.
-			running, _ := sm.IsRunning(dg.Name)
-			if running {
-				_ = sm.Stop(dg.Name, true)
+			running, runErr := sm.IsRunning(dg.Name)
+			if runErr != nil {
+				d.logger.Printf("Handler: failed to verify idle dog %s session before removal: %v", dg.Name, runErr)
+				continue
+			}
+			if running || dg.SessionGeneration != nil {
+				if err := sm.StopIfMatches(dg, true); err != nil {
+					d.logger.Printf("Handler: failed exact stop before removing idle dog %s: %v", dg.Name, err)
+				}
+				continue
 			}
 
-			if err := mgr.Remove(dg.Name); err != nil {
+			removed, err := mgr.RemoveIfMatches(dg)
+			if err != nil {
 				d.logger.Printf("Handler: failed to remove idle dog %s: %v", dg.Name, err)
+				continue
+			}
+			if !removed {
+				d.logger.Printf("Handler: skipped removing idle dog %s: lifecycle state changed", dg.Name)
 				continue
 			}
 			poolSize--

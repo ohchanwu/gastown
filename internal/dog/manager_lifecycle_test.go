@@ -1049,6 +1049,75 @@ func TestManager_Remove_cleansUpDirectory(t *testing.T) {
 	}
 }
 
+func TestManager_RemoveIfMatchesPreservesReplacementAssignment(t *testing.T) {
+	m, tmpDir := testManager(t)
+	now := time.Now().UTC().Round(0)
+	state := &DogState{
+		Name:       "alpha",
+		State:      StateIdle,
+		LastActive: now.Add(-5 * time.Hour),
+		Worktrees:  map[string]string{},
+		CreatedAt:  now.Add(-24 * time.Hour),
+		UpdatedAt:  now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get snapshot: %v", err)
+	}
+	assigned, err := m.AssignWorkIfIdle("alpha", "replacement-work")
+	if err != nil {
+		t.Fatalf("AssignWorkIfIdle replacement: %v", err)
+	}
+
+	removed, err := m.RemoveIfMatches(snapshot)
+	if err != nil {
+		t.Fatalf("RemoveIfMatches: %v", err)
+	}
+	if removed {
+		t.Fatal("stale idle snapshot removed replacement assignment")
+	}
+	current, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get replacement: %v", err)
+	}
+	if current.State != StateWorking || current.Work != assigned.Work || !current.WorkStartedAt.Equal(assigned.WorkStartedAt) {
+		t.Fatalf("replacement assignment changed: %+v", current)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "deacon", "dogs", "alpha")); err != nil {
+		t.Fatalf("replacement kennel removed: %v", err)
+	}
+}
+
+func TestManager_RemoveIfMatchesRemovesExactIdleSnapshot(t *testing.T) {
+	m, tmpDir := testManager(t)
+	now := time.Now().UTC().Round(0)
+	state := &DogState{
+		Name:       "alpha",
+		State:      StateIdle,
+		LastActive: now.Add(-5 * time.Hour),
+		Worktrees:  map[string]string{},
+		CreatedAt:  now.Add(-24 * time.Hour),
+		UpdatedAt:  now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatalf("Get snapshot: %v", err)
+	}
+
+	removed, err := m.RemoveIfMatches(snapshot)
+	if err != nil {
+		t.Fatalf("RemoveIfMatches: %v", err)
+	}
+	if !removed {
+		t.Fatal("exact idle snapshot was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "deacon", "dogs", "alpha")); !os.IsNotExist(err) {
+		t.Fatalf("exact kennel remains after removal: %v", err)
+	}
+}
+
 func TestManager_Remove_handlesMissingStateFile(t *testing.T) {
 	m, tmpDir := testManager(t)
 
