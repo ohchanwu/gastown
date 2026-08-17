@@ -288,10 +288,17 @@ func TestRunDoneRejectsMayorRigBeforeAutosave(t *testing.T) {
 
 func TestIsDoneCommand(t *testing.T) {
 	done := &cobra.Command{Use: "done"}
+	dogDone := &cobra.Command{Use: "done"}
+	dog := &cobra.Command{Use: "dog"}
 	root := &cobra.Command{Use: "gt"}
 	root.AddCommand(done)
+	dog.AddCommand(dogDone)
+	root.AddCommand(dog)
 	if !isDoneCommand(done) {
-		t.Fatal("done command should be detected")
+		t.Fatal("top-level done command should be detected")
+	}
+	if isDoneCommand(dogDone) {
+		t.Fatal("nested dog done command should not be detected as polecat done")
 	}
 	if isDoneCommand(root) {
 		t.Fatal("root command should not be detected as done")

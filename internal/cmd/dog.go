@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -675,49 +677,102 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
-	// Always close accumulated plugin mails, even if dog is already idle.
-	// Plugin dispatch mails accumulate across sessions and must be cleaned up
-	// regardless of current work state.
+	// Close accumulated plugin mails only after durable work and exact runtime
+	// teardown agree. Incomplete closeout leaves all recovery evidence intact.
+	controller := tmux.NewTmux()
+	if err := completeDogCloseout(mgr, controller, d); err != nil {
+		return fmt.Errorf("closing out dog %s: %w", name, err)
+	}
 	closePluginMails(name)
 
-	if d.State == dog.StateIdle && d.Work == "" {
-		fmt.Printf("Dog %s is already idle with no work\n", name)
+	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
+	return nil
+}
+
+type dogCloseoutManager interface {
+	ClearWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time) (bool, error)
+	CompleteWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time, expectedGeneration tmux.SessionGeneration) (bool, error)
+	ClearSessionGenerationIfMatches(name string, expected tmux.SessionGeneration) (bool, error)
+}
+
+type dogSessionController interface {
+	CaptureSessionGeneration(name string) (tmux.SessionGeneration, error)
+	KillSessionGeneration(generation tmux.SessionGeneration) error
+}
+
+var errDogCloseoutIncomplete = errors.New("dog closeout incomplete")
+
+func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, snapshot *dog.Dog) error {
+	if mgr == nil || sessions == nil || snapshot == nil {
+		return fmt.Errorf("%w: lifecycle evidence unavailable", errDogCloseoutIncomplete)
+	}
+	sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
+	current, captureErr := sessions.CaptureSessionGeneration(sessionName)
+
+	if snapshot.SessionGeneration == nil {
+		switch {
+		case errors.Is(captureErr, tmux.ErrSessionNotFound), errors.Is(captureErr, tmux.ErrNoServer):
+			if snapshot.State == dog.StateIdle && snapshot.Work == "" {
+				return nil
+			}
+			cleared, err := mgr.ClearWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt)
+			if err != nil {
+				return fmt.Errorf("clearing work after proven session absence: %w", err)
+			}
+			if !cleared {
+				return fmt.Errorf("%w: work assignment changed during absent-session cleanup", errDogCloseoutIncomplete)
+			}
+			return nil
+		case captureErr != nil:
+			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
+		default:
+			return fmt.Errorf("%w: live legacy session has no persisted generation; preserve it for recovery", errDogCloseoutIncomplete)
+		}
+	}
+
+	expected := snapshot.SessionGeneration.Tmux()
+	if captureErr != nil {
+		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
+			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
+		}
+		completed, err := mgr.CompleteWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, expected)
+		if err != nil {
+			return fmt.Errorf("completing work after proven session absence: %w", err)
+		}
+		if !completed {
+			return fmt.Errorf("%w: work assignment or generation changed", errDogCloseoutIncomplete)
+		}
+		cleared, err := mgr.ClearSessionGenerationIfMatches(snapshot.Name, expected)
+		if err != nil {
+			return fmt.Errorf("clearing absent session generation: %w", err)
+		}
+		if !cleared {
+			return fmt.Errorf("%w: replacement generation was recorded", errDogCloseoutIncomplete)
+		}
 		return nil
 	}
-
-	if err := mgr.ClearWork(name); err != nil {
-		return fmt.Errorf("clearing work for dog %s: %w", name, err)
+	if !current.Equal(expected) {
+		return fmt.Errorf("%w: live session does not match the persisted generation", errDogCloseoutIncomplete)
 	}
 
-	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
-
-	// Auto-terminate the tmux session after a short delay.
-	// Dogs run inside tmux sessions (hq-dog-<name>). Without this, the
-	// Claude agent idles at the prompt indefinitely after completing work,
-	// wasting resources until the stale-working detector kills it (2 hours).
-	// The delay lets the agent see the success output before termination.
-	//
-	// We disable remain-on-exit first — otherwise kill-session leaves a
-	// dead pane that the deacon's health-check reports as an orphan.
-	sessionID := fmt.Sprintf("hq-dog-%s", name)
-	t := tmux.NewTmux()
-	_ = t.SetRemainOnExit(sessionID, false)
-	fmt.Printf("  Session %s will terminate in 3s\n", sessionID)
-
-	// Kill the tmux session after a short delay using a goroutine.
-	// Previous approach used bash -c "sleep 3 && tmux kill-session" which
-	// fails silently on Windows. The goroutine is cross-platform and uses
-	// the tmux package which handles the socket name automatically.
-	go func() {
-		time.Sleep(3 * time.Second)
-		if err := t.KillSession(sessionID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to kill session %s: %v\n", sessionID, err)
-		}
-	}()
-
-	// Wait for the goroutine to finish (the process will exit after kill).
-	time.Sleep(4 * time.Second)
-
+	completed, err := mgr.CompleteWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, expected)
+	if err != nil {
+		return fmt.Errorf("completing guarded dog work: %w", err)
+	}
+	if !completed {
+		return fmt.Errorf("%w: work assignment or generation changed", errDogCloseoutIncomplete)
+	}
+	if err := sessions.KillSessionGeneration(expected); err != nil &&
+		!errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
+		return fmt.Errorf("%w: exact dog session teardown failed: %w", errDogCloseoutIncomplete, err)
+	}
+	cleared, err := mgr.ClearSessionGenerationIfMatches(snapshot.Name, expected)
+	if err != nil {
+		return fmt.Errorf("clearing completed dog session generation: %w", err)
+	}
+	if !cleared {
+		return fmt.Errorf("%w: replacement generation was recorded", errDogCloseoutIncomplete)
+	}
 	return nil
 }
 
@@ -796,49 +851,104 @@ func runDogStatus(cmd *cobra.Command, args []string) error {
 	return showPackStatus(mgr)
 }
 
+type dogSessionState string
+
+const (
+	dogSessionRunning dogSessionState = "running"
+	dogSessionAbsent  dogSessionState = "absent"
+	dogSessionStale   dogSessionState = "stale"
+	dogSessionUnknown dogSessionState = "unknown"
+)
+
+type dogSessionStatus struct {
+	Name            string
+	State           dogSessionState
+	GenerationMatch bool
+	Diagnostic      string
+}
+
+func inspectDogSession(d *dog.Dog, sessions dogSessionController) dogSessionStatus {
+	status := dogSessionStatus{Name: fmt.Sprintf("hq-dog-%s", d.Name)}
+	current, err := sessions.CaptureSessionGeneration(status.Name)
+	if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
+		status.State = dogSessionAbsent
+		return status
+	}
+	if err != nil {
+		status.State = dogSessionUnknown
+		status.Diagnostic = "session identity could not be verified"
+		return status
+	}
+	if d.SessionGeneration == nil {
+		status.State = dogSessionUnknown
+		status.Diagnostic = "live session has no persisted generation"
+		return status
+	}
+	if d.SessionGeneration.EqualTmux(current) {
+		status.State = dogSessionRunning
+		status.GenerationMatch = true
+		return status
+	}
+	status.State = dogSessionStale
+	status.Diagnostic = "live session does not match persisted generation"
+	return status
+}
+
+func writeDogStatus(w io.Writer, d *dog.Dog, sessionStatus dogSessionStatus, jsonOutput bool) error {
+	if jsonOutput {
+		payload := struct {
+			*dog.Dog
+			SessionName     string          `json:"session_name"`
+			SessionState    dogSessionState `json:"session_state"`
+			GenerationMatch bool            `json:"generation_match"`
+			Diagnostic      string          `json:"diagnostic,omitempty"`
+		}{
+			Dog:             d,
+			SessionName:     sessionStatus.Name,
+			SessionState:    sessionStatus.State,
+			GenerationMatch: sessionStatus.GenerationMatch,
+			Diagnostic:      sessionStatus.Diagnostic,
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(payload)
+	}
+
+	fmt.Fprintf(w, "Dog: %s\n\n", style.Bold.Render(d.Name))
+	fmt.Fprintf(w, "  Work State:  %s\n", d.State)
+	if d.Work != "" {
+		fmt.Fprintf(w, "  Work:        %s\n", d.Work)
+	} else {
+		fmt.Fprintf(w, "  Work:        %s\n", style.Dim.Render("(none)"))
+	}
+	fmt.Fprintf(w, "  Session:     %s (%s)\n", sessionStatus.Name, sessionStatus.State)
+	if sessionStatus.Diagnostic != "" {
+		fmt.Fprintf(w, "  Diagnostic:  %s\n", sessionStatus.Diagnostic)
+	}
+	fmt.Fprintf(w, "  Path:        %s\n", d.Path)
+	fmt.Fprintf(w, "  Last Active: %s\n", dogFormatTimeAgo(d.LastActive))
+	fmt.Fprintf(w, "  Created:     %s\n", d.CreatedAt.Format("2006-01-02 15:04"))
+
+	if len(d.Worktrees) > 0 {
+		fmt.Fprintln(w, "\nWorktrees:")
+		for rigName, path := range d.Worktrees {
+			exists := "✓"
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				exists = "✗"
+			}
+			fmt.Fprintf(w, "  %s %s: %s\n", exists, rigName, path)
+		}
+	}
+	return nil
+}
+
 func showDogStatus(mgr *dog.Manager, name string) error {
 	d, err := mgr.Get(name)
 	if err != nil {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
-	if dogStatusJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(d)
-	}
-
-	fmt.Printf("Dog: %s\n\n", style.Bold.Render(d.Name))
-	fmt.Printf("  State:       %s\n", d.State)
-	if d.Work != "" {
-		fmt.Printf("  Work:        %s\n", d.Work)
-	} else {
-		fmt.Printf("  Work:        %s\n", style.Dim.Render("(none)"))
-	}
-	fmt.Printf("  Path:        %s\n", d.Path)
-	fmt.Printf("  Last Active: %s\n", dogFormatTimeAgo(d.LastActive))
-	fmt.Printf("  Created:     %s\n", d.CreatedAt.Format("2006-01-02 15:04"))
-
-	if len(d.Worktrees) > 0 {
-		fmt.Println("\nWorktrees:")
-		for rigName, path := range d.Worktrees {
-			// Check if worktree exists
-			exists := "✓"
-			if _, err := os.Stat(path); os.IsNotExist(err) {
-				exists = "✗"
-			}
-			fmt.Printf("  %s %s: %s\n", exists, rigName, path)
-		}
-	}
-
-	// Check for tmux session
-	sessionName := fmt.Sprintf("hq-dog-%s", name)
-	tm := tmux.NewTmux()
-	if has, _ := tm.HasSession(sessionName); has {
-		fmt.Printf("\nSession: %s (running)\n", sessionName)
-	}
-
-	return nil
+	return writeDogStatus(os.Stdout, d, inspectDogSession(d, tmux.NewTmux()), dogStatusJSON)
 }
 
 func showPackStatus(mgr *dog.Manager) error {

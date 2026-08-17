@@ -29,7 +29,7 @@ type Dog struct {
 	Work              string             // Current work assignment (bead ID or molecule)
 	WorkStartedAt     time.Time          // When current work was assigned
 	CreatedAt         time.Time          // When dog was added to kennel
-	SessionGeneration *SessionGeneration // Exact tmux generation owned by this dog
+	SessionGeneration *SessionGeneration `json:"-"` // Exact tmux generation owned by this dog
 }
 
 // SessionGeneration is the JSON-compatible form of tmux.SessionGeneration.

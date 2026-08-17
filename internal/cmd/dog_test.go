@@ -1,15 +1,21 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/dog"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // =============================================================================
@@ -280,6 +286,338 @@ func TestDogDone_NotFound(t *testing.T) {
 	err := m.ClearWork("nonexistent")
 	if err != dog.ErrDogNotFound {
 		t.Errorf("ClearWork() error = %v, want ErrDogNotFound", err)
+	}
+}
+
+type fakeDogSessionController struct {
+	captured   tmux.SessionGeneration
+	captureErr error
+	killed     []tmux.SessionGeneration
+	killFn     func(tmux.SessionGeneration) error
+}
+
+func (f *fakeDogSessionController) CaptureSessionGeneration(string) (tmux.SessionGeneration, error) {
+	return f.captured, f.captureErr
+}
+
+func (f *fakeDogSessionController) KillSessionGeneration(generation tmux.SessionGeneration) error {
+	f.killed = append(f.killed, generation)
+	if f.killFn != nil {
+		return f.killFn(generation)
+	}
+	return nil
+}
+
+func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	generation := cmdTestDogGeneration("$1", "nonce-old")
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:              "alpha",
+		State:             dog.StateWorking,
+		Work:              "hq-work-old",
+		WorkStartedAt:     started,
+		LastActive:        started,
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	d, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captured: generation}
+
+	if err := completeDogCloseout(mgr, controller, d); err != nil {
+		t.Fatalf("completeDogCloseout: %v", err)
+	}
+	if len(controller.killed) != 1 || !controller.killed[0].Equal(generation) {
+		t.Fatalf("killed = %+v, want exact persisted generation", controller.killed)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != dog.StateIdle || got.Work != "" || got.SessionGeneration != nil {
+		t.Fatalf("completed dog = %+v, want idle with no work or generation", got)
+	}
+}
+
+func TestDogDoneGenerationReplacementSurvivesPostCompletionSubstitution(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	oldGeneration := cmdTestDogGeneration("$1", "nonce-old")
+	newGeneration := cmdTestDogGeneration("$2", "nonce-new")
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:              "alpha",
+		State:             dog.StateWorking,
+		Work:              "hq-work-old",
+		WorkStartedAt:     started,
+		LastActive:        started,
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		SessionGeneration: dog.SessionGenerationFromTmux(oldGeneration),
+	})
+	d, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captured: oldGeneration}
+	controller.killFn = func(generation tmux.SessionGeneration) error {
+		if !generation.Equal(oldGeneration) {
+			t.Fatalf("kill targeted %+v, want old generation", generation)
+		}
+		if err := mgr.AssignWork("alpha", "hq-work-new"); err != nil {
+			t.Fatal(err)
+		}
+		if err := mgr.SetSessionGeneration("alpha", newGeneration); err != nil {
+			t.Fatal(err)
+		}
+		return tmux.ErrSessionGenerationChanged
+	}
+
+	err = completeDogCloseout(mgr, controller, d)
+	if !errors.Is(err, tmux.ErrSessionGenerationChanged) {
+		t.Fatalf("completeDogCloseout error = %v, want generation-changed", err)
+	}
+	got, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if got.Work != "hq-work-new" || got.State != dog.StateWorking ||
+		got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(newGeneration) {
+		t.Fatalf("replacement state was mutated: %+v", got)
+	}
+}
+
+func TestDogDoneGenerationAbsentSessionCompletesAndRepeatsIdempotently(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	generation := cmdTestDogGeneration("$1", "nonce-absent")
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:              "alpha",
+		State:             dog.StateWorking,
+		Work:              "hq-work",
+		WorkStartedAt:     started,
+		LastActive:        started,
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	controller := &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}
+	d, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := completeDogCloseout(mgr, controller, d); err != nil {
+		t.Fatalf("absent closeout: %v", err)
+	}
+	d, err = mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := completeDogCloseout(mgr, controller, d); err != nil {
+		t.Fatalf("repeated absent closeout: %v", err)
+	}
+	if len(controller.killed) != 0 {
+		t.Fatalf("absent session received kills: %+v", controller.killed)
+	}
+}
+
+func TestDogDoneGenerationLegacyLiveAndTmuxUnknownRefuseWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		controller *fakeDogSessionController
+	}{
+		{name: "legacy live", controller: &fakeDogSessionController{captured: cmdTestDogGeneration("$8", "nonce-legacy")}},
+		{name: "tmux unknown", controller: &fakeDogSessionController{captureErr: errors.New("tmux unavailable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, townRoot := testDogManager(t)
+			started := time.Now().UTC().Round(0)
+			setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+				Name:          "alpha",
+				State:         dog.StateWorking,
+				Work:          "hq-work",
+				WorkStartedAt: started,
+				LastActive:    started,
+				CreatedAt:     started,
+				UpdatedAt:     started,
+			})
+			before, err := mgr.Get("alpha")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := completeDogCloseout(mgr, tc.controller, before); !errors.Is(err, errDogCloseoutIncomplete) {
+				t.Fatalf("closeout error = %v, want incomplete", err)
+			}
+			after, err := mgr.Get("alpha")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.State != before.State || after.Work != before.Work ||
+				!after.WorkStartedAt.Equal(before.WorkStartedAt) || after.SessionGeneration != nil {
+				t.Fatalf("refusal mutated dog state: before=%+v after=%+v", before, after)
+			}
+			if len(tc.controller.killed) != 0 {
+				t.Fatalf("refusal killed session: %+v", tc.controller.killed)
+			}
+		})
+	}
+}
+
+func TestDogStatusSessionStateClassification(t *testing.T) {
+	oldGeneration := cmdTestDogGeneration("$1", "nonce-old")
+	newGeneration := cmdTestDogGeneration("$2", "nonce-new")
+	tests := []struct {
+		name       string
+		persisted  *dog.SessionGeneration
+		controller *fakeDogSessionController
+		wantState  dogSessionState
+		wantMatch  bool
+		wantDiag   bool
+	}{
+		{name: "absent legacy", controller: &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}, wantState: dogSessionAbsent},
+		{name: "legacy live unknown", controller: &fakeDogSessionController{captured: oldGeneration}, wantState: dogSessionUnknown, wantDiag: true},
+		{name: "exact running", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captured: oldGeneration}, wantState: dogSessionRunning, wantMatch: true},
+		{name: "replacement stale", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captured: newGeneration}, wantState: dogSessionStale, wantDiag: true},
+		{name: "tmux failure unknown", persisted: dog.SessionGenerationFromTmux(oldGeneration), controller: &fakeDogSessionController{captureErr: errors.New("private process detail")}, wantState: dogSessionUnknown, wantDiag: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &dog.Dog{Name: "alpha", SessionGeneration: tc.persisted}
+			got := inspectDogSession(d, tc.controller)
+			if got.State != tc.wantState || got.GenerationMatch != tc.wantMatch {
+				t.Fatalf("status = %+v, want state=%s match=%v", got, tc.wantState, tc.wantMatch)
+			}
+			if (got.Diagnostic != "") != tc.wantDiag {
+				t.Fatalf("diagnostic = %q, want present=%v", got.Diagnostic, tc.wantDiag)
+			}
+			if strings.Contains(got.Diagnostic, "private process detail") {
+				t.Fatalf("diagnostic leaked tmux detail: %q", got.Diagnostic)
+			}
+		})
+	}
+}
+
+func TestDogStatusOutputSeparatesWorkAndSessionState(t *testing.T) {
+	d := &dog.Dog{Name: "alpha", State: dog.StateWorking, Work: "hq-work", Path: "/tmp/alpha"}
+	status := dogSessionStatus{Name: "hq-dog-alpha", State: dogSessionStale, Diagnostic: "live session does not match persisted generation"}
+	var human bytes.Buffer
+	if err := writeDogStatus(&human, d, status, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Work State:", "working", "Session:", "stale"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human status missing %q in %q", want, human.String())
+		}
+	}
+
+	var encoded bytes.Buffer
+	if err := writeDogStatus(&encoded, d, status, true); err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(encoded.Bytes(), &object); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	for _, key := range []string{"Name", "State", "Path", "Worktrees", "LastActive", "Work", "WorkStartedAt", "CreatedAt", "session_name", "session_state", "generation_match"} {
+		if _, ok := object[key]; !ok {
+			t.Errorf("JSON missing existing or additive field %q: %s", key, encoded.String())
+		}
+	}
+	if _, ok := object["SessionGeneration"]; ok {
+		t.Fatalf("JSON exposed raw process generation: %s", encoded.String())
+	}
+}
+
+func TestDogDoneCLIFormsReachDogSpecificCloseout(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		name := "implicit"
+		if explicit {
+			name = "explicit"
+		}
+		t.Run(name, func(t *testing.T) {
+			townRoot := canonicalTestTempDir(t)
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			rigsData, err := json.Marshal(&config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), rigsData, 0644); err != nil {
+				t.Fatal(err)
+			}
+			dogName := "alpha"
+			kennel := filepath.Join(townRoot, "deacon", "dogs", dogName)
+			if err := os.MkdirAll(kennel, 0755); err != nil {
+				t.Fatal(err)
+			}
+			socket := fmt.Sprintf("gt-dog-cli-%s-%d", name, os.Getpid())
+			tm := tmux.NewTmuxWithSocket(socket)
+			t.Cleanup(func() { _ = tm.KillServer() })
+			if err := tm.NewSessionWithCommand("hq-dog-alpha", kennel, "sleep 300"); err != nil {
+				t.Fatalf("create dog session: %v", err)
+			}
+			generation, err := tm.CaptureSessionGeneration("hq-dog-alpha")
+			if err != nil {
+				t.Fatalf("capture dog session: %v", err)
+			}
+			now := time.Now().UTC().Round(0)
+			setupTestDog(t, dog.NewManager(townRoot, &config.RigsConfig{}), townRoot, dogName, &dog.DogState{
+				Name:              dogName,
+				State:             dog.StateWorking,
+				Work:              "hq-cli-work",
+				WorkStartedAt:     now,
+				LastActive:        now,
+				CreatedAt:         now,
+				UpdatedAt:         now,
+				SessionGeneration: dog.SessionGenerationFromTmux(generation),
+			})
+
+			args := []string{"dog", "done"}
+			if explicit {
+				args = append(args, dogName)
+			}
+			command := exec.Command(os.Args[0], args...)
+			command.Dir = kennel
+			command.Env = append(os.Environ(),
+				"GT_TEST_CMD_EXECUTE_HELPER=1",
+				"GT_TOWN_ROOT="+townRoot,
+				"GT_ROOT="+townRoot,
+				"GT_ROLE=dog",
+				"BD_ACTOR=dog",
+				"GT_TOWN_SOCKET="+socket,
+				"TMUX=",
+			)
+			output, runErr := command.CombinedOutput()
+			if runErr != nil {
+				t.Fatalf("gt dog done failed: %v\n%s", runErr, output)
+			}
+			if strings.Contains(string(output), "gt done is for polecats only") {
+				t.Fatalf("dog-specific command reached generic done route: %s", output)
+			}
+			stored, err := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Work != "" || stored.State != dog.StateIdle || stored.SessionGeneration != nil {
+				t.Fatalf("CLI closeout state = %+v", stored)
+			}
+		})
+	}
+}
+
+func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {
+	return tmux.SessionGeneration{
+		Name:           "hq-dog-alpha",
+		SessionID:      sessionID,
+		Nonce:          nonce,
+		Custody:        "custody-alpha",
+		ServerPID:      4242,
+		ServerIdentity: "server-start-alpha",
 	}
 }
 

@@ -194,12 +194,11 @@ func isRoleCommand(cmd *cobra.Command) bool {
 }
 
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
-	}
-	return false
+	// Only the top-level `gt done` command can publish polecat work. Nested
+	// commands such as `gt dog done` have their own lifecycle contracts and
+	// must not inherit the polecat worktree guard merely because their leaf has
+	// the same name.
+	return cmd != nil && cmd.Name() == "done" && cmd.Parent() != nil && cmd.Parent().Parent() == nil
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.
