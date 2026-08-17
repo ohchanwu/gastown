@@ -50,6 +50,7 @@ type Dog struct {
 type SessionGeneration struct {
 	Name           string `json:"name"`
 	SessionID      string `json:"session_id"`
+	PaneID         string `json:"pane_id,omitempty"`
 	Nonce          string `json:"nonce"`
 	Custody        string `json:"custody"`
 	ServerPID      int    `json:"server_pid"`
@@ -61,6 +62,7 @@ func SessionGenerationFromTmux(generation tmux.SessionGeneration) *SessionGenera
 	return &SessionGeneration{
 		Name:           generation.Name,
 		SessionID:      generation.SessionID,
+		PaneID:         generation.PaneID,
 		Nonce:          generation.Nonce,
 		Custody:        generation.Custody,
 		ServerPID:      generation.ServerPID,
@@ -73,6 +75,7 @@ func (g SessionGeneration) Tmux() tmux.SessionGeneration {
 	return tmux.SessionGeneration{
 		Name:           g.Name,
 		SessionID:      g.SessionID,
+		PaneID:         g.PaneID,
 		Nonce:          g.Nonce,
 		Custody:        g.Custody,
 		ServerPID:      g.ServerPID,

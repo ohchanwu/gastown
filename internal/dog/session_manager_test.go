@@ -319,3 +319,31 @@ func TestDogStopIfMatchesPreservesLiveLegacySession(t *testing.T) {
 		t.Fatalf("legacy custody changed: %+v", current)
 	}
 }
+
+func TestDogStopIfMatchesPluginFinalizerFailurePreservesAssignment(t *testing.T) {
+	mgr, state := newDogStateManager(t, "alpha", "plugin:reaper")
+	wantErr := errors.New("mail archive unavailable")
+	mgr.assignmentFinalizer = func(string, string, time.Time) error { return wantErr }
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-mail-%d", os.Getpid())), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) {
+		return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
+	}
+
+	if err := sm.StopIfMatches(snapshot, true); !errors.Is(err, wantErr) {
+		t.Fatalf("StopIfMatches() error = %v, want assignment finalizer failure", err)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+		t.Fatalf("StopIfMatches released plugin assignment after archive failure: %+v", got)
+	}
+	if replacement, err := mgr.AssignWorkIfIdle("alpha", "plugin:replacement"); replacement != nil || !errors.Is(err, ErrDogWorking) {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", replacement, err)
+	}
+}

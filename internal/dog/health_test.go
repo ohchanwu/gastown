@@ -1,6 +1,8 @@
 package dog
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +49,7 @@ func healthTestGeneration() tmux.SessionGeneration {
 	return tmux.SessionGeneration{
 		Name:           "hq-dog-alpha",
 		SessionID:      "$1",
+		PaneID:         "%0",
 		Nonce:          "health-generation",
 		Custody:        "health-custody",
 		ServerPID:      4242,
@@ -226,6 +229,42 @@ func TestHealth_Hung_AutoCleared(t *testing.T) {
 	d2, _ := m.Get("alpha")
 	if d2.State != StateIdle {
 		t.Errorf("state = %q, want idle after auto-clear", d2.State)
+	}
+}
+
+func TestHealthAutoClearPluginFinalizerFailurePreservesAssignment(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	state := &DogState{
+		Name: "alpha", State: StateWorking, Work: "plugin:reaper",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+	wantErr := errors.New("mail archive unavailable")
+	m.assignmentFinalizer = func(string, string, time.Time) error { return wantErr }
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
+	hc := NewHealthChecker(m, mc)
+	d, _ := m.Get("alpha")
+	result := hc.Check(d, 30*time.Minute, true)
+
+	if result.AutoCleared {
+		t.Fatal("health auto-clear released plugin assignment after archive failure")
+	}
+	if !strings.Contains(result.Recommendation, wantErr.Error()) {
+		t.Fatalf("recommendation = %q, want archive failure", result.Recommendation)
+	}
+	got, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+		t.Fatalf("health auto-clear released plugin assignment: %+v", got)
+	}
+	if replacement, err := m.AssignWorkIfIdle("alpha", "plugin:replacement"); replacement != nil || !errors.Is(err, ErrDogWorking) {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", replacement, err)
 	}
 }
 

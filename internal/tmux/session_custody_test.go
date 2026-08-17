@@ -22,6 +22,21 @@ func TestParseSessionGenerationBindsCustodyToken(t *testing.T) {
 	}
 }
 
+func TestParseSessionGenerationBindsPersistedPaneToken(t *testing.T) {
+	generation, err := parseSessionGeneration("gt-test", "123\t$7\tfixture-generation\t\t19")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generation.PaneID != "%19" {
+		t.Fatalf("pane ID = %q, want %%19", generation.PaneID)
+	}
+	replacement := generation
+	replacement.PaneID = "%20"
+	if generation.Equal(replacement) {
+		t.Fatal("session generations with different immutable panes compared equal")
+	}
+}
+
 func TestWrapSessionCommandWithCustodyIsPlatformHonest(t *testing.T) {
 	const command = "exec env GT_ROLE=witness codex"
 	wrapped, custody, err := WrapSessionCommandWithCustody("/tmp/gt", command)

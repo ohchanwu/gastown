@@ -48,6 +48,10 @@ var validSessionNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 var validSessionIDRe = regexp.MustCompile(`^\$[0-9]+$`)
 
+var validPaneIDRe = regexp.MustCompile(`^%[0-9]+$`)
+
+var validPaneTokenRe = regexp.MustCompile(`^[0-9]+$`)
+
 var validSessionGenerationRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,128}$`)
 
 // Common errors
@@ -225,6 +229,11 @@ const EnvAgentReady = "GT_AGENT_READY"
 // Destructive tmux operations use it inside the server command queue so a
 // same-name/session-ID replacement cannot inherit the prior session's custody.
 const EnvSessionGeneration = "GT_SESSION_GENERATION"
+
+// EnvSessionPane stores the immutable pane ID returned by the new-session
+// transaction. Pane activity is mutable, so process custody must never infer
+// the agent pane from whichever pane happens to be active later.
+const EnvSessionPane = "GT_SESSION_PANE"
 
 // EnvSessionCustody names the launch-time OS containment token. It is empty
 // for pre-upgrade or unsupported-platform sessions, which makes destructive
@@ -477,7 +486,7 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 	nonce := uuid.NewString()
 	sessionEnv[EnvSessionGeneration] = nonce
 
-	args := []string{"new-session", "-d", "-P", "-F", "#{pid}\t#{session_id}", "-s", name}
+	args := []string{"new-session", "-d", "-P", "-F", "#{pid}\t#{session_id}\t#{pane_id}", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
@@ -504,7 +513,7 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 		}
 	}()
 	parts := strings.Split(strings.TrimSpace(out), "\t")
-	if len(parts) != 2 {
+	if len(parts) != 3 {
 		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: unexpected field count %d", len(parts))
 	}
 	serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
@@ -515,6 +524,10 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 	if !validSessionIDRe.MatchString(sessionID) {
 		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: invalid session ID %q", sessionID)
 	}
+	paneID := strings.TrimSpace(parts[2])
+	if !validPaneIDRe.MatchString(paneID) {
+		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: invalid pane ID %q", paneID)
+	}
 	serverIdentity, err := processGenerationIdentity(serverPID)
 	if err != nil {
 		return SessionGeneration{}, fmt.Errorf("reading created tmux server process generation: %w", err)
@@ -522,10 +535,18 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 	generation = SessionGeneration{
 		Name:           name,
 		SessionID:      sessionID,
+		PaneID:         paneID,
 		Nonce:          nonce,
 		Custody:        sessionEnv[EnvSessionCustody],
 		ServerPID:      serverPID,
 		ServerIdentity: serverIdentity,
+	}
+	if err := t.runGuardedSessionGenerationContext(
+		ctx,
+		generation,
+		"set-environment -t "+generation.SessionID+" "+EnvSessionPane+" "+strings.TrimPrefix(generation.PaneID, "%"),
+	); err != nil {
+		return SessionGeneration{}, fmt.Errorf("persisting created tmux agent pane: %w", err)
 	}
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
@@ -929,15 +950,15 @@ func (t *Tmux) NewSessionWithCommandAndEnvGenerationContext(ctx context.Context,
 	}()
 
 	// Enable remain-on-exit BEFORE command runs so we can inspect exit status
-	_, _ = t.runContext(ctx, "set-option", "-t", name, "remain-on-exit", "on")
+	_, _ = t.runContext(ctx, "set-option", "-p", "-t", generation.PaneID, "remain-on-exit", "on")
 
 	// Replace the initial shell with the actual command.
 	if runtime.GOOS == "windows" {
-		if _, err := t.runContext(ctx, "send-keys", "-t", name, command, "Enter"); err != nil {
+		if _, err := t.runContext(ctx, "send-keys", "-t", generation.PaneID, command, "Enter"); err != nil {
 			return SessionGeneration{}, fmt.Errorf("failed to send command in session %q: %w", name, err)
 		}
 	} else {
-		respawnArgs := []string{"respawn-pane", "-k", "-t", name}
+		respawnArgs := []string{"respawn-pane", "-k", "-t", generation.PaneID}
 		if workDir != "" {
 			respawnArgs = append(respawnArgs, "-c", workDir)
 		}
@@ -972,11 +993,11 @@ func (t *Tmux) checkSessionAfterCreateGenerationContext(ctx context.Context, gen
 		if !current.Equal(generation) {
 			return false, ErrSessionGenerationChanged
 		}
-		paneDead, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.SessionID, "#{pane_dead}")
+		paneDead, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.PaneID, "#{pane_dead}")
 		if strings.TrimSpace(paneDead) != "1" {
 			return false, nil
 		}
-		exitStatus, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.SessionID, "#{pane_dead_status}")
+		exitStatus, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.PaneID, "#{pane_dead_status}")
 		status := strings.TrimSpace(exitStatus)
 		if status != "" && status != "0" {
 			return true, fmt.Errorf("session %q: command exited with status %s: %s", generation.Name, status, command)
@@ -1132,6 +1153,7 @@ func (t *Tmux) EnsureSessionFreshWithCommandAndEnv(name, workDir, command string
 type SessionGeneration struct {
 	Name           string
 	SessionID      string
+	PaneID         string
 	Nonce          string
 	Custody        string
 	ServerPID      int
@@ -1143,6 +1165,7 @@ type SessionGeneration struct {
 func (g SessionGeneration) Equal(other SessionGeneration) bool {
 	return g.Name == other.Name &&
 		g.SessionID == other.SessionID &&
+		g.PaneID == other.PaneID &&
 		g.Nonce == other.Nonce &&
 		g.Custody == other.Custody &&
 		g.ServerPID == other.ServerPID &&
@@ -1163,7 +1186,7 @@ func (g PaneProcessGeneration) Equal(other PaneProcessGeneration) bool {
 
 func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 	parts := strings.Split(output, "\t")
-	if len(parts) != 3 && len(parts) != 4 {
+	if len(parts) != 3 && len(parts) != 4 && len(parts) != 5 {
 		// tmux display-message exits successfully for a missing target when the
 		// server still has other sessions, returning only the server PID after
 		// output trimming. Classify that exact shape as terminal absence.
@@ -1187,13 +1210,26 @@ func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 		return SessionGeneration{}, fmt.Errorf("reading tmux session generation: missing or invalid %s", EnvSessionGeneration)
 	}
 	var custody string
-	if len(parts) == 4 {
+	if len(parts) >= 4 {
 		custody = strings.TrimSpace(parts[3])
 		if custody != "" && !validSessionGenerationRe.MatchString(custody) {
 			return SessionGeneration{}, fmt.Errorf("reading tmux session generation: invalid %s", EnvSessionCustody)
 		}
 	}
-	return SessionGeneration{Name: name, SessionID: sessionID, Nonce: nonce, Custody: custody, ServerPID: serverPID}, nil
+	var paneID string
+	if len(parts) == 5 {
+		paneToken := strings.TrimSpace(parts[4])
+		switch {
+		case paneToken == "":
+		case validPaneIDRe.MatchString(paneToken):
+			paneID = paneToken
+		case validPaneTokenRe.MatchString(paneToken):
+			paneID = "%" + paneToken
+		default:
+			return SessionGeneration{}, fmt.Errorf("reading tmux session generation: invalid %s", EnvSessionPane)
+		}
+	}
+	return SessionGeneration{Name: name, SessionID: sessionID, PaneID: paneID, Nonce: nonce, Custody: custody, ServerPID: serverPID}, nil
 }
 
 // CaptureSessionGeneration observes the server PID, immutable-within-server
@@ -1207,7 +1243,7 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 	if err := validateSessionName(name); err != nil {
 		return SessionGeneration{}, err
 	}
-	format := "#{pid}\t#{session_id}\t#{E:" + EnvSessionGeneration + "}\t#{E:" + EnvSessionCustody + "}"
+	format := "#{pid}\t#{session_id}\t#{E:" + EnvSessionGeneration + "}\t#{E:" + EnvSessionCustody + "}\t#{E:" + EnvSessionPane + "}"
 	out, err := t.runContext(ctx, "display-message", "-t", name, "-p", format)
 	if err != nil {
 		return SessionGeneration{}, err
@@ -1221,6 +1257,13 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 		return SessionGeneration{}, fmt.Errorf("reading tmux server process generation: %w", err)
 	}
 	generation.ServerIdentity = serverIdentity
+	legacyPaneID := ""
+	if generation.PaneID == "" {
+		legacyPaneID, err = t.resolveLegacySessionPaneContext(ctx, generation.SessionID)
+		if err != nil {
+			return SessionGeneration{}, err
+		}
+	}
 
 	confirmOut, err := t.runContext(ctx, "display-message", "-t", name, "-p", format)
 	if err != nil {
@@ -1230,14 +1273,45 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 	if err != nil {
 		return SessionGeneration{}, err
 	}
-	if generation.SessionID != confirmed.SessionID || generation.Nonce != confirmed.Nonce || generation.Custody != confirmed.Custody || generation.ServerPID != confirmed.ServerPID {
+	if generation.SessionID != confirmed.SessionID || generation.PaneID != confirmed.PaneID || generation.Nonce != confirmed.Nonce || generation.Custody != confirmed.Custody || generation.ServerPID != confirmed.ServerPID {
 		return SessionGeneration{}, ErrSessionGenerationChanged
+	}
+	if confirmed.PaneID == "" {
+		confirmedLegacyPaneID, paneErr := t.resolveLegacySessionPaneContext(ctx, confirmed.SessionID)
+		if paneErr != nil || confirmedLegacyPaneID != legacyPaneID {
+			return SessionGeneration{}, ErrSessionGenerationChanged
+		}
 	}
 	confirmedServerIdentity, err := processGenerationIdentity(generation.ServerPID)
 	if err != nil || confirmedServerIdentity != generation.ServerIdentity {
 		return SessionGeneration{}, ErrSessionGenerationChanged
 	}
 	return generation, nil
+}
+
+// resolveLegacySessionPaneContext permits a pre-upgrade generation only while
+// its session has exactly one pane. Multiple panes make the historical agent
+// pane unknowable, so cleanup must fail closed rather than follow activity.
+func (t *Tmux) resolveLegacySessionPaneContext(ctx context.Context, sessionID string) (string, error) {
+	out, err := t.runContext(ctx, "list-panes", "-s", "-t", sessionID, "-F", "#{pane_id}")
+	if err != nil {
+		return "", err
+	}
+	panes := strings.Fields(out)
+	if len(panes) != 1 || !validPaneIDRe.MatchString(panes[0]) {
+		return "", ErrSessionGenerationChanged
+	}
+	return panes[0], nil
+}
+
+func (t *Tmux) resolveGenerationPaneContext(ctx context.Context, generation SessionGeneration) (string, error) {
+	if generation.PaneID != "" {
+		if !validPaneIDRe.MatchString(generation.PaneID) {
+			return "", errors.New("invalid tmux session pane")
+		}
+		return generation.PaneID, nil
+	}
+	return t.resolveLegacySessionPaneContext(ctx, generation.SessionID)
 }
 
 func sessionGenerationCondition(generation SessionGeneration) (string, error) {
@@ -1305,17 +1379,22 @@ func (t *Tmux) runGuardedSessionGenerationPaneContext(
 	if panePID <= 0 {
 		return errors.New("invalid tmux pane process generation")
 	}
+	paneID, err := t.resolveGenerationPaneContext(ctx, generation)
+	if err != nil {
+		return err
+	}
 	expectedDead := 0
 	if paneDead {
 		expectedDead = 1
 	}
 	condition = fmt.Sprintf(
-		"#{&&:%s,#{&&:#{==:#{pane_pid},%d},#{==:#{pane_dead},%d}}}",
+		"#{&&:%s,#{&&:#{==:#{pane_id},%s},#{&&:#{==:#{pane_pid},%d},#{==:#{pane_dead},%d}}}}",
 		condition,
+		paneID,
 		panePID,
 		expectedDead,
 	)
-	return t.runGuardedSessionGenerationConditionContext(ctx, generation, condition, command)
+	return t.runGuardedSessionGenerationConditionTargetContext(ctx, generation, paneID, condition, command)
 }
 
 func (t *Tmux) runGuardedSessionGenerationCondition(generation SessionGeneration, condition, command string) error {
@@ -1327,6 +1406,14 @@ func (t *Tmux) runGuardedSessionGenerationConditionContext(
 	generation SessionGeneration,
 	condition, command string,
 ) error {
+	return t.runGuardedSessionGenerationConditionTargetContext(ctx, generation, generation.SessionID, condition, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationConditionTargetContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	target, condition, command string,
+) error {
 	if err := validateServerGeneration(generation); err != nil {
 		return err
 	}
@@ -1335,13 +1422,23 @@ func (t *Tmux) runGuardedSessionGenerationConditionContext(
 	matchedCommand := "display-message -p " + matchMarker + " ; " + command
 	out, err := t.runContext(
 		ctx,
-		"if-shell", "-F", "-t", generation.SessionID,
+		"if-shell", "-F", "-t", target,
 		condition,
 		matchedCommand,
 		"display-message -p "+changedMarker,
 	)
 	if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
-		return nil
+		if target == generation.SessionID {
+			return nil
+		}
+		current, captureErr := t.captureSessionGenerationContext(ctx, generation.Name)
+		if errors.Is(captureErr, ErrSessionNotFound) || errors.Is(captureErr, ErrNoServer) {
+			return nil
+		}
+		if captureErr != nil || !current.Equal(generation) {
+			return errors.Join(ErrSessionGenerationChanged, captureErr)
+		}
+		return ErrSessionGenerationChanged
 	}
 	if err != nil {
 		return err
@@ -1374,17 +1471,26 @@ func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation Sessi
 	if err := validateServerGeneration(generation); err != nil {
 		return 0, false, err
 	}
+	paneID, err := t.resolveGenerationPaneContext(ctx, generation)
+	if err != nil {
+		return 0, false, err
+	}
+	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_id},%s}}", condition, paneID)
 	const paneMarker = "GT_SESSION_GENERATION_PANE:"
 	const changedMarker = "GT_SESSION_GENERATION_CHANGED"
 	out, err := t.runContext(
 		ctx,
-		"if-shell", "-F", "-t", generation.SessionID,
+		"if-shell", "-F", "-t", paneID,
 		condition,
-		"display-message -t "+generation.SessionID+":^ -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
+		"display-message -t "+paneID+" -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
 		"display-message -p "+changedMarker,
 	)
 	if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
-		return 0, false, nil
+		_, captureErr := t.captureSessionGenerationContext(ctx, generation.Name)
+		if errors.Is(captureErr, ErrSessionNotFound) || errors.Is(captureErr, ErrNoServer) {
+			return 0, false, nil
+		}
+		return 0, false, errors.Join(ErrSessionGenerationChanged, captureErr)
 	}
 	if err != nil {
 		return 0, false, err
@@ -4437,17 +4543,6 @@ func (t *Tmux) SelectWindow(session string, index int) error {
 func (t *Tmux) ResolveCurrentSession() (string, error) {
 	_, session, err := t.ResolveCurrentPaneOwner()
 	return session, err
-}
-
-// RunShellBackground asks the tmux server to launch a command outside any pane
-// process tree. Lifecycle finalizers use this so retiring their own pane cannot
-// terminate the process that must commit the durable closeout receipt.
-func (t *Tmux) RunShellBackground(command string) error {
-	if strings.TrimSpace(command) == "" {
-		return errors.New("background tmux command is empty")
-	}
-	_, err := t.run("run-shell", "-b", command)
-	return err
 }
 
 // ResolveCurrentPaneOwner returns the durable pane PID and session containing

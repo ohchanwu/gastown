@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -611,6 +612,44 @@ func TestDaemonDogDispatchMailUsesExactAssignmentThread(t *testing.T) {
 	}
 	if msg.To != "deacon/dogs/alpha" || msg.Subject != "Plugin: reaper" {
 		t.Fatalf("daemon dispatch envelope = to:%q subject:%q", msg.To, msg.Subject)
+	}
+}
+
+func TestRollbackDogDispatchAssignmentPreservesPluginCustodyWhenArchiveFails(t *testing.T) {
+	townRoot := t.TempDir()
+	started := time.Now().UTC().Round(0)
+	testSetupDogState(t, townRoot, "alpha", dog.StateWorking, started)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	state := &dog.DogState{
+		Name:          "alpha",
+		State:         dog.StateWorking,
+		Work:          "plugin:reaper",
+		WorkStartedAt: started,
+		LastActive:    started,
+		CreatedAt:     started,
+		UpdatedAt:     started,
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "deacon", "dogs", "alpha", ".dog.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := rollbackDogDispatchAssignment(mgr, "alpha", state)
+	if cleared || err == nil {
+		t.Fatalf("rollback = %v, %v; want fail-closed archive error", cleared, err)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != dog.StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+		t.Fatalf("daemon rollback released plugin assignment: %+v", got)
+	}
+	if replacement, err := mgr.AssignWorkIfIdle("alpha", "plugin:replacement"); replacement != nil || !errors.Is(err, dog.ErrDogWorking) {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", replacement, err)
 	}
 }
 

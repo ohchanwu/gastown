@@ -784,6 +784,7 @@ func TestManager_ClearWorkFinalizerFailurePreservesAssignmentForRetry(t *testing
 		UpdatedAt:     now,
 	}
 	setupDogWithState(t, m, "alpha", state)
+	m.assignmentFinalizer = func(string, string, time.Time) error { return nil }
 	finalizeErr := errors.New("archive unavailable")
 
 	cleared, err := m.ClearWorkWithFinalizeIfMatches(

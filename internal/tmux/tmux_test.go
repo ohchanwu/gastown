@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -998,6 +999,93 @@ func TestSessionGenerationCleanupRejectsReplacementPane(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("session was killed after pane generation mismatch")
+	}
+}
+
+func TestSessionGenerationPanePIDIgnoresMutableActivePane(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-active-pane-%d", time.Now().UnixNano()))
+	session := "gt-generation-active-pane"
+	defer func() { _ = tm.KillServer() }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPID, exists, err := tm.getPanePIDGeneration(generation)
+	if err != nil || !exists {
+		t.Fatalf("initial pane PID = %d, exists=%v, err=%v", originalPID, exists, err)
+	}
+
+	replacementPane, err := tm.run("split-window", "-P", "-F", "#{pane_id}", "-t", session, "sleep 60")
+	if err != nil {
+		t.Fatalf("split-window: %v", err)
+	}
+	replacementPane = strings.TrimSpace(replacementPane)
+	if _, err := tm.run("select-pane", "-t", replacementPane); err != nil {
+		t.Fatalf("select-pane: %v", err)
+	}
+	replacementPIDText, err := tm.run("display-message", "-p", "-t", replacementPane, "#{pane_pid}")
+	if err != nil {
+		t.Fatalf("replacement pane PID: %v", err)
+	}
+	replacementPID, err := strconv.Atoi(strings.TrimSpace(replacementPIDText))
+	if err != nil {
+		t.Fatalf("parse replacement pane PID %q: %v", replacementPIDText, err)
+	}
+	if replacementPID == originalPID {
+		t.Fatalf("test setup reused pane PID %d", originalPID)
+	}
+
+	gotPID, exists, err := tm.getPanePIDGeneration(generation)
+	if err != nil || !exists {
+		t.Fatalf("generation-bound pane PID = %d, exists=%v, err=%v", gotPID, exists, err)
+	}
+	if gotPID != originalPID {
+		t.Fatalf("generation-bound pane PID = %d, want immutable created-pane PID %d (active pane PID %d)", gotPID, originalPID, replacementPID)
+	}
+}
+
+func TestLegacySessionGenerationAllowsOnePaneAndRejectsAmbiguousPanes(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-legacy-pane-%d", time.Now().UnixNano()))
+	session := "gt-generation-legacy-pane"
+	defer func() { _ = tm.KillServer() }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.PaneID == "" {
+		t.Fatal("new session generation did not persist its created pane")
+	}
+	if _, err := tm.run("set-environment", "-u", "-t", created.SessionID, EnvSessionPane); err != nil {
+		t.Fatalf("remove pane receipt: %v", err)
+	}
+
+	legacy, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatalf("single-pane legacy capture: %v", err)
+	}
+	if legacy.PaneID != "" {
+		t.Fatalf("legacy generation pane = %q, want empty compatibility marker", legacy.PaneID)
+	}
+	if _, exists, err := tm.getPanePIDGeneration(legacy); err != nil || !exists {
+		t.Fatalf("single-pane legacy PID lookup exists=%v err=%v", exists, err)
+	}
+
+	if _, err := tm.run("new-window", "-d", "-t", session, "sleep 60"); err != nil {
+		t.Fatalf("add legacy session window: %v", err)
+	}
+	if _, err := tm.CaptureSessionGeneration(session); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("ambiguous legacy capture error = %v, want generation change", err)
+	}
+	if _, _, err := tm.getPanePIDGeneration(legacy); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("ambiguous legacy PID lookup error = %v, want generation change", err)
 	}
 }
 

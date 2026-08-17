@@ -308,11 +308,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		if err := router.Send(msg); err != nil {
 			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
 			// Roll back assignment — no point starting a session without instructions.
-			cleared, clearErr := mgr.ClearWorkIfMatches(
-				idleDog.Name,
-				assignedState.Work,
-				assignedState.WorkStartedAt,
-			)
+			cleared, clearErr := rollbackDogDispatchAssignment(mgr, idleDog.Name, assignedState)
 			if clearErr != nil {
 				d.logger.Printf("Handler: failed to clear work after mail failure for dog %s: %v", idleDog.Name, clearErr)
 			} else if !cleared {
@@ -331,11 +327,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 				d.logger.Printf("Handler: preserving assignment for dog %s because exact session cleanup is incomplete", idleDog.Name)
 				continue
 			}
-			cleared, clearErr := mgr.ClearWorkIfMatches(
-				idleDog.Name,
-				assignedState.Work,
-				assignedState.WorkStartedAt,
-			)
+			cleared, clearErr := rollbackDogDispatchAssignment(mgr, idleDog.Name, assignedState)
 			if clearErr != nil {
 				d.logger.Printf("Handler: failed to clear work after start failure for dog %s: %v", idleDog.Name, clearErr)
 			} else if !cleared {
@@ -358,6 +350,13 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			d.logger.Printf("Handler: failed to record dispatch for plugin %s: %v", p.Name, err)
 		}
 	}
+}
+
+func rollbackDogDispatchAssignment(mgr *dog.Manager, dogName string, assigned *dog.DogState) (bool, error) {
+	if mgr == nil || assigned == nil {
+		return false, errors.New("dog dispatch rollback evidence is unavailable")
+	}
+	return mgr.ClearWorkIfMatches(dogName, assigned.Work, assigned.WorkStartedAt)
 }
 
 func newDogPluginDispatchMessage(dogName string, assigned *dog.DogState, p *plugin.Plugin) *mail.Message {

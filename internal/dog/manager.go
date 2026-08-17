@@ -30,18 +30,21 @@ var (
 
 // Manager handles dog lifecycle in the kennel.
 type Manager struct {
-	townRoot   string
-	kennelPath string // ~/gt/deacon/dogs/
-	rigsConfig *config.RigsConfig
+	townRoot            string
+	kennelPath          string // ~/gt/deacon/dogs/
+	rigsConfig          *config.RigsConfig
+	assignmentFinalizer func(name, work string, startedAt time.Time) error
 }
 
 // NewManager creates a new dog manager.
 func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
-	return &Manager{
+	m := &Manager{
 		townRoot:   townRoot,
 		kennelPath: filepath.Join(townRoot, "deacon", "dogs"),
 		rigsConfig: rigsConfig,
 	}
+	m.assignmentFinalizer = m.archivePluginAssignmentMails
+	return m
 }
 
 // lockDog acquires an exclusive file lock for a specific dog's full lifecycle.
@@ -396,6 +399,10 @@ func (m *Manager) SetState(name string, state State) error {
 	if err != nil {
 		return fmt.Errorf("loading state: %w", err)
 	}
+	if state == StateIdle &&
+		(dogState.State == StateWorking || dogState.Work != "" || dogState.SessionGeneration != nil) {
+		return ErrDogWorking
+	}
 
 	dogState.State = state
 	dogState.LastActive = time.Now()
@@ -466,6 +473,12 @@ func (m *Manager) ClearWork(name string) error {
 	if err != nil {
 		return fmt.Errorf("loading state: %w", err)
 	}
+	if state.SessionGeneration != nil {
+		return errors.New("dog still owns an exact session generation")
+	}
+	if err := m.finalizeAssignment(state); err != nil {
+		return err
+	}
 
 	state.State = StateIdle
 	state.Work = ""
@@ -514,6 +527,9 @@ func (m *Manager) ClearWorkWithFinalizeIfMatches(
 		!state.WorkStartedAt.Equal(expectedStartedAt) ||
 		state.SessionGeneration != nil {
 		return false, nil
+	}
+	if err := m.finalizeAssignment(state); err != nil {
+		return false, err
 	}
 	if finalize != nil {
 		if err := finalize(); err != nil {
@@ -670,6 +686,9 @@ func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 	if err := teardown(expectedGeneration); err != nil {
 		return false, err
 	}
+	if err := m.finalizeAssignment(state); err != nil {
+		return false, err
+	}
 	if finalize != nil {
 		if err := finalize(); err != nil {
 			return false, fmt.Errorf("finalizing dog assignment: %w", err)
@@ -686,6 +705,23 @@ func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 		return false, err
 	}
 	return true, nil
+}
+
+// finalizeAssignment retires durable instructions owned by the exact current
+// assignment before any path can publish the reusable idle state. Keeping this
+// invariant in Manager prevents CLI, daemon, health, and rollback callers from
+// accidentally bypassing assignment-bound cleanup.
+func (m *Manager) finalizeAssignment(state *DogState) error {
+	if state == nil || !strings.HasPrefix(state.Work, "plugin:") {
+		return nil
+	}
+	if m.assignmentFinalizer == nil {
+		return errors.New("dog assignment finalizer is unavailable")
+	}
+	if err := m.assignmentFinalizer(state.Name, state.Work, state.WorkStartedAt); err != nil {
+		return fmt.Errorf("finalizing dog assignment: %w", err)
+	}
+	return nil
 }
 
 // RetireSessionWithTeardownIfMatches removes an exact runtime generation from

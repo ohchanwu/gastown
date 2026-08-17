@@ -16,7 +16,6 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/dog"
-	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -349,85 +348,47 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 	}
 }
 
-func TestDogPluginMailCleanupMatchesOnlyCompletedAssignment(t *testing.T) {
+func TestDogCloseoutPluginMailFailurePreservesAssignment(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
 	started := time.Now().UTC().Round(0)
-	oldThread := dog.AssignmentThreadID("alpha", "work-old", started)
-	newThread := dog.AssignmentThreadID("alpha", "work-new", started.Add(time.Nanosecond))
-	dogAddress := "deacon/dogs/alpha"
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:          "alpha",
+		State:         dog.StateWorking,
+		Work:          "plugin:reaper",
+		WorkStartedAt: started,
+		LastActive:    started,
+		CreatedAt:     started,
+		UpdatedAt:     started,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}
 
-	oldMail := &mail.Message{
-		From:     "deacon/",
-		To:       dogAddress,
-		Subject:  "Plugin: reaper",
-		ThreadID: oldThread,
+	if err := completeDogCloseout(mgr, controller, snapshot); err == nil || !strings.Contains(err.Error(), "finalizing dog assignment") {
+		t.Fatalf("completeDogCloseout() error = %v, want mandatory assignment finalizer failure", err)
 	}
-	replacementMail := *oldMail
-	replacementMail.ThreadID = newThread
-
-	if !matchesPluginDispatchMail(oldMail, dogAddress, oldThread) {
-		t.Fatal("completed assignment mail did not match its exact dispatch thread")
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if matchesPluginDispatchMail(&replacementMail, dogAddress, oldThread) {
-		t.Fatal("stale closeout matched replacement assignment mail")
+	if got.State != dog.StateWorking || got.Work != snapshot.Work || !got.WorkStartedAt.Equal(snapshot.WorkStartedAt) {
+		t.Fatalf("command closeout released plugin assignment: %+v", got)
 	}
-	if oldThread == "" || oldThread == newThread {
-		t.Fatalf("dispatch thread tokens are not assignment-specific: old=%q new=%q", oldThread, newThread)
+	if replacement, err := mgr.AssignWorkIfIdle("alpha", "plugin:replacement"); replacement != nil || !errors.Is(err, dog.ErrDogWorking) {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", replacement, err)
 	}
 }
 
-type fakePluginMailArchiver struct {
-	messages   []*mail.Message
-	listErr    error
-	archiveErr error
-	archived   []string
-}
-
-func (f *fakePluginMailArchiver) List() ([]*mail.Message, error) {
-	return f.messages, f.listErr
-}
-
-func (f *fakePluginMailArchiver) Archive(id string) error {
-	if f.archiveErr != nil {
-		return f.archiveErr
-	}
-	f.archived = append(f.archived, id)
-	return nil
-}
-
-func TestArchivePluginDispatchMailsReportsListAndArchiveFailures(t *testing.T) {
-	dogAddress := "deacon/dogs/alpha"
-	thread := dog.AssignmentThreadID("alpha", "plugin:reaper", time.Now().UTC().Round(0))
-	wantErr := errors.New("mail store unavailable")
-
-	if _, err := archivePluginDispatchMails(&fakePluginMailArchiver{listErr: wantErr}, dogAddress, thread); !errors.Is(err, wantErr) {
-		t.Fatalf("list failure = %v, want %v", err, wantErr)
-	}
-	mailbox := &fakePluginMailArchiver{
-		messages: []*mail.Message{{
-			ID:       "mail-old",
-			From:     "daemon",
-			To:       dogAddress,
-			Subject:  "Plugin: reaper",
-			ThreadID: thread,
-		}},
-		archiveErr: wantErr,
-	}
-	if _, err := archivePluginDispatchMails(mailbox, dogAddress, thread); !errors.Is(err, wantErr) {
-		t.Fatalf("archive failure = %v, want %v", err, wantErr)
-	}
-	if len(mailbox.archived) != 0 {
-		t.Fatalf("failed archive recorded success: %v", mailbox.archived)
-	}
-}
-
-func TestDogDoneArchiveFailurePreservesCustodyAndRetries(t *testing.T) {
+func TestDogDoneCallerFinalizerFailurePreservesCustodyAndRetries(t *testing.T) {
 	mgr, townRoot := testDogManager(t)
 	generation := cmdTestDogGeneration("$archive", "nonce-archive")
 	started := time.Now().UTC().Round(0)
 	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
 		Name:              "alpha",
 		State:             dog.StateWorking,
-		Work:              "plugin:reaper",
+		Work:              "task:reaper",
 		WorkStartedAt:     started,
 		LastActive:        started,
 		CreatedAt:         started,
@@ -841,13 +802,19 @@ func TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane(t *testing.T) {
 	}
 	stored, _ := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
 	running, _ := tm.HasSession("hq-dog-alpha")
-	t.Fatalf("in-session closeout did not finish: running=%v state=%+v", running, stored)
+	currentGeneration, generationErr := tm.CaptureSessionGeneration("hq-dog-alpha")
+	currentPane, paneErr := tm.GetPaneID("hq-dog-alpha")
+	t.Fatalf(
+		"in-session closeout did not finish: running=%v state=%+v original=%+v current=%+v generation_err=%v pane=%q pane_err=%v",
+		running, stored, generation, currentGeneration, generationErr, currentPane, paneErr,
+	)
 }
 
 func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {
 	return tmux.SessionGeneration{
 		Name:           "hq-dog-alpha",
 		SessionID:      sessionID,
+		PaneID:         "%0",
 		Nonce:          nonce,
 		Custody:        "custody-alpha",
 		ServerPID:      4242,

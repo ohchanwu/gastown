@@ -166,6 +166,116 @@ func TestCompleteWorkWithTeardownIfMatchesKeepsFailedCloseoutUnavailable(t *test
 	}
 }
 
+func TestPluginAssignmentFinalizerFailureBlocksEveryManagerCloseoutPath(t *testing.T) {
+	wantErr := errors.New("assignment mail archive failed")
+	tests := []struct {
+		name       string
+		generation bool
+		close      func(*Manager, *DogState, tmux.SessionGeneration) (bool, error)
+	}{
+		{
+			name: "compare and clear",
+			close: func(mgr *Manager, state *DogState, _ tmux.SessionGeneration) (bool, error) {
+				return mgr.ClearWorkIfMatches("alpha", state.Work, state.WorkStartedAt)
+			},
+		},
+		{
+			name: "compare clear with caller finalizer",
+			close: func(mgr *Manager, state *DogState, _ tmux.SessionGeneration) (bool, error) {
+				return mgr.ClearWorkWithFinalizeIfMatches("alpha", state.Work, state.WorkStartedAt, func() error {
+					t.Fatal("caller finalizer ran after mandatory assignment finalizer failed")
+					return nil
+				})
+			},
+		},
+		{
+			name:       "generation teardown",
+			generation: true,
+			close: func(mgr *Manager, state *DogState, generation tmux.SessionGeneration) (bool, error) {
+				return mgr.CompleteWorkWithTeardownIfMatches(
+					"alpha", state.Work, state.WorkStartedAt, generation,
+					func(tmux.SessionGeneration) error { return nil },
+				)
+			},
+		},
+		{
+			name:       "generation teardown with caller finalizer",
+			generation: true,
+			close: func(mgr *Manager, state *DogState, generation tmux.SessionGeneration) (bool, error) {
+				return mgr.CompleteWorkWithTeardownAndFinalizeIfMatches(
+					"alpha", state.Work, state.WorkStartedAt, generation,
+					func(tmux.SessionGeneration) error { return nil },
+					func() error {
+						t.Fatal("caller finalizer ran after mandatory assignment finalizer failed")
+						return nil
+					},
+				)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, state := newDogStateManager(t, "alpha", "plugin:reaper")
+			generation := testDogTmuxGeneration("$1", "nonce-plugin")
+			if tt.generation {
+				persistDogSessionGenerationForTest(t, mgr, state, generation)
+			}
+			finalizerCalls := 0
+			mgr.assignmentFinalizer = func(name, work string, startedAt time.Time) error {
+				finalizerCalls++
+				if name != "alpha" || work != state.Work || !startedAt.Equal(state.WorkStartedAt) {
+					t.Fatalf("finalizer assignment = %q %q %s, want exact snapshot", name, work, startedAt)
+				}
+				return wantErr
+			}
+
+			closed, err := tt.close(mgr, state, generation)
+			if closed || !errors.Is(err, wantErr) {
+				t.Fatalf("closeout = %v, %v; want false and archive error", closed, err)
+			}
+			if finalizerCalls != 1 {
+				t.Fatalf("assignment finalizer calls = %d, want 1", finalizerCalls)
+			}
+			got, err := mgr.Get("alpha")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+				t.Fatalf("failed finalizer released assignment custody: %+v", got)
+			}
+			if tt.generation && (got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(generation)) {
+				t.Fatalf("failed finalizer released runtime custody: %+v", got.SessionGeneration)
+			}
+			if replacement, err := mgr.AssignWorkIfIdle("alpha", "plugin:replacement"); replacement != nil || !errors.Is(err, ErrDogWorking) {
+				t.Fatalf("replacement assignment = %+v, %v; want blocked", replacement, err)
+			}
+		})
+	}
+}
+
+func TestUnconditionalManagerMutationsCannotBypassPluginCloseout(t *testing.T) {
+	wantErr := errors.New("assignment mail archive failed")
+	mgr, state := newDogStateManager(t, "alpha", "plugin:reaper")
+	mgr.assignmentFinalizer = func(name, work string, startedAt time.Time) error {
+		return wantErr
+	}
+
+	if err := mgr.ClearWork("alpha"); !errors.Is(err, wantErr) {
+		t.Fatalf("ClearWork() error = %v, want archive failure", err)
+	}
+	if err := mgr.SetState("alpha", StateIdle); !errors.Is(err, ErrDogWorking) {
+		t.Fatalf("SetState(idle) error = %v, want ErrDogWorking", err)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+		t.Fatalf("unconditional mutation released plugin assignment: %+v", got)
+	}
+}
+
 func TestSetSessionGenerationIfAssignmentMatchesRejectsStaleStartup(t *testing.T) {
 	mgr, initial := newDogStateManager(t, "alpha", "work-old")
 	oldGeneration := testDogTmuxGeneration("$1", "nonce-old")
@@ -391,6 +501,7 @@ func testDogTmuxGeneration(sessionID, nonce string) tmux.SessionGeneration {
 	return tmux.SessionGeneration{
 		Name:           "hq-dog-alpha",
 		SessionID:      sessionID,
+		PaneID:         "%0",
 		Nonce:          nonce,
 		Custody:        "custody-alpha",
 		ServerPID:      4242,
