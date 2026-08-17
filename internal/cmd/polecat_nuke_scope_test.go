@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
+	"strings"
 	"testing"
 
 	polecatpkg "github.com/steveyegge/gastown/internal/polecat"
@@ -41,6 +44,53 @@ func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnly"); calls != 1 {
 		t.Fatalf("nukePolecatFullWithOptions local-only removal calls = %d, want 1", calls)
+	}
+}
+
+func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "polecat.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse polecat.go: %v", err)
+	}
+
+	if refs := referencesIdentifier(t, file, "runPolecatNuke", "provePolecatNukeCustody"); refs != 1 {
+		t.Fatalf("runPolecatNuke custody proof references = %d, want 1", refs)
+	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 1 {
+		t.Fatalf("real nuke custody proof calls = %d, want 1", calls)
+	}
+}
+
+func TestPolecatNukeDryRunRefusesWhenCustodyProofFails(t *testing.T) {
+	oldDryRun, oldForce := polecatNukeDryRun, polecatNukeForce
+	polecatNukeDryRun, polecatNukeForce = true, true
+	t.Cleanup(func() {
+		polecatNukeDryRun, polecatNukeForce = oldDryRun, oldForce
+	})
+
+	proofCalls := 0
+	targets := []polecatTarget{{rigName: "rig", polecatName: "nitro", r: &rigpkg.Rig{}}}
+	output := capturePolecatNukeStdout(t, func() {
+		err := runResolvedPolecatNuke(targets, func(string, string, *polecatpkg.Manager, *rigpkg.Rig, nukePolecatOptions) (polecatNukeCustody, error) {
+			proofCalls++
+			return polecatNukeCustody{}, errors.New("branch custody is ambiguous")
+		})
+		if err != nil {
+			t.Fatalf("runResolvedPolecatNuke: %v", err)
+		}
+	})
+
+	if proofCalls != 1 {
+		t.Fatalf("custody proof calls = %d, want 1", proofCalls)
+	}
+	if !strings.Contains(output, "Would refuse to nuke rig/nitro") {
+		t.Fatalf("output did not report refusal:\n%s", output)
+	}
+	if !strings.Contains(output, "branch custody is ambiguous") {
+		t.Fatalf("output did not explain custody failure:\n%s", output)
+	}
+	if strings.Contains(output, "Would nuke rig/nitro") {
+		t.Fatalf("output falsely advertised nuke:\n%s", output)
 	}
 }
 
@@ -112,4 +162,59 @@ func callsTo(t *testing.T, file *ast.File, function, callee string) int {
 		return true
 	})
 	return calls
+}
+
+func referencesIdentifier(t *testing.T, file *ast.File, function, identifier string) int {
+	t.Helper()
+
+	var body *ast.BlockStmt
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == function {
+			body = fn.Body
+			break
+		}
+	}
+	if body == nil {
+		t.Fatalf("function %s not found", function)
+	}
+
+	references := 0
+	ast.Inspect(body, func(node ast.Node) bool {
+		ident, ok := node.(*ast.Ident)
+		if ok && ident.Name == identifier {
+			references++
+		}
+		return true
+	})
+	return references
+}
+
+func capturePolecatNukeStdout(t *testing.T, run func()) string {
+	t.Helper()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	t.Cleanup(func() { os.Stdout = original })
+
+	output := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		output <- data
+	}()
+
+	run()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	os.Stdout = original
+	data := <-output
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close stdout reader: %v", err)
+	}
+	return string(data)
 }

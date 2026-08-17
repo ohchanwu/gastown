@@ -1977,6 +1977,18 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 		fmt.Println("No polecats to nuke.")
 		return nil
 	}
+	return runResolvedPolecatNuke(targets, provePolecatNukeCustody)
+}
+
+type polecatNukeCustodyProver func(
+	polecatName string,
+	rigName string,
+	mgr *polecat.Manager,
+	r *rig.Rig,
+	opts nukePolecatOptions,
+) (polecatNukeCustody, error)
+
+func runResolvedPolecatNuke(targets []polecatTarget, proveCustody polecatNukeCustodyProver) error {
 
 	// Safety checks: refuse to nuke polecats with active work unless --force is set
 	if !polecatNukeForce && !polecatNukeDryRun {
@@ -2003,20 +2015,36 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 	for _, p := range targets {
 		if polecatNukeDryRun {
-			blocked := !polecatNukeForce && checkPolecatSafety(p).Blocked
-			if blocked {
+			safetyBlocked := !polecatNukeForce && checkPolecatSafety(p).Blocked
+			var custodyErr error
+			if !safetyBlocked {
+				_, custodyErr = proveCustody(
+					p.polecatName,
+					p.rigName,
+					p.mgr,
+					p.r,
+					nukePolecatOptions{Force: polecatNukeForce},
+				)
+			}
+			blocked := safetyBlocked || custodyErr != nil
+			if safetyBlocked {
 				fmt.Printf("Would refuse to nuke %s/%s without --force:\n", p.rigName, p.polecatName)
-				dryRunBlocked++
+			} else if custodyErr != nil {
+				fmt.Printf("Would refuse to nuke %s/%s:\n", p.rigName, p.polecatName)
+				fmt.Printf("  - Custody proof: %v\n", custodyErr)
 			} else {
 				fmt.Printf("Would nuke %s/%s:\n", p.rigName, p.polecatName)
+			}
+			if blocked {
+				dryRunBlocked++
 			}
 			fmt.Printf("  - Kill session: gt-%s-%s\n", p.rigName, p.polecatName)
 			fmt.Printf("  - Delete worktree: %s/polecats/%s\n", p.r.Path, p.polecatName)
 			fmt.Printf("  - Delete branch (if exists)\n")
 			fmt.Printf("  - Reset agent bead: %s\n", polecatBeadIDForRig(p.r, p.rigName, p.polecatName))
 
-			if displayDryRunSafetyCheck(p) && !blocked {
-				dryRunBlocked++
+			if custodyErr == nil {
+				displayDryRunSafetyCheck(p)
 			}
 			fmt.Println()
 			continue
@@ -2074,7 +2102,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 func dryRunNukeSummary(total, blocked int) string {
 	if blocked > 0 {
-		return fmt.Sprintf("Would refuse to nuke %d of %d polecat(s) without --force.", blocked, total)
+		return fmt.Sprintf("Would refuse to nuke %d of %d polecat(s).", blocked, total)
 	}
 	return fmt.Sprintf("Would nuke %d polecat(s).", total)
 }
@@ -2094,36 +2122,63 @@ type nukePolecatOptions struct {
 	PurgeClosedEphemerals bool
 }
 
-func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
+type polecatNukeCustody struct {
+	PolecatInfo    *polecat.Polecat
+	BranchToDelete string
+	BranchTargets  []string
+}
+
+func provePolecatNukeCustody(
+	polecatName string,
+	rigName string,
+	mgr *polecat.Manager,
+	r *rig.Rig,
+	opts nukePolecatOptions,
+) (polecatNukeCustody, error) {
+	var custody polecatNukeCustody
 	if err := checkNukeActiveMRSafety(mgr, polecatName, rigName, opts.Force); err != nil {
-		return err
+		return custody, err
 	}
 
 	// Resolve branch custody before any local mutation. Nuke is a retirement
 	// operation, not a publication path: unique work must already be preserved.
 	polecatInfo, getErr := mgr.Get(polecatName)
 	if getErr != nil && !errors.Is(getErr, polecat.ErrPolecatNotFound) {
-		return fmt.Errorf("cannot resolve custody for %s/%s before nuke: %w", rigName, polecatName, getErr)
+		return custody, fmt.Errorf("cannot resolve custody for %s/%s before nuke: %w", rigName, polecatName, getErr)
 	}
-	var branchToDelete string
-	var branchTargets []string
-	if getErr == nil && polecatInfo != nil {
-		branchToDelete = polecatInfo.Branch
-		if branchToDelete != "" {
-			var err error
-			branchTargets, err = nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
-			if err != nil {
-				return err
-			}
-			branchGit := git.NewGit(polecatInfo.ClonePath)
-			if _, statErr := os.Stat(polecatInfo.ClonePath); statErr != nil {
-				branchGit = getRepoGitForRig(r.Path)
-			}
-			if err := verifyPreservedLocalPolecatBranch(branchGit, branchToDelete, branchTargets); err != nil {
-				return fmt.Errorf("cannot nuke %s/%s: %w", rigName, polecatName, err)
-			}
-		}
+	if getErr != nil || polecatInfo == nil {
+		return custody, nil
 	}
+
+	custody.PolecatInfo = polecatInfo
+	custody.BranchToDelete = polecatInfo.Branch
+	if custody.BranchToDelete == "" {
+		return custody, nil
+	}
+
+	branchTargets, err := nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
+	if err != nil {
+		return polecatNukeCustody{}, err
+	}
+	custody.BranchTargets = branchTargets
+	branchGit := git.NewGit(polecatInfo.ClonePath)
+	if _, statErr := os.Stat(polecatInfo.ClonePath); statErr != nil {
+		branchGit = getRepoGitForRig(r.Path)
+	}
+	if err := verifyPreservedLocalPolecatBranch(branchGit, custody.BranchToDelete, branchTargets); err != nil {
+		return polecatNukeCustody{}, fmt.Errorf("cannot nuke %s/%s: %w", rigName, polecatName, err)
+	}
+	return custody, nil
+}
+
+func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
+	custody, err := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
+	if err != nil {
+		return err
+	}
+	polecatInfo := custody.PolecatInfo
+	branchToDelete := custody.BranchToDelete
+	branchTargets := custody.BranchTargets
 
 	t := tmux.NewTmux()
 
@@ -2142,7 +2197,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	// Without this, nuked polecats leave orphan molecule refs that block re-sling.
 	// The stale attached_molecule in the work bead's description causes sling to
 	// fail with "bead already has N attached molecule(s)" on re-dispatch (gt-npzy).
-	if getErr == nil && polecatInfo != nil && polecatInfo.Issue != "" {
+	if polecatInfo != nil && polecatInfo.Issue != "" {
 		nukeCleanupMolecules(polecatInfo.Issue, r)
 	}
 

@@ -778,7 +778,7 @@ func TestDryRunNukeSummary(t *testing.T) {
 		want    string
 	}{
 		{name: "safe", total: 2, want: "Would nuke 2 polecat(s)."},
-		{name: "blocked", total: 2, blocked: 1, want: "Would refuse to nuke 1 of 2 polecat(s) without --force."},
+		{name: "blocked", total: 2, blocked: 1, want: "Would refuse to nuke 1 of 2 polecat(s)."},
 	}
 
 	for _, tt := range tests {
