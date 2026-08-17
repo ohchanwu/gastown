@@ -294,11 +294,15 @@ func TestDogDone_NotFound(t *testing.T) {
 type fakeDogSessionController struct {
 	captured   tmux.SessionGeneration
 	captureErr error
+	captureFn  func(string) (tmux.SessionGeneration, error)
 	killed     []tmux.SessionGeneration
 	killFn     func(tmux.SessionGeneration) error
 }
 
-func (f *fakeDogSessionController) CaptureSessionGeneration(string) (tmux.SessionGeneration, error) {
+func (f *fakeDogSessionController) CaptureSessionGeneration(name string) (tmux.SessionGeneration, error) {
+	if f.captureFn != nil {
+		return f.captureFn(name)
+	}
 	return f.captured, f.captureErr
 }
 
@@ -347,8 +351,8 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 
 func TestDogPluginMailCleanupMatchesOnlyCompletedAssignment(t *testing.T) {
 	started := time.Now().UTC().Round(0)
-	oldThread := dogDispatchThreadID("alpha", "work-old", started)
-	newThread := dogDispatchThreadID("alpha", "work-new", started.Add(time.Nanosecond))
+	oldThread := dog.AssignmentThreadID("alpha", "work-old", started)
+	newThread := dog.AssignmentThreadID("alpha", "work-new", started.Add(time.Nanosecond))
 	dogAddress := "deacon/dogs/alpha"
 
 	oldMail := &mail.Message{
@@ -368,6 +372,139 @@ func TestDogPluginMailCleanupMatchesOnlyCompletedAssignment(t *testing.T) {
 	}
 	if oldThread == "" || oldThread == newThread {
 		t.Fatalf("dispatch thread tokens are not assignment-specific: old=%q new=%q", oldThread, newThread)
+	}
+}
+
+type fakePluginMailArchiver struct {
+	messages   []*mail.Message
+	listErr    error
+	archiveErr error
+	archived   []string
+}
+
+func (f *fakePluginMailArchiver) List() ([]*mail.Message, error) {
+	return f.messages, f.listErr
+}
+
+func (f *fakePluginMailArchiver) Archive(id string) error {
+	if f.archiveErr != nil {
+		return f.archiveErr
+	}
+	f.archived = append(f.archived, id)
+	return nil
+}
+
+func TestArchivePluginDispatchMailsReportsListAndArchiveFailures(t *testing.T) {
+	dogAddress := "deacon/dogs/alpha"
+	thread := dog.AssignmentThreadID("alpha", "plugin:reaper", time.Now().UTC().Round(0))
+	wantErr := errors.New("mail store unavailable")
+
+	if _, err := archivePluginDispatchMails(&fakePluginMailArchiver{listErr: wantErr}, dogAddress, thread); !errors.Is(err, wantErr) {
+		t.Fatalf("list failure = %v, want %v", err, wantErr)
+	}
+	mailbox := &fakePluginMailArchiver{
+		messages: []*mail.Message{{
+			ID:       "mail-old",
+			From:     "daemon",
+			To:       dogAddress,
+			Subject:  "Plugin: reaper",
+			ThreadID: thread,
+		}},
+		archiveErr: wantErr,
+	}
+	if _, err := archivePluginDispatchMails(mailbox, dogAddress, thread); !errors.Is(err, wantErr) {
+		t.Fatalf("archive failure = %v, want %v", err, wantErr)
+	}
+	if len(mailbox.archived) != 0 {
+		t.Fatalf("failed archive recorded success: %v", mailbox.archived)
+	}
+}
+
+func TestDogDoneArchiveFailurePreservesCustodyAndRetries(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	generation := cmdTestDogGeneration("$archive", "nonce-archive")
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:              "alpha",
+		State:             dog.StateWorking,
+		Work:              "plugin:reaper",
+		WorkStartedAt:     started,
+		LastActive:        started,
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}
+	archiveErr := errors.New("archive failed")
+	if err := completeDogCloseoutWithFinalize(mgr, controller, snapshot, func() error { return archiveErr }); !errors.Is(err, archiveErr) {
+		t.Fatalf("closeout error = %v, want archive failure", err)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != dog.StateWorking || got.Work != snapshot.Work || got.SessionGeneration == nil ||
+		!got.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("archive failure released custody: %+v", got)
+	}
+	if assigned, err := mgr.AssignWorkIfIdle("alpha", "replacement"); !errors.Is(err, dog.ErrDogWorking) || assigned != nil {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", assigned, err)
+	}
+	if err := completeDogCloseoutWithFinalize(mgr, controller, snapshot, func() error { return nil }); err != nil {
+		t.Fatalf("retry closeout: %v", err)
+	}
+	got, err = mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != dog.StateIdle || got.Work != "" || got.SessionGeneration != nil {
+		t.Fatalf("successful retry did not release custody: %+v", got)
+	}
+}
+
+func TestDogDoneAbsentSessionCannotClearNewlyPersistedGeneration(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name:          "alpha",
+		State:         dog.StateWorking,
+		Work:          "plugin:reaper",
+		WorkStartedAt: started,
+		LastActive:    started,
+		CreatedAt:     started,
+		UpdatedAt:     started,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := cmdTestDogGeneration("$replacement", "nonce-replacement")
+	controller := &fakeDogSessionController{}
+	controller.captureFn = func(string) (tmux.SessionGeneration, error) {
+		persisted, persistErr := mgr.SetSessionGenerationIfAssignmentMatches(
+			"alpha", snapshot.Work, snapshot.WorkStartedAt, nil, generation,
+		)
+		if persistErr != nil || !persisted {
+			t.Fatalf("persist replacement generation = %v, %v", persisted, persistErr)
+		}
+		return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
+	}
+
+	err = completeDogCloseout(mgr, controller, snapshot)
+	if !errors.Is(err, errDogCloseoutIncomplete) {
+		t.Fatalf("closeout error = %v, want incomplete", err)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != dog.StateWorking || got.Work != snapshot.Work || got.SessionGeneration == nil ||
+		!got.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("stale absent-session closeout mutated replacement generation: %+v", got)
 	}
 }
 

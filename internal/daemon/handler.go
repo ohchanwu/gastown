@@ -304,14 +304,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 
 		// Send mail with plugin instructions BEFORE starting the session
 		// so the dog finds work in its inbox on first check.
-		msg := mail.NewMessage(
-			"daemon",
-			fmt.Sprintf("deacon/dogs/%s", idleDog.Name),
-			fmt.Sprintf("Plugin: %s", p.Name),
-			p.FormatMailBody(),
-		)
-		msg.Type = mail.TypeTask
-		msg.Timestamp = time.Now()
+		msg := newDogPluginDispatchMessage(idleDog.Name, assignedState, p)
 		if err := router.Send(msg); err != nil {
 			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
 			// Roll back assignment — no point starting a session without instructions.
@@ -365,6 +358,21 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			d.logger.Printf("Handler: failed to record dispatch for plugin %s: %v", p.Name, err)
 		}
 	}
+}
+
+func newDogPluginDispatchMessage(dogName string, assigned *dog.DogState, p *plugin.Plugin) *mail.Message {
+	msg := mail.NewMessage(
+		"daemon",
+		fmt.Sprintf("deacon/dogs/%s", dogName),
+		fmt.Sprintf("Plugin: %s", p.Name),
+		p.FormatMailBody(),
+	)
+	msg.Type = mail.TypeTask
+	msg.Timestamp = time.Now()
+	if assigned != nil {
+		msg.ThreadID = dog.AssignmentThreadID(dogName, assigned.Work, assigned.WorkStartedAt)
+	}
+	return msg
 }
 
 // findDispatchableDog returns the first dog in the kennel whose registry

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
 )
 
@@ -697,9 +698,10 @@ func TestManager_ClearWorkFinalizeKeepsReplacementNonAssignable(t *testing.T) {
 	releaseFinalize := make(chan struct{})
 	closeoutDone := make(chan error, 1)
 	go func() {
-		_, err := m.ClearWorkWithFinalizeIfMatches("alpha", state.Work, state.WorkStartedAt, func() {
+		_, err := m.ClearWorkWithFinalizeIfMatches("alpha", state.Work, state.WorkStartedAt, func() error {
 			close(finalizeStarted)
 			<-releaseFinalize
+			return nil
 		})
 		closeoutDone <- err
 	}()
@@ -732,6 +734,135 @@ func TestManager_ClearWorkFinalizeKeepsReplacementNonAssignable(t *testing.T) {
 	defer assignedMu.Unlock()
 	if assigned == nil || assigned.Work != "work-new" {
 		t.Fatalf("replacement assignment = %+v, want work-new", assigned)
+	}
+}
+
+func TestManager_ClearWorkIfMatchesRejectsPersistedSessionGeneration(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	generation := testDogTmuxGeneration("$persisted", "nonce-persisted")
+	state := &DogState{
+		Name:              "alpha",
+		State:             StateWorking,
+		Work:              "work-old",
+		WorkStartedAt:     now.Add(-time.Minute),
+		LastActive:        now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		SessionGeneration: SessionGenerationFromTmux(generation),
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	cleared, err := m.ClearWorkIfMatches("alpha", state.Work, state.WorkStartedAt)
+	if err != nil {
+		t.Fatalf("ClearWorkIfMatches() error = %v", err)
+	}
+	if cleared {
+		t.Fatal("ClearWorkIfMatches() cleared assignment after a session generation was persisted")
+	}
+
+	got, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateWorking || got.Work != state.Work || got.SessionGeneration == nil ||
+		!got.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("generation-owning assignment mutated: %+v", got)
+	}
+}
+
+func TestManager_ClearWorkFinalizerFailurePreservesAssignmentForRetry(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	state := &DogState{
+		Name:          "alpha",
+		State:         StateWorking,
+		Work:          "plugin:reaper",
+		WorkStartedAt: now.Add(-time.Minute),
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+	finalizeErr := errors.New("archive unavailable")
+
+	cleared, err := m.ClearWorkWithFinalizeIfMatches(
+		"alpha", state.Work, state.WorkStartedAt, func() error { return finalizeErr },
+	)
+	if cleared || !errors.Is(err, finalizeErr) {
+		t.Fatalf("failed finalizer = %v, %v; want false and archive error", cleared, err)
+	}
+	got, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateWorking || got.Work != state.Work || !got.WorkStartedAt.Equal(state.WorkStartedAt) {
+		t.Fatalf("failed finalizer released assignment: %+v", got)
+	}
+	if assigned, err := m.AssignWorkIfIdle("alpha", "replacement"); !errors.Is(err, ErrDogWorking) || assigned != nil {
+		t.Fatalf("replacement assignment = %+v, %v; want blocked", assigned, err)
+	}
+
+	cleared, err = m.ClearWorkWithFinalizeIfMatches(
+		"alpha", state.Work, state.WorkStartedAt, func() error { return nil },
+	)
+	if err != nil || !cleared {
+		t.Fatalf("retry closeout = %v, %v; want true, nil", cleared, err)
+	}
+}
+
+func TestManager_DogLifecycleLockSurvivesKennelRemoval(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name:       "alpha",
+		State:      StateIdle,
+		LastActive: now,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	})
+
+	first, err := m.lockDog("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(m.dogDir("alpha")); err != nil {
+		_ = first.Unlock()
+		t.Fatal(err)
+	}
+
+	acquired := make(chan *flock.Flock, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		second, lockErr := m.lockDog("alpha")
+		if lockErr != nil {
+			errCh <- lockErr
+			return
+		}
+		acquired <- second
+	}()
+
+	select {
+	case second := <-acquired:
+		_ = second.Unlock()
+		_ = first.Unlock()
+		t.Fatal("same-name lifecycle lock was reacquired while the original lock remained held")
+	case lockErr := <-errCh:
+		_ = first.Unlock()
+		t.Fatalf("second lock failed: %v", lockErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := first.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case second := <-acquired:
+		_ = second.Unlock()
+	case lockErr := <-errCh:
+		t.Fatalf("second lock failed after release: %v", lockErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second lock did not acquire after release")
 	}
 }
 

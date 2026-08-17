@@ -16,6 +16,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	gtruntime "github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -413,6 +414,45 @@ func TestStartContextSerializesWithPolecatLifecycleLock(t *testing.T) {
 	}
 }
 
+func TestStopSerializesWithPolecatLifecycleLock(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}}
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-stop-lock-%d", time.Now().UnixNano()))
+	m := NewSessionManager(tm, r)
+	m.capturePollerGeneration = func(string, string) (nudge.PollerGeneration, error) {
+		return nudge.PollerGeneration{}, nil
+	}
+	m.stopPollerGeneration = func(string, string, nudge.PollerGeneration) error { return nil }
+	fl, err := m.lifecycle.lockPolecat("Toast")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- m.Stop("Toast", true) }()
+	select {
+	case stopErr := <-done:
+		_ = fl.Unlock()
+		t.Fatalf("Stop crossed the shared lifecycle lock: %v", stopErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := fl.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case stopErr := <-done:
+		if !errors.Is(stopErr, ErrSessionNotFound) {
+			t.Fatalf("Stop error = %v, want ErrSessionNotFound", stopErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop remained blocked after lifecycle lock release")
+	}
+}
+
 func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
@@ -575,6 +615,7 @@ func TestStopNotFound(t *testing.T) {
 
 	r := &rig.Rig{
 		Name:     "test-rig",
+		Path:     filepath.Join(t.TempDir(), "test-rig"),
 		Polecats: []string{"Toast"},
 	}
 	m := NewSessionManager(tmux.NewTmux(), r)

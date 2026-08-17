@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/dog"
+	"github.com/steveyegge/gastown/internal/plugin"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -591,6 +592,28 @@ func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
 		t.Errorf("dog work = %q, want empty (manual-gate plugin must not auto-dispatch)", dg.Work)
 	}
 }
+
+func TestDaemonDogDispatchMailUsesExactAssignmentThread(t *testing.T) {
+	started := time.Now().UTC().Round(0)
+	assigned := &dog.DogState{
+		Name:          "alpha",
+		State:         dog.StateWorking,
+		Work:          "plugin:reaper",
+		WorkStartedAt: started,
+	}
+	msg := newDogPluginDispatchMessage("alpha", assigned, &plugin.Plugin{
+		Name:         "reaper",
+		Instructions: "Run the reaper.",
+	})
+	want := dog.AssignmentThreadID("alpha", assigned.Work, assigned.WorkStartedAt)
+	if msg.ThreadID != want || want == "" {
+		t.Fatalf("daemon dispatch thread = %q, want exact assignment token %q", msg.ThreadID, want)
+	}
+	if msg.To != "deacon/dogs/alpha" || msg.Subject != "Plugin: reaper" {
+		t.Fatalf("daemon dispatch envelope = to:%q subject:%q", msg.To, msg.Subject)
+	}
+}
+
 func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)

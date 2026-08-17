@@ -1380,7 +1380,7 @@ func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation Sessi
 		ctx,
 		"if-shell", "-F", "-t", generation.SessionID,
 		condition,
-		"display-message -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
+		"display-message -t "+generation.SessionID+":^ -p '"+paneMarker+"#{pane_pid}:#{pane_dead}'",
 		"display-message -p "+changedMarker,
 	)
 	if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {

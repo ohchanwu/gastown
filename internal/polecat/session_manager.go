@@ -813,37 +813,35 @@ func (m *SessionManager) isSessionStale(sessionID string) bool {
 	return isSessionProcessDead(m.tmux, sessionID, filepath.Dir(m.rig.Path))
 }
 
-// Stop terminates a polecat session.
+// Stop terminates only the exact session and poller generations observed while
+// holding the same per-polecat lifecycle lock as Start and nuke. A same-name
+// replacement therefore cannot appear between graceful exit and final teardown.
 func (m *SessionManager) Stop(polecat string, force bool) error {
-	sessionID := m.SessionName(polecat)
-	townRoot := filepath.Dir(m.rig.Path)
-
-	running, err := m.tmux.HasSession(sessionID)
+	lifecycle := m.lifecycle
+	if lifecycle == nil {
+		lifecycle = NewManager(m.rig, nil, m.tmux)
+	}
+	fl, err := lifecycle.lockPolecat(polecat)
 	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
+		return err
 	}
-	if !running {
-		if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
-			return err
-		}
-		return ErrSessionNotFound
-	}
-	if err := m.stopNudgePoller(townRoot, sessionID); err != nil {
+	defer func() { _ = fl.Unlock() }()
+
+	custody, err := m.CaptureSessionCustody(polecat)
+	if err != nil {
 		return err
 	}
 
-	// Try graceful shutdown first
-	if !force {
-		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
-		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
+	if !force && custody.running {
+		_ = m.tmux.SendKeysRaw(custody.generation.SessionID, "C-c")
+		session.WaitForSessionExit(m.tmux, custody.generation.SessionID, constants.GracefulShutdownTimeout)
 	}
-
-	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-	// This prevents orphan bash processes from Claude's Bash tool surviving session termination.
-	if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
-		return fmt.Errorf("killing session: %w", err)
+	if err := m.StopSessionCustody(custody); err != nil {
+		return err
 	}
-
+	if !custody.running {
+		return ErrSessionNotFound
+	}
 	return nil
 }
 

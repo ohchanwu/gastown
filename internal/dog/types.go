@@ -4,10 +4,23 @@
 package dog
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+// AssignmentThreadID returns the durable mail-ownership token for one exact
+// dog assignment. Every dispatcher and closeout path must derive the token
+// here so same-name replacement assignments cannot inherit old instructions.
+func AssignmentThreadID(dogName, work string, startedAt time.Time) string {
+	if dogName == "" || work == "" || startedAt.IsZero() {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(dogName + "\x00" + work + "\x00" + startedAt.UTC().Format(time.RFC3339Nano)))
+	return fmt.Sprintf("dog-dispatch-%x", sum[:16])
+}
 
 // State represents a dog's operational state.
 type State string

@@ -54,7 +54,7 @@ func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionMana
 		if m.mgr == nil {
 			return false, errors.New("dog session generation store is unavailable")
 		}
-		return m.mgr.SetSessionGenerationIfAssignmentMatches(
+		return m.mgr.setSessionGenerationIfAssignmentMatchesLocked(
 			name,
 			expectedWork,
 			expectedStartedAt,
@@ -109,6 +109,18 @@ func (m *SessionManager) kennelPath(dogName string) string {
 // Start creates and starts a new session for a dog.
 // Dogs run agent sessions that check mail for work and execute formulas.
 func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
+	if err := validateDogName(dogName); err != nil {
+		return err
+	}
+	if m.mgr == nil {
+		return errors.New("dog session generation store is unavailable")
+	}
+	fl, err := m.mgr.lockDog(dogName)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	kennelDir := m.kennelPath(dogName)
 	if _, err := os.Stat(kennelDir); os.IsNotExist(err) {
 		return fmt.Errorf("%w: %s", ErrDogNotFound, dogName)
@@ -116,19 +128,16 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 
 	sessionID := m.SessionName(dogName)
 
-	if m.mgr == nil {
-		return errors.New("dog session generation store is unavailable")
-	}
-	snapshot, err := m.mgr.Get(dogName)
+	state, err := m.mgr.loadState(dogName)
 	if err != nil {
 		return fmt.Errorf("reading dog assignment before session start: %w", err)
 	}
-	if snapshot.State != StateWorking || snapshot.WorkStartedAt.IsZero() {
+	if state.State != StateWorking || state.WorkStartedAt.IsZero() {
 		return fmt.Errorf("dog %s has no active assignment for session start", dogName)
 	}
 	var priorGeneration *tmux.SessionGeneration
-	if snapshot.SessionGeneration != nil {
-		prior := snapshot.SessionGeneration.Tmux()
+	if state.SessionGeneration != nil {
+		prior := state.SessionGeneration.Tmux()
 		priorGeneration = &prior
 	}
 
@@ -196,8 +205,8 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	}
 	persisted, err := m.persistSessionGeneration(
 		dogName,
-		snapshot.Work,
-		snapshot.WorkStartedAt,
+		state.Work,
+		state.WorkStartedAt,
 		priorGeneration,
 		generation,
 	)

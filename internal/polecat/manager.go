@@ -1377,7 +1377,17 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 			_ = mayorGit.WorktreePrune()
 		}
 		// Fall back to direct removal if repo base not found
-		return m.removeAllPath(polecatDir)
+		if removeErr := m.removeAllPath(polecatDir); removeErr != nil {
+			return fmt.Errorf("removing polecat directory without repo base: %w", removeErr)
+		}
+		if verifyErr := verifyRemovalComplete(polecatDir, clonePath); verifyErr != nil {
+			return fmt.Errorf("verifying polecat removal without repo base: %w", verifyErr)
+		}
+		m.namePool.Release(name)
+		if saveErr := m.namePool.Save(); saveErr != nil {
+			return fmt.Errorf("saving released polecat name: %w", saveErr)
+		}
+		return nil
 	}
 
 	// Try to remove as a worktree first (use force flag for worktree removal too)
@@ -1391,7 +1401,9 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 		// GT-1L3MY9: git worktree remove may leave untracked directories behind.
 		// Clean up any leftover files (overlay files, .beads/, setup hook outputs, etc.)
 		// Use RemoveAll to handle non-empty directories with untracked files.
-		_ = m.removeAllPath(clonePath)
+		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
+			return fmt.Errorf("removing leftover clone path: %w", removeErr)
+		}
 	}
 
 	// Also remove the parent polecat directory
@@ -1399,7 +1411,9 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	if polecatDir != clonePath {
 		// GT-1L3MY9: Clean up any orphaned files at polecat level.
 		// Use RemoveAll to handle non-empty directories with leftover files.
-		_ = m.removeAllPath(polecatDir)
+		if removeErr := m.removeAllPath(polecatDir); removeErr != nil {
+			return fmt.Errorf("removing leftover polecat directory: %w", removeErr)
+		}
 	}
 
 	// Prune any stale worktree entries (non-fatal: cleanup only)
@@ -1408,13 +1422,14 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	// Verify removal succeeded (fixes #618)
 	// The above removal attempts may fail silently on permissions, symlinks, or busy files
 	if err := verifyRemovalComplete(polecatDir, clonePath); err != nil {
-		// Log warning but don't fail - the polecat is effectively "removed" from Gas Town's perspective
-		style.PrintWarning("incomplete removal for %s: %v", name, err)
+		return fmt.Errorf("verifying polecat removal: %w", err)
 	}
 
-	// Release name back to pool if it's a pooled name (non-fatal: state file update)
+	// Publish the name as reusable only after exact filesystem cleanup is proven.
 	m.namePool.Release(name)
-	_ = m.namePool.Save()
+	if err := m.namePool.Save(); err != nil {
+		return fmt.Errorf("saving released polecat name: %w", err)
+	}
 
 	return nil
 }

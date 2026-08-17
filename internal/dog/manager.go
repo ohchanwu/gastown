@@ -44,15 +44,16 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
 	}
 }
 
-// lockDog acquires an exclusive file lock for a specific dog's state operations.
-// This prevents concurrent load-modify-save races on .dog.json.
+// lockDog acquires an exclusive file lock for a specific dog's full lifecycle.
+// Locks live outside the removable dog directory so removal cannot unlink the
+// held inode and let a same-name replacement acquire a different lock.
 // Caller must defer fl.Unlock().
 func (m *Manager) lockDog(name string) (*flock.Flock, error) {
-	lockDir := m.dogDir(name)
+	lockDir := filepath.Join(m.kennelPath, ".locks")
 	if err := os.MkdirAll(lockDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating dog lock dir: %w", err)
 	}
-	lockPath := filepath.Join(lockDir, ".dog.lock")
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("dog-%s.lock", name))
 	fl := flock.New(lockPath)
 	if err := fl.Lock(); err != nil {
 		return nil, fmt.Errorf("acquiring dog lock for %s: %w", name, err)
@@ -97,6 +98,12 @@ func (m *Manager) Add(name string) (*Dog, error) {
 	if err := validateDogName(name); err != nil {
 		return nil, err
 	}
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	if m.exists(name) {
 		return nil, ErrDogExists
 	}
@@ -476,14 +483,14 @@ func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedA
 	return m.ClearWorkWithFinalizeIfMatches(name, expectedWork, expectedStartedAt, nil)
 }
 
-// ClearWorkWithFinalizeIfMatches clears an exact assignment and runs finalize
-// after the durable idle transition while the per-dog lifecycle lock is still
-// held. This keeps a replacement assignment from becoming visible before the
-// old assignment's exact cleanup has finished.
+// ClearWorkWithFinalizeIfMatches clears an exact generation-free assignment
+// only after finalize succeeds, while the per-dog lifecycle lock is held. A
+// failed finalizer therefore leaves the assignment non-assignable and exactly
+// retryable instead of publishing idle state with old instructions still open.
 func (m *Manager) ClearWorkWithFinalizeIfMatches(
 	name, expectedWork string,
 	expectedStartedAt time.Time,
-	finalize func(),
+	finalize func() error,
 ) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
@@ -502,8 +509,16 @@ func (m *Manager) ClearWorkWithFinalizeIfMatches(
 	if err != nil {
 		return false, fmt.Errorf("loading state: %w", err)
 	}
-	if state.Work != expectedWork || !state.WorkStartedAt.Equal(expectedStartedAt) {
+	if state.State != StateWorking ||
+		state.Work != expectedWork ||
+		!state.WorkStartedAt.Equal(expectedStartedAt) ||
+		state.SessionGeneration != nil {
 		return false, nil
+	}
+	if finalize != nil {
+		if err := finalize(); err != nil {
+			return false, fmt.Errorf("finalizing dog assignment: %w", err)
+		}
 	}
 
 	state.State = StateIdle
@@ -514,9 +529,6 @@ func (m *Manager) ClearWorkWithFinalizeIfMatches(
 
 	if err := m.saveState(name, state); err != nil {
 		return false, err
-	}
-	if finalize != nil {
-		finalize()
 	}
 	return true, nil
 }
@@ -552,7 +564,22 @@ func (m *Manager) SetSessionGenerationIfAssignmentMatches(
 		return false, err
 	}
 	defer func() { _ = fl.Unlock() }()
+	return m.setSessionGenerationIfAssignmentMatchesLocked(
+		name,
+		expectedWork,
+		expectedStartedAt,
+		expectedPrior,
+		generation,
+	)
+}
 
+func (m *Manager) setSessionGenerationIfAssignmentMatchesLocked(
+	name string,
+	expectedWork string,
+	expectedStartedAt time.Time,
+	expectedPrior *tmux.SessionGeneration,
+	generation tmux.SessionGeneration,
+) (bool, error) {
 	state, err := m.loadState(name)
 	if err != nil {
 		return false, fmt.Errorf("loading state: %w", err)
@@ -598,17 +625,17 @@ func (m *Manager) CompleteWorkWithTeardownIfMatches(
 	)
 }
 
-// CompleteWorkWithTeardownAndFinalizeIfMatches tears down an exact session,
-// commits the corresponding assignment idle, and runs finalize before the dog
-// lifecycle lock is released. The finalizer is intentionally best-effort and
-// cannot turn a committed closeout into an ambiguous failure.
+// CompleteWorkWithTeardownAndFinalizeIfMatches tears down an exact session and
+// runs the exact assignment finalizer before committing idle state. Teardown
+// and finalization failures leave durable assignment custody intact so retry is
+// idempotent and a replacement cannot start prematurely.
 func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 	name string,
 	expectedWork string,
 	expectedStartedAt time.Time,
 	expectedGeneration tmux.SessionGeneration,
 	teardown func(tmux.SessionGeneration) error,
-	finalize func(),
+	finalize func() error,
 ) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
@@ -643,6 +670,11 @@ func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 	if err := teardown(expectedGeneration); err != nil {
 		return false, err
 	}
+	if finalize != nil {
+		if err := finalize(); err != nil {
+			return false, fmt.Errorf("finalizing dog assignment: %w", err)
+		}
+	}
 
 	state.State = StateIdle
 	state.Work = ""
@@ -652,9 +684,6 @@ func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 	state.UpdatedAt = time.Now()
 	if err := m.saveState(name, state); err != nil {
 		return false, err
-	}
-	if finalize != nil {
-		finalize()
 	}
 	return true, nil
 }

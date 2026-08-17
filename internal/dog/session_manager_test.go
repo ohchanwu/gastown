@@ -44,6 +44,56 @@ func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
 	}
 }
 
+func TestDogStartHoldsLifecycleLockThroughGenerationPersistence(t *testing.T) {
+	mgr, state := newDogStateManager(t, "alpha", "work")
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-start-lock-%d", os.Getpid()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	sm := NewSessionManager(tm, mgr.townRoot, mgr)
+	generation := testDogTmuxGeneration("$locked", "nonce-locked")
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
+		close(startEntered)
+		<-releaseStart
+		return &session.StartResult{SessionGeneration: generation}, nil
+	}
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- sm.Start("alpha", SessionStartOptions{WorkDesc: state.Work}) }()
+	<-startEntered
+
+	type clearResult struct {
+		cleared bool
+		err     error
+	}
+	clearDone := make(chan clearResult, 1)
+	go func() {
+		cleared, err := mgr.ClearWorkIfMatches("alpha", state.Work, state.WorkStartedAt)
+		clearDone <- clearResult{cleared: cleared, err: err}
+	}()
+	select {
+	case result := <-clearDone:
+		t.Fatalf("closeout crossed in-progress session generation publication: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseStart)
+	if err := <-startDone; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	result := <-clearDone
+	if result.err != nil || result.cleared {
+		t.Fatalf("post-start stale closeout = %+v, want false and nil", result)
+	}
+	got, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("published generation lost: %+v", got)
+	}
+}
+
 func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
 	mgr, _ := newDogStateManager(t, "alpha", "work")
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-fail-%d", os.Getpid()))

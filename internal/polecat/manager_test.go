@@ -474,6 +474,30 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationClassifiesPostCommitFilesystemFa
 	}
 }
 
+func TestRemoveWithOptionsLocalOnlyIfIncarnationDoesNotPublishSuccessAfterWorktreeRemovalLeavesResiduals(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	if _, err := mgr.AddWithOptions("toast", AddOptions{}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	filesystemErr := errors.New("injected leftover removal failure")
+	mgr.removeAll = func(string) error { return filesystemErr }
+	afterCalls := 0
+
+	err := mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "fixture-generation", true, true, false, nil,
+		func() error {
+			afterCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, filesystemErr) || !errors.Is(err, ErrPolecatRetirementCommitted) {
+		t.Fatalf("residual cleanup error = %v, want filesystem and committed-retirement errors", err)
+	}
+	if afterCalls != 0 {
+		t.Fatalf("after-remove branch cleanup ran %d time(s) after residual cleanup failure", afterCalls)
+	}
+}
+
 func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {
 	t.Helper()
 
