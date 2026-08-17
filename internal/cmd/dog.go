@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -615,7 +616,7 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if already idle
-	if d.State == dog.StateIdle && d.Work == "" {
+	if d.State == dog.StateIdle && d.Work == "" && d.SessionGeneration == nil {
 		fmt.Printf("Dog %s is already idle\n", name)
 		return nil
 	}
@@ -629,9 +630,10 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Clear work and return to idle
-	if err := mgr.ClearWork(name); err != nil {
-		return fmt.Errorf("clearing work for dog %s: %w", name, err)
+	// Clear only after exact absence or generation-bound teardown. --force
+	// bypasses the liveness refusal above; it never bypasses identity custody.
+	if err := completeDogCloseout(mgr, tmux.NewTmux(), d); err != nil {
+		return fmt.Errorf("clearing dog %s: %w", name, err)
 	}
 
 	fmt.Printf("✓ Cleared dog %s (now idle)\n", name)
@@ -647,8 +649,17 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	finalizerSnapshot, isFinalizer, err := dogCloseoutSnapshotFromEnvironment()
+	if err != nil {
+		return err
+	}
 	var name string
-	if len(args) > 0 {
+	if isFinalizer {
+		name = finalizerSnapshot.Name
+		if len(args) > 0 && args[0] != name {
+			return errors.New("dog closeout finalizer name does not match snapshot")
+		}
+	} else if len(args) > 0 {
 		name = args[0]
 	} else {
 		// Auto-detect dog from cwd
@@ -672,14 +683,27 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	d, err := mgr.Get(name)
-	if err != nil {
-		return fmt.Errorf("getting dog %s: %w", name, err)
+	d := finalizerSnapshot
+	if !isFinalizer {
+		d, err = mgr.Get(name)
+		if err != nil {
+			return fmt.Errorf("getting dog %s: %w", name, err)
+		}
 	}
 
 	// Close accumulated plugin mails only after durable work and exact runtime
 	// teardown agree. Incomplete closeout leaves all recovery evidence intact.
 	controller := tmux.NewTmux()
+	if !isFinalizer && d.SessionGeneration != nil {
+		currentSession, resolveErr := controller.ResolveCurrentSession()
+		if resolveErr == nil && currentSession == fmt.Sprintf("hq-dog-%s", d.Name) {
+			if err := scheduleDogCloseoutFinalizer(controller, d); err != nil {
+				return fmt.Errorf("scheduling external closeout for dog %s: %w", name, err)
+			}
+			fmt.Printf("✓ Dog %s closeout handed to the tmux server\n", name)
+			return nil
+		}
+	}
 	if err := completeDogCloseout(mgr, controller, d); err != nil {
 		return fmt.Errorf("closing out dog %s: %w", name, err)
 	}
@@ -691,8 +715,8 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 
 type dogCloseoutManager interface {
 	ClearWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time) (bool, error)
-	CompleteWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time, expectedGeneration tmux.SessionGeneration) (bool, error)
-	ClearSessionGenerationIfMatches(name string, expected tmux.SessionGeneration) (bool, error)
+	CompleteWorkWithTeardownIfMatches(name, expectedWork string, expectedStartedAt time.Time, expectedGeneration tmux.SessionGeneration, teardown func(tmux.SessionGeneration) error) (bool, error)
+	RetireSessionWithTeardownIfMatches(name string, expectedGeneration tmux.SessionGeneration, teardown func(tmux.SessionGeneration) error) (bool, error)
 }
 
 type dogSessionController interface {
@@ -701,6 +725,96 @@ type dogSessionController interface {
 }
 
 var errDogCloseoutIncomplete = errors.New("dog closeout incomplete")
+
+const dogCloseoutFinalizerEnv = "GT_DOG_CLOSEOUT_FINALIZER"
+
+type durableDogCloseoutSnapshot struct {
+	Name              string                 `json:"name"`
+	State             dog.State              `json:"state"`
+	Work              string                 `json:"work"`
+	WorkStartedAt     time.Time              `json:"work_started_at"`
+	SessionGeneration *dog.SessionGeneration `json:"session_generation"`
+}
+
+func dogCloseoutSnapshotFromEnvironment() (*dog.Dog, bool, error) {
+	encoded := strings.TrimSpace(os.Getenv(dogCloseoutFinalizerEnv))
+	if encoded == "" {
+		return nil, false, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, false, fmt.Errorf("decoding dog closeout snapshot: %w", err)
+	}
+	var snapshot durableDogCloseoutSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, false, fmt.Errorf("reading dog closeout snapshot: %w", err)
+	}
+	if snapshot.Name == "" || snapshot.SessionGeneration == nil {
+		return nil, false, errors.New("dog closeout snapshot is incomplete")
+	}
+	return &dog.Dog{
+		Name:              snapshot.Name,
+		State:             snapshot.State,
+		Work:              snapshot.Work,
+		WorkStartedAt:     snapshot.WorkStartedAt,
+		SessionGeneration: snapshot.SessionGeneration,
+	}, true, nil
+}
+
+func scheduleDogCloseoutFinalizer(controller *tmux.Tmux, snapshot *dog.Dog) error {
+	if controller == nil || snapshot == nil || snapshot.SessionGeneration == nil {
+		return errors.New("dog closeout scheduling evidence unavailable")
+	}
+	payload, err := json.Marshal(durableDogCloseoutSnapshot{
+		Name:              snapshot.Name,
+		State:             snapshot.State,
+		Work:              snapshot.Work,
+		WorkStartedAt:     snapshot.WorkStartedAt,
+		SessionGeneration: snapshot.SessionGeneration,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding dog closeout snapshot: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolving current executable: %w", err)
+	}
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return fmt.Errorf("resolving town root for dog closeout: %w", err)
+	}
+
+	environment := map[string]string{
+		dogCloseoutFinalizerEnv:      base64.RawURLEncoding.EncodeToString(payload),
+		"GT_TOWN_ROOT":               townRoot,
+		"GT_ROOT":                    townRoot,
+		"GT_ROLE":                    "dog",
+		"BD_ACTOR":                   "dog",
+		"GT_TOWN_SOCKET":             os.Getenv("GT_TOWN_SOCKET"),
+		"GT_TEST_CMD_EXECUTE_HELPER": os.Getenv("GT_TEST_CMD_EXECUTE_HELPER"),
+	}
+	parts := []string{"env"}
+	for _, key := range []string{
+		dogCloseoutFinalizerEnv,
+		"GT_TOWN_ROOT",
+		"GT_ROOT",
+		"GT_ROLE",
+		"BD_ACTOR",
+		"GT_TOWN_SOCKET",
+		"GT_TEST_CMD_EXECUTE_HELPER",
+	} {
+		if environment[key] == "" {
+			continue
+		}
+		parts = append(parts, quoteDogCloseoutShellArg(key+"="+environment[key]))
+	}
+	parts = append(parts, quoteDogCloseoutShellArg(executable), "dog", "done", quoteDogCloseoutShellArg(snapshot.Name))
+	return controller.RunShellBackground(strings.Join(parts, " "))
+}
+
+func quoteDogCloseoutShellArg(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
 
 func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, snapshot *dog.Dog) error {
 	if mgr == nil || sessions == nil || snapshot == nil {
@@ -735,19 +849,12 @@ func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, 
 		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
 		}
-		completed, err := mgr.CompleteWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, expected)
+		completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(tmux.SessionGeneration) error { return nil })
 		if err != nil {
 			return fmt.Errorf("completing work after proven session absence: %w", err)
 		}
 		if !completed {
 			return fmt.Errorf("%w: work assignment or generation changed", errDogCloseoutIncomplete)
-		}
-		cleared, err := mgr.ClearSessionGenerationIfMatches(snapshot.Name, expected)
-		if err != nil {
-			return fmt.Errorf("clearing absent session generation: %w", err)
-		}
-		if !cleared {
-			return fmt.Errorf("%w: replacement generation was recorded", errDogCloseoutIncomplete)
 		}
 		return nil
 	}
@@ -755,25 +862,38 @@ func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, 
 		return fmt.Errorf("%w: live session does not match the persisted generation", errDogCloseoutIncomplete)
 	}
 
-	completed, err := mgr.CompleteWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, expected)
+	completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(generation tmux.SessionGeneration) error {
+		err := sessions.KillSessionGeneration(generation)
+		if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
+			return nil
+		}
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("completing guarded dog work: %w", err)
+		return fmt.Errorf("%w: exact dog session teardown failed: %w", errDogCloseoutIncomplete, err)
 	}
 	if !completed {
 		return fmt.Errorf("%w: work assignment or generation changed", errDogCloseoutIncomplete)
 	}
-	if err := sessions.KillSessionGeneration(expected); err != nil &&
-		!errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
-		return fmt.Errorf("%w: exact dog session teardown failed: %w", errDogCloseoutIncomplete, err)
-	}
-	cleared, err := mgr.ClearSessionGenerationIfMatches(snapshot.Name, expected)
-	if err != nil {
-		return fmt.Errorf("clearing completed dog session generation: %w", err)
-	}
-	if !cleared {
-		return fmt.Errorf("%w: replacement generation was recorded", errDogCloseoutIncomplete)
-	}
 	return nil
+}
+
+func completeDogCloseoutState(
+	mgr dogCloseoutManager,
+	snapshot *dog.Dog,
+	expected tmux.SessionGeneration,
+	teardown func(tmux.SessionGeneration) error,
+) (bool, error) {
+	if snapshot.State == dog.StateIdle && snapshot.Work == "" {
+		return mgr.RetireSessionWithTeardownIfMatches(snapshot.Name, expected, teardown)
+	}
+	return mgr.CompleteWorkWithTeardownIfMatches(
+		snapshot.Name,
+		snapshot.Work,
+		snapshot.WorkStartedAt,
+		expected,
+		teardown,
+	)
 }
 
 func splitPathComponents(path string) []string {
@@ -1258,7 +1378,8 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 
 	// Assign work FIRST (before sending mail) to prevent race condition
 	// If this fails, we haven't sent any mail yet
-	if err := mgr.AssignWork(targetDog.Name, workDesc); err != nil {
+	assignedState, err := mgr.AssignWorkIfIdle(targetDog.Name, workDesc)
+	if err != nil {
 		return fmt.Errorf("assigning work to dog: %w", err)
 	}
 
@@ -1279,7 +1400,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 
 	if err := router.Send(msg); err != nil {
 		// Rollback: clear work assignment since mail failed
-		if clearErr := mgr.ClearWork(targetDog.Name); clearErr != nil {
+		if _, clearErr := mgr.ClearWorkIfMatches(targetDog.Name, assignedState.Work, assignedState.WorkStartedAt); clearErr != nil {
 			// Log rollback failure but return original error
 			if !dogDispatchJSON {
 				fmt.Printf("  Warning: rollback failed: %v\n", clearErr)
@@ -1302,14 +1423,30 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		// cannot read its mail, leaving it stuck in StateWorking (zombie).
 		// Clearing work returns it to idle so it can be re-dispatched.
 		// See: github.com/steveyegge/gastown/issues/2748
-		if clearErr := mgr.ClearWork(targetDog.Name); clearErr != nil {
+		var (
+			clearErr error
+			cleared  bool
+		)
+		if errors.Is(sessErr, dog.ErrSessionStartCleanupIncomplete) {
+			clearErr = errors.New("exact session cleanup is incomplete; preserving assignment for recovery")
+		} else {
+			cleared, clearErr = mgr.ClearWorkIfMatches(targetDog.Name, assignedState.Work, assignedState.WorkStartedAt)
+			if clearErr == nil && !cleared {
+				clearErr = errors.New("assignment changed before rollback; preserving current state")
+			}
+		}
+		if clearErr != nil {
 			warn := fmt.Sprintf("session start failed AND rollback failed for dog %s — dog stuck in StateWorking, run: gt dog health-check --auto-clear: %v", targetDog.Name, clearErr)
 			result.Warnings = append(result.Warnings, warn)
 			if !dogDispatchJSON {
 				style.PrintWarning("%s", warn)
 			}
 		}
-		warn := fmt.Sprintf("dog dispatch: session start failed for %s (work rolled back, re-dispatch with: gt dog dispatch --plugin %s): %v", targetDog.Name, p.Name, sessErr)
+		disposition := "work preserved for exact recovery"
+		if cleared {
+			disposition = fmt.Sprintf("work rolled back; re-dispatch with: gt dog dispatch --plugin %s", p.Name)
+		}
+		warn := fmt.Sprintf("dog dispatch: session start failed for %s (%s): %v", targetDog.Name, disposition, sessErr)
 		result.Warnings = append(result.Warnings, warn)
 		if !dogDispatchJSON {
 			style.PrintWarning("%s", warn)

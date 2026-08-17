@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -21,13 +22,7 @@ func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
 	killed := 0
 	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
 		started++
-		return &session.StartResult{}, nil
-	}
-	sm.captureSessionGeneration = func(name string) (tmux.SessionGeneration, error) {
-		if name != want.Name {
-			t.Fatalf("capture name = %q, want %q", name, want.Name)
-		}
-		return want, nil
+		return &session.StartResult{SessionGeneration: want}, nil
 	}
 	sm.killSessionGeneration = func(generation tmux.SessionGeneration) error {
 		killed++
@@ -58,13 +53,10 @@ func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
 	persistErr := errors.New("persist failed")
 	var killed []tmux.SessionGeneration
 	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
-		return &session.StartResult{}, nil
+		return &session.StartResult{SessionGeneration: want}, nil
 	}
-	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) {
-		return want, nil
-	}
-	sm.persistSessionGeneration = func(string, tmux.SessionGeneration) error {
-		return persistErr
+	sm.persistSessionGeneration = func(string, string, time.Time, *tmux.SessionGeneration, tmux.SessionGeneration) (bool, error) {
+		return false, persistErr
 	}
 	sm.killSessionGeneration = func(generation tmux.SessionGeneration) error {
 		killed = append(killed, generation)
@@ -80,18 +72,14 @@ func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
 	}
 }
 
-func TestDogStartCaptureFailurePreservesUnprovenSession(t *testing.T) {
+func TestDogStartMissingCreationReceiptFailsClosed(t *testing.T) {
 	mgr, _ := newDogStateManager(t, "alpha", "work")
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-capture-%d", os.Getpid()))
 	t.Cleanup(func() { _ = tm.KillServer() })
 	sm := NewSessionManager(tm, mgr.townRoot, mgr)
-	captureErr := errors.New("capture failed")
 	killed := 0
 	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
 		return &session.StartResult{}, nil
-	}
-	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) {
-		return tmux.SessionGeneration{}, captureErr
 	}
 	sm.killSessionGeneration = func(tmux.SessionGeneration) error {
 		killed++
@@ -99,10 +87,104 @@ func TestDogStartCaptureFailurePreservesUnprovenSession(t *testing.T) {
 	}
 
 	err := sm.Start("alpha", SessionStartOptions{})
-	if !errors.Is(err, captureErr) || !strings.Contains(err.Error(), "capture") {
-		t.Fatalf("Start error = %v, want capture failure", err)
+	if !errors.Is(err, ErrSessionStartCleanupIncomplete) || !strings.Contains(err.Error(), "creation receipt") {
+		t.Fatalf("Start error = %v, want missing-receipt cleanup blocker", err)
 	}
 	if killed != 0 {
 		t.Fatalf("unproven session received %d destructive kill(s)", killed)
+	}
+}
+
+func TestDogStartPreservesAssignmentWhenLowerLifecycleCleanupIsUnreconciled(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work")
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-unreconciled-%d", os.Getpid()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	sm := NewSessionManager(tm, mgr.townRoot, mgr)
+	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
+		return nil, errors.Join(errors.New("startup failed"), tmux.ErrSessionCleanupUnreconciled)
+	}
+
+	err := sm.Start("alpha", SessionStartOptions{WorkDesc: "work"})
+	if !errors.Is(err, ErrSessionStartCleanupIncomplete) ||
+		!errors.Is(err, tmux.ErrSessionCleanupUnreconciled) {
+		t.Fatalf("Start error = %v, want cleanup-incomplete assignment hold", err)
+	}
+	after, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if after.State != StateWorking || after.Work != initial.Work ||
+		!after.WorkStartedAt.Equal(initial.WorkStartedAt) {
+		t.Fatalf("unreconciled startup mutated assignment: %+v", after)
+	}
+}
+
+func TestDogStopClearsOnlyAfterExactGenerationTeardown(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work")
+	generation := testDogTmuxGeneration("$20", "nonce-stop")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha",
+		initial.Work,
+		initial.WorkStartedAt,
+		nil,
+		generation,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist generation = %v, %v", set, err)
+	}
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-%d", os.Getpid())), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return generation, nil }
+	killed := 0
+	sm.killSessionGeneration = func(got tmux.SessionGeneration) error {
+		killed++
+		if !got.Equal(generation) {
+			t.Fatalf("killed generation = %+v, want %+v", got, generation)
+		}
+		return nil
+	}
+
+	if err := sm.Stop("alpha", true); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if killed != 1 {
+		t.Fatalf("exact teardown calls = %d, want 1", killed)
+	}
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StateIdle || stored.Work != "" || stored.SessionGeneration != nil {
+		t.Fatalf("stopped dog = %+v, want idle and custody-free", stored)
+	}
+}
+
+func TestDogStopTeardownFailurePreservesAssignment(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work")
+	generation := testDogTmuxGeneration("$21", "nonce-stop-fail")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha",
+		initial.Work,
+		initial.WorkStartedAt,
+		nil,
+		generation,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist generation = %v, %v", set, err)
+	}
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-fail-%d", os.Getpid())), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return generation, nil }
+	teardownErr := errors.New("exact kill failed")
+	sm.killSessionGeneration = func(tmux.SessionGeneration) error { return teardownErr }
+
+	if err := sm.Stop("alpha", true); !errors.Is(err, teardownErr) {
+		t.Fatalf("Stop error = %v, want teardown failure", err)
+	}
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StateWorking || stored.Work != initial.Work ||
+		stored.SessionGeneration == nil || !stored.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("failed stop mutated custody: %+v", stored)
 	}
 }

@@ -456,21 +456,28 @@ func (t *Tmux) wrapError(err error, stderr string, args []string) error {
 }
 
 func (t *Tmux) createNewSession(name, workDir string, env map[string]string) error {
-	return t.createNewSessionContext(context.Background(), name, workDir, env)
+	_, err := t.createNewSessionGenerationContext(context.Background(), name, workDir, env)
+	return err
 }
 
 func (t *Tmux) createNewSessionContext(ctx context.Context, name, workDir string, env map[string]string) error {
+	_, err := t.createNewSessionGenerationContext(ctx, name, workDir, env)
+	return err
+}
+
+func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, workDir string, env map[string]string) (_ SessionGeneration, retErr error) {
 	if err := t.ensureNewSessionSocketSafeContext(ctx); err != nil {
-		return err
+		return SessionGeneration{}, err
 	}
 
 	sessionEnv := make(map[string]string, len(env)+1)
 	for key, value := range env {
 		sessionEnv[key] = value
 	}
-	sessionEnv[EnvSessionGeneration] = uuid.NewString()
+	nonce := uuid.NewString()
+	sessionEnv[EnvSessionGeneration] = nonce
 
-	args := []string{"new-session", "-d", "-s", name}
+	args := []string{"new-session", "-d", "-P", "-F", "#{pid}\t#{session_id}", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
@@ -482,14 +489,267 @@ func (t *Tmux) createNewSessionContext(ctx context.Context, name, workDir string
 	for _, k := range keys {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, sessionEnv[k]))
 	}
-	if _, err := t.runContext(ctx, args...); err != nil {
-		return err
+	out, err := t.runContext(ctx, args...)
+	if err != nil {
+		return SessionGeneration{}, err
+	}
+	created := true
+	var generation SessionGeneration
+	defer func() {
+		if retErr == nil || !created {
+			return
+		}
+		if cleanupErr := t.cleanupUnreturnedSessionGeneration(name, nonce, generation); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
+	parts := strings.Split(strings.TrimSpace(out), "\t")
+	if len(parts) != 2 {
+		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: unexpected field count %d", len(parts))
+	}
+	serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || serverPID <= 0 {
+		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: invalid server PID %q", parts[0])
+	}
+	sessionID := strings.TrimSpace(parts[1])
+	if !validSessionIDRe.MatchString(sessionID) {
+		return SessionGeneration{}, fmt.Errorf("reading created tmux session generation: invalid session ID %q", sessionID)
+	}
+	serverIdentity, err := processGenerationIdentity(serverPID)
+	if err != nil {
+		return SessionGeneration{}, fmt.Errorf("reading created tmux server process generation: %w", err)
+	}
+	generation = SessionGeneration{
+		Name:           name,
+		SessionID:      sessionID,
+		Nonce:          nonce,
+		Custody:        sessionEnv[EnvSessionCustody],
+		ServerPID:      serverPID,
+		ServerIdentity: serverIdentity,
 	}
 	// tmux 3.3+ sets window-size=manual on detached sessions (no client present),
 	// which locks the window at 80x24 even after a client attaches. Override to
 	// "latest" so the window auto-resizes to the attaching client's terminal size.
 	_, _ = t.runContext(ctx, "set-option", "-wt", name, "window-size", "latest")
+	return generation, nil
+}
+
+func sessionGenerationCleanupTerminal(err error) bool {
+	return err == nil ||
+		errors.Is(err, ErrSessionNotFound) ||
+		errors.Is(err, ErrNoServer) ||
+		errors.Is(err, ErrSessionGenerationChanged)
+}
+
+// CleanupFailedSessionGeneration performs bounded process-aware teardown of a
+// generation created by a startup attempt. Any uncertainty is reported with
+// ErrSessionCleanupUnreconciled so callers retain durable ownership instead of
+// making the reusable session name or worker available again.
+func (t *Tmux) CleanupFailedSessionGeneration(generation SessionGeneration) error {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
+	defer cleanupCancel()
+	processErr := t.KillSessionGenerationWithProcessesContext(cleanupCtx, generation)
+	if sessionGenerationCleanupTerminal(processErr) {
+		return nil
+	}
+	// Deliberate failed-start rollback may use the weaker explicit path on a
+	// platform without retained kernel/custody handles. It still binds every
+	// signal to the exact tmux generation and process-start identity. Automatic
+	// zombie replacement must never use this fallback.
+	explicitErr := t.killSessionGenerationExplicitWithProcessesContext(cleanupCtx, generation)
+	if sessionGenerationCleanupTerminal(explicitErr) {
+		return nil
+	}
+	fallbackErr := t.KillSessionGeneration(generation)
+	if sessionGenerationCleanupTerminal(fallbackErr) {
+		// The tmux generation is terminal, but process-aware custody did not
+		// complete, so descendants may remain. Preserve the assignment until a
+		// later health/recovery pass proves the whole boundary absent.
+		return errors.Join(ErrSessionCleanupUnreconciled, processErr, explicitErr)
+	}
+	return errors.Join(ErrSessionCleanupUnreconciled, processErr, explicitErr, fallbackErr)
+}
+
+type explicitProcessGeneration struct {
+	pid      int
+	identity string
+}
+
+func captureExplicitProcessGenerations(rootPID int) ([]explicitProcessGeneration, error) {
+	rootIdentity, err := processGenerationIdentity(rootPID)
+	if err != nil {
+		return nil, errors.Join(ErrSessionGenerationChanged, err)
+	}
+	root := strconv.Itoa(rootPID)
+	descendants := getAllDescendants(root)
+	knownPIDs := map[string]bool{root: true}
+	for _, pid := range descendants {
+		knownPIDs[pid] = true
+	}
+	if pgid := getProcessGroupID(root); pgid != "" && pgid != "0" && pgid != "1" {
+		descendants = append(descendants, collectReparentedGroupMembers(pgid, knownPIDs)...)
+	}
+
+	seen := make(map[int]bool, len(descendants)+1)
+	processes := make([]explicitProcessGeneration, 0, len(descendants)+1)
+	for _, rawPID := range descendants {
+		pid, parseErr := strconv.Atoi(rawPID)
+		if parseErr != nil || pid <= 0 || pid == rootPID || seen[pid] {
+			continue
+		}
+		identity, identityErr := processGenerationIdentity(pid)
+		if identityErr != nil {
+			// A descendant that disappeared before its identity was captured is
+			// already terminal. Never signal the reusable PID without identity.
+			continue
+		}
+		seen[pid] = true
+		processes = append(processes, explicitProcessGeneration{pid: pid, identity: identity})
+	}
+	processes = append(processes, explicitProcessGeneration{pid: rootPID, identity: rootIdentity})
+	return processes, nil
+}
+
+func signalExplicitProcessGeneration(process explicitProcessGeneration, signal processSignal) error {
+	identity, err := processGenerationIdentity(process.pid)
+	if err != nil {
+		if errors.Is(err, errProcessNotFound) {
+			return nil
+		}
+		return err
+	}
+	if identity != process.identity {
+		// The captured process exited and its PID was reused. Preserve the
+		// replacement; this old process generation is already terminal.
+		return nil
+	}
+	if err := exec.Command("kill", "-"+string(signal), strconv.Itoa(process.pid)).Run(); err != nil {
+		identity, identityErr := processGenerationIdentity(process.pid)
+		if identityErr != nil || identity != process.identity {
+			return nil
+		}
+		return err
+	}
 	return nil
+}
+
+func explicitProcessGenerationAlive(process explicitProcessGeneration) (bool, error) {
+	identity, err := processGenerationIdentity(process.pid)
+	if errors.Is(err, errProcessNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return identity == process.identity, nil
+}
+
+func waitForExplicitProcessGenerations(ctx context.Context, processes []explicitProcessGeneration) error {
+	deadline := time.Now().Add(processKillGracePeriod)
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, process := range processes {
+			processAlive, err := explicitProcessGenerationAlive(process)
+			if err != nil {
+				return err
+			}
+			if processAlive {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return nil
+		}
+		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Tmux) killSessionGenerationExplicitWithProcessesContext(ctx context.Context, generation SessionGeneration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	paneGeneration, err := t.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		return err
+	}
+	processes, err := captureExplicitProcessGenerations(paneGeneration.PID)
+	if err != nil {
+		return err
+	}
+	current, err := t.captureSessionGenerationContext(ctx, generation.Name)
+	if err != nil {
+		return err
+	}
+	if !current.Equal(generation) {
+		return ErrSessionGenerationChanged
+	}
+	confirmedPane, err := t.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		return err
+	}
+	if confirmedPane != paneGeneration {
+		return ErrSessionGenerationChanged
+	}
+
+	var errs []error
+	for i := 0; i < len(processes)-1; i++ {
+		if err := signalExplicitProcessGeneration(processes[i], processSignalTerminate); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := signalExplicitProcessGeneration(processes[len(processes)-1], processSignalTerminate); err != nil {
+		errs = append(errs, err)
+	}
+	if err := waitForExplicitProcessGenerations(ctx, processes); err != nil {
+		errs = append(errs, err)
+	}
+	for i := 0; i < len(processes)-1; i++ {
+		if err := signalExplicitProcessGeneration(processes[i], processSignalKill); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := signalExplicitProcessGeneration(processes[len(processes)-1], processSignalKill); err != nil {
+		errs = append(errs, err)
+	}
+	for _, process := range processes {
+		alive, err := explicitProcessGenerationAlive(process)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if alive {
+			errs = append(errs, fmt.Errorf("process generation %d remained live after failed-start cleanup", process.pid))
+		}
+	}
+	if err := t.KillSessionGeneration(generation); !sessionGenerationCleanupTerminal(err) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (t *Tmux) cleanupUnreturnedSessionGeneration(name, nonce string, generation SessionGeneration) error {
+	if generation.Name == "" {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
+		defer cleanupCancel()
+		observed, err := t.captureSessionGenerationContext(cleanupCtx, name)
+		if sessionGenerationCleanupTerminal(err) {
+			return nil
+		}
+		if err != nil {
+			return errors.Join(ErrSessionCleanupUnreconciled, err)
+		}
+		if observed.Nonce != nonce {
+			// A differently-nonced replacement proves the attempt-created session
+			// is already terminal; never mutate the replacement.
+			return nil
+		}
+		generation = observed
+	}
+	return t.CleanupFailedSessionGeneration(generation)
 }
 
 // NewSession creates a new detached tmux session.
@@ -520,7 +780,7 @@ func commandInWorkDir(command, workDir string) string {
 // a brief health check to catch immediate command failures (binary not found, syntax
 // errors, etc.) so callers get an error instead of a silently dead session.
 // See: https://github.com/anthropics/gastown/issues/280
-func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
+func (t *Tmux) NewSessionWithCommand(name, workDir, command string) (retErr error) {
 	if err := validateSessionName(name); err != nil {
 		return err
 	}
@@ -558,9 +818,15 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	// Two-step creation: create session with default shell first, configure
 	// remain-on-exit, then replace the shell with the actual command. This
 	// eliminates the race between command exit and health check setup.
-	if err := t.createNewSession(name, workDir, nil); err != nil {
+	generation, err := t.createNewSessionGenerationContext(context.Background(), name, workDir, nil)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, t.CleanupFailedSessionGeneration(generation))
+		}
+	}()
 
 	// Enable remain-on-exit BEFORE command runs so we can inspect exit status
 	_, _ = t.run("set-option", "-t", name, "remain-on-exit", "on")
@@ -570,7 +836,6 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	// argument, so we use send-keys to type the command into the shell.
 	if runtime.GOOS == "windows" {
 		if _, err := t.run("send-keys", "-t", name, command, "Enter"); err != nil {
-			_ = t.KillSession(name)
 			return fmt.Errorf("failed to send command in session %q: %w", name, err)
 		}
 	} else {
@@ -580,12 +845,11 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		}
 		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.run(respawnArgs...); err != nil {
-			_ = t.KillSession(name)
 			return fmt.Errorf("failed to start command in session %q: %w", name, err)
 		}
 	}
 
-	return t.checkSessionAfterCreate(name, command)
+	return t.checkSessionAfterCreateGenerationContext(context.Background(), generation, command)
 }
 
 // NewSessionWithCommandAndEnv creates a new detached tmux session with environment
@@ -602,40 +866,50 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	return t.NewSessionWithCommandAndEnvContext(context.Background(), name, workDir, command, env)
 }
 
-const failedSessionCreationCleanupTimeout = 500 * time.Millisecond
+// NewSessionWithCommandAndEnvGeneration creates a session and returns the
+// immutable generation receipt established by the new-session transaction.
+func (t *Tmux) NewSessionWithCommandAndEnvGeneration(name, workDir, command string, env map[string]string) (SessionGeneration, error) {
+	return t.NewSessionWithCommandAndEnvGenerationContext(context.Background(), name, workDir, command, env)
+}
+
+const failedSessionCreationCleanupTimeout = 3 * time.Second
 
 // NewSessionWithCommandAndEnvContext is NewSessionWithCommandAndEnv bounded by ctx.
 func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, workDir, command string, env map[string]string) (retErr error) {
+	_, err := t.NewSessionWithCommandAndEnvGenerationContext(ctx, name, workDir, command, env)
+	return err
+}
+
+// NewSessionWithCommandAndEnvGenerationContext is the generation-returning,
+// context-bounded form used by lifecycle code that must retain exact rollback
+// custody after successful creation.
+func (t *Tmux) NewSessionWithCommandAndEnvGenerationContext(ctx context.Context, name, workDir, command string, env map[string]string) (_ SessionGeneration, retErr error) {
 	if err := validateSessionName(name); err != nil {
-		return err
+		return SessionGeneration{}, err
 	}
 
 	if workDir != "" {
 		info, err := os.Stat(workDir)
 		if err != nil {
-			return fmt.Errorf("invalid work directory %q: %w", workDir, err)
+			return SessionGeneration{}, fmt.Errorf("invalid work directory %q: %w", workDir, err)
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("work directory %q is not a directory", workDir)
+			return SessionGeneration{}, fmt.Errorf("work directory %q is not a directory", workDir)
 		}
 	}
 	if err := validateCommandBinary(command); err != nil {
-		return err
+		return SessionGeneration{}, err
 	}
 
 	// Two-step creation: create session with env vars and default shell, then
 	// replace the shell with the actual command after configuring remain-on-exit.
-	if err := t.createNewSessionContext(ctx, name, workDir, env); err != nil {
-		return err
+	generation, err := t.createNewSessionGenerationContext(ctx, name, workDir, env)
+	if err != nil {
+		return SessionGeneration{}, err
 	}
 	defer func() {
 		if retErr != nil {
-			// Creation may fail because the caller's budget is already exhausted.
-			// Give attempt-owned cleanup an independent bounded context so a
-			// detached child cannot inherit the failed caller's deadline.
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
-			defer cleanupCancel()
-			_ = t.KillSessionWithProcessesContext(cleanupCtx, name)
+			retErr = errors.Join(retErr, t.CleanupFailedSessionGeneration(generation))
 		}
 	}()
 
@@ -645,7 +919,7 @@ func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, wor
 	// Replace the initial shell with the actual command.
 	if runtime.GOOS == "windows" {
 		if _, err := t.runContext(ctx, "send-keys", "-t", name, command, "Enter"); err != nil {
-			return fmt.Errorf("failed to send command in session %q: %w", name, err)
+			return SessionGeneration{}, fmt.Errorf("failed to send command in session %q: %w", name, err)
 		}
 	} else {
 		respawnArgs := []string{"respawn-pane", "-k", "-t", name}
@@ -654,34 +928,47 @@ func (t *Tmux) NewSessionWithCommandAndEnvContext(ctx context.Context, name, wor
 		}
 		respawnArgs = append(respawnArgs, commandInWorkDir(command, workDir))
 		if _, err := t.runContext(ctx, respawnArgs...); err != nil {
-			return fmt.Errorf("failed to start command in session %q: %w", name, err)
+			return SessionGeneration{}, fmt.Errorf("failed to start command in session %q: %w", name, err)
 		}
 	}
 
-	return t.checkSessionAfterCreateContext(ctx, name, command)
+	if err := t.checkSessionAfterCreateGenerationContext(ctx, generation, command); err != nil {
+		return SessionGeneration{}, err
+	}
+	observed, err := t.captureSessionGenerationContext(ctx, name)
+	if err != nil {
+		return SessionGeneration{}, fmt.Errorf("confirming created session generation: %w", err)
+	}
+	if !observed.Equal(generation) {
+		return SessionGeneration{}, ErrSessionGenerationChanged
+	}
+	return generation, nil
 }
 
-// checkSessionAfterCreate verifies that a newly created session's command didn't
-// fail immediately (binary not found, syntax error, etc.). Expects remain-on-exit
-// to already be enabled on the session. Checks the exit status after a brief delay.
-// Only returns an error for non-zero exits (command failures), not clean exits (status 0).
-func (t *Tmux) checkSessionAfterCreate(name, command string) error {
-	return t.checkSessionAfterCreateContext(context.Background(), name, command)
-}
-
-func (t *Tmux) checkSessionAfterCreateContext(ctx context.Context, name, command string) error {
+// checkSessionAfterCreateGenerationContext verifies that a newly created
+// generation's command did not fail immediately. Any cleanup is bound to the
+// creation receipt so a same-name replacement is never mutated.
+func (t *Tmux) checkSessionAfterCreateGenerationContext(ctx context.Context, generation SessionGeneration, command string) error {
 	checkPaneDead := func() (bool, error) {
-		paneDead, _ := t.runContext(ctx, "display-message", "-p", "-t", name, "#{pane_dead}")
+		current, err := t.captureSessionGenerationContext(ctx, generation.Name)
+		if err != nil {
+			return false, err
+		}
+		if !current.Equal(generation) {
+			return false, ErrSessionGenerationChanged
+		}
+		paneDead, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.SessionID, "#{pane_dead}")
 		if strings.TrimSpace(paneDead) != "1" {
 			return false, nil
 		}
-		exitStatus, _ := t.runContext(ctx, "display-message", "-p", "-t", name, "#{pane_dead_status}")
+		exitStatus, _ := t.runContext(ctx, "display-message", "-p", "-t", generation.SessionID, "#{pane_dead_status}")
 		status := strings.TrimSpace(exitStatus)
 		if status != "" && status != "0" {
-			_ = t.KillSession(name)
-			return true, fmt.Errorf("session %q: command exited with status %s: %s", name, status, command)
+			return true, fmt.Errorf("session %q: command exited with status %s: %s", generation.Name, status, command)
 		}
-		_ = t.KillSession(name)
+		if err := t.KillSessionGeneration(generation); !sessionGenerationCleanupTerminal(err) {
+			return true, fmt.Errorf("cleaning completed session generation: %w", err)
+		}
 		return true, nil
 	}
 
@@ -705,7 +992,13 @@ func (t *Tmux) checkSessionAfterCreateContext(ctx context.Context, name, command
 	}
 
 	// Pane is alive — restore default (no need to keep dead sessions around)
-	_, _ = t.runContext(ctx, "set-option", "-t", name, "remain-on-exit", "off")
+	if err := t.runGuardedSessionGenerationContext(
+		ctx,
+		generation,
+		"set-option -t "+generation.SessionID+" remain-on-exit off",
+	); err != nil {
+		return err
+	}
 	return ctx.Err()
 }
 
@@ -963,11 +1256,15 @@ func validateServerGeneration(generation SessionGeneration) error {
 }
 
 func (t *Tmux) runGuardedSessionGeneration(generation SessionGeneration, command string) error {
+	return t.runGuardedSessionGenerationContext(context.Background(), generation, command)
+}
+
+func (t *Tmux) runGuardedSessionGenerationContext(ctx context.Context, generation SessionGeneration, command string) error {
 	condition, err := sessionGenerationCondition(generation)
 	if err != nil {
 		return err
 	}
-	return t.runGuardedSessionGenerationCondition(generation, condition, command)
+	return t.runGuardedSessionGenerationConditionContext(ctx, generation, condition, command)
 }
 
 func (t *Tmux) runGuardedSessionGenerationPane(
@@ -4125,6 +4422,17 @@ func (t *Tmux) SelectWindow(session string, index int) error {
 func (t *Tmux) ResolveCurrentSession() (string, error) {
 	_, session, err := t.ResolveCurrentPaneOwner()
 	return session, err
+}
+
+// RunShellBackground asks the tmux server to launch a command outside any pane
+// process tree. Lifecycle finalizers use this so retiring their own pane cannot
+// terminate the process that must commit the durable closeout receipt.
+func (t *Tmux) RunShellBackground(command string) error {
+	if strings.TrimSpace(command) == "" {
+		return errors.New("background tmux command is empty")
+	}
+	_, err := t.run("run-shell", "-b", command)
+	return err
 }
 
 // ResolveCurrentPaneOwner returns the durable pane PID and session containing

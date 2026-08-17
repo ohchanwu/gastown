@@ -95,6 +95,58 @@ func TestNewSessionWithCommandAndEnv_ValidInputPreservesOtherSocketSession(t *te
 	}
 }
 
+func TestNewSessionWithCommandAndEnvGenerationReturnsExactReceipt(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-generation-receipt"
+	_ = tm.KillSession(session)
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+
+	generation, err := tm.NewSessionWithCommandAndEnvGeneration(session, t.TempDir(), "sleep 10", nil)
+	if err != nil {
+		t.Fatalf("create session with generation receipt: %v", err)
+	}
+	observed, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatalf("capture created session generation: %v", err)
+	}
+	if !generation.Equal(observed) {
+		t.Fatalf("creation receipt = %+v, observed = %+v", generation, observed)
+	}
+}
+
+func TestCleanupFailedSessionGenerationPreservesSameNameReplacement(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-failed-start-replacement"
+	_ = tm.KillSession(session)
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+
+	original, err := tm.NewSessionWithCommandAndEnvGeneration(session, t.TempDir(), "sleep 10", nil)
+	if err != nil {
+		t.Fatalf("create original generation: %v", err)
+	}
+	if err := tm.KillSessionGeneration(original); err != nil {
+		t.Fatalf("retire original generation: %v", err)
+	}
+	replacement, err := tm.NewSessionWithCommandAndEnvGeneration(session, t.TempDir(), "sleep 10", nil)
+	if err != nil {
+		t.Fatalf("create replacement generation: %v", err)
+	}
+	if replacement.Equal(original) {
+		t.Fatal("replacement unexpectedly reused original exact generation")
+	}
+
+	if err := tm.CleanupFailedSessionGeneration(original); err != nil {
+		t.Fatalf("cleanup terminal original generation: %v", err)
+	}
+	observed, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatalf("capture preserved replacement: %v", err)
+	}
+	if !observed.Equal(replacement) {
+		t.Fatalf("cleanup changed replacement: got %+v, want %+v", observed, replacement)
+	}
+}
+
 func TestNewSessionWithCommandAndEnvContext_EntersWorkDirWhenServerCWDIsUnlinked(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unlinking a process working directory is a Unix-specific regression")
@@ -223,7 +275,7 @@ func TestNewSessionWithCommandAndEnvContext_CancellationCleansDetachedChild(t *t
 	wrapperDir := t.TempDir()
 	wrapper := fmt.Sprintf(`#!/bin/sh
 case " $* " in
-  *" -t %s remain-on-exit off "*)
+	  *" remain-on-exit off "*)
     if mkdir %q 2>/dev/null; then
       printf 'ready\n' > %q
       exec /bin/sleep 30
@@ -231,7 +283,7 @@ case " $* " in
     ;;
 esac
 exec %q "$@"
-`, session, barrierOnce, barrier, realTmux)
+`, barrierOnce, barrier, realTmux)
 	if err := os.WriteFile(filepath.Join(wrapperDir, "tmux"), []byte(wrapper), 0o755); err != nil {
 		t.Fatalf("write tmux barrier wrapper: %v", err)
 	}

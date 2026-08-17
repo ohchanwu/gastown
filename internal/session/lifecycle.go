@@ -3,6 +3,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -127,6 +128,10 @@ type StartResult struct {
 	// waterfall correlation across prompts, BD calls, mail operations, and
 	// agent conversation events.
 	RunID string
+
+	// SessionGeneration is the immutable creation receipt for the exact tmux
+	// session established by this startup.
+	SessionGeneration tmux.SessionGeneration
 }
 
 // StartSession creates a tmux session following the standard Gas Town lifecycle.
@@ -221,9 +226,17 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 5. Create tmux session with command and env vars via -e flags so the
 	// initial shell — and the agent's subprocesses — inherit them from the start.
-	if err := t.NewSessionWithCommandAndEnv(cfg.SessionID, cfg.WorkDir, command, envVars); err != nil {
+	sessionGeneration, err := t.NewSessionWithCommandAndEnvGeneration(cfg.SessionID, cfg.WorkDir, command, envVars)
+	if err != nil {
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
+	defer func() {
+		if retErr != nil {
+			if cleanupErr := t.CleanupFailedSessionGeneration(sessionGeneration); cleanupErr != nil {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
+		}
+	}()
 
 	// 6. Set remain-on-exit immediately if requested (before anything else can fail).
 	if cfg.RemainOnExit {
@@ -239,7 +252,6 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	if cfg.WaitForAgent {
 		if err := t.WaitForCommand(cfg.SessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 			if cfg.WaitFatal {
-				_ = t.KillSessionWithProcesses(cfg.SessionID)
 				return nil, fmt.Errorf("waiting for %s to start: %w", cfg.Role, err)
 			}
 		}
@@ -256,7 +268,6 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	if cfg.AcceptBypass {
 		_ = t.AcceptStartupDialogs(cfg.SessionID)
 		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
 			return nil, fmt.Errorf("startup blocked: %w", err)
 		}
 	}
@@ -274,19 +285,15 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	if cfg.VerifySurvived {
 		running, err := t.HasSession(cfg.SessionID)
 		if err != nil {
-			// Clean up session on verification error to prevent orphan
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
 			return nil, fmt.Errorf("verifying session: %w", err)
 		}
 		if !running {
 			return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
 		}
 		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
 			return nil, fmt.Errorf("startup blocked: %w", err)
 		}
 		if status := t.CheckSessionHealth(cfg.SessionID, 0); status != tmux.SessionHealthy {
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
 			return nil, fmt.Errorf("session %s unhealthy during startup: %s", cfg.SessionID, status)
 		}
 	}
@@ -317,7 +324,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	RecordAgentInstantiateFromDir(ctx, runID, runtimeConfig.ResolvedAgent,
 		cfg.Role, cfg.AgentName, cfg.SessionID, cfg.RigName, cfg.TownRoot, "", cfg.WorkDir)
 
-	return &StartResult{RuntimeConfig: runtimeConfig, RunID: runID}, nil
+	return &StartResult{RuntimeConfig: runtimeConfig, RunID: runID, SessionGeneration: sessionGeneration}, nil
 }
 
 // RecordAgentInstantiateFromDir resolves the git branch/commit from workDir and

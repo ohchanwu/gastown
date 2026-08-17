@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -299,7 +300,8 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 
 		// Assign work and start session.
 		workDesc := fmt.Sprintf("plugin:%s", p.Name)
-		if err := mgr.AssignWork(idleDog.Name, workDesc); err != nil {
+		assignedState, err := mgr.AssignWorkIfIdle(idleDog.Name, workDesc)
+		if err != nil {
 			d.logger.Printf("Handler: failed to assign work to dog %s: %v", idleDog.Name, err)
 			continue
 		}
@@ -317,8 +319,15 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		if err := router.Send(msg); err != nil {
 			d.logger.Printf("Handler: failed to send mail to dog %s: %v", idleDog.Name, err)
 			// Roll back assignment — no point starting a session without instructions.
-			if clearErr := mgr.ClearWork(idleDog.Name); clearErr != nil {
+			cleared, clearErr := mgr.ClearWorkIfMatches(
+				idleDog.Name,
+				assignedState.Work,
+				assignedState.WorkStartedAt,
+			)
+			if clearErr != nil {
 				d.logger.Printf("Handler: failed to clear work after mail failure for dog %s: %v", idleDog.Name, clearErr)
+			} else if !cleared {
+				d.logger.Printf("Handler: preserved changed assignment after mail failure for dog %s", idleDog.Name)
 			}
 			continue
 		}
@@ -327,9 +336,21 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			WorkDesc: workDesc,
 		}); err != nil {
 			d.logger.Printf("Handler: failed to start session for dog %s: %v", idleDog.Name, err)
-			// Roll back assignment on session start failure.
-			if clearErr := mgr.ClearWork(idleDog.Name); clearErr != nil {
+			// A cleanup-incomplete start may still own an exact live generation.
+			// Preserve the assignment so the dog cannot be reused until recovery.
+			if errors.Is(err, dog.ErrSessionStartCleanupIncomplete) {
+				d.logger.Printf("Handler: preserving assignment for dog %s because exact session cleanup is incomplete", idleDog.Name)
+				continue
+			}
+			cleared, clearErr := mgr.ClearWorkIfMatches(
+				idleDog.Name,
+				assignedState.Work,
+				assignedState.WorkStartedAt,
+			)
+			if clearErr != nil {
 				d.logger.Printf("Handler: failed to clear work after start failure for dog %s: %v", idleDog.Name, clearErr)
+			} else if !cleared {
+				d.logger.Printf("Handler: preserved changed assignment after start failure for dog %s", idleDog.Name)
 			}
 			continue
 		}

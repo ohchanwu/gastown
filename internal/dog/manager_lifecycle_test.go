@@ -2,6 +2,7 @@ package dog
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1163,7 +1164,7 @@ func TestManager_StateTransition_WorkingToIdle(t *testing.T) {
 	}
 }
 
-func TestManager_StateTransition_WorkReassignment(t *testing.T) {
+func TestManager_StateTransition_WorkReassignmentRefusesActiveDog(t *testing.T) {
 	m, _ := testManager(t)
 
 	now := time.Now()
@@ -1177,14 +1178,13 @@ func TestManager_StateTransition_WorkReassignment(t *testing.T) {
 	}
 	setupDogWithState(t, m, "alpha", state)
 
-	// Can reassign work while already working
-	if err := m.AssignWork("alpha", "task-2"); err != nil {
-		t.Fatalf("AssignWork() error = %v", err)
+	if err := m.AssignWork("alpha", "task-2"); !errors.Is(err, ErrDogWorking) {
+		t.Fatalf("AssignWork() error = %v, want ErrDogWorking", err)
 	}
 
 	dog, _ := m.Get("alpha")
-	if dog.Work != "task-2" {
-		t.Errorf("After reassignment: Work = %q, want 'task-2'", dog.Work)
+	if dog.Work != "task-1" {
+		t.Errorf("After refused reassignment: Work = %q, want 'task-1'", dog.Work)
 	}
 }
 

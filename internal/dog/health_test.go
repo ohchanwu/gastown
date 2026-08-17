@@ -11,6 +11,7 @@ import (
 type mockSessionChecker struct {
 	healthResults  map[string]tmux.ZombieStatus // session -> status
 	sessionsAlive  map[string]bool              // session -> exists
+	generations    map[string]tmux.SessionGeneration
 	killedSessions []string
 }
 
@@ -18,6 +19,7 @@ func newMockChecker() *mockSessionChecker {
 	return &mockSessionChecker{
 		healthResults: make(map[string]tmux.ZombieStatus),
 		sessionsAlive: make(map[string]bool),
+		generations:   make(map[string]tmux.SessionGeneration),
 	}
 }
 
@@ -32,9 +34,24 @@ func (m *mockSessionChecker) HasSession(name string) (bool, error) {
 	return m.sessionsAlive[name], nil
 }
 
-func (m *mockSessionChecker) KillSession(name string) error {
-	m.killedSessions = append(m.killedSessions, name)
+func (m *mockSessionChecker) CaptureSessionGeneration(name string) (tmux.SessionGeneration, error) {
+	return m.generations[name], nil
+}
+
+func (m *mockSessionChecker) KillSessionGeneration(generation tmux.SessionGeneration) error {
+	m.killedSessions = append(m.killedSessions, generation.Name)
 	return nil
+}
+
+func healthTestGeneration() tmux.SessionGeneration {
+	return tmux.SessionGeneration{
+		Name:           "hq-dog-alpha",
+		SessionID:      "$1",
+		Nonce:          "health-generation",
+		Custody:        "health-custody",
+		ServerPID:      4242,
+		ServerIdentity: "health-server",
+	}
 }
 
 // =============================================================================
@@ -180,14 +197,16 @@ func TestHealth_Hung_ReportOnly(t *testing.T) {
 func TestHealth_Hung_AutoCleared(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
+	mc.generations["hq-dog-alpha"] = generation
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
@@ -247,14 +266,16 @@ func TestHealth_AutoClear_SessionDead(t *testing.T) {
 func TestHealth_AutoClear_AgentDead(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-1 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.AgentDead
+	mc.generations["hq-dog-alpha"] = generation
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
@@ -306,13 +327,15 @@ func TestHealth_Orphan_IdleWithSession(t *testing.T) {
 func TestHealth_Orphan_AutoCleared(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateIdle, LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.sessionsAlive["hq-dog-alpha"] = true
+	mc.generations["hq-dog-alpha"] = generation
 	hc := NewHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")

@@ -345,32 +345,8 @@ func (m *Manager) SetState(name string, state State) error {
 
 // AssignWork assigns work to a dog and sets it to working state.
 func (m *Manager) AssignWork(name, work string) error {
-	if err := validateDogName(name); err != nil {
-		return err
-	}
-	if !m.exists(name) {
-		return ErrDogNotFound
-	}
-
-	// Acquire per-dog lock to prevent concurrent load-modify-save races
-	fl, err := m.lockDog(name)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = fl.Unlock() }()
-
-	state, err := m.loadState(name)
-	if err != nil {
-		return fmt.Errorf("loading state: %w", err)
-	}
-
-	state.State = StateWorking
-	state.Work = work
-	state.WorkStartedAt = time.Now()
-	state.LastActive = time.Now()
-	state.UpdatedAt = time.Now()
-
-	return m.saveState(name, state)
+	_, err := m.AssignWorkIfIdle(name, work)
+	return err
 }
 
 // AssignWorkIfIdle assigns work only if the dog is still idle, returning the
@@ -393,7 +369,7 @@ func (m *Manager) AssignWorkIfIdle(name, work string) (*DogState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading state: %w", err)
 	}
-	if state.State != StateIdle {
+	if state.State != StateIdle || state.SessionGeneration != nil {
 		return nil, ErrDogWorking
 	}
 
@@ -473,43 +449,16 @@ func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedA
 	return true, m.saveState(name, state)
 }
 
-// SetSessionGeneration records the exact tmux generation owned by a dog without
-// conflating runtime liveness with the independently tracked work state.
-func (m *Manager) SetSessionGeneration(name string, generation tmux.SessionGeneration) error {
-	if err := validateDogName(name); err != nil {
-		return err
-	}
-	if !m.exists(name) {
-		return ErrDogNotFound
-	}
-	if err := validateSessionGenerationForDog(name, generation); err != nil {
-		return err
-	}
-
-	fl, err := m.lockDog(name)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = fl.Unlock() }()
-
-	state, err := m.loadState(name)
-	if err != nil {
-		return fmt.Errorf("loading state: %w", err)
-	}
-	state.SessionGeneration = SessionGenerationFromTmux(generation)
-	state.LastActive = time.Now()
-	state.UpdatedAt = time.Now()
-	return m.saveState(name, state)
-}
-
-// CompleteWorkIfMatches clears work only when both the assignment and exact
-// runtime generation still match. A replacement assignment or session causes
-// zero durable mutation.
-func (m *Manager) CompleteWorkIfMatches(
+// SetSessionGenerationIfAssignmentMatches records a newly created session only
+// when the assignment and prior runtime generation are unchanged. A stale
+// startup may therefore tear down only the generation it created; it cannot
+// overwrite custody for a replacement assignment or session.
+func (m *Manager) SetSessionGenerationIfAssignmentMatches(
 	name string,
 	expectedWork string,
 	expectedStartedAt time.Time,
-	expectedGeneration tmux.SessionGeneration,
+	expectedPrior *tmux.SessionGeneration,
+	generation tmux.SessionGeneration,
 ) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
@@ -517,6 +466,14 @@ func (m *Manager) CompleteWorkIfMatches(
 	if !m.exists(name) {
 		return false, ErrDogNotFound
 	}
+	if err := validateSessionGenerationForDog(name, generation); err != nil {
+		return false, err
+	}
+	if expectedPrior != nil {
+		if err := validateSessionGenerationForDog(name, *expectedPrior); err != nil {
+			return false, err
+		}
+	}
 
 	fl, err := m.lockDog(name)
 	if err != nil {
@@ -528,30 +485,49 @@ func (m *Manager) CompleteWorkIfMatches(
 	if err != nil {
 		return false, fmt.Errorf("loading state: %w", err)
 	}
-	if state.Work != expectedWork ||
+	if state.State != StateWorking ||
+		state.Work != expectedWork ||
 		!state.WorkStartedAt.Equal(expectedStartedAt) ||
-		state.SessionGeneration == nil ||
-		!state.SessionGeneration.EqualTmux(expectedGeneration) {
+		!sessionGenerationMatches(state.SessionGeneration, expectedPrior) {
 		return false, nil
 	}
 
-	state.State = StateIdle
-	state.Work = ""
-	state.WorkStartedAt = time.Time{}
+	state.SessionGeneration = SessionGenerationFromTmux(generation)
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 	return true, m.saveState(name, state)
 }
 
-// ClearSessionGenerationIfMatches removes only the expected generation record.
-// If a replacement generation was persisted, it is left untouched.
-func (m *Manager) ClearSessionGenerationIfMatches(name string, expected tmux.SessionGeneration) (bool, error) {
+func sessionGenerationMatches(stored *SessionGeneration, expected *tmux.SessionGeneration) bool {
+	if expected == nil {
+		return stored == nil
+	}
+	return stored != nil && stored.EqualTmux(*expected)
+}
+
+// CompleteWorkWithTeardownIfMatches keeps a dog non-assignable while it owns
+// an exact runtime generation. The exact teardown runs under the same dog lock
+// as the final state transition, so replacement assignment and session records
+// cannot interleave between proof, teardown, and durable closeout.
+func (m *Manager) CompleteWorkWithTeardownIfMatches(
+	name string,
+	expectedWork string,
+	expectedStartedAt time.Time,
+	expectedGeneration tmux.SessionGeneration,
+	teardown func(tmux.SessionGeneration) error,
+) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
 	}
 	if !m.exists(name) {
 		return false, ErrDogNotFound
 	}
+	if err := validateSessionGenerationForDog(name, expectedGeneration); err != nil {
+		return false, err
+	}
+	if teardown == nil {
+		return false, errors.New("dog session teardown is unavailable")
+	}
 
 	fl, err := m.lockDog(name)
 	if err != nil {
@@ -563,9 +539,66 @@ func (m *Manager) ClearSessionGenerationIfMatches(name string, expected tmux.Ses
 	if err != nil {
 		return false, fmt.Errorf("loading state: %w", err)
 	}
-	if state.SessionGeneration == nil || !state.SessionGeneration.EqualTmux(expected) {
+	if state.State != StateWorking ||
+		state.Work != expectedWork ||
+		!state.WorkStartedAt.Equal(expectedStartedAt) ||
+		state.SessionGeneration == nil ||
+		!state.SessionGeneration.EqualTmux(expectedGeneration) {
 		return false, nil
 	}
+	if err := teardown(expectedGeneration); err != nil {
+		return false, err
+	}
+
+	state.State = StateIdle
+	state.Work = ""
+	state.WorkStartedAt = time.Time{}
+	state.SessionGeneration = nil
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+	return true, m.saveState(name, state)
+}
+
+// RetireSessionWithTeardownIfMatches removes an exact runtime generation from
+// an already-idle dog. It is the orphan-session counterpart to guarded work
+// completion and keeps the generation non-assignable until teardown succeeds.
+func (m *Manager) RetireSessionWithTeardownIfMatches(
+	name string,
+	expectedGeneration tmux.SessionGeneration,
+	teardown func(tmux.SessionGeneration) error,
+) (bool, error) {
+	if err := validateDogName(name); err != nil {
+		return false, err
+	}
+	if !m.exists(name) {
+		return false, ErrDogNotFound
+	}
+	if err := validateSessionGenerationForDog(name, expectedGeneration); err != nil {
+		return false, err
+	}
+	if teardown == nil {
+		return false, errors.New("dog session teardown is unavailable")
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if state.State != StateIdle || state.Work != "" ||
+		state.SessionGeneration == nil ||
+		!state.SessionGeneration.EqualTmux(expectedGeneration) {
+		return false, nil
+	}
+	if err := teardown(expectedGeneration); err != nil {
+		return false, err
+	}
+
 	state.SessionGeneration = nil
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
@@ -834,7 +867,7 @@ func (m *Manager) GetIdleDog() (*Dog, error) {
 	}
 
 	for _, dog := range dogs {
-		if dog.State == StateIdle {
+		if dog.State == StateIdle && dog.SessionGeneration == nil {
 			return dog, nil
 		}
 	}
@@ -851,7 +884,7 @@ func (m *Manager) IdleCount() (int, error) {
 
 	count := 0
 	for _, dog := range dogs {
-		if dog.State == StateIdle {
+		if dog.State == StateIdle && dog.SessionGeneration == nil {
 			count++
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -343,10 +344,9 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 	}
 }
 
-func TestDogDoneGenerationReplacementSurvivesPostCompletionSubstitution(t *testing.T) {
+func TestDogDoneGenerationChangeDuringTeardownPreservesDurableCustody(t *testing.T) {
 	mgr, townRoot := testDogManager(t)
 	oldGeneration := cmdTestDogGeneration("$1", "nonce-old")
-	newGeneration := cmdTestDogGeneration("$2", "nonce-new")
 	started := time.Now().UTC().Round(0)
 	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
 		Name:              "alpha",
@@ -367,12 +367,6 @@ func TestDogDoneGenerationReplacementSurvivesPostCompletionSubstitution(t *testi
 		if !generation.Equal(oldGeneration) {
 			t.Fatalf("kill targeted %+v, want old generation", generation)
 		}
-		if err := mgr.AssignWork("alpha", "hq-work-new"); err != nil {
-			t.Fatal(err)
-		}
-		if err := mgr.SetSessionGeneration("alpha", newGeneration); err != nil {
-			t.Fatal(err)
-		}
 		return tmux.ErrSessionGenerationChanged
 	}
 
@@ -384,9 +378,9 @@ func TestDogDoneGenerationReplacementSurvivesPostCompletionSubstitution(t *testi
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
-	if got.Work != "hq-work-new" || got.State != dog.StateWorking ||
-		got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(newGeneration) {
-		t.Fatalf("replacement state was mutated: %+v", got)
+	if got.Work != "hq-work-old" || got.State != dog.StateWorking ||
+		got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(oldGeneration) {
+		t.Fatalf("failed teardown mutated durable custody: %+v", got)
 	}
 }
 
@@ -608,6 +602,82 @@ func TestDogDoneCLIFormsReachDogSpecificCloseout(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux run-shell closeout test uses a POSIX command")
+	}
+	townRoot := canonicalTestTempDir(t)
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsData, err := json.Marshal(&config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), rigsData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dogName := "alpha"
+	kennel := filepath.Join(townRoot, "deacon", "dogs", dogName)
+	if err := os.MkdirAll(kennel, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	socket := fmt.Sprintf("gt-dog-cli-in-session-%d", os.Getpid())
+	tm := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = tm.KillServer() })
+	barrier := filepath.Join(t.TempDir(), "start")
+	command := fmt.Sprintf(
+		"while [ ! -f %s ]; do sleep 0.02; done; exec %s dog done",
+		shellQuote(barrier),
+		shellQuote(os.Args[0]),
+	)
+	generation, err := tm.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha",
+		kennel,
+		command,
+		map[string]string{
+			"GT_TEST_CMD_EXECUTE_HELPER": "1",
+			"GT_TOWN_ROOT":               townRoot,
+			"GT_ROOT":                    townRoot,
+			"GT_ROLE":                    "dog",
+			"BD_ACTOR":                   "dog",
+			"GT_TOWN_SOCKET":             socket,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create in-session dog command: %v", err)
+	}
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, dog.NewManager(townRoot, &config.RigsConfig{}), townRoot, dogName, &dog.DogState{
+		Name:              dogName,
+		State:             dog.StateWorking,
+		Work:              "hq-cli-work",
+		WorkStartedAt:     now,
+		LastActive:        now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	if err := os.WriteFile(barrier, []byte("go\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		stored, getErr := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
+		running, sessionErr := tm.HasSession("hq-dog-alpha")
+		if getErr == nil && sessionErr == nil && !running &&
+			stored.State == dog.StateIdle && stored.Work == "" && stored.SessionGeneration == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	stored, _ := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
+	running, _ := tm.HasSession("hq-dog-alpha")
+	t.Fatalf("in-session closeout did not finish: running=%v state=%+v", running, stored)
 }
 
 func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {
