@@ -114,15 +114,16 @@ func isDoltConfigError(err error) bool {
 
 // Common errors
 var (
-	ErrPolecatExists             = errors.New("polecat already exists")
-	ErrPolecatNotFound           = errors.New("polecat not found")
-	ErrPolecatIncarnationChanged = errors.New("polecat incarnation changed")
-	ErrHasChanges                = errors.New("polecat has uncommitted changes")
-	ErrHasUncommittedWork        = errors.New("polecat has uncommitted work")
-	ErrShellInWorktree           = errors.New("shell working directory is inside polecat worktree")
-	ErrDoltUnhealthy             = errors.New("dolt health check failed")
-	ErrDoltAtCapacity            = errors.New("dolt server at connection capacity")
-	ErrDiskSpaceLow              = errors.New("insufficient disk space")
+	ErrPolecatExists              = errors.New("polecat already exists")
+	ErrPolecatNotFound            = errors.New("polecat not found")
+	ErrPolecatIncarnationChanged  = errors.New("polecat incarnation changed")
+	ErrPolecatRetirementCommitted = errors.New("polecat retirement committed with incomplete post-removal cleanup")
+	ErrHasChanges                 = errors.New("polecat has uncommitted changes")
+	ErrHasUncommittedWork         = errors.New("polecat has uncommitted work")
+	ErrShellInWorktree            = errors.New("shell working directory is inside polecat worktree")
+	ErrDoltUnhealthy              = errors.New("dolt health check failed")
+	ErrDoltAtCapacity             = errors.New("dolt server at connection capacity")
+	ErrDiskSpaceLow               = errors.New("insufficient disk space")
 )
 
 var checkDiskSpace = util.CheckDiskSpace
@@ -213,6 +214,25 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 // GetNamePool returns the manager's name pool for external use (e.g., pool init).
 func (m *Manager) GetNamePool() *NamePool {
 	return m.namePool
+}
+
+// EnsurePolecatIncarnation assigns a durable identity to one pre-upgrade
+// polecat while holding the same lifecycle lock used by spawn, reuse, repair,
+// and removal. Newer generations already have an ID and are left unchanged.
+func (m *Manager) EnsurePolecatIncarnation(name string) (string, error) {
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = fl.Unlock() }()
+	if !m.exists(name) {
+		return "", ErrPolecatNotFound
+	}
+	incarnation, err := m.agentBeads().InitializeAgentIncarnationIfMissing(m.agentBeadID(name))
+	if err != nil {
+		return "", fmt.Errorf("initializing polecat incarnation for %s: %w", name, err)
+	}
+	return incarnation, nil
 }
 
 // lockPolecat acquires an exclusive file lock for a specific polecat.
@@ -1166,6 +1186,7 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 	name, expectedIncarnation string,
 	force, nuclear, selfNuke bool,
 	beforeRemove func(*Polecat) error,
+	afterRemove func() error,
 ) (retErr error) {
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
 	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
@@ -1194,7 +1215,15 @@ func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
 			return err
 		}
 	}
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation)
+	if err := m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation); err != nil {
+		return err
+	}
+	if afterRemove != nil {
+		if err := afterRemove(); err != nil {
+			return errors.Join(ErrPolecatRetirementCommitted, err)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {

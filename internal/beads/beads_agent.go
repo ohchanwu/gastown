@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/google/uuid"
 	beadsdk "github.com/steveyegge/beads"
 
 	"github.com/steveyegge/gastown/internal/constants"
@@ -483,7 +484,6 @@ func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 // cycle, avoiding races where concurrent callers overwrite each other's changes.
 type AgentFieldUpdates struct {
 	AgentState        *string // Sync description agent_state with column (gt-ulom)
-	Incarnation       *string // New opaque value only at spawn/reuse; clear at exact retirement
 	CleanupStatus     *string
 	ActiveMR          *string
 	NotificationLevel *string
@@ -609,9 +609,6 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 
 	if updates.AgentState != nil {
 		fields.AgentState = *updates.AgentState
-	}
-	if updates.Incarnation != nil {
-		fields.Incarnation = *updates.Incarnation
 	}
 	if updates.CleanupStatus != nil {
 		fields.CleanupStatus = *updates.CleanupStatus
@@ -803,6 +800,39 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 	fields := ParseAgentFields(issue.Description)
 	fields.AgentState = ResolveAgentState(issue.Description, issue.AgentState)
 	return issue, fields, nil
+}
+
+// InitializeAgentIncarnationIfMissing performs the sole permitted in-place
+// incarnation transition: a legacy empty value becomes a new opaque lifetime
+// ID. Existing values are immutable and returned unchanged.
+func (b *Beads) InitializeAgentIncarnationIfMissing(id string) (string, error) {
+	if target := b.agentBeadTarget(); target != b {
+		return target.InitializeAgentIncarnationIfMissing(id)
+	}
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return "", fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	issue, err := b.Show(id)
+	if err != nil {
+		return "", err
+	}
+	if !IsAgentBead(issue) {
+		return "", fmt.Errorf("issue %s is not an agent bead (type=%s)", id, issue.Type)
+	}
+	fields := ParseAgentFields(issue.Description)
+	if fields.Incarnation != "" {
+		return fields.Incarnation, nil
+	}
+	incarnation := uuid.NewString()
+	fields.Incarnation = incarnation
+	description := FormatAgentDescription(issue.Title, fields)
+	if err := b.Update(id, UpdateOptions{Description: &description}); err != nil {
+		return "", fmt.Errorf("initializing agent incarnation: %w", err)
+	}
+	return incarnation, nil
 }
 
 // ListAgentBeads returns all agent beads in a single query.

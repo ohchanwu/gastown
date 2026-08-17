@@ -45,6 +45,12 @@ func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnation"); calls != 1 {
 		t.Fatalf("nukePolecatFullWithOptions incarnation-bound local-only removal calls = %d, want 1", calls)
 	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "resetPolecatAgentBeadForReuse"); calls != 0 {
+		t.Fatalf("nukePolecatFullWithOptions stale-name bead resets = %d, want 0", calls)
+	}
+	if !callNestedWithinCallArgument(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnation", "deletePreservedLocalPolecatBranch") {
+		t.Fatal("local branch deletion is not contained by the exact polecat lifecycle transaction")
+	}
 }
 
 func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
@@ -56,8 +62,8 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	if refs := referencesIdentifier(t, file, "runPolecatNuke", "provePolecatNukeCustody"); refs != 1 {
 		t.Fatalf("runPolecatNuke custody proof references = %d, want 1", refs)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 1 {
-		t.Fatalf("real nuke custody proof calls = %d, want 1", calls)
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 2 {
+		t.Fatalf("real nuke custody proof calls = %d, want initial and lifecycle-locked recheck", calls)
 	}
 }
 
@@ -191,6 +197,52 @@ func callsTo(t *testing.T, file *ast.File, function, callee string) int {
 		return true
 	})
 	return calls
+}
+
+func callNestedWithinCallArgument(t *testing.T, file *ast.File, function, outer, inner string) bool {
+	t.Helper()
+
+	var body *ast.BlockStmt
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == function {
+			body = fn.Body
+			break
+		}
+	}
+	if body == nil {
+		t.Fatalf("function %s not found", function)
+	}
+
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || calledFunctionName(call) != outer {
+			return true
+		}
+		for _, arg := range call.Args {
+			ast.Inspect(arg, func(nested ast.Node) bool {
+				innerCall, ok := nested.(*ast.CallExpr)
+				if ok && calledFunctionName(innerCall) == inner {
+					found = true
+				}
+				return !found
+			})
+		}
+		return !found
+	})
+	return found
+}
+
+func calledFunctionName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	default:
+		return ""
+	}
 }
 
 func referencesIdentifier(t *testing.T, file *ast.File, function, identifier string) int {

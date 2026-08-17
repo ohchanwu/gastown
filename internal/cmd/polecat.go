@@ -1050,6 +1050,11 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if polecatCheckRecoveryReconcileCleanup {
+		if _, err := mgr.EnsurePolecatIncarnation(polecatName); err != nil {
+			return fmt.Errorf("initializing durable polecat incarnation: %w", err)
+		}
+	}
 
 	// Verify polecat exists and get info
 	p, err := mgr.Get(polecatName)
@@ -2222,30 +2227,27 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 				},
 			)
 		},
+		func() error {
+			if branchToDelete == "" {
+				return nil
+			}
+			repoGit := getRepoGitForRig(r.Path)
+			if err := deletePreservedLocalPolecatBranch(repoGit, branchToDelete, branchTargets); err != nil {
+				return fmt.Errorf("branch delete: %w", err)
+			}
+			fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
+			fmt.Printf("  %s verified branch contents were already preserved before local deletion\n", style.Dim.Render("○"))
+			return nil
+		},
 	)
 	if err != nil {
-		if errors.Is(err, polecat.ErrPolecatNotFound) {
-			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
-			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
-		} else {
-			return fmt.Errorf("exact polecat retirement failed: %w", err)
+		if errors.Is(err, polecat.ErrPolecatRetirementCommitted) {
+			return fmt.Errorf("polecat retired locally, but exact post-removal cleanup is incomplete: %w", err)
 		}
+		return fmt.Errorf("exact polecat retirement failed: %w", err)
 	} else {
 		fmt.Printf("  %s stopped exact session generation\n", style.Success.Render("✓"))
 		fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
-	}
-
-	// Step 4: Delete local branch (if we know it)
-	// The local branch is deleted only after a second preservation proof. Remote
-	// refs are neither created nor updated by nuke.
-	if branchToDelete != "" {
-		repoGit := getRepoGitForRig(r.Path)
-		if err := deletePreservedLocalPolecatBranch(repoGit, branchToDelete, branchTargets); err != nil {
-			fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
-		} else {
-			fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
-			fmt.Printf("  %s verified branch contents were already preserved before local deletion\n", style.Dim.Render("○"))
-		}
 	}
 
 	// Step 5: Purge closed ephemeral beads (wisps) accumulated during sessions.
@@ -2344,16 +2346,6 @@ func checkNukeActiveMRSafety(checker activeMRRemovalChecker, polecatName, rigNam
 		return fmt.Errorf("cannot nuke %s/%s: MR %s is still pending in merge queue (%s)\nRefinery will process the MR and clean up after merge\nUse --force to override (risks data loss)", rigName, polecatName, activeMR, blocker)
 	}
 	return nil
-}
-
-func resetPolecatAgentBeadForReuse(r *rig.Rig, rigName, polecatName string) {
-	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	bd := beads.New(r.Path)
-	if err := bd.ForAgentBead().ResetAgentBeadForReuse(agentBeadID, "nuked"); err != nil {
-		fmt.Printf("  %s agent bead not found or already cleaned\n", style.Dim.Render("○"))
-	} else {
-		fmt.Printf("  %s reset agent bead %s\n", style.Success.Render("✓"), agentBeadID)
-	}
 }
 
 // nukeCleanupMolecules burns any molecule attached to a work bead during polecat nuke.

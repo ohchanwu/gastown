@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -572,6 +574,16 @@ func TestCleanupStatusReconcileCandidateRequiresStrictPredicates(t *testing.T) {
 				t.Fatal("cleanupStatusReconcileCandidate() allowed unsafe reconciliation")
 			}
 		})
+	}
+}
+
+func TestCheckRecoveryReconcileInitializesLegacyIncarnation(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "polecat.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse polecat.go: %v", err)
+	}
+	if calls := callsTo(t, file, "runPolecatCheckRecovery", "EnsurePolecatIncarnation"); calls != 1 {
+		t.Fatalf("runPolecatCheckRecovery incarnation initialization calls = %d, want 1", calls)
 	}
 }
 

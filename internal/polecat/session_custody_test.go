@@ -46,6 +46,34 @@ func TestStopSessionCustodyPreservesSameNameReplacement(t *testing.T) {
 	}
 }
 
+func TestStopSessionCustodyStopsCapturedGeneration(t *testing.T) {
+	m, tm, sessionID := newSessionCustodyTestManager(t)
+	if err := tm.NewSessionWithCommandAndEnv(sessionID, t.TempDir(), "sleep 60", nil); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	custody, err := m.CaptureSessionCustody("nitro")
+	if err != nil {
+		t.Fatalf("capture custody: %v", err)
+	}
+	if err := m.StopSessionCustody(custody); err != nil {
+		t.Fatalf("stop exact custody: %v", err)
+	}
+	if running, checkErr := tm.HasSession(sessionID); checkErr != nil || running {
+		t.Fatalf("captured session running = %v, error = %v; want terminal", running, checkErr)
+	}
+}
+
+func TestStopSessionCustodyAcceptsProvenAbsence(t *testing.T) {
+	m, _, _ := newSessionCustodyTestManager(t)
+	custody, err := m.CaptureSessionCustody("nitro")
+	if err != nil {
+		t.Fatalf("capture absent custody: %v", err)
+	}
+	if err := m.StopSessionCustody(custody); err != nil {
+		t.Fatalf("stop absent custody: %v", err)
+	}
+}
+
 func TestStopSessionCustodyPreservesSessionCreatedAfterAbsentProof(t *testing.T) {
 	m, tm, sessionID := newSessionCustodyTestManager(t)
 	custody, err := m.CaptureSessionCustody("nitro")

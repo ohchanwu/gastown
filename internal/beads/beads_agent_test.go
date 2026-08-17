@@ -332,6 +332,53 @@ func TestCompareAndUpdateAgentDescriptionFieldsRejectsChangedExpectations(t *tes
 	}
 }
 
+func TestInitializeAgentIncarnationIfMissingWritesOpaqueGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: stuck\ncleanup_status: has_unpushed"}]`)
+	bd := NewIsolated(tmpDir)
+
+	incarnation, err := bd.InitializeAgentIncarnationIfMissing("gt-gastown-polecat-nux")
+	if err != nil {
+		t.Fatalf("InitializeAgentIncarnationIfMissing: %v", err)
+	}
+	if strings.TrimSpace(incarnation) == "" {
+		t.Fatal("initialized incarnation is empty")
+	}
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "incarnation: "+incarnation) {
+		t.Fatalf("mock bd log %q missing initialized incarnation", logOutput)
+	}
+}
+
+func TestInitializeAgentIncarnationIfMissingPreservesExistingGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: stuck\nincarnation: existing-generation\ncleanup_status: has_unpushed"}]`)
+	bd := NewIsolated(tmpDir)
+
+	incarnation, err := bd.InitializeAgentIncarnationIfMissing("gt-gastown-polecat-nux")
+	if err != nil {
+		t.Fatalf("InitializeAgentIncarnationIfMissing: %v", err)
+	}
+	if incarnation != "existing-generation" {
+		t.Fatalf("incarnation = %q, want existing-generation", incarnation)
+	}
+	if logOutput := readMockBDLog(t, logPath); strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q unexpectedly rewrote immutable incarnation", logOutput)
+	}
+}
+
 func stringPointer(value string) *string {
 	return &value
 }

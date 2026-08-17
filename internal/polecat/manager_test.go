@@ -156,7 +156,7 @@ switch ($cmd) {
     exit 0
   }
   'show' {
-			Write-Output '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","description":"agent\n\nrole_type: polecat\nagent_state: idle\nhook_bead: null\ncleanup_status: clean\nactive_mr: null\nbranch: polecat/toast/gt-work@abc123","status":"open","created_at":"2025-01-01T00:00:00Z"}]'
+			Write-Output '[{"id":"gt-gastown-polecat-toast","title":"agent","issue_type":"agent","description":"agent\n\nrole_type: polecat\nagent_state: idle\nincarnation: fixture-generation\nhook_bead: null\ncleanup_status: clean\nactive_mr: null\nbranch: polecat/toast/gt-work@abc123","status":"open","created_at":"2025-01-01T00:00:00Z"}]'
 			exit 0
   }
   default { exit 0 }
@@ -206,7 +206,7 @@ case "$cmd" in
       id="$arg"
       break
     done
-    printf '[{"id":"%s","title":"agent","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: null\\nbranch: polecat/toast/gt-work@abc123"}]\n' "$id"
+    printf '[{"id":"%s","title":"agent","issue_type":"agent","description":"agent\\n\\nrole_type: polecat\\nagent_state: idle\\nincarnation: fixture-generation\\nhook_bead: null\\ncleanup_status: clean\\nactive_mr: null\\nbranch: polecat/toast/gt-work@abc123"}]\n' "$id"
     exit 0
     ;;
   *)
@@ -341,6 +341,77 @@ func TestRemoveWithOptionsLocalOnlyDoesNotPush(t *testing.T) {
 	}
 	if _, err := os.Stat(p.ClonePath); !os.IsNotExist(err) {
 		t.Fatalf("local worktree still exists after removal; stat error = %v", err)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationRejectsReplacementBeforeMutation(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	beforeCalls, afterCalls := 0, 0
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", "stale-generation", true, true, false,
+		func(*Polecat) error { beforeCalls++; return nil },
+		func() error { afterCalls++; return nil },
+	)
+	if !errors.Is(err, ErrPolecatIncarnationChanged) {
+		t.Fatalf("error = %v, want ErrPolecatIncarnationChanged", err)
+	}
+	if beforeCalls != 0 || afterCalls != 0 {
+		t.Fatalf("lifecycle callbacks = before:%d after:%d, want 0/0", beforeCalls, afterCalls)
+	}
+	if _, statErr := os.Stat(p.ClonePath); statErr != nil {
+		t.Fatalf("replacement worktree changed after stale proof: %v", statErr)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationHoldsLockThroughAfterRemove(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	if _, err := mgr.AddWithOptions("toast", AddOptions{}); err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	afterEntered := make(chan struct{})
+	releaseAfter := make(chan struct{})
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+			"toast", "fixture-generation", true, true, false, nil,
+			func() error {
+				close(afterEntered)
+				<-releaseAfter
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-afterEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("after-remove callback was not reached")
+	}
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		fl, lockErr := mgr.lockPolecat("toast")
+		if lockErr == nil {
+			close(lockAcquired)
+			_ = fl.Unlock()
+		}
+	}()
+	select {
+	case <-lockAcquired:
+		t.Fatal("same-name lifecycle lock acquired before after-remove completed")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseAfter)
+	if err := <-removeDone; err != nil {
+		t.Fatalf("exact local removal: %v", err)
+	}
+	select {
+	case <-lockAcquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("same-name lifecycle lock remained blocked after retirement")
 	}
 }
 
