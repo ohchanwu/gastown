@@ -299,6 +299,11 @@ func TestCompareAndUpdateAgentDescriptionFieldsRejectsChangedExpectations(t *tes
 			description: "role_type: polecat\nrig: gastown\nagent_state: stuck\nactive_mr: gt-mr-new",
 			expected:    AgentFieldExpectations{ActiveMR: stringPointer("")},
 		},
+		{
+			name:        "incarnation same-value ABA",
+			description: "role_type: polecat\nrig: gastown\nagent_state: stuck\ncleanup_status: has_unpushed\nincarnation: replacement-generation",
+			expected:    AgentFieldExpectations{Incarnation: stringPointer("original-generation")},
+		},
 	}
 
 	for _, tt := range tests {

@@ -42,8 +42,8 @@ func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptions"); calls != 0 {
 		t.Fatalf("nukePolecatFullWithOptions called publishing RemoveWithOptions %d time(s), want 0", calls)
 	}
-	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnly"); calls != 1 {
-		t.Fatalf("nukePolecatFullWithOptions local-only removal calls = %d, want 1", calls)
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnlyIfIncarnation"); calls != 1 {
+		t.Fatalf("nukePolecatFullWithOptions incarnation-bound local-only removal calls = %d, want 1", calls)
 	}
 }
 
@@ -58,6 +58,35 @@ func TestPolecatNukeDryRunAndRealNukeShareCustodyProof(t *testing.T) {
 	}
 	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "provePolecatNukeCustody"); calls != 1 {
 		t.Fatalf("real nuke custody proof calls = %d, want 1", calls)
+	}
+}
+
+func TestRunPolecatNukeLockedTeardownFailsClosedOnSessionError(t *testing.T) {
+	stopErr := errors.New("exact session custody changed")
+	mutations := 0
+	err := runPolecatNukeLockedTeardown(
+		func() error { return stopErr },
+		func() { mutations++ },
+	)
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("error = %v, want %v", err, stopErr)
+	}
+	if mutations != 0 {
+		t.Fatalf("post-stop mutations = %d, want 0", mutations)
+	}
+}
+
+func TestRunPolecatNukeLockedTeardownMutatesOnlyAfterExactStop(t *testing.T) {
+	mutations := 0
+	err := runPolecatNukeLockedTeardown(
+		func() error { return nil },
+		func() { mutations++ },
+	)
+	if err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if mutations != 1 {
+		t.Fatalf("post-stop mutations = %d, want 1", mutations)
 	}
 }
 

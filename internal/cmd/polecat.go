@@ -1460,6 +1460,9 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		return cleanupReconcileProof{}, false
 	}
 	agentState := beads.AgentState(fields.AgentState)
+	if strings.TrimSpace(fields.Incarnation) == "" {
+		return cleanupReconcileProof{}, false
+	}
 	if p.State != polecat.StateIdle || (agentState != beads.AgentStateIdle && agentState != beads.AgentStateStuck) {
 		return cleanupReconcileProof{}, false
 	}
@@ -1473,6 +1476,7 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		Previous: previous,
 		Expected: beads.AgentFieldExpectations{
 			AgentState:    stringPointer(fields.AgentState),
+			Incarnation:   stringPointer(fields.Incarnation),
 			CleanupStatus: stringPointer(fields.CleanupStatus),
 			HookBead:      stringPointer(fields.HookBead),
 			ActiveMR:      stringPointer(fields.ActiveMR),
@@ -1522,6 +1526,7 @@ func validateCleanupRecheckEvidence(evidence cleanupRecheckEvidence, proof clean
 		current string
 	}{
 		{name: "agent_state", want: proof.Expected.AgentState, current: evidence.Fields.AgentState},
+		{name: "incarnation", want: proof.Expected.Incarnation, current: evidence.Fields.Incarnation},
 		{name: "cleanup_status", want: proof.Expected.CleanupStatus, current: evidence.Fields.CleanupStatus},
 		{name: "hook_bead", want: proof.Expected.HookBead, current: evidence.Fields.HookBead},
 		{name: "active_mr", want: proof.Expected.ActiveMR, current: evidence.Fields.ActiveMR},
@@ -1583,7 +1588,7 @@ func recheckPolecatCleanup(
 	}
 	evidence := cleanupRecheckEvidence{
 		PolecatState:      fresh.State,
-		GenerationMatches: fresh.Branch == original.Branch && fresh.Issue == original.Issue && fresh.ClonePath == original.ClonePath,
+		GenerationMatches: fresh.Incarnation != "" && fresh.Incarnation == original.Incarnation && fresh.Branch == original.Branch && fresh.Issue == original.Issue && fresh.ClonePath == original.ClonePath,
 		BranchMatches:     true,
 	}
 
@@ -2124,6 +2129,7 @@ type nukePolecatOptions struct {
 
 type polecatNukeCustody struct {
 	PolecatInfo    *polecat.Polecat
+	Session        polecat.SessionCustody
 	BranchToDelete string
 	BranchTargets  []string
 }
@@ -2147,10 +2153,19 @@ func provePolecatNukeCustody(
 		return custody, fmt.Errorf("cannot resolve custody for %s/%s before nuke: %w", rigName, polecatName, getErr)
 	}
 	if getErr != nil || polecatInfo == nil {
-		return custody, nil
+		return custody, fmt.Errorf("cannot nuke %s/%s: durable polecat incarnation is unavailable", rigName, polecatName)
+	}
+	if strings.TrimSpace(polecatInfo.Incarnation) == "" {
+		return custody, fmt.Errorf("cannot nuke %s/%s: legacy polecat has no durable incarnation; refresh it through the ordinary lifecycle first", rigName, polecatName)
 	}
 
 	custody.PolecatInfo = polecatInfo
+	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
+	sessionCustody, err := sessMgr.CaptureSessionCustody(polecatName)
+	if err != nil {
+		return polecatNukeCustody{}, fmt.Errorf("cannot capture session custody for %s/%s: %w", rigName, polecatName, err)
+	}
+	custody.Session = sessionCustody
 	custody.BranchToDelete = polecatInfo.Branch
 	if custody.BranchToDelete == "" {
 		return custody, nil
@@ -2180,36 +2195,43 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	branchToDelete := custody.BranchToDelete
 	branchTargets := custody.BranchTargets
 
-	t := tmux.NewTmux()
-
-	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
-	// when IsRunning fails to detect the session.
-	sessMgr := polecat.NewSessionManager(t, r)
-	if err := sessMgr.Stop(polecatName, true); err != nil {
-		if !errors.Is(err, polecat.ErrSessionNotFound) {
-			fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
-		}
-	} else {
-		fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
-	}
-
-	// Step 2: Burn any molecule attached to the polecat's hooked work bead.
-	// Without this, nuked polecats leave orphan molecule refs that block re-sling.
-	// The stale attached_molecule in the work bead's description causes sling to
-	// fail with "bead already has N attached molecule(s)" on re-dispatch (gt-npzy).
-	if polecatInfo != nil && polecatInfo.Issue != "" {
-		nukeCleanupMolecules(polecatInfo.Issue, r)
-	}
-
-	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
-	if err := mgr.RemoveWithOptionsLocalOnly(polecatName, opts.Force, true, false); err != nil {
+	sessMgr := polecat.NewSessionManager(tmux.NewTmux(), r)
+	// Hold the same lifecycle lock used by spawn/reuse from the second custody
+	// proof through exact session teardown and durable retirement.
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		polecatName,
+		polecatInfo.Incarnation,
+		opts.Force,
+		true,
+		false,
+		func(current *polecat.Polecat) error {
+			lockedCustody, lockedErr := provePolecatNukeCustody(polecatName, rigName, mgr, r, opts)
+			if lockedErr != nil {
+				return lockedErr
+			}
+			if lockedCustody.PolecatInfo == nil || lockedCustody.PolecatInfo.Incarnation != polecatInfo.Incarnation ||
+				lockedCustody.BranchToDelete != branchToDelete {
+				return fmt.Errorf("%w during nuke recheck", polecat.ErrPolecatIncarnationChanged)
+			}
+			return runPolecatNukeLockedTeardown(
+				func() error { return sessMgr.StopSessionCustody(custody.Session) },
+				func() {
+					if current.Issue != "" {
+						nukeCleanupMolecules(current.Issue, r)
+					}
+				},
+			)
+		},
+	)
+	if err != nil {
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
 			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
 		} else {
-			return fmt.Errorf("worktree removal failed: %w", err)
+			return fmt.Errorf("exact polecat retirement failed: %w", err)
 		}
 	} else {
+		fmt.Printf("  %s stopped exact session generation\n", style.Success.Render("✓"))
 		fmt.Printf("  %s deleted worktree\n", style.Success.Render("✓"))
 	}
 
@@ -2233,6 +2255,19 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		purgeClosedEphemeralBeads(beads.New(r.Path))
 	}
 
+	return nil
+}
+
+func runPolecatNukeLockedTeardown(stopExactSession func() error, mutate func()) error {
+	if stopExactSession == nil {
+		return errors.New("exact session teardown unavailable")
+	}
+	if err := stopExactSession(); err != nil {
+		return err
+	}
+	if mutate != nil {
+		mutate()
+	}
 	return nil
 }
 

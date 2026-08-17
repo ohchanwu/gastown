@@ -43,12 +43,14 @@ var (
 
 // SessionManager handles polecat session lifecycle.
 type SessionManager struct {
-	tmux                 *tmux.Tmux
-	rig                  *rig.Rig
-	deliverStartupPrompt func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
-	verifyStartupNudge   func(context.Context, string, *config.RuntimeConfig, string, bool) error
-	startPoller          func(string, string, []string) (int, error)
-	stopPoller           func(string, string) error
+	tmux                    *tmux.Tmux
+	rig                     *rig.Rig
+	deliverStartupPrompt    func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
+	verifyStartupNudge      func(context.Context, string, *config.RuntimeConfig, string, bool) error
+	startPoller             func(string, string, []string) (int, error)
+	stopPoller              func(string, string) error
+	capturePollerGeneration func(string, string) (nudge.PollerGeneration, error)
+	stopPollerGeneration    func(string, string, nudge.PollerGeneration) error
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
@@ -61,6 +63,8 @@ func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	m.verifyStartupNudge = m.verifyStartupNudgeDelivery
 	m.startPoller = nudge.StartPollerWithEnv
 	m.stopPoller = nudge.StopPoller
+	m.capturePollerGeneration = nudge.CapturePollerGeneration
+	m.stopPollerGeneration = nudge.StopPollerGeneration
 	return m
 }
 
@@ -129,6 +133,88 @@ type SessionInfo struct {
 
 	// LastActivity is when the session last had activity.
 	LastActivity time.Time `json:"last_activity,omitempty"`
+}
+
+// SessionCustody is a read-only proof of both the exact tmux session and exact
+// nudge-poller generations observed for one polecat lifetime. Absence is part
+// of the proof: a session or poller created later is a replacement, not the
+// inspected generation.
+type SessionCustody struct {
+	sessionID  string
+	generation tmux.SessionGeneration
+	running    bool
+	poller     nudge.PollerGeneration
+}
+
+func (m *SessionManager) currentSessionGeneration(sessionID string) (tmux.SessionGeneration, bool, error) {
+	generation, err := m.tmux.CaptureSessionGeneration(sessionID)
+	if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
+		return tmux.SessionGeneration{}, false, nil
+	}
+	if err != nil {
+		return tmux.SessionGeneration{}, false, err
+	}
+	return generation, true, nil
+}
+
+// CaptureSessionCustody records the exact session and poller generations for a
+// later lifecycle-locked stop.
+func (m *SessionManager) CaptureSessionCustody(polecat string) (SessionCustody, error) {
+	sessionID := m.SessionName(polecat)
+	generation, running, err := m.currentSessionGeneration(sessionID)
+	if err != nil {
+		return SessionCustody{}, fmt.Errorf("capturing session generation: %w", err)
+	}
+	capturePoller := m.capturePollerGeneration
+	if capturePoller == nil {
+		capturePoller = nudge.CapturePollerGeneration
+	}
+	poller, err := capturePoller(filepath.Dir(m.rig.Path), sessionID)
+	if err != nil {
+		return SessionCustody{}, fmt.Errorf("capturing poller generation: %w", err)
+	}
+	return SessionCustody{sessionID: sessionID, generation: generation, running: running, poller: poller}, nil
+}
+
+// StopSessionCustody stops only the generations captured by
+// CaptureSessionCustody. It fails closed before session mutation when poller
+// custody changed and reports any same-name tmux replacement to the caller.
+func (m *SessionManager) StopSessionCustody(custody SessionCustody) error {
+	current, running, err := m.currentSessionGeneration(custody.sessionID)
+	if err != nil {
+		return fmt.Errorf("rechecking session generation: %w", err)
+	}
+	if running && (!custody.running || !current.Equal(custody.generation)) {
+		return fmt.Errorf("%w: session %s", tmux.ErrSessionGenerationChanged, custody.sessionID)
+	}
+
+	stopPoller := m.stopPollerGeneration
+	if stopPoller == nil {
+		stopPoller = nudge.StopPollerGeneration
+	}
+	if err := stopPoller(filepath.Dir(m.rig.Path), custody.sessionID, custody.poller); err != nil {
+		return fmt.Errorf("stopping exact poller generation: %w", err)
+	}
+
+	if custody.running && running {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.tmux.KillSessionGenerationWithProcessesPortableContext(cleanupCtx, custody.generation); err != nil {
+			return fmt.Errorf("killing exact session generation: %w", err)
+		}
+	}
+
+	final, finalRunning, err := m.currentSessionGeneration(custody.sessionID)
+	if err != nil {
+		return fmt.Errorf("verifying session generation teardown: %w", err)
+	}
+	if finalRunning {
+		if !custody.running || !final.Equal(custody.generation) {
+			return fmt.Errorf("%w: session %s replaced during teardown", tmux.ErrSessionGenerationChanged, custody.sessionID)
+		}
+		return fmt.Errorf("session generation %s remained live after teardown", custody.sessionID)
+	}
+	return nil
 }
 
 // SessionName generates the tmux session name for a polecat.

@@ -414,12 +414,13 @@ func TestReconcileCleanupStatusIfSafe(t *testing.T) {
 			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
 				AgentState:    string(beads.AgentStateStuck),
 				CleanupStatus: string(previous),
+				Incarnation:   "generation-1",
 			}, func(cleanupReconcileProof) error { return nil })
 
 			if updater.calls != 1 {
 				t.Fatalf("CompareAndUpdateAgentDescriptionFields calls = %d, want 1", updater.calls)
 			}
-			if updater.id != "gt-gastown-polecat-nitro" || updater.expected.AgentState == nil || *updater.expected.AgentState != string(beads.AgentStateStuck) || updater.expected.CleanupStatus == nil || *updater.expected.CleanupStatus != string(previous) {
+			if updater.id != "gt-gastown-polecat-nitro" || updater.expected.AgentState == nil || *updater.expected.AgentState != string(beads.AgentStateStuck) || updater.expected.CleanupStatus == nil || *updater.expected.CleanupStatus != string(previous) || updater.expected.Incarnation == nil || *updater.expected.Incarnation != "generation-1" {
 				t.Fatalf("guarded expectations = (%q, %#v), want stuck and %s", updater.id, updater.expected, previous)
 			}
 			if updater.updates.AgentState == nil || *updater.updates.AgentState != string(beads.AgentStateIdle) || updater.updates.CleanupStatus == nil || *updater.updates.CleanupStatus != string(polecat.CleanupClean) {
@@ -442,6 +443,7 @@ func TestReconcileCleanupStatusIfSafe_FailsClosed(t *testing.T) {
 	reconcileCleanupStatusIfSafe(status, &fakeCleanupUpdater{err: errors.New("bd update failed")}, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
 		AgentState:    string(beads.AgentStateStuck),
 		CleanupStatus: string(polecat.CleanupUnpushed),
+		Incarnation:   "generation-1",
 	}, func(cleanupReconcileProof) error { return nil })
 
 	if status.Verdict != "NEEDS_RECOVERY" || !status.NeedsRecovery || status.SafeToNuke {
@@ -458,7 +460,7 @@ func TestReconcileCleanupStatusIfSafeRechecksEverySafetyBoundary(t *testing.T) {
 			status := &RecoveryStatus{CleanupStatus: polecat.CleanupUnpushed, Verdict: "SAFE_TO_NUKE", SafeToNuke: true, Branch: "polecat/nitro", MQStatus: "submitted"}
 			updater := &fakeCleanupUpdater{}
 			reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
-				AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed),
+				AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed), Incarnation: "generation-1",
 			}, func(cleanupReconcileProof) error { return errors.New(boundary) })
 
 			if updater.calls != 0 {
@@ -475,12 +477,12 @@ func TestReconcileCleanupStatusIfSafeRechecksEverySafetyBoundary(t *testing.T) {
 }
 
 func TestValidateCleanupRecheckEvidenceFailsClosed(t *testing.T) {
-	stuck, dirty := string(beads.AgentStateStuck), string(polecat.CleanupUnpushed)
+	stuck, dirty, incarnation := string(beads.AgentStateStuck), string(polecat.CleanupUnpushed), "generation-1"
 	proof := cleanupReconcileProof{
 		Previous: polecat.CleanupUnpushed,
 		Expected: beads.AgentFieldExpectations{
 			AgentState: &stuck, CleanupStatus: &dirty,
-			HookBead: stringPointer(""), ActiveMR: stringPointer(""),
+			HookBead: stringPointer(""), ActiveMR: stringPointer(""), Incarnation: &incarnation,
 		},
 	}
 	base := func() cleanupRecheckEvidence {
@@ -489,7 +491,7 @@ func TestValidateCleanupRecheckEvidenceFailsClosed(t *testing.T) {
 			GenerationMatches: true,
 			BranchPreserved:   true,
 			Fields: &beads.AgentFields{
-				AgentState: stuck, CleanupStatus: dirty,
+				AgentState: stuck, CleanupStatus: dirty, Incarnation: incarnation,
 			},
 			HookSafe:      true,
 			WorkTerminal:  true,
@@ -509,6 +511,7 @@ func TestValidateCleanupRecheckEvidenceFailsClosed(t *testing.T) {
 		{name: "branch unpreserved", mutate: func(e *cleanupRecheckEvidence) { e.UnpreservedPatches = 1 }, want: "branch_preservation=unpreserved"},
 		{name: "branch preservation unverified", mutate: func(e *cleanupRecheckEvidence) { e.BranchPreserved = false }, want: "branch_preservation=unverified"},
 		{name: "generation changed", mutate: func(e *cleanupRecheckEvidence) { e.GenerationMatches = false }, want: "polecat_generation=changed"},
+		{name: "same-value ABA incarnation changed", mutate: func(e *cleanupRecheckEvidence) { e.Fields.Incarnation = "generation-2" }, want: "incarnation"},
 		{name: "persisted state changed", mutate: func(e *cleanupRecheckEvidence) { e.Fields.AgentState = string(beads.AgentStateWorking) }, want: "agent_state"},
 	}
 
@@ -530,7 +533,7 @@ func TestReconcileCleanupStatusIfSafeGenerationSubstitution(t *testing.T) {
 	status := &RecoveryStatus{CleanupStatus: polecat.CleanupUnpushed, Verdict: "SAFE_TO_NUKE", SafeToNuke: true, Branch: "polecat/nitro", MQStatus: "submitted"}
 	updater := &fakeCleanupUpdater{err: fmt.Errorf("%w: agent_state", beads.ErrAgentFieldsChanged)}
 	reconcileCleanupStatusIfSafe(status, updater, "gt-gastown-polecat-nitro", &polecat.Polecat{State: polecat.StateIdle}, &beads.AgentFields{
-		AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed),
+		AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed), Incarnation: "generation-1",
 	}, func(cleanupReconcileProof) error { return nil })
 
 	if status.Reconciled || status.SafeToNuke || status.Verdict != "NEEDS_RECOVERY" {
@@ -544,7 +547,7 @@ func TestReconcileCleanupStatusIfSafeGenerationSubstitution(t *testing.T) {
 func TestCleanupStatusReconcileCandidateRequiresStrictPredicates(t *testing.T) {
 	baseStatus := &RecoveryStatus{Verdict: "SAFE_TO_NUKE", Branch: "polecat/nitro", MQStatus: "submitted"}
 	basePolecat := &polecat.Polecat{State: polecat.StateIdle}
-	baseFields := &beads.AgentFields{AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed)}
+	baseFields := &beads.AgentFields{AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed), Incarnation: "generation-1"}
 
 	tests := []struct {
 		name   string
@@ -557,6 +560,7 @@ func TestCleanupStatusReconcileCandidateRequiresStrictPredicates(t *testing.T) {
 		{name: "working agent bead blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateWorking), CleanupStatus: string(polecat.CleanupUnpushed)}},
 		{name: "done agent bead blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(polecat.CleanupUnpushed)}},
 		{name: "missing agent state blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{CleanupStatus: string(polecat.CleanupUnpushed)}},
+		{name: "missing incarnation blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnpushed)}},
 		{name: "unknown cleanup blocks", status: baseStatus, p: basePolecat, fields: &beads.AgentFields{AgentState: string(beads.AgentStateStuck), CleanupStatus: string(polecat.CleanupUnknown)}},
 		{name: "needs recovery blocks", status: &RecoveryStatus{Verdict: "NEEDS_RECOVERY", NeedsRecovery: true, Branch: "polecat/nitro", MQStatus: "submitted"}, p: basePolecat, fields: baseFields},
 		{name: "unknown mq blocks", status: &RecoveryStatus{Verdict: "SAFE_TO_NUKE", Branch: "polecat/nitro", MQStatus: "unknown"}, p: basePolecat, fields: baseFields},

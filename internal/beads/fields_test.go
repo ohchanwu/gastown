@@ -147,11 +147,12 @@ func TestSetAttachmentFieldsPreservesAdjacentKeyValueLines(t *testing.T) {
 
 func TestAgentFieldsModeRoundTrip(t *testing.T) {
 	original := &AgentFields{
-		RoleType:   "polecat",
-		Rig:        "gastown",
-		AgentState: "working",
-		HookBead:   "gt-abc",
-		Mode:       "ralph",
+		RoleType:    "polecat",
+		Rig:         "gastown",
+		AgentState:  "working",
+		HookBead:    "gt-abc",
+		Incarnation: "polecat-generation-123",
+		Mode:        "ralph",
 	}
 
 	formatted := FormatAgentDescription("Polecat Test", original)
@@ -165,6 +166,9 @@ func TestAgentFieldsModeRoundTrip(t *testing.T) {
 	}
 	if parsed.RoleType != "polecat" {
 		t.Errorf("RoleType: got %q, want %q", parsed.RoleType, "polecat")
+	}
+	if parsed.Incarnation != original.Incarnation {
+		t.Errorf("Incarnation: got %q, want %q", parsed.Incarnation, original.Incarnation)
 	}
 }
 
@@ -472,7 +476,7 @@ func TestSetConvoyFieldsWithMixedContent(t *testing.T) {
 // --- ParseAgentFields (not covered in beads_test.go) ---
 
 func TestParseAgentFields_AllFields(t *testing.T) {
-	desc := "role_type: polecat\nrig: gastown\nagent_state: working\nhook_bead: gt-abc\ncleanup_status: clean\nactive_mr: gt-mr1\nlast_source_issue: gt-src\nnotification_level: verbose"
+	desc := "role_type: polecat\nrig: gastown\nagent_state: working\nincarnation: polecat-generation-123\nhook_bead: gt-abc\ncleanup_status: clean\nactive_mr: gt-mr1\nlast_source_issue: gt-src\nnotification_level: verbose"
 	got := ParseAgentFields(desc)
 	if got.RoleType != "polecat" {
 		t.Errorf("RoleType = %q, want %q", got.RoleType, "polecat")
@@ -482,6 +486,9 @@ func TestParseAgentFields_AllFields(t *testing.T) {
 	}
 	if got.AgentState != "working" {
 		t.Errorf("AgentState = %q, want %q", got.AgentState, "working")
+	}
+	if got.Incarnation != "polecat-generation-123" {
+		t.Errorf("Incarnation = %q, want %q", got.Incarnation, "polecat-generation-123")
 	}
 	if got.HookBead != "gt-abc" {
 		t.Errorf("HookBead = %q, want %q", got.HookBead, "gt-abc")

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/google/uuid"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -113,14 +114,15 @@ func isDoltConfigError(err error) bool {
 
 // Common errors
 var (
-	ErrPolecatExists      = errors.New("polecat already exists")
-	ErrPolecatNotFound    = errors.New("polecat not found")
-	ErrHasChanges         = errors.New("polecat has uncommitted changes")
-	ErrHasUncommittedWork = errors.New("polecat has uncommitted work")
-	ErrShellInWorktree    = errors.New("shell working directory is inside polecat worktree")
-	ErrDoltUnhealthy      = errors.New("dolt health check failed")
-	ErrDoltAtCapacity     = errors.New("dolt server at connection capacity")
-	ErrDiskSpaceLow       = errors.New("insufficient disk space")
+	ErrPolecatExists             = errors.New("polecat already exists")
+	ErrPolecatNotFound           = errors.New("polecat not found")
+	ErrPolecatIncarnationChanged = errors.New("polecat incarnation changed")
+	ErrHasChanges                = errors.New("polecat has uncommitted changes")
+	ErrHasUncommittedWork        = errors.New("polecat has uncommitted work")
+	ErrShellInWorktree           = errors.New("shell working directory is inside polecat worktree")
+	ErrDoltUnhealthy             = errors.New("dolt health check failed")
+	ErrDoltAtCapacity            = errors.New("dolt server at connection capacity")
+	ErrDiskSpaceLow              = errors.New("insufficient disk space")
 )
 
 var checkDiskSpace = util.CheckDiskSpace
@@ -850,11 +852,13 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 	}
 
 	agentID := m.agentBeadID(name)
+	incarnation := uuid.NewString()
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead,
+		RoleType:    "polecat",
+		Rig:         m.rig.Name,
+		AgentState:  "spawning",
+		Incarnation: incarnation,
+		HookBead:    opts.HookBead,
 	}); err != nil {
 		cleanupOnError()
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
@@ -862,13 +866,14 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 
 	now := time.Now()
 	polecat := &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     StateWorking,
-		ClonePath: clonePath,
-		Branch:    branchName,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:        name,
+		Rig:         m.rig.Name,
+		State:       StateWorking,
+		Incarnation: incarnation,
+		ClonePath:   clonePath,
+		Branch:      branchName,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	return polecat, nil
@@ -1084,11 +1089,13 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	// Uses CreateOrReopenAgentBead to handle re-spawning with same name (GH #332).
 	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
 	agentID := m.agentBeadID(name)
+	incarnation := uuid.NewString()
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead, // Set atomically at spawn time
+		RoleType:    "polecat",
+		Rig:         m.rig.Name,
+		AgentState:  "spawning",
+		Incarnation: incarnation,
+		HookBead:    opts.HookBead, // Set atomically at spawn time
 	}); err != nil {
 		// Hard fail — an untrackable polecat is worse than no polecat
 		cleanupOnError()
@@ -1099,13 +1106,14 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	// State is derived from beads, not stored in state.json
 	now := time.Now()
 	polecat := &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     StateWorking, // Transient model: polecat spawns with work
-		ClonePath: clonePath,
-		Branch:    branchName,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:        name,
+		Rig:         m.rig.Name,
+		State:       StateWorking, // Transient model: polecat spawns with work
+		Incarnation: incarnation,
+		ClonePath:   clonePath,
+		Branch:      branchName,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	return polecat, nil
@@ -1147,14 +1155,53 @@ func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNu
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, "")
+}
+
+// RemoveWithOptionsLocalOnlyIfIncarnation holds the same per-polecat lifecycle
+// lock used by spawn, reuse, repair, and removal; revalidates the durable opaque
+// incarnation; performs exact pre-removal teardown; and only then removes the
+// inspected worktree. A stale caller can never retire a same-name replacement.
+func (m *Manager) RemoveWithOptionsLocalOnlyIfIncarnation(
+	name, expectedIncarnation string,
+	force, nuclear, selfNuke bool,
+	beforeRemove func(*Polecat) error,
+) (retErr error) {
+	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: missing expected incarnation", ErrPolecatIncarnationChanged)
+	}
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	current, err := m.loadFromBeads(name)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.Incarnation != expectedIncarnation {
+		observed := "<missing>"
+		if current != nil && current.Incarnation != "" {
+			observed = current.Incarnation
+		}
+		return fmt.Errorf("%w: expected %s, observed %s", ErrPolecatIncarnationChanged, expectedIncarnation, observed)
+	}
+	if beforeRemove != nil {
+		if err := beforeRemove(current); err != nil {
+			return err
+		}
+	}
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false, expectedIncarnation)
 }
 
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
-	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true)
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "")
 }
 
-func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool) error {
+func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool, expectedIncarnation string) error {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
@@ -1210,10 +1257,19 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	// simply update it without needing close/reopen (which fails on Dolt).
 	// See gt-14b8o: close/reopen cycle breaks on Dolt backend.
 	agentID := m.agentBeadID(name)
-	if err := m.resetAgentBeadForReuse(agentID, "polecat removed"); err != nil {
+	var resetErr error
+	if expectedIncarnation != "" {
+		resetErr = m.agentBeads().ResetAgentBeadForReuseIfIncarnation(agentID, "polecat removed", expectedIncarnation)
+	} else {
+		resetErr = m.resetAgentBeadForReuse(agentID, "polecat removed")
+	}
+	if resetErr != nil {
+		if expectedIncarnation != "" {
+			return fmt.Errorf("retiring exact agent incarnation: %w", resetErr)
+		}
 		// Only log if not "not found" - it's ok if it doesn't exist
-		if !errors.Is(err, beads.ErrNotFound) {
-			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
+		if !errors.Is(resetErr, beads.ErrNotFound) {
+			style.PrintWarning("could not reset agent bead %s: %v", agentID, resetErr)
 		}
 	}
 
@@ -1736,11 +1792,13 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// HookBead is set atomically at recreation time if provided.
 	// Uses CreateOrReopenAgentBead to handle re-spawning with same name (GH #332).
 	// Retries with backoff — a polecat without an agent bead is untrackable (gt-94llt7).
+	incarnation := uuid.NewString()
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead, // Set atomically at spawn time
+		RoleType:    "polecat",
+		Rig:         m.rig.Name,
+		AgentState:  "spawning",
+		Incarnation: incarnation,
+		HookBead:    opts.HookBead, // Set atomically at spawn time
 	}); err != nil {
 		// Hard fail — clean up the new worktree since we can't track this polecat
 		_ = repoGit.WorktreeRemove(newClonePath, true)
@@ -1754,13 +1812,14 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Return fresh polecat in working state (transient model: polecats are spawned with work)
 	now := time.Now()
 	return &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     StateWorking,
-		ClonePath: newClonePath,
-		Branch:    branchName,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:        name,
+		Rig:         m.rig.Name,
+		State:       StateWorking,
+		Incarnation: incarnation,
+		ClonePath:   newClonePath,
+		Branch:      branchName,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}, nil
 }
 
@@ -1935,11 +1994,13 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	}
 
 	// Create or reopen agent bead with hook_bead set atomically
+	incarnation := uuid.NewString()
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
-		RoleType:   "polecat",
-		Rig:        m.rig.Name,
-		AgentState: "spawning",
-		HookBead:   opts.HookBead,
+		RoleType:    "polecat",
+		Rig:         m.rig.Name,
+		AgentState:  "spawning",
+		Incarnation: incarnation,
+		HookBead:    opts.HookBead,
 	}); err != nil {
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
@@ -1956,13 +2017,14 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	now := time.Now()
 	return &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     StateWorking,
-		ClonePath: clonePath,
-		Branch:    branchName,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:        name,
+		Rig:         m.rig.Name,
+		State:       StateWorking,
+		Incarnation: incarnation,
+		ClonePath:   clonePath,
+		Branch:      branchName,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}, nil
 }
 
@@ -2763,6 +2825,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	}
 
 	assignee := m.assigneeID(name)
+	agentID := m.agentBeadID(name)
+	_, fields, agentErr := m.beads.GetAgentBead(agentID)
+	incarnation := ""
+	if agentErr == nil && fields != nil {
+		incarnation = fields.Incarnation
+	}
 
 	// Cross-check tmux session liveness once for use in state derivation below.
 	// When a tmux session has died (e.g., due to disk space exhaustion or OOM),
@@ -2788,20 +2856,19 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 			state = StateStalled
 		}
 		return &Polecat{
-			Name:      name,
-			Rig:       m.rig.Name,
-			State:     state,
-			ClonePath: clonePath,
-			Branch:    branchName,
-			Issue:     hookedBeads[0].ID,
+			Name:        name,
+			Rig:         m.rig.Name,
+			State:       state,
+			Incarnation: incarnation,
+			ClonePath:   clonePath,
+			Branch:      branchName,
+			Issue:       hookedBeads[0].ID,
 		}, nil
 	}
 
 	// Compatibility fallback: if legacy hook_bead is still set, only trust it when
 	// it resolves to a currently hooked bead for this assignee. This avoids stale
 	// issue reporting when hook_bead diverges from the work bead state.
-	agentID := m.agentBeadID(name)
-	_, fields, agentErr := m.beads.GetAgentBead(agentID)
 	if agentErr == nil && fields != nil && fields.HookBead != "" {
 		if hookIssue, err := m.beads.Show(fields.HookBead); err == nil &&
 			isCurrentHookedIssueForAssignee(hookIssue, assignee) {
@@ -2810,12 +2877,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 				state = StateStalled
 			}
 			return &Polecat{
-				Name:      name,
-				Rig:       m.rig.Name,
-				State:     state,
-				ClonePath: clonePath,
-				Branch:    branchName,
-				Issue:     fields.HookBead,
+				Name:        name,
+				Rig:         m.rig.Name,
+				State:       state,
+				Incarnation: incarnation,
+				ClonePath:   clonePath,
+				Branch:      branchName,
+				Issue:       fields.HookBead,
 			}, nil
 		}
 	}
@@ -2833,11 +2901,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 			state = StateReviewNeeded
 		}
 		return &Polecat{
-			Name:      name,
-			Rig:       m.rig.Name,
-			State:     state,
-			ClonePath: clonePath,
-			Branch:    branchName,
+			Name:        name,
+			Rig:         m.rig.Name,
+			State:       state,
+			Incarnation: incarnation,
+			ClonePath:   clonePath,
+			Branch:      branchName,
 		}, nil
 	}
 
@@ -2868,12 +2937,13 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	}
 
 	return &Polecat{
-		Name:      name,
-		Rig:       m.rig.Name,
-		State:     state,
-		ClonePath: clonePath,
-		Branch:    branchName,
-		Issue:     issueID,
+		Name:        name,
+		Rig:         m.rig.Name,
+		State:       state,
+		Incarnation: incarnation,
+		ClonePath:   clonePath,
+		Branch:      branchName,
+		Issue:       issueID,
 	}, nil
 }
 

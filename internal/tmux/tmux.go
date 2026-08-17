@@ -548,20 +548,35 @@ func sessionGenerationCleanupTerminal(err error) bool {
 func (t *Tmux) CleanupFailedSessionGeneration(generation SessionGeneration) error {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), failedSessionCreationCleanupTimeout)
 	defer cleanupCancel()
-	processErr := t.KillSessionGenerationWithProcessesContext(cleanupCtx, generation)
-	if sessionGenerationCleanupTerminal(processErr) {
+	err := t.KillSessionGenerationWithProcessesPortableContext(cleanupCtx, generation)
+	if sessionGenerationCleanupTerminal(err) {
 		return nil
+	}
+	return err
+}
+
+// KillSessionGenerationWithProcessesPortableContext performs exact-generation,
+// process-aware teardown using the strongest custody mechanism available on
+// the host. Unlike failed-start cleanup, it reports generation substitution to
+// the caller so a surrounding lifecycle transaction can preserve a replacement.
+func (t *Tmux) KillSessionGenerationWithProcessesPortableContext(ctx context.Context, generation SessionGeneration) error {
+	processErr := t.KillSessionGenerationWithProcessesContext(ctx, generation)
+	if sessionGenerationCleanupTerminal(processErr) {
+		return processErr
 	}
 	// Deliberate failed-start rollback may use the weaker explicit path on a
 	// platform without retained kernel/custody handles. It still binds every
 	// signal to the exact tmux generation and process-start identity. Automatic
 	// zombie replacement must never use this fallback.
-	explicitErr := t.killSessionGenerationExplicitWithProcessesContext(cleanupCtx, generation)
+	explicitErr := t.killSessionGenerationExplicitWithProcessesContext(ctx, generation)
 	if sessionGenerationCleanupTerminal(explicitErr) {
-		return nil
+		return explicitErr
 	}
 	fallbackErr := t.KillSessionGeneration(generation)
-	if sessionGenerationCleanupTerminal(fallbackErr) {
+	if errors.Is(fallbackErr, ErrSessionGenerationChanged) {
+		return errors.Join(ErrSessionGenerationChanged, processErr, explicitErr)
+	}
+	if fallbackErr == nil || errors.Is(fallbackErr, ErrSessionNotFound) || errors.Is(fallbackErr, ErrNoServer) {
 		// The tmux generation is terminal, but process-aware custody did not
 		// complete, so descendants may remain. Preserve the assignment until a
 		// later health/recovery pass proves the whole boundary absent.

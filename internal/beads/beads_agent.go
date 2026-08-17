@@ -41,6 +41,7 @@ type AgentFields struct {
 	RoleType          string // polecat, witness, refinery, deacon, mayor
 	Rig               string // Rig name (empty for global agents like mayor/deacon)
 	AgentState        string // spawning, working, done, stuck, escalated, idle, running, nuked
+	Incarnation       string // Opaque polecat lifetime ID; immutable until retirement/reuse
 	HookBead          string // Currently pinned work bead ID
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
 	ActiveMR          string // Currently active merge request bead ID (for traceability)
@@ -86,6 +87,9 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 	}
 
 	lines = append(lines, fmt.Sprintf("agent_state: %s", fields.AgentState))
+	if fields.Incarnation != "" {
+		lines = append(lines, fmt.Sprintf("incarnation: %s", fields.Incarnation))
+	}
 
 	if fields.HookBead != "" {
 		lines = append(lines, fmt.Sprintf("hook_bead: %s", fields.HookBead))
@@ -171,6 +175,8 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.Rig = value
 		case "agent_state":
 			fields.AgentState = value
+		case "incarnation":
+			fields.Incarnation = value
 		case "hook_bead":
 			fields.HookBead = value
 		case "cleanup_status":
@@ -391,6 +397,21 @@ func labelsForAgentBeadReuse(existing []string) []string {
 //
 // This is the standard nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
+	return b.resetAgentBeadForReuse(id, reason, nil)
+}
+
+// ResetAgentBeadForReuseIfIncarnation retires only the exact polecat lifetime
+// observed by the caller. A same-name replacement is preserved even when all
+// other mutable agent fields happen to have the same values (the ABA case).
+func (b *Beads) ResetAgentBeadForReuseIfIncarnation(id, reason, expectedIncarnation string) error {
+	expectedIncarnation = strings.TrimSpace(expectedIncarnation)
+	if expectedIncarnation == "" {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
+	return b.resetAgentBeadForReuse(id, reason, &expectedIncarnation)
+}
+
+func (b *Beads) resetAgentBeadForReuse(id, reason string, expectedIncarnation *string) error {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
 	// the nuked state we're about to set. See gt-joazs.
@@ -410,10 +431,14 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 
 	// Parse existing fields and clear mutable ones
 	fields := ParseAgentFields(issue.Description)
+	if expectedIncarnation != nil && fields.Incarnation != *expectedIncarnation {
+		return fmt.Errorf("%w: incarnation", ErrAgentFieldsChanged)
+	}
 	fields.HookBead = ""      // Clear hook_bead
 	fields.ActiveMR = ""      // Clear active_mr
 	fields.CleanupStatus = "" // Clear cleanup_status
 	fields.Mode = ""          // Clear Ralph-mode threshold marker
+	fields.Incarnation = ""   // Retired generation must never match a stale lifecycle proof
 	fields.AgentState = string(AgentStateNuked)
 	// Clear completion metadata (gt-x7t9)
 	fields.ExitType = ""
@@ -458,6 +483,7 @@ func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 // cycle, avoiding races where concurrent callers overwrite each other's changes.
 type AgentFieldUpdates struct {
 	AgentState        *string // Sync description agent_state with column (gt-ulom)
+	Incarnation       *string // New opaque value only at spawn/reuse; clear at exact retirement
 	CleanupStatus     *string
 	ActiveMR          *string
 	NotificationLevel *string
@@ -478,6 +504,7 @@ type AgentFieldUpdates struct {
 // compared.
 type AgentFieldExpectations struct {
 	AgentState    *string
+	Incarnation   *string
 	CleanupStatus *string
 	ActiveMR      *string
 	HookBead      *string
@@ -568,6 +595,7 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 			current string
 		}{
 			{name: "agent_state", want: expected.AgentState, current: fields.AgentState},
+			{name: "incarnation", want: expected.Incarnation, current: fields.Incarnation},
 			{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
 			{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
 			{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
@@ -581,6 +609,9 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 
 	if updates.AgentState != nil {
 		fields.AgentState = *updates.AgentState
+	}
+	if updates.Incarnation != nil {
+		fields.Incarnation = *updates.Incarnation
 	}
 	if updates.CleanupStatus != nil {
 		fields.CleanupStatus = *updates.CleanupStatus

@@ -94,6 +94,9 @@ type Polecat struct {
 	// State is the current lifecycle state.
 	State State `json:"state"`
 
+	// Incarnation is the opaque immutable ID of this worker lifetime.
+	Incarnation string `json:"incarnation,omitempty"`
+
 	// ClonePath is the path to the polecat's clone of the rig.
 	ClonePath string `json:"clone_path"`
 
