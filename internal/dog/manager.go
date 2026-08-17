@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // Common errors
@@ -302,14 +303,15 @@ func (m *Manager) Get(name string) (*Dog, error) {
 	}
 
 	return &Dog{
-		Name:          name,
-		State:         state.State,
-		Path:          m.dogDir(name),
-		Worktrees:     state.Worktrees,
-		LastActive:    state.LastActive,
-		Work:          state.Work,
-		WorkStartedAt: state.WorkStartedAt,
-		CreatedAt:     state.CreatedAt,
+		Name:              name,
+		State:             state.State,
+		Path:              m.dogDir(name),
+		Worktrees:         state.Worktrees,
+		LastActive:        state.LastActive,
+		Work:              state.Work,
+		WorkStartedAt:     state.WorkStartedAt,
+		CreatedAt:         state.CreatedAt,
+		SessionGeneration: state.SessionGeneration,
 	}, nil
 }
 
@@ -469,6 +471,117 @@ func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedA
 	state.UpdatedAt = time.Now()
 
 	return true, m.saveState(name, state)
+}
+
+// SetSessionGeneration records the exact tmux generation owned by a dog without
+// conflating runtime liveness with the independently tracked work state.
+func (m *Manager) SetSessionGeneration(name string, generation tmux.SessionGeneration) error {
+	if err := validateDogName(name); err != nil {
+		return err
+	}
+	if !m.exists(name) {
+		return ErrDogNotFound
+	}
+	if err := validateSessionGenerationForDog(name, generation); err != nil {
+		return err
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return fmt.Errorf("loading state: %w", err)
+	}
+	state.SessionGeneration = SessionGenerationFromTmux(generation)
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+	return m.saveState(name, state)
+}
+
+// CompleteWorkIfMatches clears work only when both the assignment and exact
+// runtime generation still match. A replacement assignment or session causes
+// zero durable mutation.
+func (m *Manager) CompleteWorkIfMatches(
+	name string,
+	expectedWork string,
+	expectedStartedAt time.Time,
+	expectedGeneration tmux.SessionGeneration,
+) (bool, error) {
+	if err := validateDogName(name); err != nil {
+		return false, err
+	}
+	if !m.exists(name) {
+		return false, ErrDogNotFound
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if state.Work != expectedWork ||
+		!state.WorkStartedAt.Equal(expectedStartedAt) ||
+		state.SessionGeneration == nil ||
+		!state.SessionGeneration.EqualTmux(expectedGeneration) {
+		return false, nil
+	}
+
+	state.State = StateIdle
+	state.Work = ""
+	state.WorkStartedAt = time.Time{}
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+	return true, m.saveState(name, state)
+}
+
+// ClearSessionGenerationIfMatches removes only the expected generation record.
+// If a replacement generation was persisted, it is left untouched.
+func (m *Manager) ClearSessionGenerationIfMatches(name string, expected tmux.SessionGeneration) (bool, error) {
+	if err := validateDogName(name); err != nil {
+		return false, err
+	}
+	if !m.exists(name) {
+		return false, ErrDogNotFound
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if state.SessionGeneration == nil || !state.SessionGeneration.EqualTmux(expected) {
+		return false, nil
+	}
+	state.SessionGeneration = nil
+	state.LastActive = time.Now()
+	state.UpdatedAt = time.Now()
+	return true, m.saveState(name, state)
+}
+
+func validateSessionGenerationForDog(name string, generation tmux.SessionGeneration) error {
+	wantName := "hq-dog-" + name
+	if generation.Name != wantName ||
+		strings.TrimSpace(generation.SessionID) == "" ||
+		strings.TrimSpace(generation.Nonce) == "" ||
+		generation.ServerPID <= 0 ||
+		strings.TrimSpace(generation.ServerIdentity) == "" {
+		return fmt.Errorf("invalid session generation for dog %s", name)
+	}
+	return nil
 }
 
 // Refresh recreates all worktrees for a dog with fresh branches.

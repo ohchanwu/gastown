@@ -23,20 +23,34 @@ var (
 
 // SessionManager handles dog session lifecycle.
 type SessionManager struct {
-	tmux     *tmux.Tmux
-	mgr      *Manager
-	townRoot string
+	tmux                     *tmux.Tmux
+	mgr                      *Manager
+	townRoot                 string
+	startSession             func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error)
+	captureSessionGeneration func(string) (tmux.SessionGeneration, error)
+	killSessionGeneration    func(tmux.SessionGeneration) error
+	persistSessionGeneration func(string, tmux.SessionGeneration) error
 }
 
 // NewSessionManager creates a new dog session manager.
 // The Manager parameter is used to sync persistent dog state (idle/working)
 // when sessions start and stop.
 func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionManager {
-	return &SessionManager{
-		tmux:     t,
-		mgr:      mgr,
-		townRoot: townRoot,
+	m := &SessionManager{
+		tmux:                     t,
+		mgr:                      mgr,
+		townRoot:                 townRoot,
+		startSession:             session.StartSession,
+		captureSessionGeneration: t.CaptureSessionGeneration,
+		killSessionGeneration:    t.KillSessionGeneration,
 	}
+	m.persistSessionGeneration = func(name string, generation tmux.SessionGeneration) error {
+		if m.mgr == nil {
+			return errors.New("dog session generation store is unavailable")
+		}
+		return m.mgr.SetSessionGeneration(name, generation)
+	}
+	return m
 }
 
 // SessionStartOptions configures dog session startup.
@@ -114,7 +128,7 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 
 	// Use unified session lifecycle.
 	theme := tmux.DogTheme()
-	_, err = session.StartSession(m.tmux, session.SessionConfig{
+	_, err = m.startSession(m.tmux, session.SessionConfig{
 		SessionID: sessionID,
 		WorkDir:   kennelDir,
 		Role:      "dog",
@@ -139,12 +153,18 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 		return err
 	}
 
-	// Update persistent state to working
-	if m.mgr != nil {
-		if err := m.mgr.SetState(dogName, StateWorking); err != nil {
-			// Log but don't fail - session is running, state sync is best-effort
-			fmt.Fprintf(os.Stderr, "warning: failed to set dog %s state to working: %v\n", dogName, err)
+	generation, err := m.captureSessionGeneration(sessionID)
+	if err != nil {
+		// Without an exact generation, a name-based rollback could kill a
+		// replacement. Preserve the unproven session and report incomplete start.
+		return fmt.Errorf("capturing dog session generation: %w", err)
+	}
+	if err := m.persistSessionGeneration(dogName, generation); err != nil {
+		persistErr := fmt.Errorf("persisting dog session generation: %w", err)
+		if killErr := m.killSessionGeneration(generation); killErr != nil {
+			return errors.Join(persistErr, fmt.Errorf("rolling back captured dog session generation: %w", killErr))
 		}
+		return persistErr
 	}
 
 	return nil

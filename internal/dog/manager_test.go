@@ -1,13 +1,16 @@
 package dog
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // TestDogStateJSON verifies DogState JSON serialization.
@@ -46,6 +49,217 @@ func TestDogStateJSON(t *testing.T) {
 	if len(state.Worktrees) != 2 {
 		t.Errorf("expected 2 worktrees, got %d", len(state.Worktrees))
 	}
+}
+
+func TestDogSessionGenerationJSONRoundTripAndLegacyCompatibility(t *testing.T) {
+	legacy := []byte(`{"name":"alpha","state":"idle","last_active":"2026-08-17T00:00:00Z","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z"}`)
+	var legacyState DogState
+	if err := json.Unmarshal(legacy, &legacyState); err != nil {
+		t.Fatalf("unmarshal legacy state: %v", err)
+	}
+	if legacyState.SessionGeneration != nil {
+		t.Fatalf("legacy session generation = %+v, want nil", legacyState.SessionGeneration)
+	}
+	legacyRoundTrip, err := json.Marshal(&legacyState)
+	if err != nil {
+		t.Fatalf("marshal legacy state: %v", err)
+	}
+	if string(legacyRoundTrip) == "" || containsJSONField(legacyRoundTrip, "session_generation") {
+		t.Fatalf("legacy round trip unexpectedly added session_generation: %s", legacyRoundTrip)
+	}
+
+	want := testDogTmuxGeneration("$9", "nonce-new")
+	state := legacyState
+	state.SessionGeneration = SessionGenerationFromTmux(want)
+	data, err := json.Marshal(&state)
+	if err != nil {
+		t.Fatalf("marshal generation state: %v", err)
+	}
+	var got DogState
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal generation state: %v", err)
+	}
+	if got.SessionGeneration == nil || !got.SessionGeneration.EqualTmux(want) {
+		t.Fatalf("generation round trip = %+v, want %+v", got.SessionGeneration, want)
+	}
+}
+
+func TestManagerSessionGenerationGuardedCompletionAndCompareClear(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work-old")
+	oldGeneration := testDogTmuxGeneration("$1", "nonce-old")
+	newGeneration := testDogTmuxGeneration("$2", "nonce-new")
+	if err := mgr.SetSessionGeneration("alpha", oldGeneration); err != nil {
+		t.Fatalf("SetSessionGeneration: %v", err)
+	}
+
+	beforeMismatch, err := os.ReadFile(mgr.stateFilePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := mgr.CompleteWorkIfMatches("alpha", initial.Work, initial.WorkStartedAt, newGeneration)
+	if err != nil {
+		t.Fatalf("CompleteWorkIfMatches mismatch: %v", err)
+	}
+	if completed {
+		t.Fatal("mismatched generation completed work")
+	}
+	afterMismatch, err := os.ReadFile(mgr.stateFilePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(beforeMismatch) != string(afterMismatch) {
+		t.Fatal("mismatched generation mutated durable state")
+	}
+
+	completed, err = mgr.CompleteWorkIfMatches("alpha", initial.Work, initial.WorkStartedAt, oldGeneration)
+	if err != nil || !completed {
+		t.Fatalf("matching CompleteWorkIfMatches = %v, %v; want true, nil", completed, err)
+	}
+	dog, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dog.State != StateIdle || dog.Work != "" || dog.SessionGeneration == nil || !dog.SessionGeneration.EqualTmux(oldGeneration) {
+		t.Fatalf("completed dog = %+v, want idle work with retained generation", dog)
+	}
+
+	cleared, err := mgr.ClearSessionGenerationIfMatches("alpha", newGeneration)
+	if err != nil || cleared {
+		t.Fatalf("mismatched ClearSessionGenerationIfMatches = %v, %v; want false, nil", cleared, err)
+	}
+	cleared, err = mgr.ClearSessionGenerationIfMatches("alpha", oldGeneration)
+	if err != nil || !cleared {
+		t.Fatalf("matching ClearSessionGenerationIfMatches = %v, %v; want true, nil", cleared, err)
+	}
+	dog, err = mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dog.SessionGeneration != nil {
+		t.Fatalf("session generation after compare-clear = %+v, want nil", dog.SessionGeneration)
+	}
+}
+
+func TestSetSessionGenerationPreservesIndependentWorkState(t *testing.T) {
+	mgr, state := newDogStateManager(t, "alpha", "")
+	state.State = StateIdle
+	state.WorkStartedAt = time.Time{}
+	if err := mgr.saveState("alpha", state); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.SetSessionGeneration("alpha", testDogTmuxGeneration("$3", "nonce-idle")); err != nil {
+		t.Fatal(err)
+	}
+	dog, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dog.State != StateIdle || dog.Work != "" {
+		t.Fatalf("work state changed while recording runtime generation: %+v", dog)
+	}
+}
+
+func TestSetSessionGenerationAcceptsPlatformWithoutCustodyMarker(t *testing.T) {
+	mgr, _ := newDogStateManager(t, "alpha", "work")
+	generation := testDogTmuxGeneration("$4", "nonce-no-custody")
+	generation.Custody = ""
+	if err := mgr.SetSessionGeneration("alpha", generation); err != nil {
+		t.Fatalf("SetSessionGeneration without custody marker: %v", err)
+	}
+}
+
+func TestManagerSessionGenerationOperationsSerializeWithAssignment(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "work-old")
+	oldGeneration := testDogTmuxGeneration("$1", "nonce-old")
+	newGeneration := testDogTmuxGeneration("$2", "nonce-new")
+	if err := mgr.SetSessionGeneration("alpha", oldGeneration); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := mgr.lockDog("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		errs <- mgr.AssignWork("alpha", "work-new")
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := mgr.CompleteWorkIfMatches("alpha", initial.Work, initial.WorkStartedAt, oldGeneration)
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		errs <- mgr.SetSessionGeneration("alpha", newGeneration)
+	}()
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent operation: %v", err)
+		}
+	}
+
+	dog, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dog.Work != "work-new" {
+		t.Fatalf("work = %q, want work-new", dog.Work)
+	}
+	if dog.SessionGeneration == nil || !dog.SessionGeneration.EqualTmux(newGeneration) {
+		t.Fatalf("generation = %+v, want replacement", dog.SessionGeneration)
+	}
+}
+
+func containsJSONField(data []byte, field string) bool {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return false
+	}
+	_, ok := object[field]
+	return ok
+}
+
+func testDogTmuxGeneration(sessionID, nonce string) tmux.SessionGeneration {
+	return tmux.SessionGeneration{
+		Name:           "hq-dog-alpha",
+		SessionID:      sessionID,
+		Nonce:          nonce,
+		Custody:        "custody-alpha",
+		ServerPID:      4242,
+		ServerIdentity: "server-start-alpha",
+	}
+}
+
+func newDogStateManager(t *testing.T, name, work string) (*Manager, *DogState) {
+	t.Helper()
+	mgr := NewManager(t.TempDir(), &config.RigsConfig{Rigs: map[string]config.RigEntry{}})
+	if err := os.MkdirAll(mgr.dogDir(name), 0755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Round(0)
+	state := &DogState{
+		Name:          name,
+		State:         StateWorking,
+		Work:          work,
+		WorkStartedAt: now,
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := mgr.saveState(name, state); err != nil {
+		t.Fatal(err)
+	}
+	return mgr, state
 }
 
 // TestManagerCreation verifies Manager initialization.
