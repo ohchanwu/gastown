@@ -2835,6 +2835,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 	}
 
 	var lastErr error
+	var unpreserved *BranchPreservationStatus
 	for _, ref := range candidates {
 		candidate, err := g.preservationOfRefAgainstRef(head, ref)
 		if err != nil {
@@ -2847,12 +2848,13 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		if candidate.Preserved {
 			return candidate, nil
 		}
-		if result.ComparisonBase == "" {
-			result = candidate
+		if unpreserved == nil {
+			candidateCopy := candidate
+			unpreserved = &candidateCopy
 		}
 	}
-	if result.ComparisonBase != "" {
-		return result, nil
+	if unpreserved != nil {
+		return *unpreserved, nil
 	}
 	if lastErr != nil {
 		return result, lastErr

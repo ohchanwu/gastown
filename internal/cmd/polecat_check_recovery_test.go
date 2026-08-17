@@ -487,6 +487,7 @@ func TestValidateCleanupRecheckEvidenceFailsClosed(t *testing.T) {
 		return cleanupRecheckEvidence{
 			PolecatState:      polecat.StateIdle,
 			GenerationMatches: true,
+			BranchPreserved:   true,
 			Fields: &beads.AgentFields{
 				AgentState: stuck, CleanupStatus: dirty,
 			},
@@ -506,6 +507,7 @@ func TestValidateCleanupRecheckEvidenceFailsClosed(t *testing.T) {
 		{name: "active mr", mutate: func(e *cleanupRecheckEvidence) { e.ActiveMRBlocker = "active_mr=gt-mr status=open" }, want: "active_mr=gt-mr"},
 		{name: "unsafe git state", mutate: func(e *cleanupRecheckEvidence) { e.GitBlocker = "git_state=has_uncommitted" }, want: "git_state=has_uncommitted"},
 		{name: "branch unpreserved", mutate: func(e *cleanupRecheckEvidence) { e.UnpreservedPatches = 1 }, want: "branch_preservation=unpreserved"},
+		{name: "branch preservation unverified", mutate: func(e *cleanupRecheckEvidence) { e.BranchPreserved = false }, want: "branch_preservation=unverified"},
 		{name: "generation changed", mutate: func(e *cleanupRecheckEvidence) { e.GenerationMatches = false }, want: "polecat_generation=changed"},
 		{name: "persisted state changed", mutate: func(e *cleanupRecheckEvidence) { e.Fields.AgentState = string(beads.AgentStateWorking) }, want: "agent_state"},
 	}

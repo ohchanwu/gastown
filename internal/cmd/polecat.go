@@ -1495,6 +1495,7 @@ type cleanupRecheckEvidence struct {
 	GitBlocker            string
 	ActiveMRBlocker       string
 	BranchMatches         bool
+	BranchPreserved       bool
 	PreservationErr       error
 	UnpreservedPatches    int
 }
@@ -1553,6 +1554,9 @@ func validateCleanupRecheckEvidence(evidence cleanupRecheckEvidence, proof clean
 	}
 	if evidence.PreservationErr != nil {
 		return fmt.Errorf("branch_preservation=lookup_error: %w", evidence.PreservationErr)
+	}
+	if !evidence.BranchPreserved {
+		return errors.New("branch_preservation=unverified")
 	}
 	if evidence.UnpreservedPatches != 0 {
 		return errors.New("branch_preservation=unpreserved")
@@ -1632,6 +1636,7 @@ func recheckPolecatCleanup(
 			preservation, preserveErr := worktreeGit.BranchPreservationStatus(branch, "origin", targetRefs)
 			evidence.PreservationErr = preserveErr
 			if preserveErr == nil {
+				evidence.BranchPreserved = preservation.Preserved
 				evidence.UnpreservedPatches = preservation.UnpreservedPatchCount
 			}
 		}
@@ -2217,6 +2222,12 @@ func verifyPreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets 
 	preservation, err := repoGit.BranchPreservationStatus(branch, "origin", targets)
 	if err != nil {
 		return fmt.Errorf("branch preservation could not be verified: %w; run reconciliation before nuke", err)
+	}
+	if !preservation.Preserved {
+		if preservation.UnpreservedPatchCount == 0 {
+			return errors.New("branch preservation was not positively verified; run reconciliation before nuke")
+		}
+		return fmt.Errorf("branch has %d unpreserved patch(es); use the separate reconciliation or publication workflow before nuke", preservation.UnpreservedPatchCount)
 	}
 	if preservation.UnpreservedPatchCount != 0 {
 		return fmt.Errorf("branch has %d unpreserved patch(es); use the separate reconciliation or publication workflow before nuke", preservation.UnpreservedPatchCount)

@@ -67,6 +67,38 @@ func TestPolecatNukeBranchDeletionRefusesUnpreservedWork(t *testing.T) {
 	}
 }
 
+func TestPolecatNukeBranchDeletionRefusesAmbiguousRemoteEvidence(t *testing.T) {
+	repo := setupGitStateRemoteRepo(t)
+	remote := filepath.Join(filepath.Dir(repo), "remote.git")
+	runGitCmd(t, repo, "switch", "-c", "polecat/nitro")
+	writeTestFile(t, filepath.Join(repo, "local-only.txt"), "local\n")
+	runGitCmd(t, repo, "add", "local-only.txt")
+	runGitCmd(t, repo, "commit", "-m", "local candidate")
+	runGitCmd(t, repo, "switch", "main")
+
+	publisher := filepath.Join(t.TempDir(), "publisher")
+	runGitCmd(t, "", "clone", remote, publisher)
+	runGitCmd(t, publisher, "config", "user.email", "test@example.com")
+	runGitCmd(t, publisher, "config", "user.name", "Test User")
+	runGitCmd(t, publisher, "switch", "-c", "polecat/nitro")
+	writeTestFile(t, filepath.Join(publisher, "remote-only.txt"), "remote\n")
+	runGitCmd(t, publisher, "add", "remote-only.txt")
+	runGitCmd(t, publisher, "commit", "-m", "unfetched remote candidate")
+	runGitCmd(t, publisher, "push", "origin", "polecat/nitro")
+
+	before := remoteRefSnapshot(t, remote)
+	err := deletePreservedLocalPolecatBranch(git.NewGit(repo), "polecat/nitro", nil)
+	if err == nil || !strings.Contains(err.Error(), "could not be verified") {
+		t.Fatalf("error = %v, want ambiguous preservation refusal", err)
+	}
+	if !localBranchExists(repo, "polecat/nitro") {
+		t.Fatal("branch with ambiguous remote evidence was deleted")
+	}
+	if after := remoteRefSnapshot(t, remote); before != after {
+		t.Fatalf("remote refs changed on ambiguous refusal\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func installReceiveMarker(t *testing.T, remote, marker string) {
 	t.Helper()
 	hook := filepath.Join(remote, "hooks", "pre-receive")
