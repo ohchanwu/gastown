@@ -2,6 +2,7 @@ package beads
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -100,6 +101,7 @@ case "$cmd" in
     exit 0
     ;;
   update)
+	cat >> "$LOG_FILE"
     exit 0
     ;;
   *)
@@ -234,6 +236,99 @@ func TestUpdateAgentState_UsesUpdateDescriptionPath(t *testing.T) {
 	if strings.Contains(logOutput, "agent state") || strings.Contains(logOutput, "set-state") {
 		t.Fatalf("mock bd log %q unexpectedly used obsolete bd agent state / set-state path", logOutput)
 	}
+}
+
+func TestCompareAndUpdateAgentDescriptionFieldsUpdatesMatchingStateAtomically(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: stuck\nhook_bead: null\ncleanup_status: has_unpushed"}]`)
+	bd := NewIsolated(tmpDir)
+	stuck, dirty := "stuck", "has_unpushed"
+	idle, clean := "idle", "clean"
+
+	err := bd.CompareAndUpdateAgentDescriptionFields(
+		"gt-gastown-polecat-nux",
+		AgentFieldExpectations{AgentState: &stuck, CleanupStatus: &dirty},
+		AgentFieldUpdates{AgentState: &idle, CleanupStatus: &clean},
+	)
+	if err != nil {
+		t.Fatalf("CompareAndUpdateAgentDescriptionFields: %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if got := strings.Count(logOutput, "update gt-gastown-polecat-nux"); got != 1 {
+		t.Fatalf("update calls = %d, want 1; log: %q", got, logOutput)
+	}
+	if !strings.Contains(logOutput, "agent_state: idle") || !strings.Contains(logOutput, "cleanup_status: clean") {
+		t.Fatalf("mock bd log %q missing atomic state and cleanup update", logOutput)
+	}
+}
+
+func TestCompareAndUpdateAgentDescriptionFieldsRejectsChangedExpectations(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tests := []struct {
+		name        string
+		description string
+		expected    AgentFieldExpectations
+	}{
+		{
+			name:        "agent state",
+			description: "role_type: polecat\nrig: gastown\nagent_state: working\ncleanup_status: has_unpushed",
+			expected:    AgentFieldExpectations{AgentState: stringPointer("stuck")},
+		},
+		{
+			name:        "cleanup status",
+			description: "role_type: polecat\nrig: gastown\nagent_state: stuck\ncleanup_status: clean",
+			expected:    AgentFieldExpectations{CleanupStatus: stringPointer("has_unpushed")},
+		},
+		{
+			name:        "hook bead",
+			description: "role_type: polecat\nrig: gastown\nagent_state: stuck\nhook_bead: gt-new",
+			expected:    AgentFieldExpectations{HookBead: stringPointer("")},
+		},
+		{
+			name:        "active mr",
+			description: "role_type: polecat\nrig: gastown\nagent_state: stuck\nactive_mr: gt-mr-new",
+			expected:    AgentFieldExpectations{ActiveMR: stringPointer("")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+				t.Fatalf("mkdir .beads: %v", err)
+			}
+			showOutput := fmt.Sprintf(`[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"agent","labels":["gt:agent"],"description":%q}]`, tt.description)
+			logPath := installMockBDShowRecorder(t, showOutput)
+			bd := NewIsolated(tmpDir)
+			idle := "idle"
+
+			err := bd.CompareAndUpdateAgentDescriptionFields(
+				"gt-gastown-polecat-nux",
+				tt.expected,
+				AgentFieldUpdates{AgentState: &idle},
+			)
+			if !errors.Is(err, ErrAgentFieldsChanged) {
+				t.Fatalf("error = %v, want ErrAgentFieldsChanged", err)
+			}
+			if logOutput := readMockBDLog(t, logPath); strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+				t.Fatalf("mock bd log %q unexpectedly updated changed fields", logOutput)
+			}
+		})
+	}
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
 
 func TestClearAgentActiveMRIfMatchesClearsExactMatch(t *testing.T) {

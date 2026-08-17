@@ -473,6 +473,31 @@ type AgentFieldUpdates struct {
 	CompletionTime  *string
 }
 
+// AgentFieldExpectations specifies description fields that must still have
+// their observed values before an update may be written. Nil fields are not
+// compared.
+type AgentFieldExpectations struct {
+	AgentState    *string
+	CleanupStatus *string
+	ActiveMR      *string
+	HookBead      *string
+}
+
+// ErrAgentFieldsChanged reports that an agent bead changed after the caller
+// observed it, so the guarded mutation was not written.
+var ErrAgentFieldsChanged = errors.New("agent description fields changed")
+
+func validateAgentFieldUpdates(updates AgentFieldUpdates) error {
+	if updates.NotificationLevel == nil {
+		return nil
+	}
+	level := *updates.NotificationLevel
+	if level != "" && level != NotifyVerbose && level != NotifyNormal && level != NotifyMuted {
+		return fmt.Errorf("invalid notification level %q: must be verbose, normal, or muted", level)
+	}
+	return nil
+}
+
 // UpdateAgentDescriptionFields atomically updates one or more agent description
 // fields in a single Show-Parse-Modify-Update cycle. This prevents the race
 // condition where concurrent callers updating different fields overwrite each
@@ -481,13 +506,8 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	if target := b.agentBeadTarget(); target != b {
 		return target.UpdateAgentDescriptionFields(id, updates)
 	}
-
-	// Validate notification level if provided
-	if updates.NotificationLevel != nil {
-		level := *updates.NotificationLevel
-		if level != "" && level != NotifyVerbose && level != NotifyNormal && level != NotifyMuted {
-			return fmt.Errorf("invalid notification level %q: must be verbose, normal, or muted", level)
-		}
+	if err := validateAgentFieldUpdates(updates); err != nil {
+		return err
 	}
 
 	// Lock the agent bead to prevent concurrent read-modify-write races.
@@ -499,12 +519,65 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	}
 	defer func() { _ = fl.Unlock() }()
 
+	return b.updateAgentDescriptionFieldsLocked(id, nil, updates)
+}
+
+// CompareAndUpdateAgentDescriptionFields updates an agent description only if
+// every supplied expectation still matches inside the agent bead lock.
+func (b *Beads) CompareAndUpdateAgentDescriptionFields(
+	id string,
+	expected AgentFieldExpectations,
+	updates AgentFieldUpdates,
+) (retErr error) {
+	if target := b.agentBeadTarget(); target != b {
+		return target.CompareAndUpdateAgentDescriptionFields(id, expected, updates)
+	}
+	if err := validateAgentFieldUpdates(updates); err != nil {
+		return err
+	}
+	if updates.AgentState != nil {
+		defer func() {
+			telemetry.RecordAgentStateChange(context.Background(), id, *updates.AgentState, nil, retErr)
+		}()
+	}
+
+	fl, lockErr := b.lockAgentBead(id)
+	if lockErr != nil {
+		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	return b.updateAgentDescriptionFieldsLocked(id, &expected, updates)
+}
+
+func (b *Beads) updateAgentDescriptionFieldsLocked(
+	id string,
+	expected *AgentFieldExpectations,
+	updates AgentFieldUpdates,
+) error {
 	issue, err := b.Show(id)
 	if err != nil {
 		return err
 	}
 
 	fields := ParseAgentFields(issue.Description)
+	if expected != nil {
+		checks := []struct {
+			name    string
+			want    *string
+			current string
+		}{
+			{name: "agent_state", want: expected.AgentState, current: fields.AgentState},
+			{name: "cleanup_status", want: expected.CleanupStatus, current: fields.CleanupStatus},
+			{name: "active_mr", want: expected.ActiveMR, current: fields.ActiveMR},
+			{name: "hook_bead", want: expected.HookBead, current: fields.HookBead},
+		}
+		for _, check := range checks {
+			if check.want != nil && check.current != *check.want {
+				return fmt.Errorf("%w: %s is %q, expected %q", ErrAgentFieldsChanged, check.name, check.current, *check.want)
+			}
+		}
+	}
 
 	if updates.AgentState != nil {
 		fields.AgentState = *updates.AgentState
