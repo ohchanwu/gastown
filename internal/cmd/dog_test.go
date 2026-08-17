@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/dog"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -341,6 +342,32 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 	}
 	if got.State != dog.StateIdle || got.Work != "" || got.SessionGeneration != nil {
 		t.Fatalf("completed dog = %+v, want idle with no work or generation", got)
+	}
+}
+
+func TestDogPluginMailCleanupMatchesOnlyCompletedAssignment(t *testing.T) {
+	started := time.Now().UTC().Round(0)
+	oldThread := dogDispatchThreadID("alpha", "work-old", started)
+	newThread := dogDispatchThreadID("alpha", "work-new", started.Add(time.Nanosecond))
+	dogAddress := "deacon/dogs/alpha"
+
+	oldMail := &mail.Message{
+		From:     "deacon/",
+		To:       dogAddress,
+		Subject:  "Plugin: reaper",
+		ThreadID: oldThread,
+	}
+	replacementMail := *oldMail
+	replacementMail.ThreadID = newThread
+
+	if !matchesPluginDispatchMail(oldMail, dogAddress, oldThread) {
+		t.Fatal("completed assignment mail did not match its exact dispatch thread")
+	}
+	if matchesPluginDispatchMail(&replacementMail, dogAddress, oldThread) {
+		t.Fatal("stale closeout matched replacement assignment mail")
+	}
+	if oldThread == "" || oldThread == newThread {
+		t.Fatalf("dispatch thread tokens are not assignment-specific: old=%q new=%q", oldThread, newThread)
 	}
 }
 

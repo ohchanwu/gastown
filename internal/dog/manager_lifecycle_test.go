@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -675,6 +676,62 @@ func TestManager_ClearWorkIfMatches_success(t *testing.T) {
 	}
 	if !dog.WorkStartedAt.IsZero() {
 		t.Errorf("WorkStartedAt = %v, want zero", dog.WorkStartedAt)
+	}
+}
+
+func TestManager_ClearWorkFinalizeKeepsReplacementNonAssignable(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	state := &DogState{
+		Name:          "alpha",
+		State:         StateWorking,
+		Work:          "work-old",
+		WorkStartedAt: now.Add(-time.Minute),
+		LastActive:    now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	setupDogWithState(t, m, "alpha", state)
+
+	finalizeStarted := make(chan struct{})
+	releaseFinalize := make(chan struct{})
+	closeoutDone := make(chan error, 1)
+	go func() {
+		_, err := m.ClearWorkWithFinalizeIfMatches("alpha", state.Work, state.WorkStartedAt, func() {
+			close(finalizeStarted)
+			<-releaseFinalize
+		})
+		closeoutDone <- err
+	}()
+	<-finalizeStarted
+
+	assignDone := make(chan error, 1)
+	var assigned *DogState
+	var assignedMu sync.Mutex
+	go func() {
+		next, err := m.AssignWorkIfIdle("alpha", "work-new")
+		assignedMu.Lock()
+		assigned = next
+		assignedMu.Unlock()
+		assignDone <- err
+	}()
+
+	select {
+	case err := <-assignDone:
+		t.Fatalf("replacement assignment completed before exact finalizer released lifecycle lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFinalize)
+	if err := <-closeoutDone; err != nil {
+		t.Fatalf("exact closeout: %v", err)
+	}
+	if err := <-assignDone; err != nil {
+		t.Fatalf("replacement assignment: %v", err)
+	}
+	assignedMu.Lock()
+	defer assignedMu.Unlock()
+	if assigned == nil || assigned.Work != "work-new" {
+		t.Fatalf("replacement assignment = %+v, want work-new", assigned)
 	}
 }
 

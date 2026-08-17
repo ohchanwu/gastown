@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -704,18 +705,19 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 	}
-	if err := completeDogCloseout(mgr, controller, d); err != nil {
+	if err := completeDogCloseoutWithFinalize(mgr, controller, d, func() {
+		closePluginMails(d.Name, dogDispatchThreadID(d.Name, d.Work, d.WorkStartedAt))
+	}); err != nil {
 		return fmt.Errorf("closing out dog %s: %w", name, err)
 	}
-	closePluginMails(name)
 
 	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
 	return nil
 }
 
 type dogCloseoutManager interface {
-	ClearWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time) (bool, error)
-	CompleteWorkWithTeardownIfMatches(name, expectedWork string, expectedStartedAt time.Time, expectedGeneration tmux.SessionGeneration, teardown func(tmux.SessionGeneration) error) (bool, error)
+	ClearWorkWithFinalizeIfMatches(name, expectedWork string, expectedStartedAt time.Time, finalize func()) (bool, error)
+	CompleteWorkWithTeardownAndFinalizeIfMatches(name, expectedWork string, expectedStartedAt time.Time, expectedGeneration tmux.SessionGeneration, teardown func(tmux.SessionGeneration) error, finalize func()) (bool, error)
 	RetireSessionWithTeardownIfMatches(name string, expectedGeneration tmux.SessionGeneration, teardown func(tmux.SessionGeneration) error) (bool, error)
 }
 
@@ -817,6 +819,15 @@ func quoteDogCloseoutShellArg(value string) string {
 }
 
 func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, snapshot *dog.Dog) error {
+	return completeDogCloseoutWithFinalize(mgr, sessions, snapshot, nil)
+}
+
+func completeDogCloseoutWithFinalize(
+	mgr dogCloseoutManager,
+	sessions dogSessionController,
+	snapshot *dog.Dog,
+	finalize func(),
+) error {
 	if mgr == nil || sessions == nil || snapshot == nil {
 		return fmt.Errorf("%w: lifecycle evidence unavailable", errDogCloseoutIncomplete)
 	}
@@ -829,7 +840,7 @@ func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, 
 			if snapshot.State == dog.StateIdle && snapshot.Work == "" {
 				return nil
 			}
-			cleared, err := mgr.ClearWorkIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt)
+			cleared, err := mgr.ClearWorkWithFinalizeIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, finalize)
 			if err != nil {
 				return fmt.Errorf("clearing work after proven session absence: %w", err)
 			}
@@ -849,7 +860,7 @@ func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, 
 		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
 		}
-		completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(tmux.SessionGeneration) error { return nil })
+		completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(tmux.SessionGeneration) error { return nil }, finalize)
 		if err != nil {
 			return fmt.Errorf("completing work after proven session absence: %w", err)
 		}
@@ -868,7 +879,7 @@ func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, 
 			return nil
 		}
 		return err
-	})
+	}, finalize)
 	if err != nil {
 		return fmt.Errorf("%w: exact dog session teardown failed: %w", errDogCloseoutIncomplete, err)
 	}
@@ -883,16 +894,18 @@ func completeDogCloseoutState(
 	snapshot *dog.Dog,
 	expected tmux.SessionGeneration,
 	teardown func(tmux.SessionGeneration) error,
+	finalize func(),
 ) (bool, error) {
 	if snapshot.State == dog.StateIdle && snapshot.Work == "" {
 		return mgr.RetireSessionWithTeardownIfMatches(snapshot.Name, expected, teardown)
 	}
-	return mgr.CompleteWorkWithTeardownIfMatches(
+	return mgr.CompleteWorkWithTeardownAndFinalizeIfMatches(
 		snapshot.Name,
 		snapshot.Work,
 		snapshot.WorkStartedAt,
 		expected,
 		teardown,
+		finalize,
 	)
 }
 
@@ -906,12 +919,25 @@ func splitPathComponents(path string) []string {
 	})
 }
 
-// closePluginMails archives all open "Plugin: " dispatch mails from a dog's inbox.
+func dogDispatchThreadID(dogName, work string, startedAt time.Time) string {
+	if dogName == "" || work == "" || startedAt.IsZero() {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(dogName + "\x00" + work + "\x00" + startedAt.UTC().Format(time.RFC3339Nano)))
+	return fmt.Sprintf("dog-dispatch-%x", sum[:16])
+}
+
+// closePluginMails archives the one exact plugin dispatch thread completed by
+// a dog. A reusable dog name is not custody: a replacement assignment may have
+// sent new instructions by the time stale closeout code reaches the mailbox.
 // Plugin dispatch mails sent by the daemon accumulate because gt dog done never
 // closed them. On every UserPromptSubmit hook, gt mail check --inject re-injects
 // ALL open mails, causing context to balloon. This function cleans up eagerly.
 // It is best-effort: failures are logged but do not prevent dog from going idle.
-func closePluginMails(dogName string) {
+func closePluginMails(dogName, dispatchThreadID string) {
+	if dispatchThreadID == "" {
+		return
+	}
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return // not in a Gas Town workspace, skip cleanup
@@ -931,18 +957,7 @@ func closePluginMails(dogName string) {
 
 	closed := 0
 	for _, msg := range messages {
-		// Archive read AND unread direct plugin dispatch mail. The dog must read
-		// the dispatch mail to execute the plugin, so skipping read mail left
-		// every executed dispatch bead open forever. Keep this scoped to Deacon
-		// dispatches so CC or human messages with a similar subject are preserved.
-		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
-			continue
-		}
-		if mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(dogAddress) {
-			continue
-		}
-		sender := mail.AddressToIdentity(msg.From)
-		if sender != "deacon/" && sender != "daemon" {
+		if !matchesPluginDispatchMail(msg, dogAddress, dispatchThreadID) {
 			continue
 		}
 		if archErr := mailbox.Archive(msg.ID); archErr == nil {
@@ -953,6 +968,24 @@ func closePluginMails(dogName string) {
 	if closed > 0 {
 		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
 	}
+}
+
+func matchesPluginDispatchMail(msg *mail.Message, dogAddress, dispatchThreadID string) bool {
+	if msg == nil || dispatchThreadID == "" || msg.ThreadID != dispatchThreadID {
+		return false
+	}
+	// Archive read AND unread direct plugin dispatch mail. The dog must read
+	// the dispatch mail to execute the plugin, so skipping read mail left every
+	// executed dispatch bead open forever. Keep this scoped to Deacon dispatches
+	// so CC or human messages with a similar subject are preserved.
+	if !strings.HasPrefix(msg.Subject, "Plugin: ") {
+		return false
+	}
+	if mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(dogAddress) {
+		return false
+	}
+	sender := mail.AddressToIdentity(msg.From)
+	return sender == "deacon/" || sender == "daemon"
 }
 
 func runDogStatus(cmd *cobra.Command, args []string) error {
@@ -1396,6 +1429,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		Subject:   subject,
 		Body:      body,
 		Timestamp: time.Now(),
+		ThreadID:  dogDispatchThreadID(targetDog.Name, assignedState.Work, assignedState.WorkStartedAt),
 	}
 
 	if err := router.Send(msg); err != nil {

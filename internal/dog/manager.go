@@ -419,6 +419,18 @@ func (m *Manager) ClearWork(name string) error {
 // the expected work and assignment timestamp. The compare-and-clear happens
 // under the dog lock so failed dispatch cleanup cannot erase a newer assignment.
 func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedAt time.Time) (bool, error) {
+	return m.ClearWorkWithFinalizeIfMatches(name, expectedWork, expectedStartedAt, nil)
+}
+
+// ClearWorkWithFinalizeIfMatches clears an exact assignment and runs finalize
+// after the durable idle transition while the per-dog lifecycle lock is still
+// held. This keeps a replacement assignment from becoming visible before the
+// old assignment's exact cleanup has finished.
+func (m *Manager) ClearWorkWithFinalizeIfMatches(
+	name, expectedWork string,
+	expectedStartedAt time.Time,
+	finalize func(),
+) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
 	}
@@ -446,7 +458,13 @@ func (m *Manager) ClearWorkIfMatches(name, expectedWork string, expectedStartedA
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 
-	return true, m.saveState(name, state)
+	if err := m.saveState(name, state); err != nil {
+		return false, err
+	}
+	if finalize != nil {
+		finalize()
+	}
+	return true, nil
 }
 
 // SetSessionGenerationIfAssignmentMatches records a newly created session only
@@ -516,6 +534,28 @@ func (m *Manager) CompleteWorkWithTeardownIfMatches(
 	expectedGeneration tmux.SessionGeneration,
 	teardown func(tmux.SessionGeneration) error,
 ) (bool, error) {
+	return m.CompleteWorkWithTeardownAndFinalizeIfMatches(
+		name,
+		expectedWork,
+		expectedStartedAt,
+		expectedGeneration,
+		teardown,
+		nil,
+	)
+}
+
+// CompleteWorkWithTeardownAndFinalizeIfMatches tears down an exact session,
+// commits the corresponding assignment idle, and runs finalize before the dog
+// lifecycle lock is released. The finalizer is intentionally best-effort and
+// cannot turn a committed closeout into an ambiguous failure.
+func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
+	name string,
+	expectedWork string,
+	expectedStartedAt time.Time,
+	expectedGeneration tmux.SessionGeneration,
+	teardown func(tmux.SessionGeneration) error,
+	finalize func(),
+) (bool, error) {
 	if err := validateDogName(name); err != nil {
 		return false, err
 	}
@@ -556,7 +596,13 @@ func (m *Manager) CompleteWorkWithTeardownIfMatches(
 	state.SessionGeneration = nil
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
-	return true, m.saveState(name, state)
+	if err := m.saveState(name, state); err != nil {
+		return false, err
+	}
+	if finalize != nil {
+		finalize()
+	}
+	return true, nil
 }
 
 // RetireSessionWithTeardownIfMatches removes an exact runtime generation from
