@@ -1137,7 +1137,24 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	return m.removeWithOptionsLocked(name, force, nuclear, selfNuke)
 }
 
+// RemoveWithOptionsLocalOnly removes a polecat without publishing or updating
+// any remote Git ref. Callers must prove branch preservation before invoking it.
+func (m *Manager) RemoveWithOptionsLocalOnly(name string, force, nuclear, selfNuke bool) (retErr error) {
+	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, false)
+}
+
 func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke bool) error {
+	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true)
+}
+
+func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool) error {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
@@ -1235,15 +1252,17 @@ func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke 
 	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
 	// any commits on the branch. The push is non-blocking: failures are warnings,
 	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	polecatGit := git.NewGit(clonePath)
-	if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-		pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-		if checkErr == nil && !pushed && unpushedCount > 0 {
-			if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
-				style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
-					branch, unpushedCount, pushErr)
-				style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
-					branch, unpushedCount, clonePath)
+	if publishBeforeRemoval {
+		polecatGit := git.NewGit(clonePath)
+		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
+			pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
+			if checkErr == nil && !pushed && unpushedCount > 0 {
+				if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
+					style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
+						branch, unpushedCount, pushErr)
+					style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
+						branch, unpushedCount, clonePath)
+				}
 			}
 		}
 	}

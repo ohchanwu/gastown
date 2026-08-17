@@ -2094,6 +2094,32 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		return err
 	}
 
+	// Resolve branch custody before any local mutation. Nuke is a retirement
+	// operation, not a publication path: unique work must already be preserved.
+	polecatInfo, getErr := mgr.Get(polecatName)
+	if getErr != nil && !errors.Is(getErr, polecat.ErrPolecatNotFound) {
+		return fmt.Errorf("cannot resolve custody for %s/%s before nuke: %w", rigName, polecatName, getErr)
+	}
+	var branchToDelete string
+	var branchTargets []string
+	if getErr == nil && polecatInfo != nil {
+		branchToDelete = polecatInfo.Branch
+		if branchToDelete != "" {
+			var err error
+			branchTargets, err = nukeBranchPreservationTargets(r, rigName, polecatName, polecatInfo)
+			if err != nil {
+				return err
+			}
+			branchGit := git.NewGit(polecatInfo.ClonePath)
+			if _, statErr := os.Stat(polecatInfo.ClonePath); statErr != nil {
+				branchGit = getRepoGitForRig(r.Path)
+			}
+			if err := verifyPreservedLocalPolecatBranch(branchGit, branchToDelete, branchTargets); err != nil {
+				return fmt.Errorf("cannot nuke %s/%s: %w", rigName, polecatName, err)
+			}
+		}
+	}
+
 	t := tmux.NewTmux()
 
 	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
@@ -2107,14 +2133,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 	}
 
-	// Step 2: Get polecat info before deletion (for branch name + hooked work bead)
-	polecatInfo, getErr := mgr.Get(polecatName)
-	var branchToDelete string
-	if getErr == nil && polecatInfo != nil {
-		branchToDelete = polecatInfo.Branch
-	}
-
-	// Step 2.5: Burn any molecule attached to the polecat's hooked work bead.
+	// Step 2: Burn any molecule attached to the polecat's hooked work bead.
 	// Without this, nuked polecats leave orphan molecule refs that block re-sling.
 	// The stale attached_molecule in the work bead's description causes sling to
 	// fail with "bead already has N attached molecule(s)" on re-dispatch (gt-npzy).
@@ -2122,37 +2141,8 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		nukeCleanupMolecules(polecatInfo.Issue, r)
 	}
 
-	// Step 2.75: Best-effort push before nuke (gt-4vr guardrail).
-	// Try to preserve any unpushed commits on the branch. Push failures are
-	// non-fatal because this cleanup path already passed its safety gates.
-	if branchToDelete != "" {
-		var pushGit *git.Git
-		// Try worktree first (may still exist), then bare repo fallback.
-		// Use ClonePath from the polecat record — the worktree lives at
-		// <rig>/polecats/<name>/<rigName>/, not <rig>/polecats/<name>/.
-		if polecatInfo != nil && polecatInfo.ClonePath != "" {
-			if _, statErr := os.Stat(polecatInfo.ClonePath); statErr == nil {
-				pushGit = git.NewGit(polecatInfo.ClonePath)
-			}
-		}
-		if pushGit == nil {
-			bareRepoPath := filepath.Join(r.Path, ".repo.git")
-			if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
-				pushGit = git.NewGitWithDir(bareRepoPath, "")
-			}
-		}
-		if pushGit != nil {
-			refspec := branchToDelete + ":" + branchToDelete
-			if err := pushGit.Push("origin", refspec, false); err != nil {
-				fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
-			} else {
-				fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
-			}
-		}
-	}
-
 	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
-	if err := mgr.RemoveWithOptions(polecatName, opts.Force, true, false); err != nil {
+	if err := mgr.RemoveWithOptionsLocalOnly(polecatName, opts.Force, true, false); err != nil {
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
 			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
@@ -2164,19 +2154,16 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	// Step 4: Delete local branch (if we know it)
-	// Local branch can always be deleted (worktree is already gone).
-	// Remote branch is never deleted during nuke — the refinery owns
-	// remote branch cleanup after successful merge (gt mq post-merge).
-	// This prevents the race where nuke deletes the branch before the
-	// refinery has a chance to merge it. (gt-v5ku)
+	// The local branch is deleted only after a second preservation proof. Remote
+	// refs are neither created nor updated by nuke.
 	if branchToDelete != "" {
 		repoGit := getRepoGitForRig(r.Path)
-		if err := repoGit.DeleteBranch(branchToDelete, true); err != nil {
+		if err := deletePreservedLocalPolecatBranch(repoGit, branchToDelete, branchTargets); err != nil {
 			fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
 		} else {
 			fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
+			fmt.Printf("  %s verified branch contents were already preserved before local deletion\n", style.Dim.Render("○"))
 		}
-		fmt.Printf("  %s remote branch preserved for refinery merge\n", style.Dim.Render("○"))
 	}
 
 	// Step 5: Purge closed ephemeral beads (wisps) accumulated during sessions.
@@ -2187,6 +2174,61 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	return nil
+}
+
+func nukeBranchPreservationTargets(
+	r *rig.Rig,
+	rigName string,
+	polecatName string,
+	polecatInfo *polecat.Polecat,
+) ([]string, error) {
+	if r == nil || polecatInfo == nil {
+		return nil, errors.New("branch preservation evidence unavailable")
+	}
+	bd := beads.New(r.Path)
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	_, fields, err := bd.GetAgentBead(agentBeadID)
+	if err != nil && !errors.Is(err, beads.ErrNotFound) {
+		return nil, fmt.Errorf("branch preservation agent lookup: %w", err)
+	}
+	activeMR := ""
+	sourceHint := polecatInfo.Issue
+	if fields != nil {
+		activeMR = fields.ActiveMR
+		sourceHint = agentSourceIssueHint(sourceHint, fields)
+	}
+	targets, lookupFailed := recoveryTargetRefs(
+		bd,
+		polecatInfo.Issue,
+		activeMR,
+		polecatInfo.Branch,
+		sourceHint,
+	)
+	if lookupFailed {
+		return nil, errors.New("branch preservation target lookup failed; run reconciliation before nuke")
+	}
+	return targets, nil
+}
+
+func verifyPreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets []string) error {
+	if repoGit == nil || strings.TrimSpace(branch) == "" {
+		return errors.New("branch preservation evidence unavailable; run reconciliation before nuke")
+	}
+	preservation, err := repoGit.BranchPreservationStatus(branch, "origin", targets)
+	if err != nil {
+		return fmt.Errorf("branch preservation could not be verified: %w; run reconciliation before nuke", err)
+	}
+	if preservation.UnpreservedPatchCount != 0 {
+		return fmt.Errorf("branch has %d unpreserved patch(es); use the separate reconciliation or publication workflow before nuke", preservation.UnpreservedPatchCount)
+	}
+	return nil
+}
+
+func deletePreservedLocalPolecatBranch(repoGit *git.Git, branch string, targets []string) error {
+	if err := verifyPreservedLocalPolecatBranch(repoGit, branch, targets); err != nil {
+		return err
+	}
+	return repoGit.DeleteBranch(branch, true)
 }
 
 type activeMRRemovalChecker interface {

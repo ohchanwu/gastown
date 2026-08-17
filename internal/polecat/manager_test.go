@@ -114,6 +114,17 @@ func runManagerGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func managerGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // installMockBd places a fake bd binary in PATH that handles the commands
 // needed by AddWithOptions (init, create, show, config, update, slot, etc.).
 // This allows polecat tests to run without a real bd installation.
@@ -294,6 +305,43 @@ func setupCanonicalBranchManagerTest(t *testing.T) (*Manager, string) {
 
 	r := &rig.Rig{Name: "rig", Path: root}
 	return NewManager(r, git.NewGit(root), nil), mayorRig
+}
+
+func TestRemoveWithOptionsLocalOnlyDoesNotPush(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runManagerGit(t, "", "init", "--bare", remote)
+	runManagerGit(t, mayorRig, "remote", "set-url", "origin", remote)
+	runManagerGit(t, mayorRig, "push", "-u", "origin", "main")
+
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	managerWriteFile(t, filepath.Join(p.ClonePath, "unique.txt"), "unique\n")
+	runManagerGit(t, p.ClonePath, "add", "unique.txt")
+	runManagerGit(t, p.ClonePath, "commit", "-m", "unique local work")
+
+	marker := filepath.Join(t.TempDir(), "receive-hook-ran")
+	hook := filepath.Join(remote, "hooks", "pre-receive")
+	if err := os.WriteFile(hook, []byte(fmt.Sprintf("#!/bin/sh\n: > %q\n", marker)), 0755); err != nil {
+		t.Fatalf("write receive hook: %v", err)
+	}
+	before := managerGitOutput(t, "", "--git-dir", remote, "for-each-ref", "--format=%(refname) %(objectname)")
+
+	if err := mgr.RemoveWithOptionsLocalOnly("toast", true, true, false); err != nil {
+		t.Fatalf("RemoveWithOptionsLocalOnly: %v", err)
+	}
+	after := managerGitOutput(t, "", "--git-dir", remote, "for-each-ref", "--format=%(refname) %(objectname)")
+	if before != after {
+		t.Fatalf("remote refs changed during local-only removal\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("remote receive hook ran during local-only removal; stat error = %v", err)
+	}
+	if _, err := os.Stat(p.ClonePath); !os.IsNotExist(err) {
+		t.Fatalf("local worktree still exists after removal; stat error = %v", err)
+	}
 }
 
 func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {

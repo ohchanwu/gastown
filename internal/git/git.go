@@ -2782,6 +2782,10 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 	if remote == "" {
 		remote = "origin"
 	}
+	head := "HEAD"
+	if localBranch != "" && localBranch != "HEAD" {
+		head = localBranch
+	}
 	var result BranchPreservationStatus
 	var candidates []string
 	hasEvidence := len(nonEmptyUnique(targets)) > 0
@@ -2790,7 +2794,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		if remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch); err == nil && remoteSHA != "" {
 			hasEvidence = true
 			result.ComparisonBase = remote + "/" + localBranch
-			if contains, containsErr := g.refContainsHead(remoteSHA); containsErr == nil && contains {
+			if contains, containsErr := g.refContains(head, remoteSHA); containsErr == nil && contains {
 				result.Preserved = true
 				result.UnpreservedPatchCount = 0
 				result.Evidence = "exact_remote_branch"
@@ -2806,7 +2810,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		}
 	}
 
-	if upstream, err := g.run("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); err == nil && strings.TrimSpace(upstream) != "" {
+	if upstream, err := g.run("rev-parse", "--abbrev-ref", "--symbolic-full-name", head+"@{u}"); err == nil && strings.TrimSpace(upstream) != "" {
 		upstream = strings.TrimSpace(upstream)
 		if includeExactBranch || !isPolecatSelfUpstream(localBranch, remote, upstream) {
 			hasEvidence = true
@@ -2832,7 +2836,7 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 
 	var lastErr error
 	for _, ref := range candidates {
-		candidate, err := g.preservationAgainstRef(ref)
+		candidate, err := g.preservationOfRefAgainstRef(head, ref)
 		if err != nil {
 			lastErr = err
 			continue
@@ -2860,15 +2864,15 @@ func isPolecatSelfUpstream(localBranch, remote, upstream string) bool {
 	return strings.HasPrefix(localBranch, "polecat/") && upstream == remote+"/"+localBranch
 }
 
-func (g *Git) refContainsHead(ref string) (bool, error) {
-	head, err := g.Rev("HEAD")
+func (g *Git) refContains(head, ref string) (bool, error) {
+	headSHA, err := g.Rev(head)
 	if err != nil {
 		return false, err
 	}
-	if strings.TrimSpace(ref) == strings.TrimSpace(head) {
+	if strings.TrimSpace(ref) == strings.TrimSpace(headSHA) {
 		return true, nil
 	}
-	return g.IsAncestor("HEAD", ref)
+	return g.IsAncestor(head, ref)
 }
 
 func (g *Git) resolveComparisonRef(ref, remote string) (string, bool) {

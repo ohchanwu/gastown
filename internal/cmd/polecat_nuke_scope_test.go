@@ -27,6 +27,23 @@ func TestRunPolecatNukeDoesNotSweepTownWideOrphans(t *testing.T) {
 	}
 }
 
+func TestPolecatNukeUsesOnlyLocalRemovalPrimitives(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "polecat.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse polecat.go: %v", err)
+	}
+
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "Push"); calls != 0 {
+		t.Fatalf("nukePolecatFullWithOptions called Push %d time(s), want 0", calls)
+	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptions"); calls != 0 {
+		t.Fatalf("nukePolecatFullWithOptions called publishing RemoveWithOptions %d time(s), want 0", calls)
+	}
+	if calls := callsTo(t, file, "nukePolecatFullWithOptions", "RemoveWithOptionsLocalOnly"); calls != 1 {
+		t.Fatalf("nukePolecatFullWithOptions local-only removal calls = %d, want 1", calls)
+	}
+}
+
 func TestTargetSessionNukePreservesUnrelatedSessionsOnDedicatedSocket(t *testing.T) {
 	socket := fmt.Sprintf("gt-nuke-scope-%d", os.Getpid())
 	tm := tmuxpkg.NewTmuxWithSocket(socket)
@@ -82,8 +99,14 @@ func callsTo(t *testing.T, file *ast.File, function, callee string) int {
 		if !ok {
 			return true
 		}
-		ident, ok := call.Fun.(*ast.Ident)
-		if ok && ident.Name == callee {
+		name := ""
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			name = fn.Name
+		case *ast.SelectorExpr:
+			name = fn.Sel.Name
+		}
+		if name == callee {
 			calls++
 		}
 		return true

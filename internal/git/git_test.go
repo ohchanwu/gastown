@@ -3695,6 +3695,39 @@ func TestComparisonRefCandidatesPreferRemoteTrackingRef(t *testing.T) {
 	}
 }
 
+func TestBranchPreservationStatusChecksNamedBranchWhenAnotherBranchIsCurrent(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/named-custody"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "unique.txt"), []byte("unique\n"), 0644); err != nil {
+		t.Fatalf("write unique work: %v", err)
+	}
+	if err := g.Add("unique.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("unique branch work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+
+	status, err := g.BranchPreservationStatus(branch, "origin", []string{"origin/" + mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus: %v", err)
+	}
+	if status.Preserved || status.UnpreservedPatchCount == 0 {
+		t.Fatalf("BranchPreservationStatus = %+v, want named branch's unique work", status)
+	}
+}
+
 func TestBranchTargetStatusPreservesSquashMergedAdvancedTarget(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	if err := exec.Command("git", "-C", localDir, "merge-tree", "--write-tree", "HEAD", "HEAD").Run(); err != nil {
