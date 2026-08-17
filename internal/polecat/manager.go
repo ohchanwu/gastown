@@ -144,12 +144,14 @@ func (e *UncommittedWorkError) Unwrap() error {
 
 // Manager handles polecat lifecycle.
 type Manager struct {
-	rig      *rig.Rig
-	git      *git.Git
-	beads    *beads.Beads
-	namePool *NamePool
-	tmux     *tmux.Tmux
-	townRoot string // Computed once at construction; used by agentBeadID for deterministic IDs
+	rig        *rig.Rig
+	git        *git.Git
+	beads      *beads.Beads
+	namePool   *NamePool
+	tmux       *tmux.Tmux
+	removeAll  func(string) error
+	repoBaseFn func() (*git.Git, error)
+	townRoot   string // Computed once at construction; used by agentBeadID for deterministic IDs
 }
 
 // NewManager creates a new polecat manager.
@@ -202,12 +204,13 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 	_ = pool.Load() // non-fatal: state file may not exist for new rigs
 
 	return &Manager{
-		rig:      r,
-		git:      g,
-		beads:    beads.NewWithBeadsDir(beadsPath, resolvedBeads),
-		namePool: pool,
-		tmux:     t,
-		townRoot: townRoot,
+		rig:       r,
+		git:       g,
+		beads:     beads.NewWithBeadsDir(beadsPath, resolvedBeads),
+		namePool:  pool,
+		tmux:      t,
+		removeAll: os.RemoveAll,
+		townRoot:  townRoot,
 	}
 }
 
@@ -489,6 +492,9 @@ func (m *Manager) checkCleanupStatus(name string, status CleanupStatus, force bo
 // Prefers the shared bare repo (.repo.git) if it exists, otherwise falls back to mayor/rig.
 // The bare repo architecture allows all worktrees (refinery, polecats) to share branch visibility.
 func (m *Manager) repoBase() (*git.Git, error) {
+	if m.repoBaseFn != nil {
+		return m.repoBaseFn()
+	}
 	// First check for shared bare repo (new architecture)
 	bareRepoPath := filepath.Join(m.rig.Path, ".repo.git")
 	if info, err := os.Stat(bareRepoPath); err == nil && info.IsDir() {
@@ -1230,7 +1236,13 @@ func (m *Manager) removeWithOptionsLocked(name string, force, nuclear, selfNuke 
 	return m.removeWithOptionsLockedPolicy(name, force, nuclear, selfNuke, true, "")
 }
 
-func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool, expectedIncarnation string) error {
+func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, selfNuke, publishBeforeRemoval bool, expectedIncarnation string) (retErr error) {
+	retirementCommitted := false
+	defer func() {
+		if retErr != nil && retirementCommitted {
+			retErr = errors.Join(ErrPolecatRetirementCommitted, retErr)
+		}
+	}()
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
@@ -1278,6 +1290,25 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 		}
 	}
 
+	// Fail closed before the durable retirement boundary if the caller's shell
+	// is inside the worktree. Once the exact incarnation is reset, a retry can
+	// no longer prove custody with the old receipt.
+	if !selfNuke {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr == nil {
+			cwdAbs, absErr1 := canonicalExistingPath(cwd)
+			cloneAbs, absErr2 := canonicalExistingPath(clonePath)
+			polecatAbs, absErr3 := canonicalExistingPath(polecatDir)
+			if absErr1 != nil || absErr2 != nil || absErr3 != nil {
+				return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
+			}
+			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
+				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
+					ErrShellInWorktree, cwd, m.rig.Name, name)
+			}
+		}
+	}
+
 	// Reset agent bead FIRST, before any filesystem operations.
 	// This prevents a race where a concurrent sling allocates the same name,
 	// sets hook_bead, and then has it cleared by this cleanup. By resetting
@@ -1301,36 +1332,14 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, resetErr)
 		}
 	}
+	if expectedIncarnation != "" {
+		retirementCommitted = true
+	}
 
 	// Unassign any work beads still pointing at this polecat (gt-e4u1).
 	// Without this, beads remain assigned to a ghost polecat (status in_progress,
 	// assignee set) after removal, permanently stuck with no one working on them.
 	m.unassignWorkBeads(name)
-
-	// Check if user's shell is cd'd into the worktree (prevents broken shell)
-	// This check runs unless selfNuke=true (polecat deleting its own worktree).
-	// When a polecat calls `gt done`, it's inside its worktree by design - the session
-	// will be killed immediately after, so breaking the shell is expected and harmless.
-	// See: https://github.com/steveyegge/gastown/issues/942
-	if !selfNuke {
-		cwd, cwdErr := os.Getwd()
-		if cwdErr == nil {
-			// Normalize paths for comparison
-			cwdAbs, absErr1 := filepath.Abs(cwd)
-			cloneAbs, absErr2 := filepath.Abs(clonePath)
-			polecatAbs, absErr3 := filepath.Abs(polecatDir)
-
-			if absErr1 != nil || absErr2 != nil || absErr3 != nil {
-				// If we can't resolve paths, refuse to nuke for safety
-				return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
-			}
-
-			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
-				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
-					ErrShellInWorktree, cwd, m.rig.Name, name)
-			}
-		}
-	}
 
 	// Best-effort: Push the polecat's branch to remote before removing the worktree.
 	// This preserves committed work that hasn't been pushed yet — without this,
@@ -1368,21 +1377,21 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 			_ = mayorGit.WorktreePrune()
 		}
 		// Fall back to direct removal if repo base not found
-		return os.RemoveAll(polecatDir)
+		return m.removeAllPath(polecatDir)
 	}
 
 	// Try to remove as a worktree first (use force flag for worktree removal too)
 	if err := repoGit.WorktreeRemove(clonePath, force); err != nil {
 		// Fall back to direct removal if worktree removal fails
 		// (e.g., if this is an old-style clone, not a worktree)
-		if removeErr := os.RemoveAll(clonePath); removeErr != nil {
+		if removeErr := m.removeAllPath(clonePath); removeErr != nil {
 			return fmt.Errorf("removing clone path: %w", removeErr)
 		}
 	} else {
 		// GT-1L3MY9: git worktree remove may leave untracked directories behind.
 		// Clean up any leftover files (overlay files, .beads/, setup hook outputs, etc.)
 		// Use RemoveAll to handle non-empty directories with untracked files.
-		_ = os.RemoveAll(clonePath)
+		_ = m.removeAllPath(clonePath)
 	}
 
 	// Also remove the parent polecat directory
@@ -1390,7 +1399,7 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	if polecatDir != clonePath {
 		// GT-1L3MY9: Clean up any orphaned files at polecat level.
 		// Use RemoveAll to handle non-empty directories with leftover files.
-		_ = os.RemoveAll(polecatDir)
+		_ = m.removeAllPath(polecatDir)
 	}
 
 	// Prune any stale worktree entries (non-fatal: cleanup only)
@@ -1408,6 +1417,21 @@ func (m *Manager) removeWithOptionsLockedPolicy(name string, force, nuclear, sel
 	_ = m.namePool.Save()
 
 	return nil
+}
+
+func canonicalExistingPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+func (m *Manager) removeAllPath(path string) error {
+	if m.removeAll != nil {
+		return m.removeAll(path)
+	}
+	return os.RemoveAll(path)
 }
 
 // ActiveMRRemovalBlocker returns the pending active-MR reason that should block

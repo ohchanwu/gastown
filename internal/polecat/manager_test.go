@@ -415,6 +415,65 @@ func TestRemoveWithOptionsLocalOnlyIfIncarnationHoldsLockThroughAfterRemove(t *t
 	}
 }
 
+func TestRemoveWithOptionsLocalOnlyIfIncarnationShellPreflightDoesNotCommit(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	originalCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(p.ClonePath); err != nil {
+		t.Fatalf("Chdir polecat: %v", err)
+	}
+	defer func() { _ = os.Chdir(originalCWD) }()
+
+	const incarnation = "fixture-generation"
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", incarnation, true, true, false, nil, nil,
+	)
+	if !errors.Is(err, ErrShellInWorktree) {
+		t.Fatalf("error = %v, want ErrShellInWorktree", err)
+	}
+	if errors.Is(err, ErrPolecatRetirementCommitted) {
+		t.Fatalf("shell preflight reported a committed retirement: %v", err)
+	}
+	current, getErr := mgr.Get("toast")
+	if getErr != nil {
+		t.Fatalf("Get after refused retirement: %v", getErr)
+	}
+	if current.Incarnation != incarnation {
+		t.Fatalf("incarnation changed after preflight refusal: got %q want %q", current.Incarnation, incarnation)
+	}
+	if _, statErr := os.Stat(p.ClonePath); statErr != nil {
+		t.Fatalf("worktree changed after shell preflight refusal: %v", statErr)
+	}
+}
+
+func TestRemoveWithOptionsLocalOnlyIfIncarnationClassifiesPostCommitFilesystemFailure(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	_, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	filesystemErr := errors.New("injected filesystem removal failure")
+	mgr.repoBaseFn = func() (*git.Git, error) { return nil, errors.New("injected repo-base failure") }
+	mgr.removeAll = func(string) error { return filesystemErr }
+
+	const incarnation = "fixture-generation"
+	err = mgr.RemoveWithOptionsLocalOnlyIfIncarnation(
+		"toast", incarnation, true, true, false, nil, nil,
+	)
+	if !errors.Is(err, filesystemErr) {
+		t.Fatalf("error = %v, want injected filesystem failure", err)
+	}
+	if !errors.Is(err, ErrPolecatRetirementCommitted) {
+		t.Fatalf("post-commit failure = %v, want ErrPolecatRetirementCommitted", err)
+	}
+}
+
 func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {
 	t.Helper()
 

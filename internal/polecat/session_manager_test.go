@@ -368,6 +368,101 @@ func TestStartContext_CancellationDuringPostReadyFallback(t *testing.T) {
 	}
 }
 
+func TestStartContextSerializesWithPolecatLifecycleLock(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	r := &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}}
+	tm := tmux.NewTmux()
+	lifecycle := NewManager(r, nil, tm)
+	fl, err := lifecycle.lockPolecat("Toast")
+	if err != nil {
+		t.Fatalf("lock polecat: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- NewSessionManager(tm, r).StartContext(context.Background(), "Toast", SessionStartOptions{
+			WorkDir: workDir,
+			Command: "sh",
+		})
+	}()
+	select {
+	case err := <-done:
+		_ = fl.Unlock()
+		t.Fatalf("startup escaped the lifecycle lock: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := os.RemoveAll(filepath.Join(rigPath, "polecats", "Toast")); err != nil {
+		_ = fl.Unlock()
+		t.Fatalf("remove polecat under lifecycle lock: %v", err)
+	}
+	if err := fl.Unlock(); err != nil {
+		t.Fatalf("unlock polecat: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrPolecatNotFound) {
+			t.Fatalf("startup after locked removal = %v, want ErrPolecatNotFound", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup remained blocked after lifecycle lock release")
+	}
+}
+
+func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	workDir := filepath.Join(rigPath, "polecats", "Toast", "testrig")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir polecat workdir: %v", err)
+	}
+	settings := config.NewTownSettings()
+	settings.Operational = &config.OperationalConfig{
+		Session: &config.SessionThresholds{ClaudeStartTimeout: "100ms"},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), settings); err != nil {
+		t.Fatalf("save town settings: %v", err)
+	}
+	r := &rig.Rig{Name: "testrig", Path: rigPath, Polecats: []string{"Toast"}}
+	m := NewSessionManager(tmux.NewTmux(), r)
+	created := tmux.SessionGeneration{
+		Name: "xz-toast", SessionID: "$old", Nonce: "old", ServerPID: 101, ServerIdentity: "server-old",
+	}
+	replacement := tmux.SessionGeneration{
+		Name: created.Name, SessionID: "$replacement", Nonce: "replacement", ServerPID: 202, ServerIdentity: "server-new",
+	}
+	m.newSessionGeneration = func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error) {
+		return created, nil
+	}
+	cleanupCalled := false
+	replacementAlive := true
+	m.cleanupFailedGeneration = func(generation tmux.SessionGeneration) error {
+		cleanupCalled = true
+		if !generation.Equal(created) {
+			if generation.Equal(replacement) {
+				replacementAlive = false
+			}
+			t.Fatalf("cleanup generation = %+v, want creation receipt %+v", generation, created)
+		}
+		return nil
+	}
+
+	err := m.StartContext(context.Background(), "Toast", SessionStartOptions{WorkDir: workDir, Command: "sh"})
+	if err == nil {
+		t.Fatal("StartContext unexpectedly succeeded without a real created session")
+	}
+	if !cleanupCalled {
+		t.Fatal("failed startup did not invoke exact-generation cleanup")
+	}
+	if !replacementAlive {
+		t.Fatal("failed-start cleanup targeted same-name replacement generation")
+	}
+}
+
 func TestStart_ExpiredContextKillsOwnedChildOnly(t *testing.T) {
 	requireTmux(t)
 

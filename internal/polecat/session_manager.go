@@ -45,6 +45,9 @@ var (
 type SessionManager struct {
 	tmux                    *tmux.Tmux
 	rig                     *rig.Rig
+	lifecycle               *Manager
+	newSessionGeneration    func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error)
+	cleanupFailedGeneration func(tmux.SessionGeneration) error
 	deliverStartupPrompt    func(context.Context, string, string, *config.RuntimeConfig, time.Duration) error
 	verifyStartupNudge      func(context.Context, string, *config.RuntimeConfig, string, bool) error
 	startPoller             func(string, string, []string) (int, error)
@@ -56,8 +59,13 @@ type SessionManager struct {
 // NewSessionManager creates a new polecat session manager for a rig.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	m := &SessionManager{
-		tmux: t,
-		rig:  r,
+		tmux:      t,
+		rig:       r,
+		lifecycle: NewManager(r, nil, t),
+	}
+	if t != nil {
+		m.newSessionGeneration = t.NewSessionWithCommandAndEnvGenerationContext
+		m.cleanupFailedGeneration = t.CleanupFailedSessionGeneration
 	}
 	m.deliverStartupPrompt = m.deliverStartupPromptFallback
 	m.verifyStartupNudge = m.verifyStartupNudgeDelivery
@@ -435,6 +443,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 // StartContext creates a polecat session under one caller-cancelable deadline.
 func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts SessionStartOptions) (retErr error) {
+	lifecycle := m.lifecycle
+	if lifecycle == nil {
+		lifecycle = NewManager(m.rig, nil, m.tmux)
+	}
+	fl, err := lifecycle.lockPolecat(polecat)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	if !m.hasPolecat(polecat) {
 		return fmt.Errorf("%w: %s", ErrPolecatNotFound, polecat)
 	}
@@ -606,16 +624,23 @@ func (m *SessionManager) StartContext(ctx context.Context, polecat string, opts 
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
 	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
-	if err := m.tmux.NewSessionWithCommandAndEnvContext(ctx, sessionID, workDir, command, envVars); err != nil {
+	newSessionGeneration := m.newSessionGeneration
+	if newSessionGeneration == nil {
+		newSessionGeneration = m.tmux.NewSessionWithCommandAndEnvGenerationContext
+	}
+	createdGeneration, err := newSessionGeneration(ctx, sessionID, workDir, command, envVars)
+	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
 	defer func() {
 		if retErr == nil {
 			return
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		if err := m.tmux.KillSessionWithProcessesContext(cleanupCtx, sessionID); err != nil {
+		cleanupFailedGeneration := m.cleanupFailedGeneration
+		if cleanupFailedGeneration == nil {
+			cleanupFailedGeneration = m.tmux.CleanupFailedSessionGeneration
+		}
+		if err := cleanupFailedGeneration(createdGeneration); err != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("cleaning failed-start session %s: %w", sessionID, err))
 		}
 	}()
