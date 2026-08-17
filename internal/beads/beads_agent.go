@@ -574,7 +574,7 @@ func (b *Beads) updateAgentDescriptionFieldsLocked(
 		}
 		for _, check := range checks {
 			if check.want != nil && check.current != *check.want {
-				return fmt.Errorf("%w: %s is %q, expected %q", ErrAgentFieldsChanged, check.name, check.current, *check.want)
+				return fmt.Errorf("%w: %s", ErrAgentFieldsChanged, check.name)
 			}
 		}
 	}

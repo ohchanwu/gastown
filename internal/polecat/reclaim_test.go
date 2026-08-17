@@ -106,3 +106,20 @@ func TestBrokenIdleReclaimAgentBlocker(t *testing.T) {
 		})
 	}
 }
+
+func TestBrokenIdleReclaimAgentBlockerAfterLifecycleReconcile(t *testing.T) {
+	fields := &beads.AgentFields{
+		AgentState:    string(beads.AgentStateStuck),
+		CleanupStatus: string(CleanupUnpushed),
+		Branch:        "polecat/toast/gt-work@abc123",
+	}
+	if blocker := brokenIdleReclaimAgentBlocker(fields); blocker != "agent_state=stuck" {
+		t.Fatalf("pre-reconcile blocker = %q, want agent_state=stuck", blocker)
+	}
+
+	fields.AgentState = string(beads.AgentStateIdle)
+	fields.CleanupStatus = string(CleanupClean)
+	if blocker := brokenIdleReclaimAgentBlocker(fields); blocker != "" {
+		t.Fatalf("post-reconcile blocker = %q, want empty", blocker)
+	}
+}

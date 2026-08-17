@@ -1175,7 +1175,16 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
 	if polecatCheckRecoveryReconcileCleanup {
-		reconcileCleanupStatusIfSafe(&status, bd, agentBeadID, p, fields)
+		reconcileCleanupStatusIfSafe(
+			&status,
+			bd,
+			agentBeadID,
+			p,
+			fields,
+			func(proof cleanupReconcileProof) error {
+				return recheckPolecatCleanup(mgr, r, rigName, polecatName, bd, p, proof)
+			},
+		)
 	}
 
 	// JSON output
@@ -1373,49 +1382,262 @@ func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, termina
 }
 
 type cleanupStatusUpdater interface {
-	UpdateAgentCleanupStatus(id string, cleanupStatus string) error
+	CompareAndUpdateAgentDescriptionFields(
+		id string,
+		expected beads.AgentFieldExpectations,
+		updates beads.AgentFieldUpdates,
+	) error
 }
 
-func reconcileCleanupStatusIfSafe(status *RecoveryStatus, updater cleanupStatusUpdater, agentBeadID string, p *polecat.Polecat, fields *beads.AgentFields) {
-	previous, ok := cleanupStatusReconcileCandidate(status, p, fields)
+type cleanupReconcileProof struct {
+	Previous polecat.CleanupStatus
+	Expected beads.AgentFieldExpectations
+}
+
+type cleanupReconcileRecheck func(cleanupReconcileProof) error
+
+func failCleanupReconcile(status *RecoveryStatus, blocker string) {
+	status.NeedsRecovery = true
+	status.SafeToNuke = false
+	status.Reusable = false
+	status.CountsTowardCapacity = true
+	status.Reconciled = false
+	status.Verdict = polecat.WorkstateVerdictNeedsRecovery
+	status.Reason = "cleanup-reconcile-failed"
+	status.Blockers = append(status.Blockers, blocker)
+}
+
+func reconcileCleanupStatusIfSafe(
+	status *RecoveryStatus,
+	updater cleanupStatusUpdater,
+	agentBeadID string,
+	p *polecat.Polecat,
+	fields *beads.AgentFields,
+	recheck cleanupReconcileRecheck,
+) {
+	proof, ok := cleanupStatusReconcileCandidate(status, p, fields)
 	if !ok {
 		return
 	}
-	if updater == nil {
-		status.NeedsRecovery = true
-		status.Verdict = "NEEDS_RECOVERY"
-		status.Blockers = append(status.Blockers, "cleanup_reconcile_failed: updater unavailable")
+	if recheck == nil {
+		failCleanupReconcile(status, "cleanup_reconcile_failed: recheck unavailable")
 		return
 	}
-	if err := updater.UpdateAgentCleanupStatus(agentBeadID, string(polecat.CleanupClean)); err != nil {
-		status.NeedsRecovery = true
-		status.Verdict = "NEEDS_RECOVERY"
-		status.Blockers = append(status.Blockers, fmt.Sprintf("cleanup_reconcile_failed: %v", err))
+	if err := recheck(proof); err != nil {
+		failCleanupReconcile(status, fmt.Sprintf("cleanup_reconcile_failed: %v", err))
+		return
+	}
+	if updater == nil {
+		failCleanupReconcile(status, "cleanup_reconcile_failed: updater unavailable")
+		return
+	}
+	idle, clean := string(beads.AgentStateIdle), string(polecat.CleanupClean)
+	if err := updater.CompareAndUpdateAgentDescriptionFields(
+		agentBeadID,
+		proof.Expected,
+		beads.AgentFieldUpdates{AgentState: &idle, CleanupStatus: &clean},
+	); err != nil {
+		prefix := "cleanup_reconcile_failed"
+		if errors.Is(err, beads.ErrAgentFieldsChanged) {
+			prefix = "cleanup_reconcile_generation_changed"
+		}
+		failCleanupReconcile(status, fmt.Sprintf("%s: %v", prefix, err))
 		return
 	}
 	status.CleanupStatus = polecat.CleanupClean
 	status.Reconciled = true
-	status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("reconciled_cleanup_status=clean previous=%s", previous))
+	status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("reconciled_agent_state=idle cleanup_status=clean previous=%s", proof.Previous))
 }
 
-func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat, fields *beads.AgentFields) (polecat.CleanupStatus, bool) {
+func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat, fields *beads.AgentFields) (cleanupReconcileProof, bool) {
 	if status == nil || p == nil || fields == nil {
-		return "", false
+		return cleanupReconcileProof{}, false
 	}
 	previous := polecat.CleanupStatus(fields.CleanupStatus)
-	if previous == "" || previous == polecat.CleanupClean {
-		return previous, false
+	switch previous {
+	case polecat.CleanupUnpushed, polecat.CleanupStash, polecat.CleanupUncommitted:
+	default:
+		return cleanupReconcileProof{}, false
 	}
-	if p.State != polecat.StateIdle || beads.AgentState(fields.AgentState) != beads.AgentStateIdle {
-		return previous, false
+	agentState := beads.AgentState(fields.AgentState)
+	if p.State != polecat.StateIdle || (agentState != beads.AgentStateIdle && agentState != beads.AgentStateStuck) {
+		return cleanupReconcileProof{}, false
 	}
 	if status.NeedsRecovery || status.Verdict != "SAFE_TO_NUKE" {
-		return previous, false
+		return cleanupReconcileProof{}, false
 	}
 	if status.Branch != "" && status.MQStatus != "submitted" && status.MQStatus != "not_required" {
-		return previous, false
+		return cleanupReconcileProof{}, false
 	}
-	return previous, true
+	return cleanupReconcileProof{
+		Previous: previous,
+		Expected: beads.AgentFieldExpectations{
+			AgentState:    stringPointer(fields.AgentState),
+			CleanupStatus: stringPointer(fields.CleanupStatus),
+			HookBead:      stringPointer(fields.HookBead),
+			ActiveMR:      stringPointer(fields.ActiveMR),
+		},
+	}, true
+}
+
+func stringPointer(value string) *string { return &value }
+
+type cleanupRecheckEvidence struct {
+	PolecatState          polecat.State
+	GenerationMatches     bool
+	SessionRunning        bool
+	SessionErr            error
+	Fields                *beads.AgentFields
+	HookSafe              bool
+	HookBlocker           string
+	WorkTerminal          bool
+	TargetRefLookupFailed bool
+	GitBlocker            string
+	ActiveMRBlocker       string
+	BranchMatches         bool
+	PreservationErr       error
+	UnpreservedPatches    int
+}
+
+func validateCleanupRecheckEvidence(evidence cleanupRecheckEvidence, proof cleanupReconcileProof) error {
+	if evidence.PolecatState != polecat.StateIdle {
+		return fmt.Errorf("polecat_state=%s", evidence.PolecatState)
+	}
+	if !evidence.GenerationMatches {
+		return errors.New("polecat_generation=changed")
+	}
+	if evidence.SessionErr != nil {
+		return fmt.Errorf("session_state=lookup_error: %w", evidence.SessionErr)
+	}
+	if evidence.SessionRunning {
+		return errors.New("session_state=running")
+	}
+	if evidence.Fields == nil {
+		return errors.New("agent_fields=missing")
+	}
+	checks := []struct {
+		name    string
+		want    *string
+		current string
+	}{
+		{name: "agent_state", want: proof.Expected.AgentState, current: evidence.Fields.AgentState},
+		{name: "cleanup_status", want: proof.Expected.CleanupStatus, current: evidence.Fields.CleanupStatus},
+		{name: "hook_bead", want: proof.Expected.HookBead, current: evidence.Fields.HookBead},
+		{name: "active_mr", want: proof.Expected.ActiveMR, current: evidence.Fields.ActiveMR},
+	}
+	for _, check := range checks {
+		if check.want != nil && check.current != *check.want {
+			return fmt.Errorf("%w: %s", beads.ErrAgentFieldsChanged, check.name)
+		}
+	}
+	if !evidence.HookSafe {
+		if evidence.HookBlocker != "" {
+			return errors.New(evidence.HookBlocker)
+		}
+		return errors.New("hook_state=unverified")
+	}
+	if !evidence.WorkTerminal {
+		return errors.New("work_state=not_terminal")
+	}
+	if evidence.TargetRefLookupFailed {
+		return errors.New("branch_preservation=target_lookup_failed")
+	}
+	if evidence.GitBlocker != "" {
+		return errors.New(evidence.GitBlocker)
+	}
+	if evidence.ActiveMRBlocker != "" {
+		return errors.New(evidence.ActiveMRBlocker)
+	}
+	if !evidence.BranchMatches {
+		return errors.New("branch_state=changed")
+	}
+	if evidence.PreservationErr != nil {
+		return fmt.Errorf("branch_preservation=lookup_error: %w", evidence.PreservationErr)
+	}
+	if evidence.UnpreservedPatches != 0 {
+		return errors.New("branch_preservation=unpreserved")
+	}
+	return nil
+}
+
+func recheckPolecatCleanup(
+	mgr *polecat.Manager,
+	r *rig.Rig,
+	rigName string,
+	polecatName string,
+	bd *beads.Beads,
+	original *polecat.Polecat,
+	proof cleanupReconcileProof,
+) error {
+	if mgr == nil || r == nil || bd == nil || original == nil {
+		return errors.New("recheck evidence unavailable")
+	}
+
+	fresh, err := mgr.Get(polecatName)
+	if err != nil {
+		return fmt.Errorf("polecat lookup: %w", err)
+	}
+	evidence := cleanupRecheckEvidence{
+		PolecatState:      fresh.State,
+		GenerationMatches: fresh.Branch == original.Branch && fresh.Issue == original.Issue && fresh.ClonePath == original.ClonePath,
+		BranchMatches:     true,
+	}
+
+	t := tmux.NewTmux()
+	sessionName := polecat.NewSessionManager(t, r).SessionName(polecatName)
+	evidence.SessionRunning, evidence.SessionErr = t.HasSession(sessionName)
+
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
+	if err != nil {
+		return fmt.Errorf("agent_state=lookup_error: %w", err)
+	}
+	evidence.Fields = fields
+	if fields == nil {
+		return validateCleanupRecheckEvidence(evidence, proof)
+	}
+
+	hookBead := agentHookBead(agentIssue, fields)
+	hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
+	evidence.HookSafe = hookSafe
+	evidence.HookBlocker = hookBlocker
+
+	sourceHint := agentSourceIssueHint(fresh.Issue, fields)
+	workTerminal := sourceHint == "" && hookBead == ""
+	if sourceHint != "" {
+		workTerminal = isAssignedBeadTerminal(bd, sourceHint)
+	}
+	evidence.WorkTerminal = workTerminal || hookTerminal
+
+	targetRefs, targetRefLookupFailed := recoveryTargetRefs(
+		bd,
+		fresh.Issue,
+		fields.ActiveMR,
+		fresh.Branch,
+		sourceHint,
+	)
+	evidence.TargetRefLookupFailed = targetRefLookupFailed
+	gitState, gitErr := getGitStateWithTargets(fresh.ClonePath, targetRefs)
+	evidence.GitBlocker = recoveryGitStateBlocker(fresh.ClonePath, gitState, gitErr)
+	evidence.ActiveMRBlocker = activeMRBlocker(bd, fields.ActiveMR, sourceHint, true, gitState != nil && gitState.Clean)
+
+	if fresh.Branch != "" {
+		worktreeGit := git.NewGit(fresh.ClonePath)
+		branch, err := worktreeGit.CurrentBranch()
+		if err != nil {
+			evidence.BranchMatches = false
+			evidence.PreservationErr = err
+		} else {
+			evidence.BranchMatches = branch == fresh.Branch
+			preservation, preserveErr := worktreeGit.BranchPreservationStatus(branch, "origin", targetRefs)
+			evidence.PreservationErr = preserveErr
+			if preserveErr == nil {
+				evidence.UnpreservedPatches = preservation.UnpreservedPatchCount
+			}
+		}
+	}
+
+	return validateCleanupRecheckEvidence(evidence, proof)
 }
 
 func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string {
