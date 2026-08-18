@@ -471,9 +471,11 @@ func TestStartContextFailedCleanupUsesCreationGeneration(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 	created := tmux.SessionGeneration{
 		Name: "xz-toast", SessionID: "$old", Nonce: "old", ServerPID: 101, ServerIdentity: "server-old",
+		Transport: tmux.SessionTransport{Bound: true, SocketName: "fixture", SocketPath: "/tmp/tmux-fixture/fixture"},
 	}
 	replacement := tmux.SessionGeneration{
 		Name: created.Name, SessionID: "$replacement", Nonce: "replacement", ServerPID: 202, ServerIdentity: "server-new",
+		Transport: created.Transport,
 	}
 	m.newSessionGeneration = func(context.Context, string, string, string, map[string]string) (tmux.SessionGeneration, error) {
 		return created, nil

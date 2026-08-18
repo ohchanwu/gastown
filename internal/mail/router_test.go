@@ -1721,7 +1721,10 @@ func requireNotifyTestSocket(t *testing.T) string {
 // for it to be ready.
 func createNotifyTestSession(t *testing.T, socket, sessionName, command string) {
 	t.Helper()
-	args := []string{"-L", socket, "new-session", "-d", "-s", sessionName, command}
+	// A unique socket is not sufficient isolation: a new tmux server still
+	// sources the user's configuration, whose synchronous plugins may block
+	// startup. Tests need a configuration-free server as well as a unique one.
+	args := []string{"-f", os.DevNull, "-L", socket, "new-session", "-d", "-s", sessionName, command}
 	out, err := exec.Command("tmux", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to create test session %q: %v\n%s", sessionName, err, out)
