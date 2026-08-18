@@ -324,7 +324,9 @@ policy binds the request to the owned dog name and finalizer argument shape. A
 handled broker failure does not fall back to a weaker host path. On platforms
 without the Linux broker, an exact transient tmux session or detached process
 group performs the host-side finalization while retaining the same generation
-checks.
+checks. The native Windows path authorizes that detached process with the exact
+encoded snapshot, dog role and name, and dog-specific finalizer-session marker;
+it does not require the process to remain inside a tmux host session.
 
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
 mount, user, network, and IPC namespaces. Host mounts are read-only; the only
