@@ -48,13 +48,14 @@ type Dog struct {
 // SessionGeneration is the JSON-compatible form of tmux.SessionGeneration.
 // Custody may be empty on platforms without an OS containment marker.
 type SessionGeneration struct {
-	Name           string `json:"name"`
-	SessionID      string `json:"session_id"`
-	PaneID         string `json:"pane_id,omitempty"`
-	Nonce          string `json:"nonce"`
-	Custody        string `json:"custody"`
-	ServerPID      int    `json:"server_pid"`
-	ServerIdentity string `json:"server_identity"`
+	Name           string                `json:"name"`
+	SessionID      string                `json:"session_id"`
+	PaneID         string                `json:"pane_id,omitempty"`
+	Nonce          string                `json:"nonce"`
+	Custody        string                `json:"custody"`
+	ServerPID      int                   `json:"server_pid"`
+	ServerIdentity string                `json:"server_identity"`
+	Transport      tmux.SessionTransport `json:"transport"`
 }
 
 // SessionGenerationFromTmux converts exact tmux custody into its durable form.
@@ -67,6 +68,7 @@ func SessionGenerationFromTmux(generation tmux.SessionGeneration) *SessionGenera
 		Custody:        generation.Custody,
 		ServerPID:      generation.ServerPID,
 		ServerIdentity: generation.ServerIdentity,
+		Transport:      generation.Transport,
 	}
 }
 
@@ -80,6 +82,7 @@ func (g SessionGeneration) Tmux() tmux.SessionGeneration {
 		Custody:        g.Custody,
 		ServerPID:      g.ServerPID,
 		ServerIdentity: g.ServerIdentity,
+		Transport:      g.Transport,
 	}
 }
 

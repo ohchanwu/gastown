@@ -302,14 +302,20 @@ against the replacement state. `gt polecat nuke` is strictly local: it verifies
 the named branch but neither its direct command path nor its manager removal
 path publishes a ref.
 
-Dogs persist an optional exact tmux session-generation and pane receipt alongside
-work state. Starting a dog captures both in the session creation transaction and
-records them before claiming successful runtime custody. Completion and removal
+Dogs persist an optional exact tmux session-generation, pane, and transport
+receipt alongside work state. The transport records both whether binding was
+captured and the exact tmux socket name; an intentionally empty name therefore
+means the bound default socket, while a missing binding identifies a legacy
+receipt. Starting a dog captures all three in the session creation transaction
+and records them before claiming successful runtime custody. Completion and removal
 hold the stable per-name lifecycle lock, compare the full durable snapshot,
 perform process-aware teardown of only that exact pane and session, finalize the
 exact assignment mail, and only then publish idle or remove the kennel. A live
 legacy session without a record, an ambiguous pane-less generation, a tmux
-lookup error, or generation substitution fails closed. `--force` bypasses only
+transport mismatch, a tmux lookup error, or generation substitution fails
+closed. Lifecycle commands reconstruct their controller from the durable
+transport instead of mutable `GT_TOWN_SOCKET`; absence on another server cannot
+release the assignment. `--force` bypasses only
 the refusal to remove working state; it never bypasses generation custody. Dog
 status exposes work state independently from `running`, `absent`, `stale`, or
 `unknown` runtime state, and nested `gt dog done` is routed separately from the
@@ -323,9 +329,11 @@ cleanup without becoming a second child in the owned session cgroup. Broker
 policy binds the request to the owned dog name and finalizer argument shape. A
 handled broker failure does not fall back to a weaker host path. On platforms
 without the Linux broker, an exact transient tmux session performs the host-side
-finalization while retaining the same generation checks. This gives Unix and
-Windows the same dog-specific host-session receipt and prevents either platform
-from reporting a handoff before the authenticated finalizer generation exists.
+finalization while retaining the same generation checks. This supports POSIX
+tmux hosts and Windows through WSL, which runs the Linux build. Native Windows
+supports the minimal CLI but not full tmux workflows, so it fails closed instead
+of sending POSIX quoting or working-directory syntax to PowerShell. No supported
+platform reports handoff before an authenticated finalizer generation exists.
 
 Dog and polecat process cleanup currently assumes cooperative session ownership:
 session work may not deliberately double-fork and call `setsid` to escape both
@@ -369,9 +377,12 @@ datagram sockets while the broker descriptor remains immutable.
 
 Generation-aware cleanup retains the Linux namespace init, aggregate cgroup,
 bounded scratch mount, and prior supervisor cgroup alongside the exact tmux and
-pane-process identities. Failed cgroup removal retains its receipt for a later
-owner-safe retry. Automatic zombie replacement always requires that strong
-custody. Platforms without retained process handles may use a separately
+pane-process identities while one owner is actively performing teardown. If
+the final reap exhausts its deadline, the cleanup returns an unreconciled error
+and releases every local pidfd and custody handle before the owner disappears.
+The durable generation and cgroup token, rather than leaked in-memory handles,
+remain the receipt for a later owner-safe pass. Automatic zombie replacement
+always requires strong custody. Platforms without retained process handles may use a separately
 revalidated tmux-generation fallback only for an explicit Stop or cleanup of
 the caller's own failed start; uncertain automatic replacement continues to
 fail closed.

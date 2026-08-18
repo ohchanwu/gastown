@@ -1297,10 +1297,11 @@ func (custody *mockParentReleaseSessionCustody) ParentReleaseFinalizationPending
 }
 
 func (custody *mockParentReleaseSessionCustody) Close() error {
+	closeErr := custody.mockSessionCustody.Close()
 	if custody.pending {
-		return errors.New("mock final reap is pending; retaining ownership")
+		return errors.Join(errors.New("mock final reap is unconfirmed; local ownership released"), closeErr)
 	}
-	return custody.mockSessionCustody.Close()
+	return closeErr
 }
 
 func (custody *mockSessionCustody) Freeze(ctx context.Context) error {
@@ -2233,11 +2234,8 @@ func TestSessionGenerationCleanupClose(t *testing.T) {
 			if !process.closed {
 				t.Fatal("retained process reference was not closed")
 			}
-			if tc.err != nil {
-				if len(cleanup.processes) != 1 {
-					t.Fatalf("failed process cleanup owners = %d, want retained owner", len(cleanup.processes))
-				}
-				process.closeErr = nil
+			if len(cleanup.processes) != 0 {
+				t.Fatalf("process cleanup retained %d unowned local handles", len(cleanup.processes))
 			}
 			if err := cleanup.Close(); err != nil {
 				t.Fatalf("second Close() error = %v", err)
@@ -2249,17 +2247,16 @@ func TestSessionGenerationCleanupClose(t *testing.T) {
 	}
 }
 
-func TestSessionGenerationCleanupCloseRetainsCustodyUntilSuccessfulRetry(t *testing.T) {
+func TestSessionGenerationCleanupCloseDiscardsReleasedCustodyAfterError(t *testing.T) {
 	closeErr := errors.New("injected custody close failure")
 	custody := &mockSessionCustody{closeErr: closeErr}
 	cleanup := &SessionGenerationCleanup{custody: custody}
 	if err := cleanup.Close(); !errors.Is(err, closeErr) {
 		t.Fatalf("first Close() error = %v, want %v", err, closeErr)
 	}
-	if cleanup.custody == nil {
-		t.Fatal("failed custody close discarded the sole owner")
+	if cleanup.custody != nil {
+		t.Fatal("failed custody close retained an unowned local handle")
 	}
-	custody.closeErr = nil
 	if err := cleanup.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
@@ -2302,7 +2299,7 @@ func TestSessionGenerationCleanupCloseRetriesPendingParentReleaseFinalization(t 
 	}
 }
 
-func TestSessionGenerationCleanupCloseContextRetainsCustodyAfterDeadline(t *testing.T) {
+func TestSessionGenerationCleanupCloseContextReleasesCustodyAfterDeadline(t *testing.T) {
 	t.Parallel()
 
 	finalizeCalls := 0
@@ -2334,8 +2331,30 @@ func TestSessionGenerationCleanupCloseContextRetainsCustodyAfterDeadline(t *test
 	if finalizeCalls != 1 {
 		t.Fatalf("final reap calls = %d, want 1", finalizeCalls)
 	}
-	if cleanup.custody == nil || !custody.ParentReleaseFinalizationPending() {
-		t.Fatal("deadline-expired final reap discarded retained custody")
+	if cleanup.custody != nil || !custody.closed {
+		t.Fatal("deadline-expired final reap retained process handles without a retry owner")
+	}
+}
+
+func TestBoundSessionGenerationRejectsWrongTransportBeforeAbsence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	target := NewTmuxWithSocket(fmt.Sprintf("gt-bound-target-%d", time.Now().UnixNano()))
+	wrong := NewTmuxWithSocket(fmt.Sprintf("gt-bound-wrong-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = target.KillServer() })
+	t.Cleanup(func() { _ = wrong.KillServer() })
+
+	generation, err := target.NewSessionWithCommandAndEnvGeneration("transport-target", t.TempDir(), "sleep 30", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrong.KillSessionGeneration(generation); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("wrong transport cleanup error = %v, want generation changed", err)
+	}
+	running, err := target.HasSession(generation.Name)
+	if err != nil || !running {
+		t.Fatalf("target after wrong-transport cleanup: running=%v err=%v", running, err)
 	}
 }
 

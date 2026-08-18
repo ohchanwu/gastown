@@ -492,6 +492,19 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	if got := result.ClosedEntries[0].ID; got != "stale-task" {
 		t.Fatalf("AutoClose candidate = %q, want stale-task", got)
 	}
+
+	result, err = AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("AutoClose live: %v", err)
+	}
+	if result.Closed != 1 || state.status("stale-task") != "closed" {
+		t.Fatalf("AutoClose live closed = %#v; stale task status = %q", result.ClosedEntries, state.status("stale-task"))
+	}
+	for _, id := range []string{"labeled-convoy", "typed-convoy", "typed-agent", "protected-agent", "protected-standing", "protected-keep", "protected-role", "protected-rig"} {
+		if got := state.status(id); got != "open" {
+			t.Fatalf("AutoClose live changed protected identity %q to %q", id, got)
+		}
+	}
 }
 
 func TestScanReturnsStableDanglingParentAnomaly(t *testing.T) {
@@ -619,7 +632,13 @@ func (s *fakeReaperState) autoCloseCandidatesLocked(query string, cutoff time.Ti
 func (s *fakeReaperState) status(id string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.wisps[id].status
+	if w := s.wisps[id]; w != nil {
+		return w.status
+	}
+	if issue := s.issues[id]; issue != nil {
+		return issue.status
+	}
+	return ""
 }
 
 func (s *fakeReaperState) statuses() map[string]string {
@@ -835,6 +854,16 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.record(c.id, "EXEC "+normalized)
 
 	switch {
+	case strings.HasPrefix(normalized, "UPDATE `testdb`.issues SET status = 'closed'"):
+		affected := int64(0)
+		for _, arg := range args {
+			id, _ := arg.Value.(string)
+			if issue := c.state.issues[id]; issue != nil && (issue.status == "open" || issue.status == "in_progress") {
+				issue.status = "closed"
+				affected++
+			}
+		}
+		return fakeReaperResult(affected), nil
 	case strings.HasPrefix(normalized, "UPDATE wisps SET status='closed'"):
 		affected := int64(0)
 		for _, arg := range args {

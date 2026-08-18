@@ -211,6 +211,37 @@ type Tmux struct {
 	nudgeLease *nudgeLease
 }
 
+// ErrSessionTransportUnbound means a durable lifecycle receipt predates the
+// authoritative tmux socket binding. Absence on an ambient socket must never
+// be treated as proof that the recorded generation is gone.
+var ErrSessionTransportUnbound = errors.New("tmux session transport is unbound")
+
+// SessionTransport identifies the exact tmux server transport used to capture
+// a generation. Bound distinguishes the default socket (an intentionally empty
+// SocketName) from a legacy receipt that did not persist transport at all.
+type SessionTransport struct {
+	Bound      bool   `json:"bound"`
+	SocketName string `json:"socket_name,omitempty"`
+}
+
+// SessionTransport returns this client's authoritative tmux transport.
+func (t *Tmux) SessionTransport() SessionTransport {
+	if t == nil {
+		return SessionTransport{}
+	}
+	return SessionTransport{Bound: true, SocketName: t.socketName}
+}
+
+// NewTmuxForSessionGeneration reconstructs the exact transport captured in a
+// durable generation. Legacy unbound receipts fail closed instead of falling
+// back to GT_TOWN_SOCKET or another mutable process environment variable.
+func NewTmuxForSessionGeneration(generation SessionGeneration) (*Tmux, error) {
+	if !generation.Transport.Bound {
+		return nil, ErrSessionTransportUnbound
+	}
+	return NewTmuxWithSocket(generation.Transport.SocketName), nil
+}
+
 type nudgeLease struct {
 	townRoot string
 	session  string
@@ -542,6 +573,7 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 		Custody:        sessionEnv[EnvSessionCustody],
 		ServerPID:      serverPID,
 		ServerIdentity: serverIdentity,
+		Transport:      t.SessionTransport(),
 	}
 	if err := t.runGuardedSessionGenerationContext(
 		ctx,
@@ -1019,7 +1051,7 @@ func (t *Tmux) StartTransientSessionWithCommandAndEnv(name, workDir, command str
 	}
 	generation = SessionGeneration{
 		Name: name, SessionID: sessionID, PaneID: paneID, Nonce: nonce,
-		ServerPID: serverPID, ServerIdentity: serverIdentity,
+		ServerPID: serverPID, ServerIdentity: serverIdentity, Transport: t.SessionTransport(),
 	}
 	return generation, nil
 }
@@ -1274,6 +1306,7 @@ type SessionGeneration struct {
 	Custody        string
 	ServerPID      int
 	ServerIdentity string
+	Transport      SessionTransport
 }
 
 // Equal reports whether two observations identify the same server/session
@@ -1285,7 +1318,8 @@ func (g SessionGeneration) Equal(other SessionGeneration) bool {
 		g.Nonce == other.Nonce &&
 		g.Custody == other.Custody &&
 		g.ServerPID == other.ServerPID &&
-		g.ServerIdentity == other.ServerIdentity
+		g.ServerIdentity == other.ServerIdentity &&
+		((!g.Transport.Bound || !other.Transport.Bound) || g.Transport == other.Transport)
 }
 
 // PaneProcessGeneration binds the pane PID reported by tmux to the process
@@ -1368,6 +1402,7 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 	if err != nil {
 		return SessionGeneration{}, err
 	}
+	generation.Transport = t.SessionTransport()
 	serverIdentity, err := processGenerationIdentity(generation.ServerPID)
 	if err != nil {
 		return SessionGeneration{}, fmt.Errorf("reading tmux server process generation: %w", err)
@@ -1389,6 +1424,7 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 	if err != nil {
 		return SessionGeneration{}, err
 	}
+	confirmed.Transport = t.SessionTransport()
 	if generation.SessionID != confirmed.SessionID || generation.PaneID != confirmed.PaneID || generation.Nonce != confirmed.Nonce || generation.Custody != confirmed.Custody || generation.ServerPID != confirmed.ServerPID {
 		return SessionGeneration{}, ErrSessionGenerationChanged
 	}
@@ -1460,6 +1496,13 @@ func validateServerGeneration(generation SessionGeneration) error {
 	identity, err := processGenerationIdentity(generation.ServerPID)
 	if err != nil || identity != generation.ServerIdentity {
 		return ErrSessionGenerationChanged
+	}
+	return nil
+}
+
+func (t *Tmux) validateSessionGenerationTransport(generation SessionGeneration) error {
+	if generation.Transport.Bound && t.SessionTransport() != generation.Transport {
+		return fmt.Errorf("%w: authoritative tmux transport changed", ErrSessionGenerationChanged)
 	}
 	return nil
 }
@@ -1560,6 +1603,9 @@ func (t *Tmux) runGuardedSessionGenerationConditionTargetContext(
 	generation SessionGeneration,
 	target, condition, command string,
 ) error {
+	if err := t.validateSessionGenerationTransport(generation); err != nil {
+		return err
+	}
 	if err := validateServerGeneration(generation); err != nil {
 		return err
 	}
@@ -1641,6 +1687,9 @@ func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation Sessi
 }
 
 func (t *Tmux) getPaneStateGenerationContext(ctx context.Context, generation SessionGeneration) (sessionGenerationPaneState, error) {
+	if err := t.validateSessionGenerationTransport(generation); err != nil {
+		return sessionGenerationPaneState{}, err
+	}
 	condition, err := sessionGenerationCondition(generation)
 	if err != nil {
 		return sessionGenerationPaneState{}, err
@@ -1909,42 +1958,34 @@ func (cleanup *SessionGenerationCleanup) Close() error {
 }
 
 // CloseContext releases retained kernel process references within the caller's
-// operation budget. If pending parent-release finalization exhausts that budget,
-// the cleanup retains every ownership handle for a later retry.
+// operation budget. If parent-release finalization exhausts that budget, Close
+// still releases every process handle; the durable generation remains the only
+// retry receipt and no unowned in-memory custody is leaked.
 func (cleanup *SessionGenerationCleanup) CloseContext(ctx context.Context) error {
 	if cleanup == nil {
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	var errs []error
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
+	}
 	if cleanup.custody != nil {
-		if parentReleaseCustody, ok := cleanup.custody.(sessionCustodyParentReleaseHandle); ok && parentReleaseCustody.ParentReleaseFinalizationPending() {
+		if parentReleaseCustody, ok := cleanup.custody.(sessionCustodyParentReleaseHandle); ctx.Err() == nil && ok && parentReleaseCustody.ParentReleaseFinalizationPending() {
 			if err := parentReleaseCustody.FinalizeAfterParentRelease(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("retrying session containment after tmux parent release: %w", err))
-				if ctx.Err() != nil {
-					return errors.Join(errs...)
-				}
 			}
 		}
 		if err := cleanup.custody.Close(); err != nil {
 			errs = append(errs, err)
-		} else {
-			cleanup.custody = nil
 		}
+		cleanup.custody = nil
 	}
-	remaining := make([]retainedProcess, 0, len(cleanup.processes))
 	for i := len(cleanup.processes) - 1; i >= 0; i-- {
 		if err := cleanup.processes[i].Close(); err != nil {
 			errs = append(errs, err)
-			remaining = append(remaining, cleanup.processes[i])
 		}
 	}
-	for left, right := 0, len(remaining)-1; left < right; left, right = left+1, right-1 {
-		remaining[left], remaining[right] = remaining[right], remaining[left]
-	}
-	cleanup.processes = remaining
+	cleanup.processes = nil
 	return errors.Join(errs...)
 }
 

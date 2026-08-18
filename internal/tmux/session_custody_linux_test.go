@@ -1039,19 +1039,28 @@ func TestLinuxSessionCustodyKillRefreshesEveryPostCommitBudget(t *testing.T) {
 	}
 }
 
-func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T) {
+func TestLinuxSessionCustodyFinalReapReleasesLocalHandlesWhenUnconfirmed(t *testing.T) {
+	initFD, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisorFD, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = unix.Close(initFD)
+		t.Fatal(err)
+	}
 	custody := &linuxSessionCustody{
 		supervisorPID:      101,
 		supervisorIdentity: "supervisor",
-		supervisorFD:       -1,
-		initFD:             -1,
+		supervisorFD:       supervisorFD,
+		initFD:             initFD,
 		cgroup:             "/fixture/session",
 		prepared:           true,
 		committed:          true,
 	}
 	reapErr := errors.New("supervisor still awaiting parent reap")
 	removeCalls := 0
-	err := custody.finalizeAfterParentReleaseWithOps(
+	err = custody.finalizeAfterParentReleaseWithOps(
 		context.Background(),
 		func(context.Context, int, string) error { return reapErr },
 		func(context.Context, string, time.Duration) error {
@@ -1065,8 +1074,11 @@ func TestLinuxSessionCustodyFinalReapRetainsOwnershipUntilConfirmed(t *testing.T
 	if custody.finalized || removeCalls != 0 {
 		t.Fatalf("failed finalization = finalized %v, removals %d; want retained receipt", custody.finalized, removeCalls)
 	}
-	if err := custody.Close(); err == nil || !strings.Contains(err.Error(), "retaining ownership handles") {
-		t.Fatalf("Close() error = %v, want retained ownership", err)
+	if err := custody.Close(); err == nil || !strings.Contains(err.Error(), "local ownership handles released") {
+		t.Fatalf("Close() error = %v, want unconfirmed reap with released handles", err)
+	}
+	if custody.initFD != -1 || custody.supervisorFD != -1 {
+		t.Fatalf("Close() retained raw handles: init=%d supervisor=%d", custody.initFD, custody.supervisorFD)
 	}
 
 	if err := custody.finalizeAfterParentReleaseWithOps(

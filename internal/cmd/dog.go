@@ -407,13 +407,20 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 
 	var removeErrors []string
 	removed := 0
-	controller := dogSessionControllerFromEnvironment()
 
 	for _, name := range names {
 		d, err := mgr.Get(name)
 		if err != nil {
 			style.PrintWarning("dog %s not found, skipping", name)
 			continue
+		}
+		controller := dogSessionControllerFromEnvironment()
+		if d.SessionGeneration != nil {
+			controller, err = dogSessionControllerFromSnapshot(d)
+			if err != nil {
+				removeErrors = append(removeErrors, fmt.Sprintf("%s: selecting exact dog runtime transport: %v", name, err))
+				continue
+			}
 		}
 
 		removedExact, err := removeDogExact(mgr, controller, d, dogForce)
@@ -671,7 +678,14 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 
 	// Clear only after exact absence or generation-bound teardown. --force
 	// bypasses the liveness refusal above; it never bypasses identity custody.
-	if err := completeDogCloseout(mgr, dogSessionControllerFromEnvironment(), d); err != nil {
+	controller := dogSessionControllerFromEnvironment()
+	if d.SessionGeneration != nil {
+		controller, err = dogSessionControllerFromSnapshot(d)
+		if err != nil {
+			return fmt.Errorf("selecting exact dog runtime transport: %w", err)
+		}
+	}
+	if err := completeDogCloseout(mgr, controller, d); err != nil {
 		return fmt.Errorf("clearing dog %s: %w", name, err)
 	}
 
@@ -742,6 +756,12 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// Close accumulated plugin mails only after durable work and exact runtime
 	// teardown agree. Incomplete closeout leaves all recovery evidence intact.
 	controller := dogSessionControllerFromEnvironment()
+	if d.SessionGeneration != nil {
+		controller, err = dogSessionControllerFromSnapshot(d)
+		if err != nil {
+			return fmt.Errorf("selecting exact dog runtime transport: %w", err)
+		}
+	}
 	if !isFinalizer && d.SessionGeneration != nil {
 		if os.Getenv("GT_ROLE") == "dog" && os.Getenv("GT_DOG_NAME") == d.Name {
 			handled, brokerErr := requestDogCloseoutBroker(d)
@@ -834,10 +854,21 @@ func dogCloseoutSnapshotFromEncoded(encoded string) (*dog.Dog, error) {
 }
 
 func dogSessionControllerFromEnvironment() *tmux.Tmux {
-	if socket := strings.TrimSpace(os.Getenv("GT_TOWN_SOCKET")); socket != "" {
-		return tmux.NewTmuxWithSocket(socket)
-	}
+	// NewTmux prefers the registry-initialized town transport and consults the
+	// environment only when no town has been initialized. Exact generations use
+	// dogSessionControllerFromSnapshot instead and never depend on ambient state.
 	return tmux.NewTmux()
+}
+
+func dogSessionControllerFromSnapshot(snapshot *dog.Dog) (*tmux.Tmux, error) {
+	if snapshot == nil || snapshot.SessionGeneration == nil {
+		return nil, fmt.Errorf("%w: durable tmux generation is unavailable", errDogCloseoutIncomplete)
+	}
+	controller, err := tmux.NewTmuxForSessionGeneration(snapshot.SessionGeneration.Tmux())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errDogCloseoutIncomplete, err)
+	}
+	return controller, nil
 }
 
 func dogCloseoutHostSessionAuthorized(encoded string) bool {
@@ -852,7 +883,11 @@ func dogCloseoutHostSessionAuthorized(encoded string) bool {
 	if !strings.HasPrefix(sessionName, "hq-dog-finalizer-"+snapshot.Name+"-") {
 		return false
 	}
-	current, err := dogSessionControllerFromEnvironment().ResolveCurrentSession()
+	controller, err := dogSessionControllerFromSnapshot(snapshot)
+	if err != nil {
+		return false
+	}
+	current, err := controller.ResolveCurrentSession()
 	return err == nil && current == sessionName
 }
 
@@ -1011,14 +1046,7 @@ func completeDogCloseoutWithFinalize(
 			if snapshot.State == dog.StateIdle && snapshot.Work == "" {
 				return nil
 			}
-			cleared, err := mgr.ClearWorkWithFinalizeIfMatches(snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, finalize)
-			if err != nil {
-				return fmt.Errorf("clearing work after proven session absence: %w", err)
-			}
-			if !cleared {
-				return fmt.Errorf("%w: work assignment changed during absent-session cleanup", errDogCloseoutIncomplete)
-			}
-			return nil
+			return fmt.Errorf("%w: legacy assignment has no transport-bound runtime generation", errDogCloseoutIncomplete)
 		case captureErr != nil:
 			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
 		default:
@@ -1027,6 +1055,9 @@ func completeDogCloseoutWithFinalize(
 	}
 
 	expected := snapshot.SessionGeneration.Tmux()
+	if !expected.Transport.Bound {
+		return fmt.Errorf("%w: %w", errDogCloseoutIncomplete, tmux.ErrSessionTransportUnbound)
+	}
 	if captureErr != nil {
 		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)

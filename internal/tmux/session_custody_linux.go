@@ -1594,19 +1594,21 @@ func (custody *linuxSessionCustody) Close() error {
 	if custody == nil {
 		return nil
 	}
-	if custody.committed && !custody.finalized {
-		return errors.New("session custody final reap is unconfirmed; retaining ownership handles")
-	}
 	var errs []error
+	if custody.committed && !custody.finalized {
+		errs = append(errs, errors.New("session custody final reap is unconfirmed; local ownership handles released"))
+	}
 	if custody.initFD >= 0 {
-		errs = append(errs, unix.Close(custody.initFD))
+		fd := custody.initFD
 		custody.initFD = -1
+		errs = append(errs, unix.Close(fd))
 	}
 	if custody.supervisorFD >= 0 {
-		errs = append(errs, unix.Close(custody.supervisorFD))
+		fd := custody.supervisorFD
 		custody.supervisorFD = -1
+		errs = append(errs, unix.Close(fd))
 	}
-	if custody.cgroup != "" {
+	if custody.finalized && custody.cgroup != "" {
 		errs = append(errs, clearLinuxSessionCgroupReceipt(&custody.cgroup, removeLinuxSessionCgroup))
 	}
 	return errors.Join(errs...)

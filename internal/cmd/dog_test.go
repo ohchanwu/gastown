@@ -475,14 +475,16 @@ func TestRemoveDogExactPreservesGenerationOnUnreconciledProcessCleanup(t *testin
 func TestDogCloseoutPluginMailFailurePreservesAssignment(t *testing.T) {
 	mgr, townRoot := testDogManager(t)
 	started := time.Now().UTC().Round(0)
+	generation := cmdTestDogGeneration("$plugin-mail", "nonce-plugin-mail")
 	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
-		Name:          "alpha",
-		State:         dog.StateWorking,
-		Work:          "plugin:reaper",
-		WorkStartedAt: started,
-		LastActive:    started,
-		CreatedAt:     started,
-		UpdatedAt:     started,
+		Name:              "alpha",
+		State:             dog.StateWorking,
+		Work:              "plugin:reaper",
+		WorkStartedAt:     started,
+		LastActive:        started,
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
 	})
 	snapshot, err := mgr.Get("alpha")
 	if err != nil {
@@ -1012,6 +1014,49 @@ func TestRequestDogCloseoutBrokerDoesNotFallBackAfterHandledFailure(t *testing.T
 	}
 }
 
+func TestDogSessionControllerFromSnapshotUsesPersistedTransport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	targetSocket := fmt.Sprintf("gt-dog-bound-target-%d", time.Now().UnixNano())
+	wrongSocket := fmt.Sprintf("gt-dog-bound-wrong-%d", time.Now().UnixNano())
+	targetController := tmux.NewTmuxWithSocket(targetSocket)
+	t.Cleanup(func() { _ = targetController.KillServer() })
+
+	target, err := targetController.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha",
+		t.TempDir(),
+		"sleep 30",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_TOWN_SOCKET", wrongSocket)
+	snapshot := &dog.Dog{Name: "alpha", SessionGeneration: dog.SessionGenerationFromTmux(target)}
+
+	controller, err := dogSessionControllerFromSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := controller.CaptureSessionGeneration(target.Name)
+	if err != nil {
+		t.Fatalf("persisted transport did not reach target server: %v", err)
+	}
+	if !current.Equal(target) {
+		t.Fatalf("persisted transport captured %+v, want %+v", current, target)
+	}
+}
+
+func TestDogSessionControllerFromSnapshotRejectsUnboundTransport(t *testing.T) {
+	generation := cmdTestDogGeneration("$legacy", "nonce-legacy")
+	generation.Transport = tmux.SessionTransport{}
+	snapshot := &dog.Dog{Name: "alpha", SessionGeneration: dog.SessionGenerationFromTmux(generation)}
+	if _, err := dogSessionControllerFromSnapshot(snapshot); !errors.Is(err, tmux.ErrSessionTransportUnbound) {
+		t.Fatalf("dogSessionControllerFromSnapshot() error = %v, want unbound transport", err)
+	}
+}
+
 func TestWaitForDogCloseoutHostHandoffRejectsEarlyFinalizerExit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("transient host-session proof uses POSIX commands")
@@ -1055,6 +1100,7 @@ func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {
 		Custody:        "custody-alpha",
 		ServerPID:      4242,
 		ServerIdentity: "server-start-alpha",
+		Transport:      tmux.SessionTransport{Bound: true, SocketName: "fixture-socket"},
 	}
 }
 
