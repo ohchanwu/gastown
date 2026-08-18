@@ -322,11 +322,10 @@ control cgroup, outlives the target session, and may use strong descendant
 cleanup without becoming a second child in the owned session cgroup. Broker
 policy binds the request to the owned dog name and finalizer argument shape. A
 handled broker failure does not fall back to a weaker host path. On platforms
-without the Linux broker, an exact transient tmux session or detached process
-group performs the host-side finalization while retaining the same generation
-checks. The native Windows path authorizes that detached process with the exact
-encoded snapshot, dog role and name, and dog-specific finalizer-session marker;
-it does not require the process to remain inside a tmux host session.
+without the Linux broker, an exact transient tmux session performs the host-side
+finalization while retaining the same generation checks. This gives Unix and
+Windows the same dog-specific host-session receipt and prevents either platform
+from reporting a handoff before the authenticated finalizer generation exists.
 
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
 mount, user, network, and IPC namespaces. Host mounts are read-only; the only

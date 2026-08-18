@@ -788,8 +788,6 @@ const dogCloseoutFinalizerEnv = "GT_DOG_CLOSEOUT_FINALIZER"
 
 const dogCloseoutHostSessionEnv = "GT_INTERNAL_DOG_CLOSEOUT_SESSION"
 
-const dogCloseoutDetachedHostEnv = "GT_INTERNAL_DOG_CLOSEOUT_DETACHED"
-
 const dogCloseoutTeardownTimeout = 15 * time.Second
 
 const dogCloseoutHostHandoffTimeout = 2 * time.Minute
@@ -856,19 +854,6 @@ func dogCloseoutHostSessionAuthorized(encoded string) bool {
 	}
 	current, err := dogSessionControllerFromEnvironment().ResolveCurrentSession()
 	return err == nil && current == sessionName
-}
-
-func dogCloseoutDetachedHostAuthorized(encoded string) bool {
-	if encoded == "" || os.Getenv(dogCloseoutFinalizerEnv) != encoded ||
-		os.Getenv(dogCloseoutDetachedHostEnv) != encoded || os.Getenv("GT_ROLE") != "dog" {
-		return false
-	}
-	snapshot, err := dogCloseoutSnapshotFromEncoded(encoded)
-	if err != nil || os.Getenv("GT_DOG_NAME") != snapshot.Name {
-		return false
-	}
-	sessionName := strings.TrimSpace(os.Getenv(dogCloseoutHostSessionEnv))
-	return strings.HasPrefix(sessionName, "hq-dog-finalizer-"+snapshot.Name+"-")
 }
 
 var runDogCloseoutBroker = tmux.RunSessionBrokerClient
@@ -984,6 +969,16 @@ func waitForDogCloseoutHostHandoff(
 		case errors.Is(hostErr, tmux.ErrSessionNotFound), errors.Is(hostErr, tmux.ErrNoServer):
 			return errors.New("dog closeout host finalizer exited before exact target teardown")
 		case hostErr != nil:
+			hostExists, existsErr := controller.HasSession(hostGeneration.Name)
+			if existsErr != nil {
+				return errors.Join(
+					fmt.Errorf("checking dog closeout host finalizer: %w", hostErr),
+					fmt.Errorf("confirming dog closeout host finalizer presence: %w", existsErr),
+				)
+			}
+			if !hostExists {
+				return errors.New("dog closeout host finalizer exited before exact target teardown")
+			}
 			return fmt.Errorf("checking dog closeout host finalizer: %w", hostErr)
 		case !currentHost.Equal(hostGeneration):
 			return errors.New("dog closeout host finalizer generation changed")

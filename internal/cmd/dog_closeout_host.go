@@ -1,5 +1,3 @@
-//go:build !windows
-
 package cmd
 
 import (
@@ -9,6 +7,10 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
+// scheduleDogCloseoutHostFallback creates a second exact tmux generation so the
+// finalizer survives destruction of the owned dog pane, including when the dog
+// was the server's last session. Keeping the fallback in tmux also gives every
+// supported platform the same authenticated host-generation receipt.
 func scheduleDogCloseoutHostFallback(
 	controller *tmux.Tmux,
 	sessionName string,
