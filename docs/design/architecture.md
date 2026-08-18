@@ -302,15 +302,29 @@ against the replacement state. `gt polecat nuke` is strictly local: it verifies
 the named branch but neither its direct command path nor its manager removal
 path publishes a ref.
 
-Dogs persist an optional exact tmux session-generation record alongside work
-state. Starting a dog captures the created session generation and records it
-before claiming successful runtime custody. Completion compare-and-sets the
-expected work, start time, and generation, tears down only that exact session,
-and compare-clears the record. A live legacy session without a record, a tmux
-lookup error, or generation substitution fails closed. Dog status exposes work
-state independently from `running`, `absent`, `stale`, or `unknown` runtime
-state, and nested `gt dog done` is routed separately from the top-level polecat
-`gt done` publication workflow.
+Dogs persist an optional exact tmux session-generation and pane receipt alongside
+work state. Starting a dog captures both in the session creation transaction and
+records them before claiming successful runtime custody. Completion and removal
+hold the stable per-name lifecycle lock, compare the full durable snapshot,
+perform process-aware teardown of only that exact pane and session, finalize the
+exact assignment mail, and only then publish idle or remove the kennel. A live
+legacy session without a record, an ambiguous pane-less generation, a tmux
+lookup error, or generation substitution fails closed. `--force` bypasses only
+the refusal to remove working state; it never bypasses generation custody. Dog
+status exposes work state independently from `running`, `absent`, `stale`, or
+`unknown` runtime state, and nested `gt dog done` is routed separately from the
+top-level polecat `gt done` publication workflow.
+
+A dog inside Linux containment cannot finalize destruction of its own supervisor
+generation. It therefore hands one exact encoded closeout snapshot to the
+session command broker. The detached broker worker is placed in the prior
+control cgroup, outlives the target session, and may use strong descendant
+cleanup without becoming a second child in the owned session cgroup. Broker
+policy binds the request to the owned dog name and finalizer argument shape. A
+handled broker failure does not fall back to a weaker host path. On platforms
+without the Linux broker, an exact transient tmux session or detached process
+group performs the host-side finalization while retaining the same generation
+checks.
 
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
 mount, user, network, and IPC namespaces. Host mounts are read-only; the only
