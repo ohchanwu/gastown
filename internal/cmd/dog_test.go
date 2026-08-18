@@ -996,6 +996,36 @@ func TestDogCloseoutSnapshotFromEnvironmentRequiresHostBoundary(t *testing.T) {
 	}
 }
 
+func TestDogCloseoutDetachedHostAuthorizationBindsExactDogSnapshot(t *testing.T) {
+	generation := cmdTestDogGeneration("$windows-finalizer", "nonce-windows-finalizer")
+	snapshot := &dog.Dog{
+		Name:              "alpha",
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	}
+	encoded, _, err := dogCloseoutFinalizerRequest(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dogCloseoutFinalizerEnv, encoded)
+	t.Setenv(dogCloseoutDetachedHostEnv, encoded)
+	t.Setenv(dogCloseoutHostSessionEnv, "hq-dog-finalizer-alpha-capability")
+	t.Setenv("GT_ROLE", "dog")
+	t.Setenv("GT_DOG_NAME", "alpha")
+	if !dogCloseoutDetachedHostAuthorized(encoded) {
+		t.Fatal("exact detached host capability was rejected")
+	}
+
+	t.Setenv("GT_DOG_NAME", "bravo")
+	if dogCloseoutDetachedHostAuthorized(encoded) {
+		t.Fatal("detached host capability authorized a different dog identity")
+	}
+	t.Setenv("GT_DOG_NAME", "alpha")
+	t.Setenv(dogCloseoutDetachedHostEnv, "forged")
+	if dogCloseoutDetachedHostAuthorized(encoded) {
+		t.Fatal("detached host capability accepted a mismatched snapshot marker")
+	}
+}
+
 func TestRequestDogCloseoutBrokerDoesNotFallBackAfterHandledFailure(t *testing.T) {
 	generation := cmdTestDogGeneration("$broker-failure", "nonce-broker-failure")
 	snapshot := &dog.Dog{Name: "alpha", SessionGeneration: dog.SessionGenerationFromTmux(generation)}

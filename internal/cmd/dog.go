@@ -788,6 +788,8 @@ const dogCloseoutFinalizerEnv = "GT_DOG_CLOSEOUT_FINALIZER"
 
 const dogCloseoutHostSessionEnv = "GT_INTERNAL_DOG_CLOSEOUT_SESSION"
 
+const dogCloseoutDetachedHostEnv = "GT_INTERNAL_DOG_CLOSEOUT_DETACHED"
+
 const dogCloseoutTeardownTimeout = 15 * time.Second
 
 const dogCloseoutHostHandoffTimeout = 2 * time.Minute
@@ -844,12 +846,29 @@ func dogCloseoutHostSessionAuthorized(encoded string) bool {
 	if encoded == "" || os.Getenv(dogCloseoutFinalizerEnv) != encoded {
 		return false
 	}
+	snapshot, err := dogCloseoutSnapshotFromEncoded(encoded)
+	if err != nil {
+		return false
+	}
 	sessionName := strings.TrimSpace(os.Getenv(dogCloseoutHostSessionEnv))
-	if !strings.HasPrefix(sessionName, "hq-dog-finalizer-") {
+	if !strings.HasPrefix(sessionName, "hq-dog-finalizer-"+snapshot.Name+"-") {
 		return false
 	}
 	current, err := dogSessionControllerFromEnvironment().ResolveCurrentSession()
 	return err == nil && current == sessionName
+}
+
+func dogCloseoutDetachedHostAuthorized(encoded string) bool {
+	if encoded == "" || os.Getenv(dogCloseoutFinalizerEnv) != encoded ||
+		os.Getenv(dogCloseoutDetachedHostEnv) != encoded || os.Getenv("GT_ROLE") != "dog" {
+		return false
+	}
+	snapshot, err := dogCloseoutSnapshotFromEncoded(encoded)
+	if err != nil || os.Getenv("GT_DOG_NAME") != snapshot.Name {
+		return false
+	}
+	sessionName := strings.TrimSpace(os.Getenv(dogCloseoutHostSessionEnv))
+	return strings.HasPrefix(sessionName, "hq-dog-finalizer-"+snapshot.Name+"-")
 }
 
 var runDogCloseoutBroker = tmux.RunSessionBrokerClient

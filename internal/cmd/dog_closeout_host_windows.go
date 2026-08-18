@@ -19,6 +19,7 @@ func scheduleDogCloseoutHostFallback(
 	args []string,
 	environment map[string]string,
 ) (tmux.SessionGeneration, bool, error) {
+	environment[dogCloseoutDetachedHostEnv] = environment[dogCloseoutFinalizerEnv]
 	command := exec.Command(executable, args...)
 	command.Dir = townRoot
 	command.Env = mergeDogCloseoutEnvironment(os.Environ(), environment)
