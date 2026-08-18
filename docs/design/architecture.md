@@ -327,6 +327,15 @@ finalization while retaining the same generation checks. This gives Unix and
 Windows the same dog-specific host-session receipt and prevents either platform
 from reporting a handoff before the authenticated finalizer generation exists.
 
+Dog and polecat process cleanup currently assumes cooperative session ownership:
+session work may not deliberately double-fork and call `setsid` to escape both
+the captured ancestry and process group. Long-lived services must instead be
+registered with an external service owner and must not be represented as an
+agent-session descendant. Enforcing ownership after an intentional escape would
+require launch-time kernel containment for every role (for example Linux
+cgroups, Windows job objects, and a container or equivalent boundary on macOS),
+which is outside the current trusted-host lifecycle contract.
+
 On Linux, the Witness runs behind a trusted session supervisor in private PID,
 mount, user, network, and IPC namespaces. Host mounts are read-only; the only
 writable areas are private, size- and inode-bounded scratch and shared-memory
