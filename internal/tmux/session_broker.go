@@ -26,6 +26,10 @@ type sessionBrokerRequest struct {
 // before the broker starts a process outside the containment namespace.
 type SessionBrokerValidator func(args []string) error
 
+// SessionBrokerDetachPolicy marks an already-validated request whose worker
+// must outlive shutdown of the contained session that requested it.
+type SessionBrokerDetachPolicy func(args []string) bool
+
 func encodeSessionBrokerRequest(request sessionBrokerRequest) ([]byte, error) {
 	if err := validateSessionBrokerRequest(request); err != nil {
 		return nil, err

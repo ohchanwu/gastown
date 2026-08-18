@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -25,11 +27,12 @@ import (
 
 // Dog command flags
 var (
-	dogListJSON   bool
-	dogStatusJSON bool
-	dogForce      bool
-	dogRemoveAll  bool
-	dogCallAll    bool
+	dogListJSON      bool
+	dogStatusJSON    bool
+	dogForce         bool
+	dogRemoveAll     bool
+	dogCallAll       bool
+	dogDoneFinalizer string
 
 	// Dispatch flags
 	dogDispatchPlugin string
@@ -158,6 +161,11 @@ Examples:
   gt dog done alpha   # Explicit name`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runDogDone,
+	Annotations: map[string]string{
+		BrokerSafeAnnotation:      "true",
+		brokerSafeArgsAnnotation:  brokerSafeArgsExactOne,
+		brokerSafeFlagsAnnotation: "finalizer",
+	},
 }
 
 var dogClearCmd = &cobra.Command{
@@ -273,6 +281,9 @@ func init() {
 	// Status flags
 	dogStatusCmd.Flags().BoolVar(&dogStatusJSON, "json", false, "Output as JSON")
 
+	dogDoneCmd.Flags().StringVar(&dogDoneFinalizer, "finalizer", "", "exact external closeout snapshot")
+	_ = dogDoneCmd.Flags().MarkHidden("finalizer")
+
 	// Dispatch flags
 	dogDispatchCmd.Flags().StringVar(&dogDispatchPlugin, "plugin", "", "Plugin name to dispatch (required)")
 	dogDispatchCmd.Flags().StringVar(&dogDispatchRig, "rig", "", "Limit plugin search to specific rig")
@@ -335,7 +346,6 @@ func runDogAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
 	d, err := mgr.Add(name)
 	if err != nil {
 		return fmt.Errorf("adding dog %s: %w", name, err)
@@ -371,7 +381,6 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
 	var names []string
 	if dogRemoveAll {
 		dogs, err := mgr.List()
@@ -398,6 +407,7 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 
 	var removeErrors []string
 	removed := 0
+	controller := dogSessionControllerFromEnvironment()
 
 	for _, name := range names {
 		d, err := mgr.Get(name)
@@ -406,14 +416,13 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Check if working
-		if d.State == dog.StateWorking && !dogForce {
-			removeErrors = append(removeErrors, fmt.Sprintf("%s: is working (use --force to remove anyway)", name))
+		removedExact, err := removeDogExact(mgr, controller, d, dogForce)
+		if err != nil {
+			removeErrors = append(removeErrors, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
-
-		if err := mgr.Remove(name); err != nil {
-			removeErrors = append(removeErrors, fmt.Sprintf("%s: %v", name, err))
+		if !removedExact {
+			removeErrors = append(removeErrors, fmt.Sprintf("%s: lifecycle changed during removal; retry with a fresh snapshot", name))
 			continue
 		}
 
@@ -445,6 +454,36 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func removeDogExact(mgr *dog.Manager, sessions dogSessionController, snapshot *dog.Dog, force bool) (bool, error) {
+	if mgr == nil || sessions == nil || snapshot == nil {
+		return false, errors.New("dog removal lifecycle evidence is unavailable")
+	}
+	return mgr.RemoveWithTeardownIfMatches(snapshot, force, func(stored *dog.SessionGeneration) error {
+		sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
+		if stored == nil {
+			_, err := sessions.CaptureSessionGeneration(sessionName)
+			switch {
+			case errors.Is(err, tmux.ErrSessionNotFound), errors.Is(err, tmux.ErrNoServer):
+				return nil
+			case err != nil:
+				return fmt.Errorf("proving legacy dog session absence: %w", err)
+			default:
+				return errors.New("live legacy dog session has no persisted generation; preserve it for recovery")
+			}
+		}
+
+		expected := stored.Tmux()
+		current, err := sessions.CaptureSessionGeneration(sessionName)
+		if err == nil && !current.Equal(expected) {
+			return tmux.ErrSessionGenerationChanged
+		}
+		if err != nil && !errors.Is(err, tmux.ErrSessionNotFound) && !errors.Is(err, tmux.ErrNoServer) {
+			return fmt.Errorf("capturing exact dog session before removal: %w", err)
+		}
+		return teardownDogSessionGeneration(sessions, expected)
+	})
 }
 
 func runDogList(cmd *cobra.Command, args []string) error {
@@ -649,7 +688,16 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	finalizerSnapshot, isFinalizer, err := dogCloseoutSnapshotFromEnvironment()
+	var finalizerSnapshot *dog.Dog
+	isFinalizer := strings.TrimSpace(dogDoneFinalizer) != ""
+	if isFinalizer {
+		if !dogCloseoutFinalizerAuthorized(dogDoneFinalizer) {
+			return errors.New("dog closeout finalizer did not arrive through the trusted host boundary")
+		}
+		finalizerSnapshot, err = dogCloseoutSnapshotFromEncoded(dogDoneFinalizer)
+	} else {
+		finalizerSnapshot, isFinalizer, err = dogCloseoutSnapshotFromEnvironment()
+	}
 	if err != nil {
 		return err
 	}
@@ -695,9 +743,19 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// teardown agree. Incomplete closeout leaves all recovery evidence intact.
 	controller := dogSessionControllerFromEnvironment()
 	if !isFinalizer && d.SessionGeneration != nil {
+		if os.Getenv("GT_ROLE") == "dog" && os.Getenv("GT_DOG_NAME") == d.Name {
+			handled, brokerErr := requestDogCloseoutBroker(d)
+			if handled {
+				if brokerErr != nil {
+					return fmt.Errorf("scheduling brokered closeout for dog %s: %w", name, brokerErr)
+				}
+				fmt.Printf("✓ Dog %s closeout handed to the host broker\n", name)
+				return nil
+			}
+		}
 		currentSession, resolveErr := controller.ResolveCurrentSession()
 		if resolveErr == nil && currentSession == fmt.Sprintf("hq-dog-%s", d.Name) {
-			if err := scheduleDogCloseoutFinalizer(d); err != nil {
+			if err := scheduleDogCloseoutFinalizer(controller, d); err != nil {
 				return fmt.Errorf("scheduling external closeout for dog %s: %w", name, err)
 			}
 			fmt.Printf("✓ Dog %s closeout handed to the tmux server\n", name)
@@ -720,12 +778,19 @@ type dogCloseoutManager interface {
 
 type dogSessionController interface {
 	CaptureSessionGeneration(name string) (tmux.SessionGeneration, error)
-	KillSessionGeneration(generation tmux.SessionGeneration) error
+	KillSessionGenerationWithProcessesContext(context.Context, tmux.SessionGeneration) error
+	KillSessionGenerationWithProcessesPortableContext(context.Context, tmux.SessionGeneration) error
 }
 
 var errDogCloseoutIncomplete = errors.New("dog closeout incomplete")
 
 const dogCloseoutFinalizerEnv = "GT_DOG_CLOSEOUT_FINALIZER"
+
+const dogCloseoutHostSessionEnv = "GT_INTERNAL_DOG_CLOSEOUT_SESSION"
+
+const dogCloseoutTeardownTimeout = 15 * time.Second
+
+const dogCloseoutHostHandoffTimeout = 2 * time.Minute
 
 type durableDogCloseoutSnapshot struct {
 	Name              string                 `json:"name"`
@@ -740,16 +805,24 @@ func dogCloseoutSnapshotFromEnvironment() (*dog.Dog, bool, error) {
 	if encoded == "" {
 		return nil, false, nil
 	}
+	if !dogCloseoutFinalizerAuthorized(encoded) {
+		return nil, true, errors.New("dog closeout finalizer did not arrive through the trusted host boundary")
+	}
+	snapshot, err := dogCloseoutSnapshotFromEncoded(encoded)
+	return snapshot, true, err
+}
+
+func dogCloseoutSnapshotFromEncoded(encoded string) (*dog.Dog, error) {
 	data, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, false, fmt.Errorf("decoding dog closeout snapshot: %w", err)
+		return nil, fmt.Errorf("decoding dog closeout snapshot: %w", err)
 	}
 	var snapshot durableDogCloseoutSnapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return nil, false, fmt.Errorf("reading dog closeout snapshot: %w", err)
+		return nil, fmt.Errorf("reading dog closeout snapshot: %w", err)
 	}
 	if snapshot.Name == "" || snapshot.SessionGeneration == nil {
-		return nil, false, errors.New("dog closeout snapshot is incomplete")
+		return nil, errors.New("dog closeout snapshot is incomplete")
 	}
 	return &dog.Dog{
 		Name:              snapshot.Name,
@@ -757,7 +830,7 @@ func dogCloseoutSnapshotFromEnvironment() (*dog.Dog, bool, error) {
 		Work:              snapshot.Work,
 		WorkStartedAt:     snapshot.WorkStartedAt,
 		SessionGeneration: snapshot.SessionGeneration,
-	}, true, nil
+	}, nil
 }
 
 func dogSessionControllerFromEnvironment() *tmux.Tmux {
@@ -767,9 +840,23 @@ func dogSessionControllerFromEnvironment() *tmux.Tmux {
 	return tmux.NewTmux()
 }
 
-func scheduleDogCloseoutFinalizer(snapshot *dog.Dog) error {
+func dogCloseoutHostSessionAuthorized(encoded string) bool {
+	if encoded == "" || os.Getenv(dogCloseoutFinalizerEnv) != encoded {
+		return false
+	}
+	sessionName := strings.TrimSpace(os.Getenv(dogCloseoutHostSessionEnv))
+	if !strings.HasPrefix(sessionName, "hq-dog-finalizer-") {
+		return false
+	}
+	current, err := dogSessionControllerFromEnvironment().ResolveCurrentSession()
+	return err == nil && current == sessionName
+}
+
+var runDogCloseoutBroker = tmux.RunSessionBrokerClient
+
+func dogCloseoutFinalizerRequest(snapshot *dog.Dog) (string, []string, error) {
 	if snapshot == nil || snapshot.SessionGeneration == nil {
-		return errors.New("dog closeout scheduling evidence unavailable")
+		return "", nil, errors.New("dog closeout scheduling evidence unavailable")
 	}
 	payload, err := json.Marshal(durableDogCloseoutSnapshot{
 		Name:              snapshot.Name,
@@ -779,7 +866,40 @@ func scheduleDogCloseoutFinalizer(snapshot *dog.Dog) error {
 		SessionGeneration: snapshot.SessionGeneration,
 	})
 	if err != nil {
-		return fmt.Errorf("encoding dog closeout snapshot: %w", err)
+		return "", nil, fmt.Errorf("encoding dog closeout snapshot: %w", err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	return encoded, []string{"dog", "done", snapshot.Name, "--finalizer", encoded}, nil
+}
+
+func requestDogCloseoutBroker(snapshot *dog.Dog) (bool, error) {
+	_, finalizerArgs, err := dogCloseoutFinalizerRequest(snapshot)
+	if err != nil {
+		return true, err
+	}
+	handled, exitCode, brokerErr := runDogCloseoutBroker(finalizerArgs)
+	if !handled {
+		return false, nil
+	}
+	if brokerErr != nil {
+		return true, fmt.Errorf("requesting host-brokered dog closeout: %w", brokerErr)
+	}
+	if exitCode != 0 {
+		return true, fmt.Errorf("host-brokered dog closeout exited with status %d", exitCode)
+	}
+	return true, nil
+}
+
+func scheduleDogCloseoutFinalizer(controller *tmux.Tmux, snapshot *dog.Dog) error {
+	if controller == nil {
+		return errors.New("dog closeout scheduling evidence unavailable")
+	}
+	encoded, finalizerArgs, err := dogCloseoutFinalizerRequest(snapshot)
+	if err != nil {
+		return err
+	}
+	if handled, brokerErr := requestDogCloseoutBroker(snapshot); handled {
+		return brokerErr
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -789,53 +909,70 @@ func scheduleDogCloseoutFinalizer(snapshot *dog.Dog) error {
 	if err != nil {
 		return fmt.Errorf("resolving town root for dog closeout: %w", err)
 	}
-
 	environment := map[string]string{
-		dogCloseoutFinalizerEnv:      base64.RawURLEncoding.EncodeToString(payload),
+		dogCloseoutFinalizerEnv:      encoded,
 		"GT_TOWN_ROOT":               townRoot,
 		"GT_ROOT":                    townRoot,
 		"GT_ROLE":                    "dog",
+		"GT_DOG_NAME":                snapshot.Name,
 		"BD_ACTOR":                   "dog",
 		"GT_TOWN_SOCKET":             os.Getenv("GT_TOWN_SOCKET"),
 		"GT_TEST_CMD_EXECUTE_HELPER": os.Getenv("GT_TEST_CMD_EXECUTE_HELPER"),
 	}
-	orderedKeys := []string{
-		dogCloseoutFinalizerEnv,
-		"GT_TOWN_ROOT",
-		"GT_ROOT",
-		"GT_ROLE",
-		"BD_ACTOR",
-		"GT_TOWN_SOCKET",
-		"GT_TEST_CMD_EXECUTE_HELPER",
+	finalizerSession := "hq-dog-finalizer-" + snapshot.Name + "-" + uuid.NewString()
+	environment[dogCloseoutHostSessionEnv] = finalizerSession
+	hostGeneration, waitForHandoff, err := scheduleDogCloseoutHostFallback(
+		controller,
+		finalizerSession,
+		executable,
+		townRoot,
+		finalizerArgs,
+		environment,
+	)
+	if err != nil || !waitForHandoff {
+		return err
 	}
-	blocked := make(map[string]struct{}, len(orderedKeys))
-	for _, key := range orderedKeys {
-		blocked[key] = struct{}{}
-	}
-	childEnv := make([]string, 0, len(os.Environ())+len(orderedKeys))
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if _, replaced := blocked[key]; !replaced {
-			childEnv = append(childEnv, entry)
-		}
-	}
-	for _, key := range orderedKeys {
-		if environment[key] != "" {
-			childEnv = append(childEnv, key+"="+environment[key])
-		}
-	}
+	return waitForDogCloseoutHostHandoff(controller, snapshot, hostGeneration)
+}
 
-	command := exec.Command(executable, "dog", "done", snapshot.Name)
-	command.Dir = townRoot
-	command.Env = childEnv
-	command.Stdin = nil
-	command.Stdout = nil
-	command.Stderr = nil
-	configureDogCloseoutProcess(command)
-	if err := command.Start(); err != nil {
-		return fmt.Errorf("starting detached dog closeout: %w", err)
+func waitForDogCloseoutHostHandoff(
+	controller *tmux.Tmux,
+	snapshot *dog.Dog,
+	hostGeneration tmux.SessionGeneration,
+) error {
+	if controller == nil || snapshot == nil || snapshot.SessionGeneration == nil || hostGeneration.Name == "" {
+		return errors.New("dog closeout host handoff evidence unavailable")
 	}
-	return command.Process.Release()
+	target := snapshot.SessionGeneration.Tmux()
+	deadline := time.Now().Add(dogCloseoutHostHandoffTimeout)
+	for time.Now().Before(deadline) {
+		currentTarget, targetErr := controller.CaptureSessionGeneration(target.Name)
+		switch {
+		case errors.Is(targetErr, tmux.ErrSessionNotFound), errors.Is(targetErr, tmux.ErrNoServer):
+			return nil
+		case targetErr != nil:
+			return fmt.Errorf("checking target during dog closeout host handoff: %w", targetErr)
+		case !currentTarget.Equal(target):
+			cleanupErr := teardownDogSessionGeneration(controller, hostGeneration)
+			return errors.Join(
+				tmux.ErrSessionGenerationChanged,
+				cleanupErr,
+			)
+		}
+
+		currentHost, hostErr := controller.CaptureSessionGeneration(hostGeneration.Name)
+		switch {
+		case errors.Is(hostErr, tmux.ErrSessionNotFound), errors.Is(hostErr, tmux.ErrNoServer):
+			return errors.New("dog closeout host finalizer exited before exact target teardown")
+		case hostErr != nil:
+			return fmt.Errorf("checking dog closeout host finalizer: %w", hostErr)
+		case !currentHost.Equal(hostGeneration):
+			return errors.New("dog closeout host finalizer generation changed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cleanupErr := teardownDogSessionGeneration(controller, hostGeneration)
+	return errors.Join(context.DeadlineExceeded, cleanupErr)
 }
 
 func completeDogCloseout(mgr dogCloseoutManager, sessions dogSessionController, snapshot *dog.Dog) error {
@@ -880,7 +1017,9 @@ func completeDogCloseoutWithFinalize(
 		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
 		}
-		completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(tmux.SessionGeneration) error { return nil }, finalize)
+		completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(generation tmux.SessionGeneration) error {
+			return teardownDogSessionGeneration(sessions, generation)
+		}, finalize)
 		if err != nil {
 			return fmt.Errorf("completing work after proven session absence: %w", err)
 		}
@@ -894,11 +1033,7 @@ func completeDogCloseoutWithFinalize(
 	}
 
 	completed, err := completeDogCloseoutState(mgr, snapshot, expected, func(generation tmux.SessionGeneration) error {
-		err := sessions.KillSessionGeneration(generation)
-		if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
-			return nil
-		}
-		return err
+		return teardownDogSessionGeneration(sessions, generation)
 	}, finalize)
 	if err != nil {
 		return fmt.Errorf("%w: exact dog session teardown failed: %w", errDogCloseoutIncomplete, err)
@@ -907,6 +1042,15 @@ func completeDogCloseoutWithFinalize(
 		return fmt.Errorf("%w: work assignment or generation changed", errDogCloseoutIncomplete)
 	}
 	return nil
+}
+
+func teardownDogSessionGeneration(sessions dogSessionController, generation tmux.SessionGeneration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dogCloseoutTeardownTimeout)
+	defer cancel()
+	if os.Getenv(tmux.EnvSessionBrokerWorker) == "1" {
+		return sessions.KillSessionGenerationWithProcessesContext(ctx, generation)
+	}
+	return sessions.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
 }
 
 func completeDogCloseoutState(

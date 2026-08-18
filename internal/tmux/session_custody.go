@@ -106,6 +106,12 @@ func RunSessionCustodyCommand(custody, command string) error {
 // RunSessionCustodyCommandWithBroker launches the contained workload and
 // serves only commands approved by validate through the trusted outer broker.
 func RunSessionCustodyCommandWithBroker(custody, command string, validate SessionBrokerValidator) error {
+	return RunSessionCustodyCommandWithBrokerPolicy(custody, command, validate, nil)
+}
+
+// RunSessionCustodyCommandWithBrokerPolicy also accepts a narrow policy for
+// workers that must finish after the requesting session begins teardown.
+func RunSessionCustodyCommandWithBrokerPolicy(custody, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy) error {
 	if !validSessionGenerationRe.MatchString(custody) {
 		return errors.New("invalid session custody token")
 	}
@@ -118,7 +124,7 @@ func RunSessionCustodyCommandWithBroker(custody, command string, validate Sessio
 	if validate == nil {
 		return errors.New("session broker validator is unavailable")
 	}
-	return runSessionWithCustody(custody, command, validate)
+	return runSessionWithCustody(custody, command, validate, detach)
 }
 
 // RunSessionCustodyInit enters the trusted namespace-init path selected by the

@@ -185,8 +185,8 @@ func TestDetectStaleWorkingDogs_KillsSessionBeforeClearing(t *testing.T) {
 	testSetupWorkingDogState(t, townRoot, "stale", constants.MolConvoyFeed, time.Now().Add(-3*time.Hour))
 
 	sessionName := sm.SessionName("stale")
-	if err := tm.NewSession(sessionName, ""); err != nil {
-		t.Fatalf("NewSession(%q): %v", sessionName, err)
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand(%q): %v", sessionName, err)
 	}
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
 	testPersistDogSessionGeneration(t, townRoot, mgr, tm, "stale")
@@ -717,8 +717,8 @@ func TestCleanupStuckDogs_ClearsAgentDeadWorker(t *testing.T) {
 	testSetupWorkingDogState(t, townRoot, "alpha", constants.MolDogReaper, time.Now())
 
 	sessionName := sm.SessionName("alpha")
-	if err := tm.NewSession(sessionName, ""); err != nil {
-		t.Fatalf("NewSession(%q): %v", sessionName, err)
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand(%q): %v", sessionName, err)
 	}
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
 	testPersistDogSessionGeneration(t, townRoot, mgr, tm, "alpha")

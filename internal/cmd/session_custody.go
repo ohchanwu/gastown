@@ -19,9 +19,9 @@ var sessionCustodyCmd = &cobra.Command{
 	Hidden: true,
 	Args:   cobra.ExactArgs(1),
 	RunE: func(_ *cobra.Command, args []string) error {
-		return tmux.RunSessionCustodyCommandWithBroker(sessionCustodyID, args[0], func(args []string) error {
+		return tmux.RunSessionCustodyCommandWithBrokerPolicy(sessionCustodyID, args[0], func(args []string) error {
 			return IsBrokerSafeCommand(rootCmd, args)
-		})
+		}, isDetachedSessionBrokerCommand)
 	},
 }
 

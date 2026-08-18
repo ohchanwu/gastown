@@ -4,7 +4,7 @@ package tmux
 
 func sessionCustodyLaunchSupported() bool { return false }
 
-func runSessionWithCustody(string, string, SessionBrokerValidator) error {
+func runSessionWithCustody(string, string, SessionBrokerValidator, SessionBrokerDetachPolicy) error {
 	return ErrSessionCustodyUnsupported
 }
 

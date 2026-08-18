@@ -117,6 +117,7 @@ type linuxCustodyLaunch struct {
 	life           *os.File
 	broker         *os.File
 	tmux           *os.File
+	control        *os.File
 	proxyExpected  bool
 	proxies        linuxCustodyProxySet
 	cgroup         string
@@ -188,17 +189,33 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 	if err != nil {
 		return nil, fmt.Errorf("capturing supervisor cgroup receipt: %w", err)
 	}
+	controlFD, err := unix.Open(previousCgroup, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("pinning supervisor control cgroup: %w", err)
+	}
+	controlCgroup := os.NewFile(uintptr(controlFD), "session-broker-control-cgroup")
+	if controlCgroup == nil {
+		_ = unix.Close(controlFD)
+		return nil, errors.New("pinning supervisor control cgroup returned no file")
+	}
 	scratch, err := os.MkdirTemp("", linuxSessionScratchPrefix)
 	if err != nil {
+		_ = controlCgroup.Close()
 		return nil, fmt.Errorf("creating bounded session scratch mountpoint: %w", err)
 	}
 	if err := os.Chmod(scratch, 0o700); err != nil {
 		_ = os.Remove(scratch)
+		_ = controlCgroup.Close()
 		return nil, fmt.Errorf("securing bounded session scratch mountpoint: %w", err)
 	}
 	defer func() {
-		if retErr != nil && scratch != "" {
-			_ = os.Remove(scratch)
+		if retErr != nil {
+			if scratch != "" {
+				_ = os.Remove(scratch)
+			}
+			if controlCgroup != nil {
+				_ = controlCgroup.Close()
+			}
 		}
 	}()
 	readyReader, readyWriter, err := os.Pipe()
@@ -291,12 +308,14 @@ func startLinuxCustodyInitCommand(command string, namespaced bool) (_ *linuxCust
 		child: child, wait: startLinuxCustodyWait(child), pidfd: pidfd,
 		ready: readyReader, permit: permitWriter, life: lifeWriter, broker: brokerServer,
 		tmux:           tmuxExecutable,
+		control:        controlCgroup,
 		proxyExpected:  namespaced,
 		previousCgroup: previousCgroup,
 		scratch:        scratch,
 	}
 	brokerServer = nil
 	tmuxExecutable = nil
+	controlCgroup = nil
 	scratch = ""
 	_ = readyWriter.Close()
 	_ = permitReader.Close()
@@ -369,6 +388,10 @@ func closeLinuxCustodyLaunchWithTimeout(launch *linuxCustodyLaunch, terminate bo
 	if terminate && launch.tmux != nil {
 		errs = append(errs, launch.tmux.Close())
 		launch.tmux = nil
+	}
+	if terminate && launch.control != nil {
+		errs = append(errs, launch.control.Close())
+		launch.control = nil
 	}
 	if terminate {
 		errs = append(errs, launch.proxies.Close())
@@ -903,7 +926,7 @@ var linuxCustodyAllowedEnvironment = map[string]struct{}{
 	"ANTHROPIC_MODEL": {}, "ANTHROPIC_DEFAULT_HAIKU_MODEL": {}, "ANTHROPIC_DEFAULT_SONNET_MODEL": {}, "ANTHROPIC_DEFAULT_OPUS_MODEL": {},
 	"OPENAI_API_KEY": {}, "GEMINI_API_KEY": {}, "GOOGLE_API_KEY": {}, "GH_TOKEN": {}, "GITHUB_TOKEN": {},
 	"GT_AGENT": {}, "GT_CONTEXT_FILE": {}, "GT_DOLT_HOST": {}, "GT_DOLT_PORT": {}, "GT_NO_EMOJI": {}, "GT_NO_PAGER": {},
-	"GT_PROCESS_NAMES": {}, "GT_READY_PROMPT_PREFIX": {}, "GT_RIG": {}, "GT_ROLE": {}, "GT_ROOT": {}, "GT_RUN": {}, "GT_SCOPE": {}, "GT_SESSION": {}, "GT_THEME": {},
+	"GT_DOG_NAME": {}, "GT_PROCESS_NAMES": {}, "GT_READY_PROMPT_PREFIX": {}, "GT_RIG": {}, "GT_ROLE": {}, "GT_ROOT": {}, "GT_RUN": {}, "GT_SCOPE": {}, "GT_SESSION": {}, "GT_THEME": {},
 	"CLAUDECODE": {}, "CLAUDE_CODE_EFFORT_LEVEL": {}, "CLAUDE_CODE_SUBAGENT_MODEL": {},
 	"CLAUDE_CODE_ENABLE_TELEMETRY": {}, "OTEL_METRICS_EXPORTER": {}, "OTEL_METRIC_EXPORT_INTERVAL": {},
 	"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": {}, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": {}, "OTEL_LOGS_EXPORTER": {},
@@ -971,7 +994,7 @@ func runLinuxCustodyWorkload(command string, proxyPorts *linuxCustodyProxyPorts)
 	}
 }
 
-func runSessionWithCustody(_ string, command string, validate SessionBrokerValidator) error {
+func runSessionWithCustody(_ string, command string, validate SessionBrokerValidator, detach SessionBrokerDetachPolicy) error {
 	launch, contained, err := launchLinuxCustodyCommand(command, startLinuxCustodyCommand)
 	if err != nil {
 		return err
@@ -982,7 +1005,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 			runtime.KeepAlive(launch)
 		}
 	}
-	if launch.broker == nil || launch.tmux == nil || launch.proxies.HTTPS == nil {
+	if launch.broker == nil || launch.tmux == nil || launch.control == nil || launch.proxies.HTTPS == nil {
 		return errors.Join(errors.New("contained session is missing broker or proxy endpoints"), closeLinuxCustodyLaunch(launch, true))
 	}
 	brokerFD, dupErr := unix.Dup(int(launch.broker.Fd()))
@@ -999,7 +1022,7 @@ func runSessionWithCustody(_ string, command string, validate SessionBrokerValid
 	defer cancelServices()
 	serviceDone := make(chan linuxCustodyServiceResult, 2)
 	go func() {
-		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: serveSessionBrokerWithPinnedTmux(serviceContext, "/proc/self/exe", launch.tmux, brokerFD, validate)}
+		serviceDone <- linuxCustodyServiceResult{name: "command broker", err: serveSessionBrokerWithPinnedTmux(serviceContext, "/proc/self/exe", launch.tmux, launch.control, brokerFD, validate, detach)}
 	}()
 	go func() {
 		serviceDone <- linuxCustodyServiceResult{name: "HTTPS proxy", err: serveHTTPSConnect(serviceContext, launch.proxies.HTTPS)}
@@ -1186,6 +1209,26 @@ func linuxDirectChildren(procRoot string, pid int) ([]int, error) {
 	return children, nil
 }
 
+func linuxUniqueDirectChildInCgroup(children []int, target string, cgroupOf func(int) (string, error)) (int, error) {
+	if target == "" || cgroupOf == nil {
+		return 0, errors.New("session child cgroup evidence is unavailable")
+	}
+	var matches []int
+	for _, child := range children {
+		cgroup, err := cgroupOf(child)
+		if err != nil {
+			return 0, fmt.Errorf("reading direct child %d cgroup: %w", child, err)
+		}
+		if cgroup == target {
+			matches = append(matches, child)
+		}
+	}
+	if len(matches) != 1 {
+		return 0, fmt.Errorf("pane supervisor has %d direct children in the owned session cgroup, want one namespace init", len(matches))
+	}
+	return matches[0], nil
+}
+
 func linuxNamespacePIDs(procRoot string, pid int) ([]int, error) {
 	data, err := os.ReadFile(fmt.Sprintf("%s/%d/status", procRoot, pid))
 	if err != nil {
@@ -1282,14 +1325,18 @@ func retainSessionCustody(custody string, panePID int) (sessionCustodyHandle, er
 		}
 		return nil, errors.Join(ErrSessionCustodyUnsupported, primary, initCloseErr, unix.Close(supervisorFD))
 	}
-	children, err := linuxDirectChildren(linuxProcRoot, panePID)
-	if err != nil || len(children) != 1 {
-		if err == nil {
-			err = fmt.Errorf("pane supervisor has %d direct children, want one namespace init", len(children))
-		}
+	supervisorCgroup, err := linuxCgroupDirectoryForPID(panePID)
+	if err != nil {
 		return reject(err, -1)
 	}
-	initPID := children[0]
+	children, err := linuxDirectChildren(linuxProcRoot, panePID)
+	if err != nil {
+		return reject(err, -1)
+	}
+	initPID, err := linuxUniqueDirectChildInCgroup(children, supervisorCgroup, linuxCgroupDirectoryForPID)
+	if err != nil {
+		return reject(err, -1)
+	}
 	initIdentity, namespace, err := validateLinuxNamespaceInit(linuxProcRoot, panePID, initPID)
 	if err != nil {
 		return reject(err, -1)
@@ -1302,12 +1349,20 @@ func retainSessionCustody(custody string, panePID int) (sessionCustodyHandle, er
 	if err != nil || confirmedSupervisor.startTime != supervisorStat.startTime || linuxProcessStateTerminal(confirmedSupervisor.state) {
 		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
 	}
+	confirmedChildren, err := linuxDirectChildren(linuxProcRoot, panePID)
+	if err != nil {
+		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
+	}
+	confirmedInitPID, err := linuxUniqueDirectChildInCgroup(confirmedChildren, supervisorCgroup, linuxCgroupDirectoryForPID)
+	if err != nil || confirmedInitPID != initPID {
+		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
+	}
 	confirmedIdentity, confirmedNamespace, err := validateLinuxNamespaceInit(linuxProcRoot, panePID, initPID)
 	if err != nil || confirmedIdentity != initIdentity || confirmedNamespace != namespace {
 		return reject(errors.Join(ErrSessionGenerationChanged, err), initFD)
 	}
 	cgroup, err := linuxCgroupDirectoryForPID(initPID)
-	if err != nil || !strings.HasPrefix(filepath.Base(cgroup), linuxSessionCgroupPrefix) {
+	if err != nil || cgroup != supervisorCgroup || !strings.HasPrefix(filepath.Base(cgroup), linuxSessionCgroupPrefix) {
 		return reject(errors.Join(ErrSessionCustodyUnsupported, errors.New("trusted namespace init lacks bounded session cgroup"), err), initFD)
 	}
 	return &linuxSessionCustody{

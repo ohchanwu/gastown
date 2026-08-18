@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,16 +273,79 @@ func (m *Manager) RemoveIfMatches(snapshot *Dog) (bool, error) {
 	return true, nil
 }
 
+// RemoveWithTeardownIfMatches removes only the exact lifecycle snapshot after
+// proving its runtime terminal and finalizing its durable assignment. Policy
+// force may authorize removal of working state, but it never bypasses snapshot,
+// session-generation, or assignment-mail custody.
+func (m *Manager) RemoveWithTeardownIfMatches(
+	snapshot *Dog,
+	force bool,
+	teardown func(*SessionGeneration) error,
+) (bool, error) {
+	if snapshot == nil {
+		return false, errors.New("dog removal snapshot is unavailable")
+	}
+	if err := validateDogName(snapshot.Name); err != nil {
+		return false, err
+	}
+	if !m.exists(snapshot.Name) {
+		return false, ErrDogNotFound
+	}
+	if teardown == nil {
+		return false, errors.New("dog removal teardown is unavailable")
+	}
+
+	fl, err := m.lockDog(snapshot.Name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(snapshot.Name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if !dogStateExactlyMatchesRemovalSnapshot(state, snapshot) {
+		return false, nil
+	}
+	if state.State == StateWorking && !force {
+		return false, ErrDogWorking
+	}
+	if err := teardown(state.SessionGeneration); err != nil {
+		return false, fmt.Errorf("tearing down exact dog runtime: %w", err)
+	}
+	if err := m.finalizeAssignment(state); err != nil {
+		return false, err
+	}
+	if err := m.removeLocked(snapshot.Name); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func dogStateMatchesRemovalSnapshot(state *DogState, snapshot *Dog) bool {
 	if state == nil || snapshot == nil || snapshot.State != StateIdle || snapshot.Work != "" || snapshot.SessionGeneration != nil {
 		return false
 	}
-	return state.Name == snapshot.Name &&
+	return dogStateExactlyMatchesRemovalSnapshot(state, snapshot)
+}
+
+func dogStateExactlyMatchesRemovalSnapshot(state *DogState, snapshot *Dog) bool {
+	if state == nil || snapshot == nil {
+		return false
+	}
+	generationMatches := state.SessionGeneration == nil && snapshot.SessionGeneration == nil
+	if state.SessionGeneration != nil && snapshot.SessionGeneration != nil {
+		generationMatches = state.SessionGeneration.EqualTmux(snapshot.SessionGeneration.Tmux())
+	}
+	return generationMatches &&
+		state.Name == snapshot.Name &&
 		state.State == snapshot.State &&
 		state.Work == snapshot.Work &&
 		state.WorkStartedAt.Equal(snapshot.WorkStartedAt) &&
 		state.LastActive.Equal(snapshot.LastActive) &&
-		state.SessionGeneration == nil
+		state.CreatedAt.Equal(snapshot.CreatedAt) &&
+		maps.Equal(state.Worktrees, snapshot.Worktrees)
 }
 
 func (m *Manager) removeLocked(name string) error {

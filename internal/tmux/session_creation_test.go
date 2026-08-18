@@ -114,6 +114,44 @@ func TestNewSessionWithCommandAndEnvGenerationReturnsExactReceipt(t *testing.T) 
 	}
 }
 
+func TestStartTransientSessionWithCommandAndEnvSurvivesLastOwnedSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("transient host-session proof uses POSIX shell commands")
+	}
+	tm := newTestTmux(t)
+	target := fmt.Sprintf("gt-transient-target-%d", time.Now().UnixNano())
+	finalizer := fmt.Sprintf("gt-transient-finalizer-%d", time.Now().UnixNano())
+	proof := filepath.Join(t.TempDir(), "finalized")
+	if err := tm.NewSessionWithCommandAndEnv(target, t.TempDir(), "sleep 30", nil); err != nil {
+		t.Fatal(err)
+	}
+	command := strings.Join([]string{
+		"tmux -L " + config.ShellQuote(tm.socketName) + " kill-session -t " + config.ShellQuote(target),
+		"printf '%s' \"$GT_TRANSIENT_PROOF\" > " + config.ShellQuote(proof),
+	}, "; ")
+	if _, err := tm.StartTransientSessionWithCommandAndEnv(
+		finalizer,
+		t.TempDir(),
+		command,
+		map[string]string{"GT_TRANSIENT_PROOF": "complete"},
+	); err != nil {
+		t.Fatalf("StartTransientSessionWithCommandAndEnv: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		payload, readErr := os.ReadFile(proof)
+		targetRunning, targetErr := tm.HasSession(target)
+		if readErr == nil && targetErr == nil && !targetRunning && string(payload) == "complete" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	payload, _ := os.ReadFile(proof)
+	targetRunning, _ := tm.HasSession(target)
+	t.Fatalf("transient host session did not finish after target removal: target_running=%v proof=%q", targetRunning, payload)
+}
+
 func TestCleanupFailedSessionGenerationPreservesSameNameReplacement(t *testing.T) {
 	tm := newTestTmux(t)
 	session := "gt-test-failed-start-replacement"

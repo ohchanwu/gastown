@@ -273,6 +273,7 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"LANG=C.UTF-8",
 		"LC_ALL=C.UTF-8",
 		"GT_ROLE=testrig/witness",
+		"GT_DOG_NAME=alpha",
 		"GT_INTERNAL_SESSION_CUSTODY_COMMAND=escape",
 		"BEADS_DOLT_SERVER_PORT=3306",
 		"BD_ACTOR=testrig/witness",
@@ -299,6 +300,7 @@ func TestLinuxCustodyWorkloadEnvironmentUsesExplicitAllowlist(t *testing.T) {
 		"LANG=C.UTF-8",
 		"LC_ALL=C.UTF-8",
 		"GT_ROLE=testrig/witness",
+		"GT_DOG_NAME=alpha",
 		"BEADS_DOLT_SERVER_PORT=3306",
 		"BD_ACTOR=testrig/witness",
 		"OPENAI_API_KEY=reviewed-secret",
@@ -680,6 +682,23 @@ func TestLinuxDirectChildrenIncludesNonLeaderThreadChildren(t *testing.T) {
 		}
 	}
 	t.Fatalf("non-leader thread %d child %d missing from %v", result.tid, result.cmd.Process.Pid, children)
+}
+
+func TestLinuxUniqueDirectChildInCgroupIgnoresControlPlaneBrokerWorker(t *testing.T) {
+	cgroups := map[int]string{101: "/service/gastown-sessions/gastown-session-a", 102: "/service/gastown-control"}
+	read := func(pid int) (string, error) { return cgroups[pid], nil }
+	child, err := linuxUniqueDirectChildInCgroup([]int{101, 102}, cgroups[101], read)
+	if err != nil || child != 101 {
+		t.Fatalf("selected child = %d, err %v", child, err)
+	}
+	for _, children := range [][]int{{102}, {101, 103}} {
+		if len(children) == 2 {
+			cgroups[103] = cgroups[101]
+		}
+		if _, err := linuxUniqueDirectChildInCgroup(children, cgroups[101], read); err == nil {
+			t.Fatalf("ambiguous owned-session children %v were accepted", children)
+		}
+	}
 }
 
 func TestLaunchLinuxCustodyFailsClosedWhenNamespacesAreUnavailable(t *testing.T) {

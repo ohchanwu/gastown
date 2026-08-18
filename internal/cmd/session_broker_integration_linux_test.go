@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/dog"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"golang.org/x/sys/unix"
 )
@@ -350,6 +352,154 @@ func TestContainedGTInvocationsUseBrokerBeforeCobra(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("contained gt broker proof timed out\n%s", output.String())
+}
+
+func TestDogDoneFinalizesThroughOuterBrokerAcrossRealCustody(t *testing.T) {
+	townRoot := canonicalTestTempDir(t)
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rigsData, err := json.Marshal(&config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), rigsData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const dogName = "alpha"
+	kennel := filepath.Join(townRoot, "deacon", "dogs", dogName)
+	if err := os.MkdirAll(kennel, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	socket := fmt.Sprintf("gt-dog-real-custody-%d", time.Now().UnixNano())
+	transport := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = transport.KillServer() })
+	barrier := filepath.Join(townRoot, "dog-closeout-barrier")
+	marker := "gt-dog-custody-descendant-" + uuid.NewString()
+	workload := strings.Join([]string{
+		"while [ ! -f " + config.ShellQuote(barrier) + " ]; do sleep 0.02; done",
+		"sh -c " + config.ShellQuote("trap '' HUP TERM; while :; do sleep 60; done") + " " + config.ShellQuote(marker) + " & sleep 1",
+		"exec env GT_TEST_CMD_EXECUTE_HELPER=1 " + config.ShellQuote(os.Args[0]) + " dog done",
+	}, "; ")
+	wrapped, custody, err := tmux.WrapSessionCommandWithCustody(os.Args[0], workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executableDir, err := filepath.EvalSymlinks(filepath.Dir(os.Args[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedPaths, err := tmux.EncodeSessionCustodyPaths([]string{townRoot, executableDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err := transport.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha",
+		kennel,
+		wrapped,
+		map[string]string{
+			"GT_TEST_CMD_EXECUTE_HELPER": "1",
+			"GT_TOWN_ROOT":               townRoot,
+			"GT_ROOT":                    townRoot,
+			"GT_ROLE":                    "dog",
+			"GT_DOG_NAME":                dogName,
+			"BD_ACTOR":                   "dog",
+			"GT_TOWN_SOCKET":             socket,
+			tmux.EnvSessionCustody:       custody,
+			tmux.EnvSessionCustodyPaths:  allowedPaths,
+		},
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "namespace") || strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("real Linux session custody unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, dog.NewManager(townRoot, &config.RigsConfig{}), townRoot, dogName, &dog.DogState{
+		Name: dogName, State: dog.StateWorking, Work: "custody-closeout", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	if err := os.WriteFile(barrier, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	markerDeadline := time.Now().Add(3 * time.Second)
+	for !linuxShellCommandContains(marker) && time.Now().Before(markerDeadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !linuxShellCommandContains(marker) {
+		t.Fatal("HUP-ignoring contained descendant was never observed")
+	}
+
+	closeoutDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(closeoutDeadline) {
+		stored, getErr := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
+		running, sessionErr := transport.HasSession(generation.Name)
+		if getErr == nil && sessionErr == nil && !running && stored.State == dog.StateIdle &&
+			stored.Work == "" && stored.SessionGeneration == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	stored, err := dog.NewManager(townRoot, &config.RigsConfig{}).Get(dogName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, sessionErr := transport.HasSession(generation.Name)
+	if sessionErr != nil || running || stored.State != dog.StateIdle || stored.Work != "" || stored.SessionGeneration != nil {
+		pane, _ := transport.CapturePane(generation.Name, 80)
+		hostWriteErr := os.MkdirAll(filepath.Join(townRoot, "host-write-proof"), 0o700)
+		sessions, listErr := transport.ListSessions()
+		t.Fatalf("real-custody closeout incomplete: running=%v session_err=%v state=%+v host_write_err=%v sessions=%q list_err=%v diagnostics=%q pane=%q", running, sessionErr, stored, hostWriteErr, sessions, listErr, linuxDogCloseoutDiagnostics(), pane)
+	}
+	processDeadline := time.Now().Add(3 * time.Second)
+	for linuxShellCommandContains(marker) && time.Now().Before(processDeadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if linuxShellCommandContains(marker) {
+		t.Fatal("HUP-ignoring contained descendant survived truthful idle publication")
+	}
+}
+
+func linuxDogCloseoutDiagnostics() string {
+	var diagnostics strings.Builder
+	processes, _ := exec.Command("ps", "-eo", "pid,ppid,state,wchan:32,cgroup,command").Output()
+	for _, line := range strings.Split(string(processes), "\n") {
+		if strings.Contains(line, "gastown-cmd.test") || strings.Contains(line, "/proc/self/fd/3") || strings.Contains(line, "tmux") {
+			diagnostics.WriteString(line)
+			diagnostics.WriteByte('\n')
+		}
+	}
+	root := strings.TrimSpace(os.Getenv("GT_SESSION_CGROUP_ROOT"))
+	entries, _ := os.ReadDir(root)
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "gastown-session-") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		for _, name := range []string{"cgroup.procs", "cgroup.events", "cgroup.freeze"} {
+			value, _ := os.ReadFile(filepath.Join(path, name))
+			fmt.Fprintf(&diagnostics, "%s/%s=%q\n", entry.Name(), name, strings.TrimSpace(string(value)))
+		}
+	}
+	return diagnostics.String()
+}
+
+func linuxShellCommandContains(marker string) bool {
+	output, err := exec.Command("ps", "-axo", "command=").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && filepath.Base(fields[0]) == "sh" && fields[1] == "-c" && strings.Contains(line, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 type synchronizedBrokerTestOutput struct {

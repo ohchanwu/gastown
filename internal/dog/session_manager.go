@@ -2,6 +2,7 @@
 package dog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -21,6 +22,8 @@ var (
 	ErrSessionStartCleanupIncomplete = errors.New("session start cleanup incomplete")
 )
 
+const dogSessionTeardownTimeout = 15 * time.Second
+
 // SessionManager handles dog session lifecycle.
 type SessionManager struct {
 	tmux                     *tmux.Tmux
@@ -28,7 +31,7 @@ type SessionManager struct {
 	townRoot                 string
 	startSession             func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error)
 	captureSessionGeneration func(string) (tmux.SessionGeneration, error)
-	killSessionGeneration    func(tmux.SessionGeneration) error
+	killSessionGeneration    func(context.Context, tmux.SessionGeneration) error
 	persistSessionGeneration func(string, string, time.Time, *tmux.SessionGeneration, tmux.SessionGeneration) (bool, error)
 }
 
@@ -42,7 +45,7 @@ func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionMana
 		townRoot:                 townRoot,
 		startSession:             session.StartSession,
 		captureSessionGeneration: t.CaptureSessionGeneration,
-		killSessionGeneration:    t.KillSessionGeneration,
+		killSessionGeneration:    t.KillSessionGenerationWithProcessesPortableContext,
 	}
 	m.persistSessionGeneration = func(
 		name string,
@@ -215,7 +218,7 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 			err = errors.New("dog assignment or prior session generation changed during startup")
 		}
 		persistErr := fmt.Errorf("persisting dog session generation: %w", err)
-		if killErr := m.killSessionGeneration(generation); killErr != nil {
+		if killErr := m.teardownSessionGeneration(generation); killErr != nil {
 			return errors.Join(
 				ErrSessionStartCleanupIncomplete,
 				persistErr,
@@ -274,16 +277,18 @@ func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
 	}
 
 	expected := snapshot.SessionGeneration.Tmux()
-	teardown := func(tmux.SessionGeneration) error { return nil }
+	teardown := func(generation tmux.SessionGeneration) error {
+		return m.teardownSessionGeneration(generation)
+	}
 	if captureErr == nil {
 		if !current.Equal(expected) {
 			return tmux.ErrSessionGenerationChanged
 		}
 		teardown = func(generation tmux.SessionGeneration) error {
 			if !force {
-				_ = m.tmux.SendKeysRaw(generation.SessionID, "C-c")
+				_ = m.tmux.SendKeysRawGeneration(generation, "C-c")
 			}
-			return m.killSessionGeneration(generation)
+			return m.teardownSessionGeneration(generation)
 		}
 	} else if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 		return fmt.Errorf("checking exact dog session: %w", captureErr)
@@ -311,6 +316,12 @@ func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
 		return errors.New("dog assignment or session generation changed during stop")
 	}
 	return nil
+}
+
+func (m *SessionManager) teardownSessionGeneration(generation tmux.SessionGeneration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dogSessionTeardownTimeout)
+	defer cancel()
+	return m.killSessionGeneration(ctx, generation)
 }
 
 // IsRunning checks if a dog session is active.

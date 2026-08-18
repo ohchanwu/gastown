@@ -1048,7 +1048,7 @@ func TestSessionGenerationPanePIDIgnoresMutableActivePane(t *testing.T) {
 	}
 }
 
-func TestLegacySessionGenerationAllowsOnePaneAndRejectsAmbiguousPanes(t *testing.T) {
+func TestLegacySessionGenerationBindsOnePaneAndRejectsAmbiguousPanes(t *testing.T) {
 	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-legacy-pane-%d", time.Now().UnixNano()))
 	session := "gt-generation-legacy-pane"
 	defer func() { _ = tm.KillServer() }()
@@ -1071,8 +1071,8 @@ func TestLegacySessionGenerationAllowsOnePaneAndRejectsAmbiguousPanes(t *testing
 	if err != nil {
 		t.Fatalf("single-pane legacy capture: %v", err)
 	}
-	if legacy.PaneID != "" {
-		t.Fatalf("legacy generation pane = %q, want empty compatibility marker", legacy.PaneID)
+	if legacy.PaneID != created.PaneID {
+		t.Fatalf("legacy generation pane = %q, want observed pane %q", legacy.PaneID, created.PaneID)
 	}
 	if _, exists, err := tm.getPanePIDGeneration(legacy); err != nil || !exists {
 		t.Fatalf("single-pane legacy PID lookup exists=%v err=%v", exists, err)
@@ -1084,8 +1084,102 @@ func TestLegacySessionGenerationAllowsOnePaneAndRejectsAmbiguousPanes(t *testing
 	if _, err := tm.CaptureSessionGeneration(session); !errors.Is(err, ErrSessionGenerationChanged) {
 		t.Fatalf("ambiguous legacy capture error = %v, want generation change", err)
 	}
-	if _, _, err := tm.getPanePIDGeneration(legacy); !errors.Is(err, ErrSessionGenerationChanged) {
-		t.Fatalf("ambiguous legacy PID lookup error = %v, want generation change", err)
+	if _, exists, err := tm.getPanePIDGeneration(legacy); err != nil || !exists {
+		t.Fatalf("bound legacy PID lookup exists=%v err=%v", exists, err)
+	}
+}
+
+func TestLegacySessionGenerationRejectsOnePaneABAAtMutation(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-generation-legacy-pane-aba-%d", time.Now().UnixNano()))
+	session := "gt-generation-legacy-pane-aba"
+	defer func() { _ = tm.KillServer() }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tm.run("set-environment", "-u", "-t", created.SessionID, EnvSessionPane); err != nil {
+		t.Fatalf("remove pane receipt: %v", err)
+	}
+	legacy, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatalf("single-pane legacy capture: %v", err)
+	}
+
+	replacementPane, err := tm.run("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", session, "sleep 60")
+	if err != nil {
+		t.Fatalf("create replacement pane: %v", err)
+	}
+	replacementPane = strings.TrimSpace(replacementPane)
+	if _, err := tm.run("kill-pane", "-t", legacy.PaneID); err != nil {
+		t.Fatalf("remove captured pane: %v", err)
+	}
+
+	if err := tm.KillSessionGeneration(legacy); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("KillSessionGeneration() error = %v, want generation change", err)
+	}
+	panes, err := tm.run("list-panes", "-s", "-t", session, "-F", "#{pane_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(panes) != replacementPane {
+		t.Fatalf("replacement pane = %q after rejected cleanup, want %q", strings.TrimSpace(panes), replacementPane)
+	}
+}
+
+func TestSendKeysRawGenerationTargetsCapturedPaneAndRejectsSubstitution(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-send-generation-pane-%d", time.Now().UnixNano()))
+	session := "gt-send-generation-pane"
+	defer func() { _ = tm.KillServer() }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tm.run("set-option", "-p", "-t", generation.PaneID, "remain-on-exit", "on"); err != nil {
+		t.Fatalf("retain captured pane after interrupt: %v", err)
+	}
+	replacementPane, err := tm.run("split-window", "-P", "-F", "#{pane_id}", "-t", session, "sleep 60")
+	if err != nil {
+		t.Fatalf("split-window: %v", err)
+	}
+	replacementPane = strings.TrimSpace(replacementPane)
+	if _, err := tm.run("select-pane", "-t", replacementPane); err != nil {
+		t.Fatalf("select replacement pane: %v", err)
+	}
+
+	if err := tm.SendKeysRawGeneration(generation, "C-c"); err != nil {
+		t.Fatalf("SendKeysRawGeneration() with another active pane: %v", err)
+	}
+	dead, err := tm.run("display-message", "-p", "-t", generation.PaneID, "#{pane_dead}")
+	if err != nil {
+		t.Fatalf("read captured pane state: %v", err)
+	}
+	if strings.TrimSpace(dead) != "1" {
+		t.Fatalf("captured pane dead = %q, want 1", strings.TrimSpace(dead))
+	}
+	replacementDead, err := tm.run("display-message", "-p", "-t", replacementPane, "#{pane_dead}")
+	if err != nil {
+		t.Fatalf("read replacement pane state: %v", err)
+	}
+	if strings.TrimSpace(replacementDead) != "0" {
+		t.Fatalf("replacement pane dead = %q, want 0", strings.TrimSpace(replacementDead))
+	}
+
+	if _, err := tm.run("respawn-pane", "-k", "-t", generation.PaneID, "sleep 60"); err != nil {
+		t.Fatalf("substitute captured pane process: %v", err)
+	}
+	if _, err := tm.run("kill-pane", "-t", generation.PaneID); err != nil {
+		t.Fatalf("remove captured pane: %v", err)
+	}
+	if err := tm.SendKeysRawGeneration(generation, "C-c"); !errors.Is(err, ErrSessionGenerationChanged) {
+		t.Fatalf("SendKeysRawGeneration() after pane substitution = %v, want generation change", err)
 	}
 }
 
@@ -1851,7 +1945,7 @@ func TestReconcileSessionGenerationRetriesPaneRaceUntilAbsent(t *testing.T) {
 				}
 				return original, nil
 			},
-			kill: func(context.Context, SessionGeneration, int) error {
+			kill: func(context.Context, SessionGeneration, int, bool) error {
 				kills++
 				if kills == 1 {
 					return ErrSessionGenerationChanged
@@ -1878,7 +1972,7 @@ func TestReconcileSessionGenerationPreservesSameNameReplacement(t *testing.T) {
 		123,
 		sessionGenerationReconcileOps{
 			capture: func(context.Context, string) (SessionGeneration, error) { return replacement, nil },
-			kill: func(context.Context, SessionGeneration, int) error {
+			kill: func(context.Context, SessionGeneration, int, bool) error {
 				kills++
 				return nil
 			},
@@ -1887,6 +1981,70 @@ func TestReconcileSessionGenerationPreservesSameNameReplacement(t *testing.T) {
 	)
 	if !errors.Is(err, ErrSessionGenerationChanged) || kills != 0 {
 		t.Fatalf("replacement reconciliation = error %v, kills %d; want preserved replacement evidence", err, kills)
+	}
+}
+
+func TestReconcileSessionGenerationKillsExactDeadPaneWithoutPIDReceipt(t *testing.T) {
+	original := SessionGeneration{
+		Name: "witness", SessionID: "$1", PaneID: "%1", Nonce: "original-generation",
+		Custody: "original-custody", ServerPID: 10, ServerIdentity: "server",
+	}
+	captures := 0
+	kills := 0
+	err := reconcileSessionGenerationContext(
+		context.Background(),
+		original,
+		123,
+		sessionGenerationReconcileOps{
+			capture: func(context.Context, string) (SessionGeneration, error) {
+				captures++
+				if captures > 1 {
+					return SessionGeneration{}, ErrSessionNotFound
+				}
+				return original, nil
+			},
+			readPane: func(context.Context, SessionGeneration) (sessionGenerationPaneState, error) {
+				return sessionGenerationPaneState{exists: true, dead: true}, nil
+			},
+			kill: func(_ context.Context, generation SessionGeneration, panePID int, paneDead bool) error {
+				kills++
+				if !generation.Equal(original) || panePID != 123 || !paneDead {
+					t.Fatalf("dead-pane kill = generation %+v, PID %d, dead %v", generation, panePID, paneDead)
+				}
+				return nil
+			},
+			wait: func(context.Context, time.Duration) error { return nil },
+		},
+	)
+	if err != nil || captures != 2 || kills != 1 {
+		t.Fatalf("dead-pane reconcile = error %v, captures %d, kills %d; want exact terminal kill", err, captures, kills)
+	}
+}
+
+func TestReconcileSessionGenerationPreservesLivePanePIDSubstitution(t *testing.T) {
+	original := SessionGeneration{
+		Name: "witness", SessionID: "$1", PaneID: "%1", Nonce: "original-generation",
+		Custody: "original-custody", ServerPID: 10, ServerIdentity: "server",
+	}
+	kills := 0
+	err := reconcileSessionGenerationContext(
+		context.Background(),
+		original,
+		123,
+		sessionGenerationReconcileOps{
+			capture: func(context.Context, string) (SessionGeneration, error) { return original, nil },
+			readPane: func(context.Context, SessionGeneration) (sessionGenerationPaneState, error) {
+				return sessionGenerationPaneState{pid: 456, exists: true}, nil
+			},
+			kill: func(context.Context, SessionGeneration, int, bool) error {
+				kills++
+				return nil
+			},
+			wait: func(context.Context, time.Duration) error { return nil },
+		},
+	)
+	if !errors.Is(err, ErrSessionGenerationChanged) || kills != 0 {
+		t.Fatalf("live pane substitution = error %v, kills %d; want preserved replacement", err, kills)
 	}
 }
 
@@ -1902,7 +2060,7 @@ func TestReconcileSessionGenerationTimeoutReportsUnreconciledCommit(t *testing.T
 			capture: func(context.Context, string) (SessionGeneration, error) {
 				return SessionGeneration{}, ambiguousErr
 			},
-			kill: func(context.Context, SessionGeneration, int) error {
+			kill: func(context.Context, SessionGeneration, int, bool) error {
 				t.Fatal("ambiguous capture must not issue a tmux mutation")
 				return nil
 			},

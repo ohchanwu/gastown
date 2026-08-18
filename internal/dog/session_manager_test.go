@@ -1,6 +1,7 @@
 package dog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -24,7 +25,7 @@ func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
 		started++
 		return &session.StartResult{SessionGeneration: want}, nil
 	}
-	sm.killSessionGeneration = func(generation tmux.SessionGeneration) error {
+	sm.killSessionGeneration = func(_ context.Context, generation tmux.SessionGeneration) error {
 		killed++
 		return nil
 	}
@@ -108,7 +109,7 @@ func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
 	sm.persistSessionGeneration = func(string, string, time.Time, *tmux.SessionGeneration, tmux.SessionGeneration) (bool, error) {
 		return false, persistErr
 	}
-	sm.killSessionGeneration = func(generation tmux.SessionGeneration) error {
+	sm.killSessionGeneration = func(_ context.Context, generation tmux.SessionGeneration) error {
 		killed = append(killed, generation)
 		return nil
 	}
@@ -131,7 +132,7 @@ func TestDogStartMissingCreationReceiptFailsClosed(t *testing.T) {
 	sm.startSession = func(_ *tmux.Tmux, _ session.SessionConfig) (*session.StartResult, error) {
 		return &session.StartResult{}, nil
 	}
-	sm.killSessionGeneration = func(tmux.SessionGeneration) error {
+	sm.killSessionGeneration = func(context.Context, tmux.SessionGeneration) error {
 		killed++
 		return nil
 	}
@@ -185,7 +186,7 @@ func TestDogStopClearsOnlyAfterExactGenerationTeardown(t *testing.T) {
 	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-%d", os.Getpid())), mgr.townRoot, mgr)
 	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return generation, nil }
 	killed := 0
-	sm.killSessionGeneration = func(got tmux.SessionGeneration) error {
+	sm.killSessionGeneration = func(_ context.Context, got tmux.SessionGeneration) error {
 		killed++
 		if !got.Equal(generation) {
 			t.Fatalf("killed generation = %+v, want %+v", got, generation)
@@ -223,8 +224,8 @@ func TestDogStopTeardownFailurePreservesAssignment(t *testing.T) {
 	}
 	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-fail-%d", os.Getpid())), mgr.townRoot, mgr)
 	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return generation, nil }
-	teardownErr := errors.New("exact kill failed")
-	sm.killSessionGeneration = func(tmux.SessionGeneration) error { return teardownErr }
+	teardownErr := errors.Join(tmux.ErrSessionCleanupUnreconciled, errors.New("detached descendant survived"))
+	sm.killSessionGeneration = func(context.Context, tmux.SessionGeneration) error { return teardownErr }
 
 	if err := sm.Stop("alpha", true); !errors.Is(err, teardownErr) {
 		t.Fatalf("Stop error = %v, want teardown failure", err)
@@ -275,7 +276,7 @@ func TestDogStopIfMatchesRejectsSameNameReplacement(t *testing.T) {
 	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-replacement-%d", os.Getpid())), mgr.townRoot, mgr)
 	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return replacementGeneration, nil }
 	killed := 0
-	sm.killSessionGeneration = func(tmux.SessionGeneration) error { killed++; return nil }
+	sm.killSessionGeneration = func(context.Context, tmux.SessionGeneration) error { killed++; return nil }
 
 	if err := sm.StopIfMatches(oldSnapshot, true); !errors.Is(err, tmux.ErrSessionGenerationChanged) {
 		t.Fatalf("StopIfMatches error = %v, want ErrSessionGenerationChanged", err)
@@ -302,7 +303,7 @@ func TestDogStopIfMatchesPreservesLiveLegacySession(t *testing.T) {
 	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-stop-legacy-%d", os.Getpid())), mgr.townRoot, mgr)
 	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) { return liveGeneration, nil }
 	killed := 0
-	sm.killSessionGeneration = func(tmux.SessionGeneration) error { killed++; return nil }
+	sm.killSessionGeneration = func(context.Context, tmux.SessionGeneration) error { killed++; return nil }
 
 	err = sm.StopIfMatches(snapshot, true)
 	if err == nil || !strings.Contains(err.Error(), "live legacy dog session") {

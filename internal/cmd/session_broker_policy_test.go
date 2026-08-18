@@ -1,10 +1,14 @@
 package cmd
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/dog"
 )
 
 func TestBrokerCapabilityRegistryMatchesAnnotatedCommands(t *testing.T) {
@@ -74,6 +78,93 @@ func TestBrokerSafeCommandAllowsReviewedExactLeaves(t *testing.T) {
 				t.Fatalf("IsBrokerSafeCommand(%q) error = %v", args, err)
 			}
 		})
+	}
+}
+
+func TestDogDoneBrokerCapabilityRequiresExactOwnedFinalizerSnapshot(t *testing.T) {
+	started := time.Now().UTC().Round(0)
+	generation := cmdTestDogGeneration("$broker", "nonce-broker")
+	payload, err := json.Marshal(durableDogCloseoutSnapshot{
+		Name: "alpha", State: dog.StateWorking, Work: "plugin:reaper",
+		WorkStartedAt: started, SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	valid := []string{"dog", "done", "alpha", "--finalizer", encoded}
+	if err := validateDogDoneBrokerRequest(valid, "dog", "alpha"); err != nil {
+		t.Fatalf("exact owned dog finalizer denied: %v", err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		args    []string
+		role    string
+		dogName string
+	}{
+		{name: "missing snapshot", args: []string{"dog", "done", "alpha"}, role: "dog", dogName: "alpha"},
+		{name: "wrong worker role", args: valid, role: "gastown/witness", dogName: "alpha"},
+		{name: "wrong owned dog", args: valid, role: "dog", dogName: "bravo"},
+		{name: "wrong requested dog", args: []string{"dog", "done", "bravo", "--finalizer", encoded}, role: "dog", dogName: "alpha"},
+		{name: "malformed snapshot", args: []string{"dog", "done", "alpha", "--finalizer", "not-base64"}, role: "dog", dogName: "alpha"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateDogDoneBrokerRequest(test.args, test.role, test.dogName); err == nil {
+				t.Fatalf("unsafe finalizer request %q was allowed", test.args)
+			}
+		})
+	}
+}
+
+func TestBrokerSafeCommandAllowsOnlyExactOwnedDogFinalizer(t *testing.T) {
+	started := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	generation := cmdTestDogGeneration("$51", "broker-exact")
+	payload, err := json.Marshal(durableDogCloseoutSnapshot{
+		Name: "alpha", State: dog.StateWorking, Work: "plugin:reaper",
+		WorkStartedAt: started, SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	t.Setenv("GT_ROLE", "dog")
+	t.Setenv("GT_DOG_NAME", "alpha")
+	if err := IsBrokerSafeCommand(rootCmd, []string{"dog", "done", "alpha", "--finalizer", encoded}); err != nil {
+		t.Fatalf("exact owned finalizer denied by broker command policy: %v", err)
+	}
+	if err := IsBrokerSafeCommand(rootCmd, []string{"dog", "done", "alpha"}); err == nil {
+		t.Fatal("snapshot-free dog closeout was admitted by broker command policy")
+	}
+	if !isDetachedSessionBrokerCommand([]string{"dog", "done", "alpha", "--finalizer", encoded}) {
+		t.Fatal("exact dog finalizer was not detached from requesting-session shutdown")
+	}
+	if isDetachedSessionBrokerCommand([]string{"dog", "done", "alpha"}) {
+		t.Fatal("ordinary dog closeout was detached from requesting-session shutdown")
+	}
+}
+
+func TestDogDoneBrokerRoutingRunsOnlySnapshotCaptureInsideOwnedDog(t *testing.T) {
+	if !shouldBypassSessionBrokerForDogDone([]string{"dog", "done"}, "dog", "alpha", false) {
+		t.Fatal("owned dog closeout did not retain its in-container snapshot phase")
+	}
+	if !shouldBypassSessionBrokerForDogDone([]string{"dog", "done", "alpha"}, "dog", "alpha", false) {
+		t.Fatal("explicit owned dog closeout did not retain its in-container snapshot phase")
+	}
+	for _, test := range []struct {
+		args    []string
+		role    string
+		dogName string
+		worker  bool
+	}{
+		{args: []string{"dog", "done", "bravo"}, role: "dog", dogName: "alpha"},
+		{args: []string{"dog", "done"}, role: "gastown/witness", dogName: "alpha"},
+		{args: []string{"dog", "done", "alpha", "--finalizer", "payload"}, role: "dog", dogName: "alpha"},
+		{args: []string{"dog", "done", "alpha"}, role: "dog", dogName: "alpha", worker: true},
+	} {
+		if shouldBypassSessionBrokerForDogDone(test.args, test.role, test.dogName, test.worker) {
+			t.Fatalf("unsafe broker bypass allowed: %+v", test)
+		}
 	}
 }
 

@@ -323,7 +323,13 @@ func checkStaleBinaryWarning() {
 var runSessionBrokerClient = tmux.RunSessionBrokerClient
 
 func Execute() int {
-	if !isSessionCustodyInitInvocation(os.Args[1:]) {
+	bypassBroker := shouldBypassSessionBrokerForDogDone(
+		os.Args[1:],
+		os.Getenv("GT_ROLE"),
+		os.Getenv("GT_DOG_NAME"),
+		os.Getenv(tmux.EnvSessionBrokerWorker) == "1",
+	)
+	if !isSessionCustodyInitInvocation(os.Args[1:]) && !bypassBroker {
 		if handled, exitCode, err := runSessionBrokerClient(os.Args[1:]); handled {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gt session broker: %v\n", err)

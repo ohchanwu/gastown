@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +85,10 @@ var containedWitnessBrokerCapabilities = []containedWitnessBrokerCapability{
 	{path: []string{"status"}, guidance: []containedWitnessPrimeCommand{
 		{description: "Read town status", args: []string{"status", "--fast"}},
 	}},
+	// Dog closeout is intentionally absent from user guidance. The only
+	// accepted form carries an exact snapshot captured inside the owned dog
+	// session, then runs through the trusted host worker.
+	{path: []string{"dog", "done"}},
 }
 
 func containedWitnessBrokerGuidance(rigName string) []containedWitnessPrimeCommand {
@@ -155,7 +160,48 @@ func IsBrokerSafeCommand(root *cobra.Command, args []string) error {
 			return fmt.Errorf("broker command path must use exact name %q", strings.Join(path, " "))
 		}
 	}
-	return validateBrokerCommandArguments(command, args[len(path):])
+	if err := validateBrokerCommandArguments(command, args[len(path):]); err != nil {
+		return err
+	}
+	if len(path) == 2 && path[0] == "dog" && path[1] == "done" {
+		return validateDogDoneBrokerRequest(args, os.Getenv("GT_ROLE"), os.Getenv("GT_DOG_NAME"))
+	}
+	return nil
+}
+
+func validateDogDoneBrokerRequest(args []string, role, ownedDog string) error {
+	if role != "dog" || ownedDog == "" {
+		return errors.New("dog closeout broker request has no owned dog identity")
+	}
+	if len(args) != 5 || args[0] != "dog" || args[1] != "done" || args[2] == "" || args[3] != "--finalizer" || args[4] == "" {
+		return errors.New("dog closeout broker request must carry one exact finalizer snapshot")
+	}
+	if args[2] != ownedDog {
+		return errors.New("dog closeout broker request does not match the owned dog")
+	}
+	snapshot, err := dogCloseoutSnapshotFromEncoded(args[4])
+	if err != nil {
+		return err
+	}
+	if snapshot.Name != ownedDog || snapshot.SessionGeneration == nil {
+		return errors.New("dog closeout snapshot does not match the owned dog generation")
+	}
+	return nil
+}
+
+func isDetachedSessionBrokerCommand(args []string) bool {
+	return len(args) == 5 && args[0] == "dog" && args[1] == "done" &&
+		args[2] != "" && args[3] == "--finalizer" && args[4] != ""
+}
+
+func shouldBypassSessionBrokerForDogDone(args []string, role, ownedDog string, brokerWorker bool) bool {
+	if brokerWorker || role != "dog" || ownedDog == "" {
+		return false
+	}
+	if len(args) == 2 && args[0] == "dog" && args[1] == "done" {
+		return true
+	}
+	return len(args) == 3 && args[0] == "dog" && args[1] == "done" && args[2] == ownedDog
 }
 
 func exactBrokerCommandPath(root, command *cobra.Command) ([]string, error) {

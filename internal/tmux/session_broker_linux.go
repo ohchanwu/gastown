@@ -213,10 +213,12 @@ func serveSessionBrokerWithPinnedTmux(
 	ctx context.Context,
 	executable string,
 	tmuxExecutable *os.File,
+	controlCgroup *os.File,
 	fd int,
 	validate SessionBrokerValidator,
+	detach SessionBrokerDetachPolicy,
 ) error {
-	return serveSessionBrokerWithTools(ctx, executable, tmuxExecutable, fd, validate, sessionBrokerMaxWorkers)
+	return serveSessionBrokerWithTools(ctx, executable, tmuxExecutable, controlCgroup, fd, validate, detach, sessionBrokerMaxWorkers)
 }
 
 func serveSessionBroker(
@@ -226,15 +228,17 @@ func serveSessionBroker(
 	validate SessionBrokerValidator,
 	maxWorkers int,
 ) error {
-	return serveSessionBrokerWithTools(ctx, executable, nil, fd, validate, maxWorkers)
+	return serveSessionBrokerWithTools(ctx, executable, nil, nil, fd, validate, nil, maxWorkers)
 }
 
 func serveSessionBrokerWithTools(
 	ctx context.Context,
 	executable string,
 	tmuxExecutable *os.File,
+	controlCgroup *os.File,
 	fd int,
 	validate SessionBrokerValidator,
+	detach SessionBrokerDetachPolicy,
 	maxWorkers int,
 ) error {
 	defer unix.Close(fd)
@@ -289,7 +293,7 @@ func serveSessionBrokerWithTools(
 			go func() {
 				defer workerGroup.Done()
 				defer func() { <-workers }()
-				handleSessionBrokerRequest(ctx, pinnedExecutable, tmuxExecutable, validate, request, descriptors)
+				handleSessionBrokerRequest(ctx, pinnedExecutable, tmuxExecutable, controlCgroup, validate, detach, request, descriptors)
 			}()
 		default:
 			rejectSessionBrokerRequest(descriptors, sessionBrokerBusyExitCode, "session broker is busy")
@@ -380,7 +384,9 @@ func handleSessionBrokerRequest(
 	serverContext context.Context,
 	executable *os.File,
 	tmuxExecutable *os.File,
+	controlCgroup *os.File,
 	validate SessionBrokerValidator,
+	detach SessionBrokerDetachPolicy,
 	request sessionBrokerRequest,
 	descriptors []int,
 ) {
@@ -397,7 +403,11 @@ func handleSessionBrokerRequest(
 		return
 	}
 
-	requestContext, cancel := context.WithTimeout(serverContext, time.Duration(request.DeadlineMS)*time.Millisecond)
+	requestParent := serverContext
+	if detach != nil && detach(request.Args) {
+		requestParent = context.Background()
+	}
+	requestContext, cancel := context.WithTimeout(requestParent, time.Duration(request.DeadlineMS)*time.Millisecond)
 	defer cancel()
 	command := exec.CommandContext(requestContext, "/proc/self/fd/3", request.Args...)
 	command.ExtraFiles = []*os.File{executable}
@@ -409,7 +419,7 @@ func handleSessionBrokerRequest(
 		command.ExtraFiles = append(command.ExtraFiles, tmuxExecutable)
 		command.Env = append(command.Env, envPinnedTmuxBinary+"=/proc/self/fd/4")
 	}
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.SysProcAttr = sessionBrokerWorkerProcessAttributes(controlCgroup)
 	command.WaitDelay = sessionBrokerWorkerStopTimeout
 	command.Cancel = func() error {
 		if command.Process == nil {
@@ -427,6 +437,15 @@ func handleSessionBrokerRequest(
 		writeSessionBrokerError(descriptors[2], fmt.Errorf("worker failed: %w", err))
 	}
 	writeSessionBrokerCompletion(descriptors[3], exitCode)
+}
+
+func sessionBrokerWorkerProcessAttributes(controlCgroup *os.File) *syscall.SysProcAttr {
+	attributes := &syscall.SysProcAttr{Setpgid: true}
+	if controlCgroup != nil {
+		attributes.UseCgroupFD = true
+		attributes.CgroupFD = int(controlCgroup.Fd())
+	}
+	return attributes
 }
 
 func sessionBrokerProcessExitCode(ctx context.Context, err error) int {

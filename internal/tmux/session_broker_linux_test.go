@@ -569,6 +569,23 @@ func TestSessionBrokerConcurrencyLimitRejectsBusyRequest(t *testing.T) {
 	}
 }
 
+func TestSessionBrokerWorkerUsesPinnedControlCgroup(t *testing.T) {
+	control, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+
+	attributes := sessionBrokerWorkerProcessAttributes(control)
+	if !attributes.Setpgid || !attributes.UseCgroupFD || attributes.CgroupFD != int(control.Fd()) {
+		t.Fatalf("worker attributes = %+v", attributes)
+	}
+	withoutControl := sessionBrokerWorkerProcessAttributes(nil)
+	if !withoutControl.Setpgid || withoutControl.UseCgroupFD {
+		t.Fatalf("uncontained worker attributes = %+v", withoutControl)
+	}
+}
+
 func newSessionBrokerSocketPair(t *testing.T) (serverFD, clientFD int) {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)

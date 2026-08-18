@@ -54,6 +54,8 @@ var validPaneTokenRe = regexp.MustCompile(`^[0-9]+$`)
 
 var validSessionGenerationRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,128}$`)
 
+var validTmuxRawKeyRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 // Common errors
 var (
 	ErrNoServer                   = errors.New("no tmux server running")
@@ -941,6 +943,87 @@ func (t *Tmux) NewSessionWithCommandAndEnvGeneration(name, workDir, command stri
 	return t.NewSessionWithCommandAndEnvGenerationContext(context.Background(), name, workDir, command, env)
 }
 
+// StartTransientSessionWithCommandAndEnv asks the tmux server to host a
+// short-lived command in its own session and returns once creation is accepted.
+// Unlike NewSessionWithCommandAndEnv, it intentionally does not health-check or
+// retain the session: the command may finish immediately. This is useful for a
+// finalizer that must outlive removal of the session that requested it.
+func (t *Tmux) StartTransientSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) (_ SessionGeneration, retErr error) {
+	if err := validateSessionName(name); err != nil {
+		return SessionGeneration{}, err
+	}
+	if strings.TrimSpace(command) == "" {
+		return SessionGeneration{}, errors.New("transient session command is empty")
+	}
+	if workDir != "" {
+		info, err := os.Stat(workDir)
+		if err != nil {
+			return SessionGeneration{}, fmt.Errorf("invalid work directory %q: %w", workDir, err)
+		}
+		if !info.IsDir() {
+			return SessionGeneration{}, fmt.Errorf("invalid work directory %q: not a directory", workDir)
+		}
+	}
+	if err := validateCommandBinary(command); err != nil {
+		return SessionGeneration{}, err
+	}
+	if err := t.ensureNewSessionSocketSafe(); err != nil {
+		return SessionGeneration{}, err
+	}
+
+	sessionEnv := make(map[string]string, len(env)+1)
+	for key, value := range env {
+		sessionEnv[key] = value
+	}
+	nonce := uuid.NewString()
+	sessionEnv[EnvSessionGeneration] = nonce
+	args := []string{"new-session", "-d", "-P", "-F", "#{pid}\t#{session_id}\t#{pane_id}", "-s", name}
+	if workDir != "" {
+		args = append(args, "-c", workDir)
+	}
+	keys := make([]string, 0, len(sessionEnv))
+	for key := range sessionEnv {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", key, sessionEnv[key]))
+	}
+	args = append(args, commandInWorkDir(command, workDir))
+	out, err := t.run(args...)
+	if err != nil {
+		return SessionGeneration{}, err
+	}
+	var generation SessionGeneration
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, t.cleanupUnreturnedSessionGeneration(name, nonce, generation))
+		}
+	}()
+	parts := strings.Split(strings.TrimSpace(out), "\t")
+	if len(parts) != 3 {
+		return SessionGeneration{}, fmt.Errorf("reading transient tmux session generation: unexpected field count %d", len(parts))
+	}
+	serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || serverPID <= 0 {
+		return SessionGeneration{}, fmt.Errorf("reading transient tmux server generation: invalid PID %q", parts[0])
+	}
+	sessionID := strings.TrimSpace(parts[1])
+	paneID := strings.TrimSpace(parts[2])
+	if !validSessionIDRe.MatchString(sessionID) || !validPaneIDRe.MatchString(paneID) {
+		return SessionGeneration{}, errors.New("reading transient tmux session generation: invalid session or pane ID")
+	}
+	serverIdentity, err := processGenerationIdentity(serverPID)
+	if err != nil {
+		return SessionGeneration{}, fmt.Errorf("reading transient tmux server process generation: %w", err)
+	}
+	generation = SessionGeneration{
+		Name: name, SessionID: sessionID, PaneID: paneID, Nonce: nonce,
+		ServerPID: serverPID, ServerIdentity: serverIdentity,
+	}
+	return generation, nil
+}
+
 const failedSessionCreationCleanupTimeout = 3 * time.Second
 
 // NewSessionWithCommandAndEnvContext is NewSessionWithCommandAndEnv bounded by ctx.
@@ -1314,6 +1397,10 @@ func (t *Tmux) captureSessionGenerationContext(ctx context.Context, name string)
 		if paneErr != nil || confirmedLegacyPaneID != legacyPaneID {
 			return SessionGeneration{}, ErrSessionGenerationChanged
 		}
+		// Bind a legacy generation to the exact pane observed on both reads.
+		// Leaving PaneID empty would make a later destructive operation resolve
+		// whichever sole pane exists then, admitting a one-pane ABA replacement.
+		generation.PaneID = legacyPaneID
 	}
 	confirmedServerIdentity, err := processGenerationIdentity(generation.ServerPID)
 	if err != nil || confirmedServerIdentity != generation.ServerIdentity {
@@ -1430,6 +1517,32 @@ func (t *Tmux) runGuardedSessionGenerationPaneContext(
 	return t.runGuardedSessionGenerationConditionTargetContext(ctx, generation, paneID, condition, command)
 }
 
+// runGuardedSessionGenerationDeadPaneContext mutates only the exact immutable
+// session/pane generation after tmux has marked that pane terminal. A dead pane
+// no longer has an authoritative live pane PID, so the guard intentionally uses
+// the session ID, generation nonce, custody token, server identity, pane ID, and
+// pane_dead receipt instead.
+func (t *Tmux) runGuardedSessionGenerationDeadPaneContext(
+	ctx context.Context,
+	generation SessionGeneration,
+	command string,
+) error {
+	condition, err := sessionGenerationCondition(generation)
+	if err != nil {
+		return err
+	}
+	paneID, err := t.resolveGenerationPaneContext(ctx, generation)
+	if err != nil {
+		return err
+	}
+	condition = fmt.Sprintf(
+		"#{&&:%s,#{&&:#{==:#{pane_id},%s},#{==:#{pane_dead},1}}}",
+		condition,
+		paneID,
+	)
+	return t.runGuardedSessionGenerationConditionTargetContext(ctx, generation, paneID, condition, command)
+}
+
 func (t *Tmux) runGuardedSessionGenerationCondition(generation SessionGeneration, condition, command string) error {
 	return t.runGuardedSessionGenerationConditionContext(context.Background(), generation, condition, command)
 }
@@ -1489,24 +1602,55 @@ func (t *Tmux) runGuardedSessionGenerationConditionTargetContext(
 // KillSessionGeneration kills only the exact nonce-bound server/session
 // generation. A same-name and same-$N replacement is preserved.
 func (t *Tmux) KillSessionGeneration(generation SessionGeneration) error {
-	return t.runGuardedSessionGeneration(generation, "kill-session -t "+generation.SessionID)
+	if !validPaneIDRe.MatchString(generation.PaneID) {
+		return errors.New("tmux session generation has no exact pane")
+	}
+	condition, err := sessionGenerationCondition(generation)
+	if err != nil {
+		return err
+	}
+	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_id},%s}}", condition, generation.PaneID)
+	return t.runGuardedSessionGenerationConditionTargetContext(
+		context.Background(), generation, generation.PaneID, condition,
+		"kill-session -t "+generation.SessionID,
+	)
 }
 
 func (t *Tmux) getPanePIDGeneration(generation SessionGeneration) (int, bool, error) {
 	return t.getPanePIDGenerationContext(context.Background(), generation)
 }
 
+type sessionGenerationPaneState struct {
+	pid    int
+	exists bool
+	dead   bool
+}
+
 func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation SessionGeneration) (int, bool, error) {
-	condition, err := sessionGenerationCondition(generation)
+	state, err := t.getPaneStateGenerationContext(ctx, generation)
 	if err != nil {
 		return 0, false, err
 	}
+	if !state.exists {
+		return 0, false, nil
+	}
+	if state.dead {
+		return 0, false, ErrSessionGenerationChanged
+	}
+	return state.pid, true, nil
+}
+
+func (t *Tmux) getPaneStateGenerationContext(ctx context.Context, generation SessionGeneration) (sessionGenerationPaneState, error) {
+	condition, err := sessionGenerationCondition(generation)
+	if err != nil {
+		return sessionGenerationPaneState{}, err
+	}
 	if err := validateServerGeneration(generation); err != nil {
-		return 0, false, err
+		return sessionGenerationPaneState{}, err
 	}
 	paneID, err := t.resolveGenerationPaneContext(ctx, generation)
 	if err != nil {
-		return 0, false, err
+		return sessionGenerationPaneState{}, err
 	}
 	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_id},%s}}", condition, paneID)
 	const paneMarker = "GT_SESSION_GENERATION_PANE:"
@@ -1521,29 +1665,32 @@ func (t *Tmux) getPanePIDGenerationContext(ctx context.Context, generation Sessi
 	if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
 		_, captureErr := t.captureSessionGenerationContext(ctx, generation.Name)
 		if errors.Is(captureErr, ErrSessionNotFound) || errors.Is(captureErr, ErrNoServer) {
-			return 0, false, nil
+			return sessionGenerationPaneState{}, nil
 		}
-		return 0, false, errors.Join(ErrSessionGenerationChanged, captureErr)
+		return sessionGenerationPaneState{}, errors.Join(ErrSessionGenerationChanged, captureErr)
 	}
 	if err != nil {
-		return 0, false, err
+		return sessionGenerationPaneState{}, err
 	}
 	out = strings.TrimSpace(out)
 	if out == changedMarker {
-		return 0, false, ErrSessionGenerationChanged
+		return sessionGenerationPaneState{}, ErrSessionGenerationChanged
 	}
 	if !strings.HasPrefix(out, paneMarker) {
-		return 0, false, fmt.Errorf("guarded pane PID read returned unexpected receipt %q", out)
+		return sessionGenerationPaneState{}, fmt.Errorf("guarded pane state read returned unexpected receipt %q", out)
 	}
 	paneFields := strings.Split(strings.TrimPrefix(out, paneMarker), ":")
-	if len(paneFields) != 2 || paneFields[1] != "0" {
-		return 0, false, ErrSessionGenerationChanged
+	if len(paneFields) != 2 || (paneFields[1] != "0" && paneFields[1] != "1") {
+		return sessionGenerationPaneState{}, fmt.Errorf("guarded pane state read returned invalid receipt %q", out)
+	}
+	if paneFields[1] == "1" {
+		return sessionGenerationPaneState{exists: true, dead: true}, nil
 	}
 	panePID, err := strconv.Atoi(paneFields[0])
 	if err != nil || panePID <= 0 {
-		return 0, false, fmt.Errorf("guarded pane PID read returned invalid PID %q", out)
+		return sessionGenerationPaneState{}, fmt.Errorf("guarded pane state read returned invalid PID %q", out)
 	}
-	return panePID, true, nil
+	return sessionGenerationPaneState{pid: panePID, exists: true}, nil
 }
 
 // CapturePaneProcessGeneration records the live pane process generation before
@@ -1846,10 +1993,17 @@ func (cleanup *SessionGenerationExplicitCleanup) PrepareCommit(ctx context.Conte
 			cleanup.panePID,
 			sessionGenerationReconcileOps{
 				capture: cleanup.tmux.captureSessionGenerationContext,
-				readPane: func(ctx context.Context, generation SessionGeneration) (int, bool, error) {
-					return cleanup.tmux.getPanePIDGenerationContext(ctx, generation)
+				readPane: func(ctx context.Context, generation SessionGeneration) (sessionGenerationPaneState, error) {
+					return cleanup.tmux.getPaneStateGenerationContext(ctx, generation)
 				},
-				kill: func(ctx context.Context, generation SessionGeneration, panePID int) error {
+				kill: func(ctx context.Context, generation SessionGeneration, panePID int, paneDead bool) error {
+					if paneDead {
+						return cleanup.tmux.runGuardedSessionGenerationDeadPaneContext(
+							ctx,
+							generation,
+							"kill-session -t "+generation.SessionID,
+						)
+					}
 					return cleanup.tmux.runGuardedSessionGenerationPaneContext(
 						ctx,
 						generation,
@@ -1870,8 +2024,8 @@ func (cleanup *SessionGenerationExplicitCleanup) PrepareCommit(ctx context.Conte
 
 type sessionGenerationReconcileOps struct {
 	capture  func(context.Context, string) (SessionGeneration, error)
-	readPane func(context.Context, SessionGeneration) (int, bool, error)
-	kill     func(context.Context, SessionGeneration, int) error
+	readPane func(context.Context, SessionGeneration) (sessionGenerationPaneState, error)
+	kill     func(context.Context, SessionGeneration, int, bool) error
 	wait     func(context.Context, time.Duration) error
 }
 
@@ -1900,12 +2054,15 @@ func reconcileSessionGenerationContext(
 				// must not be touched.
 				return ErrSessionGenerationChanged
 			}
+			paneDead := false
 			if ops.readPane != nil {
-				currentPane, exists, paneErr := ops.readPane(ctx, current)
+				paneState, paneErr := ops.readPane(ctx, current)
 				switch {
-				case paneErr == nil && !exists:
+				case paneErr == nil && !paneState.exists:
 					return nil
-				case paneErr == nil && currentPane != panePID:
+				case paneErr == nil && paneState.dead:
+					paneDead = true
+				case paneErr == nil && paneState.pid != panePID:
 					// A new pane under the same session generation is also a
 					// replacement. Preserve it without issuing a name-based kill.
 					return ErrSessionGenerationChanged
@@ -1914,7 +2071,7 @@ func reconcileSessionGenerationContext(
 				}
 			}
 			if lastErr == nil {
-				killErr := ops.kill(ctx, generation, panePID)
+				killErr := ops.kill(ctx, generation, panePID, paneDead)
 				if killErr != nil {
 					lastErr = killErr
 				}
@@ -2011,10 +2168,17 @@ func (cleanup *SessionGenerationCleanup) PrepareCommit(ctx context.Context) (fun
 			cleanup.panePID,
 			sessionGenerationReconcileOps{
 				capture: cleanup.tmux.captureSessionGenerationContext,
-				readPane: func(ctx context.Context, generation SessionGeneration) (int, bool, error) {
-					return cleanup.tmux.getPanePIDGenerationContext(ctx, generation)
+				readPane: func(ctx context.Context, generation SessionGeneration) (sessionGenerationPaneState, error) {
+					return cleanup.tmux.getPaneStateGenerationContext(ctx, generation)
 				},
-				kill: func(ctx context.Context, generation SessionGeneration, panePID int) error {
+				kill: func(ctx context.Context, generation SessionGeneration, panePID int, paneDead bool) error {
+					if paneDead {
+						return cleanup.tmux.runGuardedSessionGenerationDeadPaneContext(
+							ctx,
+							generation,
+							"kill-session -t "+generation.SessionID,
+						)
+					}
 					return cleanup.tmux.runGuardedSessionGenerationPaneContext(
 						ctx,
 						generation,
@@ -2788,6 +2952,27 @@ func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr e
 func (t *Tmux) SendKeysRaw(session, keys string) error {
 	_, err := t.run("send-keys", "-t", session, keys)
 	return err
+}
+
+// SendKeysRawGeneration sends one named tmux key only to the immutable pane
+// captured in generation. It fails closed when the pane token is absent or a
+// same-session replacement has taken its place.
+func (t *Tmux) SendKeysRawGeneration(generation SessionGeneration, keys string) error {
+	if !validPaneIDRe.MatchString(generation.PaneID) {
+		return errors.New("tmux session generation has no exact pane")
+	}
+	if !validTmuxRawKeyRe.MatchString(keys) {
+		return errors.New("invalid tmux raw key")
+	}
+	condition, err := sessionGenerationCondition(generation)
+	if err != nil {
+		return err
+	}
+	condition = fmt.Sprintf("#{&&:%s,#{==:#{pane_id},%s}}", condition, generation.PaneID)
+	command := fmt.Sprintf("send-keys -t %s %s", generation.PaneID, keys)
+	return t.runGuardedSessionGenerationConditionTargetContext(
+		context.Background(), generation, generation.PaneID, condition, command,
+	)
 }
 
 // SendKeysReplace sends keystrokes, clearing any pending input first.

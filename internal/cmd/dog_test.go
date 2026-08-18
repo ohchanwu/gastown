@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -291,11 +292,15 @@ func TestDogDone_NotFound(t *testing.T) {
 }
 
 type fakeDogSessionController struct {
-	captured   tmux.SessionGeneration
-	captureErr error
-	captureFn  func(string) (tmux.SessionGeneration, error)
-	killed     []tmux.SessionGeneration
-	killFn     func(tmux.SessionGeneration) error
+	captured      tmux.SessionGeneration
+	captureErr    error
+	captureFn     func(string) (tmux.SessionGeneration, error)
+	killed        []tmux.SessionGeneration
+	killFn        func(tmux.SessionGeneration) error
+	processKilled []tmux.SessionGeneration
+	processKillFn func(context.Context, tmux.SessionGeneration) error
+	strongKilled  []tmux.SessionGeneration
+	strongKillFn  func(context.Context, tmux.SessionGeneration) error
 }
 
 func (f *fakeDogSessionController) CaptureSessionGeneration(name string) (tmux.SessionGeneration, error) {
@@ -311,6 +316,37 @@ func (f *fakeDogSessionController) KillSessionGeneration(generation tmux.Session
 		return f.killFn(generation)
 	}
 	return nil
+}
+
+func (f *fakeDogSessionController) KillSessionGenerationWithProcessesPortableContext(ctx context.Context, generation tmux.SessionGeneration) error {
+	f.processKilled = append(f.processKilled, generation)
+	if f.processKillFn != nil {
+		return f.processKillFn(ctx, generation)
+	}
+	return nil
+}
+
+func (f *fakeDogSessionController) KillSessionGenerationWithProcessesContext(ctx context.Context, generation tmux.SessionGeneration) error {
+	f.strongKilled = append(f.strongKilled, generation)
+	if f.strongKillFn != nil {
+		return f.strongKillFn(ctx, generation)
+	}
+	return nil
+}
+
+func TestDogCloseoutBrokerWorkerUsesStrongCustodyWithoutDescendantFallback(t *testing.T) {
+	t.Setenv(tmux.EnvSessionBrokerWorker, "1")
+	generation := cmdTestDogGeneration("$strong", "nonce-strong")
+	controller := &fakeDogSessionController{}
+	if err := teardownDogSessionGeneration(controller, generation); err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.strongKilled) != 1 || !controller.strongKilled[0].Equal(generation) {
+		t.Fatalf("strong cleanup = %+v", controller.strongKilled)
+	}
+	if len(controller.processKilled) != 0 {
+		t.Fatalf("portable descendant fallback ran for broker worker: %+v", controller.processKilled)
+	}
 }
 
 func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
@@ -336,8 +372,8 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 	if err := completeDogCloseout(mgr, controller, d); err != nil {
 		t.Fatalf("completeDogCloseout: %v", err)
 	}
-	if len(controller.killed) != 1 || !controller.killed[0].Equal(generation) {
-		t.Fatalf("killed = %+v, want exact persisted generation", controller.killed)
+	if len(controller.processKilled) != 1 || !controller.processKilled[0].Equal(generation) {
+		t.Fatalf("process-aware kills = %+v, want exact persisted generation", controller.processKilled)
 	}
 	got, err := mgr.Get("alpha")
 	if err != nil {
@@ -345,6 +381,94 @@ func TestDogDoneGenerationMatchingCloseout(t *testing.T) {
 	}
 	if got.State != dog.StateIdle || got.Work != "" || got.SessionGeneration != nil {
 		t.Fatalf("completed dog = %+v, want idle with no work or generation", got)
+	}
+}
+
+func TestDogDoneUnreconciledProcessCleanupPreservesAssignment(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	generation := cmdTestDogGeneration("$process", "nonce-process")
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateWorking, Work: "hq-work-process",
+		WorkStartedAt: started, LastActive: started, CreatedAt: started, UpdatedAt: started,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{
+		captureErr: tmux.ErrSessionNotFound,
+		processKillFn: func(context.Context, tmux.SessionGeneration) error {
+			return errors.Join(tmux.ErrSessionCleanupUnreconciled, errors.New("detached descendant survived"))
+		},
+	}
+
+	err = completeDogCloseout(mgr, controller, snapshot)
+	if !errors.Is(err, tmux.ErrSessionCleanupUnreconciled) {
+		t.Fatalf("completeDogCloseout() error = %v, want unreconciled cleanup", err)
+	}
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != dog.StateWorking || stored.Work != snapshot.Work || stored.SessionGeneration == nil ||
+		!stored.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("unreconciled cleanup released assignment custody: %+v", stored)
+	}
+}
+
+func TestRemoveDogExactRejectsLiveLegacySessionEvenWithForce(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateWorking, Work: "task", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captured: cmdTestDogGeneration("$legacy", "nonce-legacy")}
+
+	removed, err := removeDogExact(mgr, controller, snapshot, true)
+	if removed || err == nil || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("forced legacy removal = %v, %v; want preserved recovery blocker", removed, err)
+	}
+	if _, err := mgr.Get("alpha"); err != nil {
+		t.Fatalf("live legacy dog was removed: %v", err)
+	}
+}
+
+func TestRemoveDogExactPreservesGenerationOnUnreconciledProcessCleanup(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	generation := cmdTestDogGeneration("$remove-process", "nonce-remove-process")
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{
+		captured: generation,
+		processKillFn: func(context.Context, tmux.SessionGeneration) error {
+			return tmux.ErrSessionCleanupUnreconciled
+		},
+	}
+
+	removed, err := removeDogExact(mgr, controller, snapshot, true)
+	if removed || !errors.Is(err, tmux.ErrSessionCleanupUnreconciled) {
+		t.Fatalf("unreconciled removal = %v, %v; want preserved blocker", removed, err)
+	}
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SessionGeneration == nil || !stored.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("unreconciled removal lost generation: %+v", stored)
 	}
 }
 
@@ -488,7 +612,7 @@ func TestDogDoneGenerationChangeDuringTeardownPreservesDurableCustody(t *testing
 		t.Fatal(err)
 	}
 	controller := &fakeDogSessionController{captured: oldGeneration}
-	controller.killFn = func(generation tmux.SessionGeneration) error {
+	controller.processKillFn = func(_ context.Context, generation tmux.SessionGeneration) error {
 		if !generation.Equal(oldGeneration) {
 			t.Fatalf("kill targeted %+v, want old generation", generation)
 		}
@@ -808,6 +932,118 @@ func TestDogDoneInsideOwnedTmuxSessionFinalizesOutsidePane(t *testing.T) {
 		"in-session closeout did not finish: running=%v state=%+v original=%+v current=%+v generation_err=%v pane=%q pane_err=%v",
 		running, stored, generation, currentGeneration, generationErr, currentPane, paneErr,
 	)
+}
+
+func TestScheduleDogCloseoutFinalizerUsesExactBrokerRequest(t *testing.T) {
+	townRoot := canonicalTestTempDir(t)
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(townRoot)
+	started := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	generation := cmdTestDogGeneration("$81", "broker-schedule")
+	snapshot := &dog.Dog{
+		Name: "alpha", State: dog.StateWorking, Work: "plugin:reaper",
+		WorkStartedAt: started, SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	}
+
+	original := runDogCloseoutBroker
+	var request []string
+	runDogCloseoutBroker = func(args []string) (bool, int, error) {
+		request = append([]string(nil), args...)
+		return true, 0, nil
+	}
+	t.Cleanup(func() { runDogCloseoutBroker = original })
+	if err := scheduleDogCloseoutFinalizer(tmux.NewTmuxWithSocket("unused"), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(request) != 5 || request[0] != "dog" || request[1] != "done" || request[2] != "alpha" || request[3] != "--finalizer" {
+		t.Fatalf("broker request = %q", request)
+	}
+	decoded, err := dogCloseoutSnapshotFromEncoded(request[4])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Name != snapshot.Name || decoded.Work != snapshot.Work || decoded.WorkStartedAt != snapshot.WorkStartedAt ||
+		decoded.SessionGeneration == nil || !decoded.SessionGeneration.EqualTmux(generation) {
+		t.Fatalf("broker snapshot = %+v, want %+v", decoded, snapshot)
+	}
+}
+
+func TestDogCloseoutSnapshotFromEnvironmentRequiresHostBoundary(t *testing.T) {
+	generation := cmdTestDogGeneration("$forged-finalizer", "nonce-forged-finalizer")
+	snapshot := &dog.Dog{
+		Name:              "alpha",
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	}
+	encoded, _, err := dogCloseoutFinalizerRequest(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(dogCloseoutFinalizerEnv, encoded)
+	t.Setenv(dogCloseoutHostSessionEnv, "hq-dog-finalizer-alpha-forged")
+	t.Setenv(tmux.EnvSessionBrokerWorker, "")
+
+	decoded, present, err := dogCloseoutSnapshotFromEnvironment()
+	if !present {
+		t.Fatal("environment finalizer was not detected")
+	}
+	if err == nil || !strings.Contains(err.Error(), "trusted host boundary") {
+		t.Fatalf("dogCloseoutSnapshotFromEnvironment() error = %v", err)
+	}
+	if decoded != nil {
+		t.Fatalf("unauthorized environment snapshot decoded as %+v", decoded)
+	}
+}
+
+func TestRequestDogCloseoutBrokerDoesNotFallBackAfterHandledFailure(t *testing.T) {
+	generation := cmdTestDogGeneration("$broker-failure", "nonce-broker-failure")
+	snapshot := &dog.Dog{Name: "alpha", SessionGeneration: dog.SessionGenerationFromTmux(generation)}
+	original := runDogCloseoutBroker
+	t.Cleanup(func() { runDogCloseoutBroker = original })
+
+	runDogCloseoutBroker = func([]string) (bool, int, error) { return false, 0, nil }
+	if handled, err := requestDogCloseoutBroker(snapshot); handled || err != nil {
+		t.Fatalf("absent broker = handled %v, err %v", handled, err)
+	}
+	runDogCloseoutBroker = func([]string) (bool, int, error) { return true, 19, nil }
+	if handled, err := requestDogCloseoutBroker(snapshot); !handled || err == nil {
+		t.Fatalf("failed broker = handled %v, err %v", handled, err)
+	}
+}
+
+func TestWaitForDogCloseoutHostHandoffRejectsEarlyFinalizerExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("transient host-session proof uses POSIX commands")
+	}
+	socket := fmt.Sprintf("gt-dog-host-handoff-%d", time.Now().UnixNano())
+	tm := tmux.NewTmuxWithSocket(socket)
+	t.Cleanup(func() { _ = tm.KillServer() })
+	target, err := tm.NewSessionWithCommandAndEnvGeneration("hq-dog-alpha", t.TempDir(), "sleep 30", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := tm.StartTransientSessionWithCommandAndEnv(
+		"hq-dog-finalizer-alpha-early",
+		t.TempDir(),
+		"true",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &dog.Dog{
+		Name: "alpha", State: dog.StateWorking, Work: "work",
+		WorkStartedAt: time.Now().UTC(), SessionGeneration: dog.SessionGenerationFromTmux(target),
+	}
+	err = waitForDogCloseoutHostHandoff(tm, snapshot, host)
+	if err == nil || !strings.Contains(err.Error(), "finalizer exited before exact target teardown") {
+		t.Fatalf("waitForDogCloseoutHostHandoff() error = %v", err)
+	}
+	running, err := tm.HasSession(target.Name)
+	if err != nil || !running {
+		t.Fatalf("target session after failed handoff: running=%v err=%v", running, err)
+	}
 }
 
 func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {

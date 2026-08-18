@@ -833,7 +833,7 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	}
 
 	if !force && custody.running {
-		_ = m.tmux.SendKeysRaw(custody.generation.SessionID, "C-c")
+		_ = m.tmux.SendKeysRawGeneration(custody.generation, "C-c")
 		session.WaitForSessionExit(m.tmux, custody.generation.SessionID, constants.GracefulShutdownTimeout)
 	}
 	if err := m.StopSessionCustody(custody); err != nil {

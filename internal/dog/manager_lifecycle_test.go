@@ -1250,6 +1250,100 @@ func TestManager_RemoveIfMatchesRemovesExactIdleSnapshot(t *testing.T) {
 	}
 }
 
+func TestManager_RemoveWithTeardownRejectsStaleSnapshotBeforeMutation(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateIdle, LastActive: now, Worktrees: map[string]string{},
+		CreatedAt: now, UpdatedAt: now,
+	})
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AssignWorkIfIdle("alpha", "replacement"); err != nil {
+		t.Fatal(err)
+	}
+	teardownCalls := 0
+	removed, err := m.RemoveWithTeardownIfMatches(snapshot, true, func(*SessionGeneration) error {
+		teardownCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed || teardownCalls != 0 {
+		t.Fatalf("stale removal = %v, teardown calls = %d; want false, 0", removed, teardownCalls)
+	}
+	current, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != StateWorking || current.Work != "replacement" {
+		t.Fatalf("replacement assignment changed: %+v", current)
+	}
+}
+
+func TestManager_RemoveWithTeardownForceFinalizesExactWorkingAssignment(t *testing.T) {
+	m, root := testManager(t)
+	now := time.Now().UTC().Round(0)
+	generation := testDogTmuxGeneration("$remove", "nonce-remove")
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "plugin:reaper", WorkStartedAt: now,
+		LastActive: now, Worktrees: map[string]string{}, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: SessionGenerationFromTmux(generation),
+	})
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized := 0
+	m.assignmentFinalizer = func(name, work string, startedAt time.Time) error {
+		finalized++
+		if name != snapshot.Name || work != snapshot.Work || !startedAt.Equal(snapshot.WorkStartedAt) {
+			t.Fatalf("finalized assignment = %q %q %v; want exact snapshot", name, work, startedAt)
+		}
+		return nil
+	}
+	teardown := 0
+	removed, err := m.RemoveWithTeardownIfMatches(snapshot, true, func(got *SessionGeneration) error {
+		teardown++
+		if got == nil || !got.EqualTmux(generation) {
+			t.Fatalf("teardown generation = %+v, want %+v", got, generation)
+		}
+		return nil
+	})
+	if err != nil || !removed {
+		t.Fatalf("forced exact removal = %v, %v; want true, nil", removed, err)
+	}
+	if teardown != 1 || finalized != 1 {
+		t.Fatalf("teardown=%d finalized=%d, want 1 and 1", teardown, finalized)
+	}
+	if _, err := os.Stat(filepath.Join(root, "deacon", "dogs", "alpha")); !os.IsNotExist(err) {
+		t.Fatalf("kennel remains after exact removal: %v", err)
+	}
+}
+
+func TestManager_RemoveWithTeardownWorkingRequiresForce(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task", WorkStartedAt: now,
+		LastActive: now, Worktrees: map[string]string{}, CreatedAt: now, UpdatedAt: now,
+	})
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := m.RemoveWithTeardownIfMatches(snapshot, false, func(*SessionGeneration) error {
+		t.Fatal("teardown ran despite working policy rejection")
+		return nil
+	})
+	if removed || !errors.Is(err, ErrDogWorking) {
+		t.Fatalf("working removal = %v, %v; want false, ErrDogWorking", removed, err)
+	}
+}
+
 func TestManager_Remove_handlesMissingStateFile(t *testing.T) {
 	m, tmpDir := testManager(t)
 

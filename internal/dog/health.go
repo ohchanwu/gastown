@@ -1,6 +1,7 @@
 package dog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -14,7 +15,7 @@ type sessionChecker interface {
 	CheckSessionHealth(session string, maxInactivity time.Duration) tmux.ZombieStatus
 	HasSession(name string) (bool, error)
 	CaptureSessionGeneration(name string) (tmux.SessionGeneration, error)
-	KillSessionGeneration(generation tmux.SessionGeneration) error
+	KillSessionGenerationWithProcessesPortableContext(context.Context, tmux.SessionGeneration) error
 }
 
 // DogHealthResult describes the health of a single dog.
@@ -155,7 +156,11 @@ func (hc *HealthChecker) clearExactDogRuntime(d *Dog, sessionLive bool) error {
 	}
 
 	expected := d.SessionGeneration.Tmux()
-	teardown := func(tmux.SessionGeneration) error { return nil }
+	teardown := func(generation tmux.SessionGeneration) error {
+		ctx, cancel := context.WithTimeout(context.Background(), dogSessionTeardownTimeout)
+		defer cancel()
+		return hc.checker.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
+	}
 	if sessionLive {
 		current, err := hc.checker.CaptureSessionGeneration(dogSessionName(d.Name))
 		if err != nil {
@@ -163,13 +168,6 @@ func (hc *HealthChecker) clearExactDogRuntime(d *Dog, sessionLive bool) error {
 		}
 		if !current.Equal(expected) {
 			return tmux.ErrSessionGenerationChanged
-		}
-		teardown = func(generation tmux.SessionGeneration) error {
-			err := hc.checker.KillSessionGeneration(generation)
-			if errors.Is(err, tmux.ErrSessionNotFound) || errors.Is(err, tmux.ErrNoServer) {
-				return nil
-			}
-			return err
 		}
 	}
 

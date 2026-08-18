@@ -1,6 +1,7 @@
 package dog
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -40,7 +41,7 @@ func (m *mockSessionChecker) CaptureSessionGeneration(name string) (tmux.Session
 	return m.generations[name], nil
 }
 
-func (m *mockSessionChecker) KillSessionGeneration(generation tmux.SessionGeneration) error {
+func (m *mockSessionChecker) KillSessionGenerationWithProcessesPortableContext(_ context.Context, generation tmux.SessionGeneration) error {
 	m.killedSessions = append(m.killedSessions, generation.Name)
 	return nil
 }
