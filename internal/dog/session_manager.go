@@ -24,6 +24,12 @@ var (
 
 const dogSessionTeardownTimeout = 15 * time.Second
 
+type sessionGenerationController interface {
+	CaptureSessionGeneration(string) (tmux.SessionGeneration, error)
+	SendKeysRawGeneration(tmux.SessionGeneration, string) error
+	KillSessionGenerationWithProcessesPortableContext(context.Context, tmux.SessionGeneration) error
+}
+
 // SessionManager handles dog session lifecycle.
 type SessionManager struct {
 	tmux                     *tmux.Tmux
@@ -32,6 +38,7 @@ type SessionManager struct {
 	startSession             func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error)
 	captureSessionGeneration func(string) (tmux.SessionGeneration, error)
 	killSessionGeneration    func(context.Context, tmux.SessionGeneration) error
+	controllerForGeneration  func(tmux.SessionGeneration) (sessionGenerationController, error)
 	persistSessionGeneration func(string, string, time.Time, *tmux.SessionGeneration, tmux.SessionGeneration) (bool, error)
 }
 
@@ -46,6 +53,9 @@ func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionMana
 		startSession:             session.StartSession,
 		captureSessionGeneration: t.CaptureSessionGeneration,
 		killSessionGeneration:    t.KillSessionGenerationWithProcessesPortableContext,
+		controllerForGeneration: func(generation tmux.SessionGeneration) (sessionGenerationController, error) {
+			return tmux.NewTmuxForSessionGeneration(generation)
+		},
 	}
 	m.persistSessionGeneration = func(
 		name string,
@@ -254,9 +264,9 @@ func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
 		return errors.New("dog stop snapshot is unavailable")
 	}
 	sessionID := m.SessionName(snapshot.Name)
-	current, captureErr := m.captureSessionGeneration(sessionID)
 
 	if snapshot.SessionGeneration == nil {
+		_, captureErr := m.captureSessionGeneration(sessionID)
 		if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 			if captureErr != nil {
 				return fmt.Errorf("checking legacy dog session: %w", captureErr)
@@ -277,8 +287,15 @@ func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
 	}
 
 	expected := snapshot.SessionGeneration.Tmux()
+	controller, controllerErr := m.controllerForGeneration(expected)
+	if controllerErr != nil {
+		return fmt.Errorf("checking exact dog session transport: %w", controllerErr)
+	}
+	current, captureErr := controller.CaptureSessionGeneration(sessionID)
 	teardown := func(generation tmux.SessionGeneration) error {
-		return m.teardownSessionGeneration(generation)
+		ctx, cancel := context.WithTimeout(context.Background(), dogSessionTeardownTimeout)
+		defer cancel()
+		return controller.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
 	}
 	if captureErr == nil {
 		if !current.Equal(expected) {
@@ -286,9 +303,11 @@ func (m *SessionManager) StopIfMatches(snapshot *Dog, force bool) error {
 		}
 		teardown = func(generation tmux.SessionGeneration) error {
 			if !force {
-				_ = m.tmux.SendKeysRawGeneration(generation, "C-c")
+				_ = controller.SendKeysRawGeneration(generation, "C-c")
 			}
-			return m.teardownSessionGeneration(generation)
+			ctx, cancel := context.WithTimeout(context.Background(), dogSessionTeardownTimeout)
+			defer cancel()
+			return controller.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
 		}
 	} else if !errors.Is(captureErr, tmux.ErrSessionNotFound) && !errors.Is(captureErr, tmux.ErrNoServer) {
 		return fmt.Errorf("checking exact dog session: %w", captureErr)

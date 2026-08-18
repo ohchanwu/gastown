@@ -350,9 +350,11 @@ func TestEnsureSessionFreshWithCommand_KillsZombie(t *testing.T) {
 	_ = tm.KillSession(sessionName)
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// Create a zombie session (empty shell, no agent)
-	if err := tm.NewSession(sessionName, ""); err != nil {
-		t.Fatalf("NewSession: %v", err)
+	// Use a bare shell so user login hooks cannot briefly run git, package
+	// managers, or another non-shell command that the fallback health heuristic
+	// would correctly classify as active work under full-suite contention.
+	if err := tm.NewSessionWithCommand(sessionName, "", "exec /bin/sh"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
 	}
 
 	// Verify it's a zombie
@@ -1931,7 +1933,10 @@ func TestSessionGenerationCleanupReleasesTmuxParentBeforeFinalCustodyReap(t *tes
 }
 
 func TestReconcileSessionGenerationRetriesPaneRaceUntilAbsent(t *testing.T) {
-	original := SessionGeneration{Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server"}
+	original := SessionGeneration{
+		Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server",
+		Transport: SessionTransport{Bound: true, SocketName: "fixture", SocketPath: "/tmp/tmux-fixture/fixture"},
+	}
 	captures := 0
 	kills := 0
 	err := reconcileSessionGenerationContext(
@@ -1962,7 +1967,10 @@ func TestReconcileSessionGenerationRetriesPaneRaceUntilAbsent(t *testing.T) {
 }
 
 func TestReconcileSessionGenerationPreservesSameNameReplacement(t *testing.T) {
-	original := SessionGeneration{Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server"}
+	original := SessionGeneration{
+		Name: "witness", SessionID: "$1", Nonce: "original-generation", ServerPID: 10, ServerIdentity: "server",
+		Transport: SessionTransport{Bound: true, SocketName: "fixture", SocketPath: "/tmp/tmux-fixture/fixture"},
+	}
 	replacement := original
 	replacement.SessionID = "$2"
 	replacement.Nonce = "replacement-generation"
@@ -1989,6 +1997,7 @@ func TestReconcileSessionGenerationKillsExactDeadPaneWithoutPIDReceipt(t *testin
 	original := SessionGeneration{
 		Name: "witness", SessionID: "$1", PaneID: "%1", Nonce: "original-generation",
 		Custody: "original-custody", ServerPID: 10, ServerIdentity: "server",
+		Transport: SessionTransport{Bound: true, SocketName: "fixture", SocketPath: "/tmp/tmux-fixture/fixture"},
 	}
 	captures := 0
 	kills := 0
@@ -2026,6 +2035,7 @@ func TestReconcileSessionGenerationPreservesLivePanePIDSubstitution(t *testing.T
 	original := SessionGeneration{
 		Name: "witness", SessionID: "$1", PaneID: "%1", Nonce: "original-generation",
 		Custody: "original-custody", ServerPID: 10, ServerIdentity: "server",
+		Transport: SessionTransport{Bound: true, SocketName: "fixture", SocketPath: "/tmp/tmux-fixture/fixture"},
 	}
 	kills := 0
 	err := reconcileSessionGenerationContext(
@@ -2070,6 +2080,81 @@ func TestReconcileSessionGenerationTimeoutReportsUnreconciledCommit(t *testing.T
 	)
 	if !errors.Is(err, ErrSessionCleanupUnreconciled) || !errors.Is(err, ambiguousErr) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("reconcile error = %v, want committed unresolved evidence", err)
+	}
+}
+
+func TestClassifyProcessCleanupPreservesCommittedUnreconciledError(t *testing.T) {
+	wantErr := errors.Join(ErrSessionCleanupUnreconciled, ErrSessionNotFound)
+	terminal, err := NewTmuxWithSocket("classification-fixture").classifyProcessCleanupResult(
+		context.Background(), SessionGeneration{Name: "missing-session"}, wantErr,
+	)
+	if terminal || !errors.Is(err, ErrSessionCleanupUnreconciled) || !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("classifyProcessCleanupResult() = %v, %v; want non-terminal committed evidence", terminal, err)
+	}
+}
+
+func TestPortableCleanupStopsAfterStrongCommittedUnreconciledError(t *testing.T) {
+	strongErr := errors.New("strong cleanup committed but reconciliation failed")
+	wantErr := errors.Join(ErrSessionCleanupUnreconciled, strongErr)
+	explicitCalls := 0
+	fallbackCalls := 0
+	classifyCalls := 0
+	err := runPortableSessionGenerationCleanup(
+		context.Background(),
+		SessionGeneration{Name: "owned-generation"},
+		func(context.Context, SessionGeneration) error { return wantErr },
+		func(context.Context, SessionGeneration, error) (bool, error) {
+			classifyCalls++
+			return false, errors.New("classification must not run after committed cleanup")
+		},
+		func(context.Context, SessionGeneration) error {
+			explicitCalls++
+			return nil
+		},
+		func(SessionGeneration) error {
+			fallbackCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrSessionCleanupUnreconciled) || !errors.Is(err, strongErr) {
+		t.Fatalf("portable cleanup error = %v, want committed strong-cleanup evidence", err)
+	}
+	if classifyCalls != 0 || explicitCalls != 0 || fallbackCalls != 0 {
+		t.Fatalf("post-commit calls = classify %d, explicit %d, fallback %d; want all zero", classifyCalls, explicitCalls, fallbackCalls)
+	}
+}
+
+func TestSessionGenerationCleanupRunMarksCommittedErrorUnreconciled(t *testing.T) {
+	tm := NewTmuxWithSocket(fmt.Sprintf("gt-cleanup-commit-error-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	if err := tm.NewSessionWithCommand("gt-cleanup-commit-error", "", "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := tm.CaptureSessionGeneration("gt-cleanup-commit-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane, err := tm.CapturePaneProcessGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("committed containment confirmation failed")
+	custody := &mockSessionCustody{onKillContext: func(context.Context) (bool, error) {
+		if err := exec.Command("kill", "-KILL", strconv.Itoa(pane.PID)).Run(); err != nil {
+			return false, err
+		}
+		return true, wantErr
+	}}
+	cleanup := &SessionGenerationCleanup{
+		tmux: tm, generation: generation, panePID: pane.PID, paneIdentity: pane.Identity,
+		identity:  processGenerationIdentity,
+		processes: []retainedProcess{&mockRetainedProcess{pid: pane.PID, generation: pane.Identity, alive: true}},
+		custody:   custody,
+	}
+
+	err = cleanup.Run(context.Background())
+	if !errors.Is(err, ErrSessionCleanupUnreconciled) || !errors.Is(err, wantErr) {
+		t.Fatalf("Run() error = %v, want committed unreconciled evidence", err)
 	}
 }
 
@@ -2355,6 +2440,168 @@ func TestBoundSessionGenerationRejectsWrongTransportBeforeAbsence(t *testing.T) 
 	running, err := target.HasSession(generation.Name)
 	if err != nil || !running {
 		t.Fatalf("target after wrong-transport cleanup: running=%v err=%v", running, err)
+	}
+}
+
+func TestNewTmuxForSessionGenerationUsesCapturedCanonicalSocketPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	// Keep the Unix socket paths below the platform limit (notably macOS's
+	// short sockaddr_un path) while still using two distinct roots.
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-transport-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-transport-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	t.Setenv("TMUX_TMPDIR", firstRoot)
+	target := NewTmuxWithSocket(fmt.Sprintf("gt-canonical-transport-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = target.KillServer() })
+
+	generation, err := target.NewSessionWithCommandAndEnvGeneration("canonical-transport", t.TempDir(), "sleep 30", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(firstRoot, fmt.Sprintf("tmux-%d", os.Getuid()), target.socketName)
+	if generation.Transport.SocketPath != wantPath {
+		t.Fatalf("captured socket path = %q, want %q", generation.Transport.SocketPath, wantPath)
+	}
+
+	// The ambient socket root changes after capture. A reconstructed controller
+	// must still address the original server, not the same alias under root two.
+	t.Setenv("TMUX_TMPDIR", secondRoot)
+	current, err := target.CaptureSessionGeneration(generation.Name)
+	if err != nil || !current.Equal(generation) {
+		t.Fatalf("constructed controller drifted with ambient socket root: current=%+v err=%v", current, err)
+	}
+	bound, err := NewTmuxForSessionGeneration(generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPollerRoot := "TMUX_TMPDIR=" + firstRoot
+	foundPollerRoot := false
+	for _, entry := range bound.PollerEnvironment() {
+		if entry == wantPollerRoot {
+			foundPollerRoot = true
+		}
+		if entry == "TMUX_TMPDIR="+secondRoot {
+			t.Fatalf("poller environment inherited ambient socket root: %q", entry)
+		}
+	}
+	if !foundPollerRoot {
+		t.Fatalf("poller environment did not preserve %q", wantPollerRoot)
+	}
+	current, err = bound.CaptureSessionGeneration(generation.Name)
+	if err != nil {
+		t.Fatalf("captured generation through durable endpoint: %v", err)
+	}
+	if !current.Equal(generation) {
+		t.Fatalf("durable endpoint captured %+v, want %+v", current, generation)
+	}
+}
+
+func TestOrdinaryDefaultTmuxIgnoresAmbientTmuxEndpoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-default-transport-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-default-transport-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	rootEnv := func(root string) []string {
+		env := replaceEnvValue(os.Environ(), "TMUX_TMPDIR", root)
+		return replaceEnvValue(env, "TMUX", "")
+	}
+	start := func(root, name string) {
+		t.Helper()
+		cmd := exec.Command("tmux", "-u", "-L", "default", "new-session", "-d", "-s", name, "sleep 30")
+		cmd.Env = rootEnv(root)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("start %s: %v: %s", name, err, output)
+		}
+		t.Cleanup(func() {
+			cmd := exec.Command("tmux", "-L", "default", "kill-server")
+			cmd.Env = rootEnv(root)
+			_ = cmd.Run()
+		})
+	}
+	start(firstRoot, "persisted-default-target")
+	start(secondRoot, "ambient-default-decoy")
+
+	t.Setenv("TMUX_TMPDIR", firstRoot)
+	target := NewTmuxWithSocket("")
+	wantPath := filepath.Join(firstRoot, fmt.Sprintf("tmux-%d", os.Getuid()), "default")
+	if got := target.SessionTransport().SocketPath; got != wantPath {
+		t.Fatalf("persisted endpoint = %q, want %q", got, wantPath)
+	}
+	t.Setenv("TMUX_TMPDIR", secondRoot)
+	t.Setenv("TMUX", filepath.Join(secondRoot, fmt.Sprintf("tmux-%d", os.Getuid()), "default")+",1,0")
+
+	has, err := target.HasSession("persisted-default-target")
+	if err != nil {
+		t.Fatalf("lookup through persisted default endpoint: %v", err)
+	}
+	if !has {
+		t.Fatal("ambient TMUX overrode the persisted default endpoint")
+	}
+}
+
+func TestOrdinaryDefaultTmuxCreatesMissingSocketParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	root, err := os.MkdirTemp("/tmp", "gt-default-create-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	t.Setenv("TMUX_TMPDIR", root)
+	t.Setenv("TMUX", "")
+	target := NewTmuxWithSocket("")
+	t.Cleanup(func() { _ = target.KillServer() })
+	parent := filepath.Dir(target.SessionTransport().SocketPath)
+	if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket parent exists before first command: %v", err)
+	}
+	if err := target.NewSessionWithCommand("default-parent-create", t.TempDir(), "sleep 30"); err != nil {
+		t.Fatalf("create session with missing socket parent: %v", err)
+	}
+	if _, err := os.Stat(parent); err != nil {
+		t.Fatalf("socket parent after first command: %v", err)
+	}
+}
+
+func TestNewTmuxForSessionGenerationRejectsLegacyNameOnlyTransport(t *testing.T) {
+	generation := SessionGeneration{Transport: SessionTransport{Bound: true, SocketName: "legacy-alias"}}
+	if _, err := NewTmuxForSessionGeneration(generation); !errors.Is(err, ErrSessionTransportUnbound) {
+		t.Fatalf("NewTmuxForSessionGeneration() error = %v, want unbound transport", err)
+	}
+}
+
+func TestSessionGenerationEqualRejectsUnboundTransportWildcard(t *testing.T) {
+	bound := SessionGeneration{
+		Name: "session", SessionID: "$1", PaneID: "%0", Nonce: "nonce",
+		ServerPID: 1, ServerIdentity: "server",
+		Transport: SessionTransport{Bound: true, SocketName: "alias", SocketPath: "/tmp/tmux-1/alias"},
+	}
+	unbound := bound
+	unbound.Transport = SessionTransport{}
+	if bound.Equal(unbound) || unbound.Equal(bound) {
+		t.Fatal("unbound transport acted as an exact-generation wildcard")
 	}
 }
 
@@ -3197,7 +3444,7 @@ func TestCrossProcessNudgeLockIsPrivate(t *testing.T) {
 func TestNewTmuxWithSocketAndEnvUsesIsolatedEnvironment(t *testing.T) {
 	tm := NewTmuxWithSocketAndEnv("isolated", []string{"PATH=/usr/bin"})
 	cmd := tm.commandContext(context.Background(), "list-sessions")
-	if got := strings.Join(cmd.Env, "\n"); got != "PATH=/usr/bin" {
+	if got := strings.Join(cmd.Env, "\n"); got != "PATH=/usr/bin\nTMUX_TMPDIR=/tmp" {
 		t.Fatalf("tmux command environment = %q", got)
 	}
 }

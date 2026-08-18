@@ -506,6 +506,9 @@ func testDogTmuxGeneration(sessionID, nonce string) tmux.SessionGeneration {
 		Custody:        "custody-alpha",
 		ServerPID:      4242,
 		ServerIdentity: "server-start-alpha",
+		Transport: tmux.SessionTransport{
+			Bound: true, SocketName: "fixture-socket", SocketPath: "/tmp/tmux-fixture/fixture-socket",
+		},
 	}
 }
 

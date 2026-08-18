@@ -303,19 +303,23 @@ the named branch but neither its direct command path nor its manager removal
 path publishes a ref.
 
 Dogs persist an optional exact tmux session-generation, pane, and transport
-receipt alongside work state. The transport records both whether binding was
-captured and the exact tmux socket name; an intentionally empty name therefore
-means the bound default socket, while a missing binding identifies a legacy
-receipt. Starting a dog captures all three in the session creation transaction
-and records them before claiming successful runtime custody. Completion and removal
-hold the stable per-name lifecycle lock, compare the full durable snapshot,
-perform process-aware teardown of only that exact pane and session, finalize the
-exact assignment mail, and only then publish idle or remove the kennel. A live
+receipt alongside work state. The transport records both the logical socket
+name and the canonical absolute socket path used by tmux. The path is the
+authority because the same `-L` name under two `TMUX_TMPDIR` roots addresses two
+different servers; reconstructed controllers use `-S` and do not consult the
+later environment. Missing paths, including older name-only records, are legacy
+unbound receipts. Starting a dog captures all three in the session creation
+transaction and records them before claiming successful runtime custody.
+Completion and removal hold the stable per-name lifecycle lock, compare the full
+durable snapshot, perform process-aware teardown of only that exact pane and
+session, finalize the exact assignment mail, and only then publish idle or remove
+the kennel. A live
 legacy session without a record, an ambiguous pane-less generation, a tmux
 transport mismatch, a tmux lookup error, or generation substitution fails
 closed. Lifecycle commands reconstruct their controller from the durable
 transport instead of mutable `GT_TOWN_SOCKET`; absence on another server cannot
-release the assignment. `--force` bypasses only
+release the assignment. Non-force clear checks liveness through that same
+controller and preserves custody when the lookup fails. `--force` bypasses only
 the refusal to remove working state; it never bypasses generation custody. Dog
 status exposes work state independently from `running`, `absent`, `stale`, or
 `unknown` runtime state, and nested `gt dog done` is routed separately from the
@@ -387,6 +391,13 @@ revalidated tmux-generation fallback only for an explicit Stop or cleanup of
 the caller's own failed start; uncertain automatic replacement continues to
 fail closed.
 
+Once strong cleanup issues its first destructive signal, any later containment,
+tmux reconciliation, final-reap, or handle-release error is marked as committed
+but unreconciled. Portable cleanup returns that evidence directly rather than
+reclassifying an absent tmux session as success or attempting a weaker fallback.
+The durable owner therefore remains unavailable until a later exact pass proves
+the complete boundary terminal.
+
 A retained-cleanup pass has one caller-owned deadline for the entire registry,
 including each final reap and cgroup removal. It never grants a fresh timeout to
 each entry: when the caller expires, the current entry and every unprocessed
@@ -404,7 +415,10 @@ can close only after every tracked issue was checked and found complete.
 Reconciliation remains dry-run-first and never treats age alone as proof of
 completion. Reaper anomaly occurrences are durably linked and deduplicated,
 while convoy issue types and `gt:convoy` tracking records remain protected from
-age-based closure.
+age-based closure. Live stale-issue closure uses one pinned SQL connection and
+rechecks status, age, priority, issue type, protected labels, and both dependency
+directions in each conditional update. A record that becomes an agent or gains
+control-plane protection after discovery is skipped rather than closed.
 
 Doctor treats an exact persisted polecat cleanup status of `preserved` as
 intentional recovery evidence: it neither reports that work as stalled nor

@@ -61,6 +61,23 @@ func setupTestDog(t *testing.T, m *dog.Manager, townRoot, name string, state *do
 	}
 }
 
+func configureDogCommandTown(t *testing.T, townRoot string, rigsConfig *config.RigsConfig) {
+	t.Helper()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(rigsConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	t.Setenv("GT_ROOT", townRoot)
+}
+
 // =============================================================================
 // Dog Name Detection from Path Tests
 // =============================================================================
@@ -292,6 +309,8 @@ func TestDogDone_NotFound(t *testing.T) {
 }
 
 type fakeDogSessionController struct {
+	hasSession    bool
+	hasSessionErr error
 	captured      tmux.SessionGeneration
 	captureErr    error
 	captureFn     func(string) (tmux.SessionGeneration, error)
@@ -301,6 +320,10 @@ type fakeDogSessionController struct {
 	processKillFn func(context.Context, tmux.SessionGeneration) error
 	strongKilled  []tmux.SessionGeneration
 	strongKillFn  func(context.Context, tmux.SessionGeneration) error
+}
+
+func (f *fakeDogSessionController) HasSession(string) (bool, error) {
+	return f.hasSession, f.hasSessionErr
 }
 
 func (f *fakeDogSessionController) CaptureSessionGeneration(name string) (tmux.SessionGeneration, error) {
@@ -1057,6 +1080,159 @@ func TestDogSessionControllerFromSnapshotRejectsUnboundTransport(t *testing.T) {
 	}
 }
 
+func TestClearDogSnapshotNonForceUsesPersistedEndpointAfterAmbientRootDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-clear-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-clear-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socket := fmt.Sprintf("gt-dog-clear-bound-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	generation, err := target.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha", t.TempDir(), "sleep 30", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, tmpDir := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, m, tmpDir, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateWorking, Work: "task-bound", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	snapshot, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX_TMPDIR", secondRoot)
+	controller, err := dogSessionControllerFromSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = clearDogSnapshot(m, controller, snapshot, false)
+	if err == nil || !strings.Contains(err.Error(), "has an active session") {
+		t.Fatalf("clearDogSnapshot() error = %v, want exact live-session refusal", err)
+	}
+	current, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != dog.StateWorking || current.Work != "task-bound" || current.SessionGeneration == nil {
+		t.Fatalf("non-force refusal changed custody: %+v", current)
+	}
+}
+
+func TestClearDogSnapshotFailsClosedOnBoundControllerLookupError(t *testing.T) {
+	m, tmpDir := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	generation := cmdTestDogGeneration("$clear", "nonce-clear")
+	setupTestDog(t, m, tmpDir, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateWorking, Work: "task-clear", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: dog.SessionGenerationFromTmux(generation),
+	})
+	d, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("exact transport lookup failed")
+	controller := &fakeDogSessionController{hasSessionErr: wantErr}
+
+	err = clearDogSnapshot(m, controller, d, false)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("clearDogSnapshot() error = %v, want exact lookup error", err)
+	}
+	if len(controller.processKilled)+len(controller.strongKilled)+len(controller.killed) != 0 {
+		t.Fatalf("lookup failure performed teardown: %+v", controller)
+	}
+	current, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != dog.StateWorking || current.Work != "task-clear" || current.SessionGeneration == nil {
+		t.Fatalf("lookup failure changed custody: %+v", current)
+	}
+}
+
+func TestRunDogClearIdleLegacyDogRefusesLiveSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	mgr, townRoot := testDogManager(t)
+	configureDogCommandTown(t, townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateIdle, LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	socketRoot, err := os.MkdirTemp("/tmp", "gt-dog-clear-idle-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+	socket := fmt.Sprintf("gt-dog-clear-idle-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + socketRoot, "TMUX=",
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	if err := target.NewSessionWithCommand("hq-dog-alpha", t.TempDir(), "sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_TOWN_SOCKET", socket)
+	t.Setenv("TMUX_TMPDIR", socketRoot)
+	t.Setenv("TMUX", "")
+	oldForce := dogForce
+	dogForce = false
+	t.Cleanup(func() { dogForce = oldForce })
+
+	err = runDogClear(nil, []string{"alpha"})
+	if err == nil || !strings.Contains(err.Error(), "has an active session") {
+		t.Fatalf("runDogClear() error = %v, want live legacy-session refusal", err)
+	}
+}
+
+func TestRunDogClearIdleLegacyDogFailsClosedOnLookupError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pinned tmux failure helper uses a POSIX script")
+	}
+	mgr, townRoot := testDogManager(t)
+	configureDogCommandTown(t, townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateIdle, LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	helper := filepath.Join(t.TempDir(), "tmux-fail")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\necho exact transport lookup failed >&2\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_INTERNAL_PINNED_TMUX_BINARY", helper)
+	t.Setenv("GT_TOWN_SOCKET", fmt.Sprintf("gt-dog-clear-error-%d", time.Now().UnixNano()))
+	t.Setenv("TMUX", "")
+	oldForce := dogForce
+	dogForce = false
+	t.Cleanup(func() { dogForce = oldForce })
+
+	err := runDogClear(nil, []string{"alpha"})
+	if err == nil || !strings.Contains(err.Error(), "exact transport lookup failed") {
+		t.Fatalf("runDogClear() error = %v, want lookup failure", err)
+	}
+}
+
 func TestWaitForDogCloseoutHostHandoffRejectsEarlyFinalizerExit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("transient host-session proof uses POSIX commands")
@@ -1100,7 +1276,9 @@ func cmdTestDogGeneration(sessionID, nonce string) tmux.SessionGeneration {
 		Custody:        "custody-alpha",
 		ServerPID:      4242,
 		ServerIdentity: "server-start-alpha",
-		Transport:      tmux.SessionTransport{Bound: true, SocketName: "fixture-socket"},
+		Transport: tmux.SessionTransport{
+			Bound: true, SocketName: "fixture-socket", SocketPath: "/tmp/tmux-fixture/fixture-socket",
+		},
 	}
 }
 

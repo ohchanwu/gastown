@@ -752,6 +752,9 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 // Excludes P0/P1 priority, epics, convoys, control-plane identity records,
 // standing-order labels, and issues with active dependencies.
 func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+	if err := ValidateDBName(dbName); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
@@ -813,59 +816,115 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	}
 	rows.Close()
 
-	// Build per-issue closure log entries.
+	// Build dry-run closure log entries. Live runs add an entry only after the
+	// corresponding conditional UPDATE proves the issue remained eligible.
 	now := time.Now().UTC()
-	ids := make([]string, len(candidates))
-	for i, c := range candidates {
-		ids[i] = c.id
-		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
-			ID:       c.id,
-			Title:    c.title,
-			AgeDays:  int(now.Sub(c.updatedAt).Hours() / 24),
-			Database: dbName,
-		})
-	}
-
 	if dryRun {
-		result.Closed = len(ids)
+		for _, c := range candidates {
+			result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+				ID: c.id, Title: c.title,
+				AgeDays: int(now.Sub(c.updatedAt).Hours() / 24), Database: dbName,
+			})
+		}
+		result.Closed = len(candidates)
 		return result, nil
 	}
 
-	if len(ids) == 0 {
+	if len(candidates) == 0 {
 		return result, nil
 	}
 
-	if _, err := db.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pin auto-close connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
 		return nil, fmt.Errorf("disable autocommit: %w", err)
 	}
+	transactionOpen := true
 	defer func() {
-		_, _ = db.ExecContext(context.Background(), "SET @@autocommit = 1")
+		if transactionOpen {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
 	}()
 
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
+	// Recheck every eligibility predicate in the mutation itself. The JOIN form
+	// avoids MySQL Error 1093 from self-referencing subqueries while preventing
+	// a candidate that was retyped, protected, or newly blocked after SELECT
+	// from being closed.
+	quotedDBName := "`" + dbName + "`"
 	updateQuery := fmt.Sprintf(
-		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW(), close_reason = 'stale:auto-closed by reaper' WHERE id IN (%s)",
-		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
-		return nil, fmt.Errorf("auto-close: %w", err)
+		`UPDATE %[1]s.issues i
+		LEFT JOIN %[1]s.labels protected_label
+			ON protected_label.issue_id = i.id
+			AND protected_label.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:convoy', 'gt:agent')
+		LEFT JOIN (
+			%[1]s.dependencies child_dependency
+			INNER JOIN %[1]s.issues open_dependency
+				ON child_dependency.depends_on_issue_id = open_dependency.id
+				AND open_dependency.status IN ('open', 'in_progress')
+		) ON child_dependency.issue_id = i.id
+		LEFT JOIN (
+			%[1]s.dependencies reverse_dependency
+			INNER JOIN %[1]s.issues open_blocker
+				ON reverse_dependency.issue_id = open_blocker.id
+				AND open_blocker.status IN ('open', 'in_progress')
+		) ON reverse_dependency.depends_on_issue_id = i.id
+		SET i.status = 'closed', i.closed_at = NOW(), i.close_reason = 'stale:auto-closed by reaper'
+		WHERE i.id = ?
+			AND i.status IN ('open', 'in_progress')
+			AND i.updated_at < ?
+			AND i.priority > 1
+			AND i.issue_type NOT IN ('epic', 'convoy', 'agent')
+			AND protected_label.issue_id IS NULL
+			AND child_dependency.issue_id IS NULL
+			AND reverse_dependency.depends_on_issue_id IS NULL`, quotedDBName)
+
+	ids := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		updateResult, err := conn.ExecContext(ctx, updateQuery, candidate.id, staleCutoff)
+		if err != nil {
+			return nil, fmt.Errorf("auto-close %s: %w", candidate.id, err)
+		}
+		affected, err := updateResult.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("confirm auto-close %s: %w", candidate.id, err)
+		}
+		if affected == 0 {
+			continue
+		}
+		if affected != 1 {
+			return nil, fmt.Errorf("auto-close %s changed %d rows, want exactly one", candidate.id, affected)
+		}
+		ids = append(ids, candidate.id)
+		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+			ID: candidate.id, Title: candidate.title,
+			AgeDays: int(now.Sub(candidate.updatedAt).Hours() / 24), Database: dbName,
+		})
 	}
 
 	result.Closed = len(ids)
 
+	if len(ids) == 0 {
+		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			return nil, fmt.Errorf("rollback unchanged auto-close transaction: %w", err)
+		}
+		transactionOpen = false
+		return result, nil
+	}
+
 	if len(ids) > 0 {
 		// Flush SQL transaction to working set before DOLT_COMMIT.
-		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
 				"sql_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("sql commit after auto-close failed: %v", err)))
 			return result, nil
 		}
+		transactionOpen = false
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// "nothing to commit" is expected when the updated tables are dolt_ignored.
 			if !isNothingToCommit(err) {
 				result.Anomalies = append(result.Anomalies, commitFailureAnomaly(

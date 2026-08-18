@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -507,6 +508,133 @@ func TestAutoCloseExcludesControlPlaneIdentityRecords(t *testing.T) {
 	}
 }
 
+func TestAutoCloseRevalidatesEligibilityAtUpdate(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		issues: map[string]*fakeIssue{
+			"becomes-agent":   {id: "becomes-agent", title: "Agent race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"gains-agent-tag": {id: "gains-agent-tag", title: "Label race", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+			"still-stale":     {id: "still-stale", title: "Still stale", status: "open", issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	state.beforeAutoCloseUpdate = func(s *fakeReaperState) {
+		s.issues["becomes-agent"].issueType = "agent"
+		s.issues["gains-agent-tag"].labels = append(s.issues["gains-agent-tag"].labels, "gt:agent")
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("AutoClose: %v", err)
+	}
+	if result.Closed != 1 || len(result.ClosedEntries) != 1 || result.ClosedEntries[0].ID != "still-stale" {
+		t.Fatalf("AutoClose closed = %d entries=%#v, want only still-stale", result.Closed, result.ClosedEntries)
+	}
+	if got := state.status("becomes-agent"); got != "open" {
+		t.Fatalf("concurrently retyped agent status = %q, want open", got)
+	}
+	if got := state.status("gains-agent-tag"); got != "open" {
+		t.Fatalf("concurrently protected identity status = %q, want open", got)
+	}
+	transactionConnections := map[int]bool{}
+	for connectionID, operations := range state.opsSince(nil) {
+		for _, operation := range operations {
+			if strings.Contains(operation, "SET @@autocommit = 0") ||
+				strings.Contains(operation, "UPDATE `testdb`.issues") ||
+				operation == "EXEC COMMIT" || strings.Contains(operation, "CALL DOLT_COMMIT") {
+				transactionConnections[connectionID] = true
+			}
+		}
+	}
+	if len(transactionConnections) != 1 {
+		t.Fatalf("AutoClose transaction used connections %v, want one pinned connection", transactionConnections)
+	}
+}
+
+func TestAutoCloseConditionalUpdateRunsOnIsolatedDolt(t *testing.T) {
+	if os.Getenv("GT_TEST_EXTERNAL_DOLT") != "1" ||
+		os.Getenv("GT_TEST_ISOLATED") != "1" ||
+		os.Getenv("GT_DOLT_HOST") != "127.0.0.1" {
+		t.Skip("requires the explicit isolated Dolt test harness")
+	}
+	port, err := strconv.Atoi(os.Getenv("GT_DOLT_PORT"))
+	if err != nil || port <= 0 || port == 33327 {
+		t.Fatalf("refusing non-isolated Dolt port %q", os.Getenv("GT_DOLT_PORT"))
+	}
+	dbName := fmt.Sprintf("reaper_autoclose_%d", time.Now().UnixNano())
+	rootDB, err := sql.Open("mysql", fmt.Sprintf("root@tcp(127.0.0.1:%d)/?parseTime=true", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rootDB.Close() })
+	if _, err := rootDB.Exec("CREATE DATABASE `" + dbName + "`"); err != nil {
+		t.Fatalf("create isolated database: %v", err)
+	}
+	t.Cleanup(func() { _, _ = rootDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`") })
+
+	db, err := OpenDB("127.0.0.1", port, dbName, 15*time.Second, 15*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		`CREATE TABLE issues (
+			id VARCHAR(64) PRIMARY KEY, title VARCHAR(255) NOT NULL, status VARCHAR(32) NOT NULL,
+			priority INT NOT NULL, issue_type VARCHAR(32) NOT NULL, updated_at DATETIME NOT NULL,
+			closed_at DATETIME NULL, close_reason TEXT NULL)`,
+		`CREATE TABLE labels (issue_id VARCHAR(64) NOT NULL, label VARCHAR(64) NOT NULL)`,
+		`CREATE TABLE dependencies (issue_id VARCHAR(64) NOT NULL, depends_on_issue_id VARCHAR(64) NULL)`,
+		`INSERT INTO issues (id, title, status, priority, issue_type, updated_at) VALUES
+			('stale-task', 'Stale task', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('protected-agent', 'Agent identity', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('mixed-dependent', 'Mixed dependency states', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('closed-dependency', 'Closed dependency', 'closed', 3, 'task', NOW()),
+			('open-dependency', 'Open dependency', 'open', 3, 'task', NOW()),
+			('mixed-blocked', 'Mixed blocker states', 'open', 3, 'task', NOW() - INTERVAL 8 DAY),
+			('closed-blocker', 'Closed blocker', 'closed', 3, 'task', NOW()),
+			('open-blocker', 'Open blocker', 'open', 3, 'task', NOW())`,
+		`INSERT INTO labels (issue_id, label) VALUES ('protected-agent', 'gt:agent')`,
+		`INSERT INTO dependencies (issue_id, depends_on_issue_id) VALUES
+			('mixed-dependent', 'closed-dependency'),
+			('mixed-dependent', 'open-dependency'),
+			('closed-blocker', 'mixed-blocked'),
+			('open-blocker', 'mixed-blocked')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("initialize isolated schema: %v\n%s", err, statement)
+		}
+	}
+
+	result, err := AutoClose(db, dbName, 7*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("AutoClose on isolated Dolt: %v", err)
+	}
+	if result.Closed != 1 || len(result.ClosedEntries) != 1 || result.ClosedEntries[0].ID != "stale-task" {
+		t.Fatalf("AutoClose result = %#v, want only stale-task", result)
+	}
+	var staleStatus, protectedStatus, mixedDependentStatus, mixedBlockedStatus string
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'stale-task'").Scan(&staleStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'protected-agent'").Scan(&protectedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'mixed-dependent'").Scan(&mixedDependentStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT status FROM issues WHERE id = 'mixed-blocked'").Scan(&mixedBlockedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if staleStatus != "closed" || protectedStatus != "open" || mixedDependentStatus != "open" || mixedBlockedStatus != "open" {
+		t.Fatalf(
+			"isolated statuses stale=%q protected=%q mixed-dependent=%q mixed-blocked=%q",
+			staleStatus, protectedStatus, mixedDependentStatus, mixedBlockedStatus,
+		)
+	}
+}
+
 func TestScanReturnsStableDanglingParentAnomaly(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
@@ -598,12 +726,13 @@ type fakeDep struct {
 }
 
 type fakeReaperState struct {
-	mu       sync.Mutex
-	wisps    map[string]*fakeWisp
-	issues   map[string]*fakeIssue
-	deps     []fakeDep
-	nextConn int
-	ops      map[int][]string
+	mu                    sync.Mutex
+	wisps                 map[string]*fakeWisp
+	issues                map[string]*fakeIssue
+	deps                  []fakeDep
+	nextConn              int
+	ops                   map[int][]string
+	beforeAutoCloseUpdate func(*fakeReaperState)
 }
 
 func (s *fakeReaperState) autoCloseCandidatesLocked(query string, cutoff time.Time) []*fakeIssue {
@@ -854,11 +983,19 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.record(c.id, "EXEC "+normalized)
 
 	switch {
-	case strings.HasPrefix(normalized, "UPDATE `testdb`.issues SET status = 'closed'"):
+	case strings.HasPrefix(normalized, "UPDATE `testdb`.issues") && strings.Contains(normalized, "SET i.status = 'closed'"):
+		if hook := c.state.beforeAutoCloseUpdate; hook != nil {
+			c.state.beforeAutoCloseUpdate = nil
+			hook(c.state)
+		}
+		eligible := make(map[string]bool)
+		for _, issue := range c.state.autoCloseCandidatesLocked(normalized, namedTime(args)) {
+			eligible[issue.id] = true
+		}
 		affected := int64(0)
 		for _, arg := range args {
 			id, _ := arg.Value.(string)
-			if issue := c.state.issues[id]; issue != nil && (issue.status == "open" || issue.status == "in_progress") {
+			if issue := c.state.issues[id]; issue != nil && eligible[id] {
 				issue.status = "closed"
 				affected++
 			}
@@ -930,11 +1067,10 @@ func (r *fakeReaperRows) Next(dest []driver.Value) error {
 }
 
 func namedTime(args []driver.NamedValue) time.Time {
-	if len(args) == 0 {
-		return time.Time{}
-	}
-	if value, ok := args[0].Value.(time.Time); ok {
-		return value
+	for _, arg := range args {
+		if value, ok := arg.Value.(time.Time); ok {
+			return value
+		}
 	}
 	return time.Time{}
 }

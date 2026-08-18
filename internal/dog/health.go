@@ -31,13 +31,20 @@ type DogHealthResult struct {
 
 // HealthChecker performs health checks on dogs in the kennel.
 type HealthChecker struct {
-	mgr     *Manager
-	checker sessionChecker
+	mgr                  *Manager
+	checker              sessionChecker
+	checkerForGeneration func(tmux.SessionGeneration) (sessionChecker, error)
 }
 
 // NewHealthChecker creates a HealthChecker.
 func NewHealthChecker(mgr *Manager, checker sessionChecker) *HealthChecker {
-	return &HealthChecker{mgr: mgr, checker: checker}
+	return &HealthChecker{
+		mgr:     mgr,
+		checker: checker,
+		checkerForGeneration: func(generation tmux.SessionGeneration) (sessionChecker, error) {
+			return tmux.NewTmuxForSessionGeneration(generation)
+		},
+	}
 }
 
 // dogSessionName returns the tmux session name for a dog.
@@ -58,10 +65,17 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 	}
 
 	session := dogSessionName(d.Name)
+	checker, checkerErr := hc.checkerForDog(d)
+	if checkerErr != nil {
+		result.SessionStatus = "unknown"
+		result.NeedsAttention = true
+		result.Recommendation = "health check failed: " + checkerErr.Error()
+		return result
+	}
 
 	switch d.State {
 	case StateWorking:
-		status := hc.checker.CheckSessionHealth(session, maxInactivity)
+		status := checker.CheckSessionHealth(session, maxInactivity)
 		result.SessionStatus = status.String()
 
 		switch status {
@@ -70,7 +84,7 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 			result.NeedsAttention = true
 			result.Recommendation = "zombie: session dead but state=working"
 			if autoClear {
-				if err := hc.clearExactDogRuntime(d, false); err == nil {
+				if err := hc.clearExactDogRuntimeWithChecker(d, false, checker); err == nil {
 					result.AutoCleared = true
 					result.Recommendation = "zombie auto-cleared (session dead)"
 				} else {
@@ -83,7 +97,7 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 			result.NeedsAttention = true
 			result.Recommendation = "zombie: agent dead in session"
 			if autoClear {
-				if err := hc.clearExactDogRuntime(d, true); err == nil {
+				if err := hc.clearExactDogRuntimeWithChecker(d, true, checker); err == nil {
 					result.AutoCleared = true
 					result.Recommendation = "zombie auto-cleared (agent dead, session killed)"
 				} else {
@@ -97,7 +111,7 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 			// finished its work but failed to call `gt dog done`.
 			result.NeedsAttention = true
 			if autoClear {
-				if err := hc.clearExactDogRuntime(d, true); err == nil {
+				if err := hc.clearExactDogRuntimeWithChecker(d, true, checker); err == nil {
 					result.AutoCleared = true
 					result.Recommendation = "hung dog auto-cleared (idle prompt, session killed)"
 				} else {
@@ -112,12 +126,12 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 
 	case StateIdle:
 		// Check for orphan session.
-		has, _ := hc.checker.HasSession(session)
+		has, _ := checker.HasSession(session)
 		if has {
 			result.SessionStatus = "orphan"
 			result.NeedsAttention = true
 			if autoClear {
-				if err := hc.clearExactDogRuntime(d, true); err == nil {
+				if err := hc.clearExactDogRuntimeWithChecker(d, true, checker); err == nil {
 					result.AutoCleared = true
 					result.Recommendation = "orphan auto-cleared (session killed)"
 				} else {
@@ -134,7 +148,22 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 	return result
 }
 
+func (hc *HealthChecker) checkerForDog(d *Dog) (sessionChecker, error) {
+	if d == nil || d.SessionGeneration == nil {
+		return hc.checker, nil
+	}
+	return hc.checkerForGeneration(d.SessionGeneration.Tmux())
+}
+
 func (hc *HealthChecker) clearExactDogRuntime(d *Dog, sessionLive bool) error {
+	checker, err := hc.checkerForDog(d)
+	if err != nil {
+		return fmt.Errorf("checking exact dog session transport: %w", err)
+	}
+	return hc.clearExactDogRuntimeWithChecker(d, sessionLive, checker)
+}
+
+func (hc *HealthChecker) clearExactDogRuntimeWithChecker(d *Dog, sessionLive bool, checker sessionChecker) error {
 	if d == nil {
 		return errors.New("dog lifecycle evidence unavailable")
 	}
@@ -159,10 +188,10 @@ func (hc *HealthChecker) clearExactDogRuntime(d *Dog, sessionLive bool) error {
 	teardown := func(generation tmux.SessionGeneration) error {
 		ctx, cancel := context.WithTimeout(context.Background(), dogSessionTeardownTimeout)
 		defer cancel()
-		return hc.checker.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
+		return checker.KillSessionGenerationWithProcessesPortableContext(ctx, generation)
 	}
 	if sessionLive {
-		current, err := hc.checker.CaptureSessionGeneration(dogSessionName(d.Name))
+		current, err := checker.CaptureSessionGeneration(dogSessionName(d.Name))
 		if err != nil {
 			return fmt.Errorf("capturing exact dog session: %w", err)
 		}

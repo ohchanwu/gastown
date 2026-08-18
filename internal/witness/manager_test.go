@@ -971,6 +971,53 @@ exit 2
 	}
 }
 
+func TestManagerStartMarksAllPostCommitErrorsUnreconciled(t *testing.T) {
+	mgr, pollerPath, _ := newFakeTmuxManager(t, `
+case "$*" in
+  *"has-session"*) exit 0 ;;
+  *"list-sessions"*) printf '%s:$1\n' "$FAKE_SESSION_NAME"; exit 0 ;;
+  *"show-environment"*"GT_PROCESS_NAMES"*) echo "GT_PROCESS_NAMES=definitely-not-running"; exit 0 ;;
+  *"show-environment"*) echo "unknown variable" >&2; exit 1 ;;
+  *"display-message"*"pane_current_command"*) echo "other"; exit 0 ;;
+  *"display-message"*"pane_pid"*) echo "999999"; exit 0 ;;
+  *"list-panes"*) exit 0 ;;
+esac
+exit 2
+`)
+	record := []byte(`{"PID":999999,"Identity":{"StartTime":"old-start","Command":"gt nudge-poller ` + mgr.SessionName() + `","Generation":"old-generation","Transport":"test"},"Session":"` + mgr.SessionName() + `","Legacy":false}` + "\n")
+	if err := os.WriteFile(pollerPath, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commitErr := errors.New("post-signal containment verification failed")
+	closeErr := errors.New("post-signal cleanup close failed")
+	mgr.prepareSessionCleanup = func(
+		generation tmux.SessionGeneration,
+		pane tmux.PaneProcessGeneration,
+	) (sessionGenerationCleanup, error) {
+		return &fakeSessionCleanup{
+			generation: generation,
+			pane:       pane,
+			prepare: func(context.Context) (func(context.Context) (bool, error), error) {
+				return func(context.Context) (bool, error) {
+					return true, commitErr
+				}, nil
+			},
+			closeContext: func(context.Context) error { return closeErr },
+		}, nil
+	}
+
+	err := mgr.Start(false, "", nil)
+	if !errors.Is(err, tmux.ErrSessionCleanupUnreconciled) ||
+		!errors.Is(err, commitErr) || !errors.Is(err, closeErr) ||
+		!errors.Is(err, nudge.ErrPollerPreservedAfterCommittedCleanup) {
+		t.Fatalf("Start() error = %v, want marked post-commit and close errors with poller preservation", err)
+	}
+	got, readErr := os.ReadFile(pollerPath)
+	if readErr != nil || string(got) != string(record) {
+		t.Fatalf("preserved poller record = %q, err %v; want %q", got, readErr, record)
+	}
+}
+
 func TestManagerStartHoldsDeliveryLeaseThroughFailedCleanup(t *testing.T) {
 	mgr, pollerPath, _ := newFakeTmuxManager(t, `
 case "$*" in

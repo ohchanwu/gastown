@@ -360,10 +360,14 @@ func (m *Manager) teardownSessionGeneration(
 			}
 			return func(commitCtx context.Context) (nudge.PollerReplacementOutcome, error) {
 				committed, commitErr := commit(commitCtx)
+				commitErr = errors.Join(commitErr, closeCleanup())
+				if committed && commitErr != nil && !errors.Is(commitErr, tmux.ErrSessionCleanupUnreconciled) {
+					commitErr = errors.Join(tmux.ErrSessionCleanupUnreconciled, commitErr)
+				}
 				return nudge.PollerReplacementOutcome{
 					Committed: committed,
 					Terminal:  committed && !errors.Is(commitErr, tmux.ErrSessionCleanupUnreconciled),
-				}, errors.Join(commitErr, closeCleanup())
+				}, commitErr
 			}, nil
 		},
 	)

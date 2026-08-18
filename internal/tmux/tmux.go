@@ -205,10 +205,12 @@ func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 
 // Tmux wraps tmux operations.
 type Tmux struct {
-	socketName string // tmux socket name (-L flag), empty = default socket
-	commandEnv []string
-	leaseMu    sync.Mutex
-	nudgeLease *nudgeLease
+	socketName    string // tmux socket name (-L flag), empty = default socket
+	socketPath    string // canonical endpoint persisted in lifecycle receipts
+	useSocketPath bool   // address socketPath directly with -S when reconstructed from a receipt
+	commandEnv    []string
+	leaseMu       sync.Mutex
+	nudgeLease    *nudgeLease
 }
 
 // ErrSessionTransportUnbound means a durable lifecycle receipt predates the
@@ -216,12 +218,65 @@ type Tmux struct {
 // be treated as proof that the recorded generation is gone.
 var ErrSessionTransportUnbound = errors.New("tmux session transport is unbound")
 
-// SessionTransport identifies the exact tmux server transport used to capture
-// a generation. Bound distinguishes the default socket (an intentionally empty
-// SocketName) from a legacy receipt that did not persist transport at all.
+// SessionTransport identifies the exact tmux server endpoint used to capture a
+// generation. SocketName is descriptive; SocketPath is authoritative because
+// one logical name beneath different TMUX_TMPDIR roots names different servers.
+// Bound without a canonical path is a legacy receipt and cannot authorize
+// destructive or absence-based lifecycle decisions.
 type SessionTransport struct {
 	Bound      bool   `json:"bound"`
 	SocketName string `json:"socket_name,omitempty"`
+	SocketPath string `json:"socket_path,omitempty"`
+}
+
+func (transport SessionTransport) boundToCanonicalEndpoint() bool {
+	return transport.Bound &&
+		transport.SocketPath != "" &&
+		filepath.IsAbs(transport.SocketPath) &&
+		filepath.Clean(transport.SocketPath) == transport.SocketPath
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return strings.TrimPrefix(env[i], prefix)
+		}
+	}
+	return ""
+}
+
+func replaceEnvValue(env []string, name, value string) []string {
+	prefix := name + "="
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+value)
+}
+
+func canonicalSocketPath(socketName string, env []string) string {
+	base := ""
+	if env == nil {
+		base = os.Getenv("TMUX_TMPDIR")
+	} else {
+		base = envValue(env, "TMUX_TMPDIR")
+	}
+	if base == "" {
+		base = "/tmp"
+	}
+	if !filepath.IsAbs(base) {
+		if absolute, err := filepath.Abs(base); err == nil {
+			base = absolute
+		}
+	}
+	name := socketName
+	if name == "" {
+		name = "default"
+	}
+	return filepath.Clean(filepath.Join(base, fmt.Sprintf("tmux-%d", os.Getuid()), name))
 }
 
 // SessionTransport returns this client's authoritative tmux transport.
@@ -229,17 +284,25 @@ func (t *Tmux) SessionTransport() SessionTransport {
 	if t == nil {
 		return SessionTransport{}
 	}
-	return SessionTransport{Bound: true, SocketName: t.socketName}
+	socketPath := t.socketPath
+	if socketPath == "" {
+		socketPath = canonicalSocketPath(t.socketName, t.commandEnv)
+	}
+	return SessionTransport{Bound: true, SocketName: t.socketName, SocketPath: socketPath}
 }
 
 // NewTmuxForSessionGeneration reconstructs the exact transport captured in a
 // durable generation. Legacy unbound receipts fail closed instead of falling
 // back to GT_TOWN_SOCKET or another mutable process environment variable.
 func NewTmuxForSessionGeneration(generation SessionGeneration) (*Tmux, error) {
-	if !generation.Transport.Bound {
+	if !generation.Transport.boundToCanonicalEndpoint() {
 		return nil, ErrSessionTransportUnbound
 	}
-	return NewTmuxWithSocket(generation.Transport.SocketName), nil
+	return &Tmux{
+		socketName:    generation.Transport.SocketName,
+		socketPath:    generation.Transport.SocketPath,
+		useSocketPath: true,
+	}, nil
 }
 
 type nudgeLease struct {
@@ -294,7 +357,7 @@ func NewTmux() *Tmux {
 		// target the correct town server even when InitRegistry was not called.
 		sock = os.Getenv("GT_TOWN_SOCKET")
 	}
-	return &Tmux{socketName: sock}
+	return &Tmux{socketName: sock, socketPath: canonicalSocketPath(sock, nil)}
 }
 
 // NewTmuxWithSocket creates a Tmux wrapper that targets a named socket.
@@ -302,13 +365,14 @@ func NewTmux() *Tmux {
 // default server. Primarily used in tests to prevent session name collisions
 // and keystroke leaks (e.g. Escape from NudgeSession hitting the user's prefix table).
 func NewTmuxWithSocket(socket string) *Tmux {
-	return &Tmux{socketName: socket}
+	return &Tmux{socketName: socket, socketPath: canonicalSocketPath(socket, nil)}
 }
 
 // NewTmuxWithSocketAndEnv creates an isolated tmux client whose server and
 // panes cannot inherit ambient process routing such as live Dolt endpoints.
 func NewTmuxWithSocketAndEnv(socket string, env []string) *Tmux {
-	return &Tmux{socketName: socket, commandEnv: append([]string(nil), env...)}
+	commandEnv := append([]string(nil), env...)
+	return &Tmux{socketName: socket, socketPath: canonicalSocketPath(socket, commandEnv), commandEnv: commandEnv}
 }
 
 // IsIsolated reports whether this client targets a dedicated tmux socket.
@@ -323,9 +387,14 @@ func (t *Tmux) PollerEnvironment() []string {
 	}
 	result := make([]string, 0, len(env)+2)
 	for _, entry := range env {
-		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") && !strings.HasPrefix(entry, "GT_TMUX_SOCKET=") {
+		if !strings.HasPrefix(entry, "GT_TOWN_SOCKET=") &&
+			!strings.HasPrefix(entry, "GT_TMUX_SOCKET=") &&
+			!(t.socketPath != "" && strings.HasPrefix(entry, "TMUX_TMPDIR=")) {
 			result = append(result, entry)
 		}
+	}
+	if t.socketPath != "" {
+		result = append(result, "TMUX_TMPDIR="+filepath.Dir(filepath.Dir(t.socketPath)))
 	}
 	if t.socketName != "" {
 		result = append(result, "GT_TOWN_SOCKET="+t.socketName)
@@ -436,8 +505,14 @@ func (t *Tmux) run(args ...string) (string, error) {
 
 func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
 	allArgs := []string{"-u"}
-	if t.socketName != "" {
+	if t.useSocketPath && t.socketPath != "" {
+		allArgs = append(allArgs, "-S", t.socketPath)
+	} else if t.socketName != "" {
 		allArgs = append(allArgs, "-L", t.socketName)
+	} else if t.socketPath != "" {
+		// An explicit default name prevents ambient TMUX from selecting a
+		// different server while still letting tmux create tmux-$UID itself.
+		allArgs = append(allArgs, "-L", "default")
 	}
 	allArgs = append(allArgs, args...)
 	binary := strings.TrimSpace(os.Getenv(envPinnedTmuxBinary))
@@ -445,8 +520,15 @@ func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
 		binary = "tmux"
 	}
 	cmd := exec.CommandContext(ctx, binary, allArgs...)
-	if t.commandEnv != nil {
-		cmd.Env = t.commandEnv
+	commandEnv := t.commandEnv
+	if commandEnv == nil && t.socketPath != "" && !t.useSocketPath {
+		commandEnv = os.Environ()
+	}
+	if commandEnv != nil {
+		if t.socketPath != "" && !t.useSocketPath {
+			commandEnv = replaceEnvValue(commandEnv, "TMUX_TMPDIR", filepath.Dir(filepath.Dir(t.socketPath)))
+		}
+		cmd.Env = commandEnv
 	}
 	hideConsoleWindow(cmd)
 	return cmd
@@ -590,6 +672,9 @@ func (t *Tmux) createNewSessionGenerationContext(ctx context.Context, name, work
 }
 
 func sessionGenerationCleanupTerminal(err error) bool {
+	if errors.Is(err, ErrSessionCleanupUnreconciled) {
+		return false
+	}
 	return err == nil ||
 		errors.Is(err, ErrSessionNotFound) ||
 		errors.Is(err, ErrNoServer) ||
@@ -605,6 +690,9 @@ func (t *Tmux) classifyProcessCleanupResult(
 	generation SessionGeneration,
 	cleanupErr error,
 ) (bool, error) {
+	if errors.Is(cleanupErr, ErrSessionCleanupUnreconciled) {
+		return false, cleanupErr
+	}
 	switch {
 	case cleanupErr == nil:
 		return true, nil
@@ -646,8 +734,29 @@ func (t *Tmux) CleanupFailedSessionGeneration(generation SessionGeneration) erro
 // the host. Unlike failed-start cleanup, it reports generation substitution to
 // the caller so a surrounding lifecycle transaction can preserve a replacement.
 func (t *Tmux) KillSessionGenerationWithProcessesPortableContext(ctx context.Context, generation SessionGeneration) error {
-	processErr := t.KillSessionGenerationWithProcessesContext(ctx, generation)
-	processTerminal, processErr := t.classifyProcessCleanupResult(ctx, generation, processErr)
+	return runPortableSessionGenerationCleanup(
+		ctx,
+		generation,
+		t.KillSessionGenerationWithProcessesContext,
+		t.classifyProcessCleanupResult,
+		t.killSessionGenerationExplicitWithProcessesContext,
+		t.KillSessionGeneration,
+	)
+}
+
+func runPortableSessionGenerationCleanup(
+	ctx context.Context,
+	generation SessionGeneration,
+	strongCleanup func(context.Context, SessionGeneration) error,
+	classify func(context.Context, SessionGeneration, error) (bool, error),
+	explicitCleanup func(context.Context, SessionGeneration) error,
+	fallbackCleanup func(SessionGeneration) error,
+) error {
+	processErr := strongCleanup(ctx, generation)
+	if errors.Is(processErr, ErrSessionCleanupUnreconciled) {
+		return processErr
+	}
+	processTerminal, processErr := classify(ctx, generation, processErr)
 	if processTerminal {
 		return processErr
 	}
@@ -655,12 +764,12 @@ func (t *Tmux) KillSessionGenerationWithProcessesPortableContext(ctx context.Con
 	// platform without retained kernel/custody handles. It still binds every
 	// signal to the exact tmux generation and process-start identity. Automatic
 	// zombie replacement must never use this fallback.
-	explicitErr := t.killSessionGenerationExplicitWithProcessesContext(ctx, generation)
-	explicitTerminal, explicitErr := t.classifyProcessCleanupResult(ctx, generation, explicitErr)
+	explicitErr := explicitCleanup(ctx, generation)
+	explicitTerminal, explicitErr := classify(ctx, generation, explicitErr)
 	if explicitTerminal {
 		return explicitErr
 	}
-	fallbackErr := t.KillSessionGeneration(generation)
+	fallbackErr := fallbackCleanup(generation)
 	if errors.Is(fallbackErr, ErrSessionGenerationChanged) {
 		return errors.Join(ErrSessionGenerationChanged, processErr, explicitErr)
 	}
@@ -1312,6 +1421,9 @@ type SessionGeneration struct {
 // Equal reports whether two observations identify the same server/session
 // generation.
 func (g SessionGeneration) Equal(other SessionGeneration) bool {
+	if !g.Transport.boundToCanonicalEndpoint() || !other.Transport.boundToCanonicalEndpoint() {
+		return false
+	}
 	return g.Name == other.Name &&
 		g.SessionID == other.SessionID &&
 		g.PaneID == other.PaneID &&
@@ -1319,7 +1431,7 @@ func (g SessionGeneration) Equal(other SessionGeneration) bool {
 		g.Custody == other.Custody &&
 		g.ServerPID == other.ServerPID &&
 		g.ServerIdentity == other.ServerIdentity &&
-		((!g.Transport.Bound || !other.Transport.Bound) || g.Transport == other.Transport)
+		g.Transport == other.Transport
 }
 
 // PaneProcessGeneration binds the pane PID reported by tmux to the process
@@ -1501,7 +1613,10 @@ func validateServerGeneration(generation SessionGeneration) error {
 }
 
 func (t *Tmux) validateSessionGenerationTransport(generation SessionGeneration) error {
-	if generation.Transport.Bound && t.SessionTransport() != generation.Transport {
+	if !generation.Transport.boundToCanonicalEndpoint() {
+		return ErrSessionTransportUnbound
+	}
+	if t.SessionTransport() != generation.Transport {
 		return fmt.Errorf("%w: authoritative tmux transport changed", ErrSessionGenerationChanged)
 	}
 	return nil
@@ -2258,7 +2373,14 @@ func (cleanup *SessionGenerationCleanup) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = commit(ctx)
+	committed, err := commit(ctx)
+	return markCommittedSessionCleanupError(committed, err)
+}
+
+func markCommittedSessionCleanupError(committed bool, err error) error {
+	if committed && err != nil && !errors.Is(err, ErrSessionCleanupUnreconciled) {
+		return errors.Join(ErrSessionCleanupUnreconciled, err)
+	}
 	return err
 }
 
@@ -2289,9 +2411,18 @@ func (t *Tmux) killSessionGenerationWithProcessesContext(
 	if err != nil {
 		return err
 	}
-	runErr := cleanup.Run(ctx)
+	commit, prepareErr := cleanup.PrepareCommit(ctx)
+	var (
+		committed bool
+		runErr    error
+	)
+	if prepareErr != nil {
+		runErr = prepareErr
+	} else {
+		committed, runErr = commit(ctx)
+	}
 	closeErr := cleanup.Close()
-	return errors.Join(runErr, closeErr)
+	return markCommittedSessionCleanupError(committed, errors.Join(runErr, closeErr))
 }
 
 // KillSession terminates a tmux session. Idempotent: returns nil if the

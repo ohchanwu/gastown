@@ -661,23 +661,12 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
-	// Check if already idle
-	if d.State == dog.StateIdle && d.Work == "" && d.SessionGeneration == nil {
-		fmt.Printf("Dog %s is already idle\n", name)
-		return nil
-	}
-
-	// Check for live tmux session
-	if !dogForce {
-		sessionName := fmt.Sprintf("hq-dog-%s", name)
-		tm := tmux.NewTmux()
-		if has, _ := tm.HasSession(sessionName); has {
-			return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", name, sessionName)
-		}
-	}
+	alreadyIdle := d.State == dog.StateIdle && d.Work == "" && d.SessionGeneration == nil
 
 	// Clear only after exact absence or generation-bound teardown. --force
-	// bypasses the liveness refusal above; it never bypasses identity custody.
+	// bypasses the liveness refusal; it never bypasses identity custody. Select
+	// the controller first so liveness and teardown address the same durable
+	// endpoint instead of reusing a socket alias under an ambient socket root.
 	controller := dogSessionControllerFromEnvironment()
 	if d.SessionGeneration != nil {
 		controller, err = dogSessionControllerFromSnapshot(d)
@@ -685,8 +674,12 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("selecting exact dog runtime transport: %w", err)
 		}
 	}
-	if err := completeDogCloseout(mgr, controller, d); err != nil {
+	if err := clearDogSnapshot(mgr, controller, d, dogForce); err != nil {
 		return fmt.Errorf("clearing dog %s: %w", name, err)
+	}
+	if alreadyIdle {
+		fmt.Printf("Dog %s is already idle\n", name)
+		return nil
 	}
 
 	fmt.Printf("✓ Cleared dog %s (now idle)\n", name)
@@ -797,9 +790,27 @@ type dogCloseoutManager interface {
 }
 
 type dogSessionController interface {
+	HasSession(name string) (bool, error)
 	CaptureSessionGeneration(name string) (tmux.SessionGeneration, error)
 	KillSessionGenerationWithProcessesContext(context.Context, tmux.SessionGeneration) error
 	KillSessionGenerationWithProcessesPortableContext(context.Context, tmux.SessionGeneration) error
+}
+
+func clearDogSnapshot(mgr dogCloseoutManager, controller dogSessionController, snapshot *dog.Dog, force bool) error {
+	if snapshot == nil {
+		return errors.New("dog closeout snapshot is unavailable")
+	}
+	if !force {
+		sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
+		has, err := controller.HasSession(sessionName)
+		if err != nil {
+			return fmt.Errorf("checking exact dog session %s: %w", sessionName, err)
+		}
+		if has {
+			return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", snapshot.Name, sessionName)
+		}
+	}
+	return completeDogCloseout(mgr, controller, snapshot)
 }
 
 var errDogCloseoutIncomplete = errors.New("dog closeout incomplete")

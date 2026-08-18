@@ -23,11 +23,14 @@ func (t *Tmux) ensureNewSessionSocketSafe() error {
 }
 
 func (t *Tmux) ensureNewSessionSocketSafeContext(ctx context.Context) error {
-	if t.socketName == "" {
+	if t.socketName == "" && t.socketPath == "" {
 		return nil
 	}
 
-	socketPath := filepath.Join(SocketDir(), t.socketName)
+	socketPath := t.socketPath
+	if socketPath == "" {
+		socketPath = filepath.Join(SocketDir(), t.socketName)
+	}
 	info, err := os.Lstat(socketPath)
 	if err != nil {
 		if os.IsNotExist(err) {

@@ -3,6 +3,9 @@ package dog
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +27,14 @@ func newMockChecker() *mockSessionChecker {
 		sessionsAlive: make(map[string]bool),
 		generations:   make(map[string]tmux.SessionGeneration),
 	}
+}
+
+func newMockHealthChecker(mgr *Manager, checker *mockSessionChecker) *HealthChecker {
+	hc := NewHealthChecker(mgr, checker)
+	hc.checkerForGeneration = func(tmux.SessionGeneration) (sessionChecker, error) {
+		return checker, nil
+	}
+	return hc
 }
 
 func (m *mockSessionChecker) CheckSessionHealth(session string, _ time.Duration) tmux.ZombieStatus {
@@ -55,6 +66,9 @@ func healthTestGeneration() tmux.SessionGeneration {
 		Custody:        "health-custody",
 		ServerPID:      4242,
 		ServerIdentity: "health-server",
+		Transport: tmux.SessionTransport{
+			Bound: true, SocketName: "health-socket", SocketPath: "/tmp/tmux-health/health-socket",
+		},
 	}
 }
 
@@ -211,7 +225,7 @@ func TestHealth_Hung_AutoCleared(t *testing.T) {
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
 	mc.generations["hq-dog-alpha"] = generation
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, true) // autoClear=true: kill and reclaim
@@ -230,6 +244,97 @@ func TestHealth_Hung_AutoCleared(t *testing.T) {
 	d2, _ := m.Get("alpha")
 	if d2.State != StateIdle {
 		t.Errorf("state = %q, want idle after auto-clear", d2.State)
+	}
+}
+
+func TestHealthUsesPersistedEndpointAfterAmbientRootDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-health-bound-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-health-bound-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socket := fmt.Sprintf("gt-dog-health-bound-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	generation, err := target.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha", t.TempDir(), "sleep 30", map[string]string{"GT_PROCESS_NAMES": "sleep"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	setupDogWithState(t, mgr, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-bound", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: SessionGenerationFromTmux(generation),
+	})
+	ambient := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + secondRoot,
+	})
+	hc := NewHealthChecker(mgr, ambient)
+	d, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := hc.Check(d, time.Hour, true)
+	if result.SessionStatus != tmux.SessionHealthy.String() || result.NeedsAttention || result.AutoCleared {
+		t.Fatalf("health through persisted endpoint = %+v, want healthy without clear", result)
+	}
+	if live, err := target.HasSession(generation.Name); err != nil || !live {
+		t.Fatalf("persisted endpoint after health check: live=%v err=%v", live, err)
+	}
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StateWorking || stored.Work != "task-bound" || stored.SessionGeneration == nil {
+		t.Fatalf("health check released live exact custody: %+v", stored)
+	}
+}
+
+func TestHealthClearExactDogRuntimeRejectsNameOnlyTransport(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC()
+	generation := healthTestGeneration()
+	generation.Transport = tmux.SessionTransport{Bound: true, SocketName: "legacy-alias"}
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-legacy", WorkStartedAt: now.Add(-time.Hour),
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+		SessionGeneration: SessionGenerationFromTmux(generation),
+	})
+	mc := newMockChecker()
+	hc := NewHealthChecker(m, mc)
+	d, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = hc.clearExactDogRuntime(d, false)
+	if !errors.Is(err, tmux.ErrSessionTransportUnbound) {
+		t.Fatalf("clearExactDogRuntime() error = %v, want unbound transport", err)
+	}
+	if len(mc.killedSessions) != 0 {
+		t.Fatalf("unbound transport received cleanup: %v", mc.killedSessions)
+	}
+	current, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != StateWorking || current.Work != "task-legacy" || current.SessionGeneration == nil {
+		t.Fatalf("unbound health cleanup changed custody: %+v", current)
 	}
 }
 
@@ -316,7 +421,7 @@ func TestHealth_AutoClear_AgentDead(t *testing.T) {
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.AgentDead
 	mc.generations["hq-dog-alpha"] = generation
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, true)
@@ -376,7 +481,7 @@ func TestHealth_Orphan_AutoCleared(t *testing.T) {
 	mc := newMockChecker()
 	mc.sessionsAlive["hq-dog-alpha"] = true
 	mc.generations["hq-dog-alpha"] = generation
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, true) // autoClear=true: kill orphan session
