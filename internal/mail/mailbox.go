@@ -1371,6 +1371,9 @@ func (m *Mailbox) ListByThread(threadID string) ([]*Message, error) {
 	if m.legacy {
 		return m.listByThreadLegacy(threadID)
 	}
+	if m.store != nil {
+		return m.storeListByThread(threadID)
+	}
 	return m.listByThreadBeads(threadID)
 }
 
@@ -1402,15 +1405,18 @@ func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 		messages = append(messages, bm.ToMessage())
 	}
 
-	// Sort by timestamp (oldest first for thread view)
+	sortThreadMessages(messages)
+
+	return messages, nil
+}
+
+func sortThreadMessages(messages []*Message) {
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].Timestamp.Equal(messages[j].Timestamp) {
 			return messages[i].ID < messages[j].ID
 		}
 		return messages[i].Timestamp.Before(messages[j].Timestamp)
 	})
-
-	return messages, nil
 }
 
 func (m *Mailbox) listByThreadLegacy(threadID string) ([]*Message, error) {

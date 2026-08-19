@@ -97,6 +97,28 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 	return messages, nil
 }
 
+func (m *Mailbox) storeListByThread(threadID string) ([]*Message, error) {
+	ctx, cancel := mailStoreCtx()
+	defer cancel()
+
+	sdkIssues, err := m.store.SearchIssues(ctx, "", beadsdk.IssueFilter{
+		Labels: []string{"gt:message", "thread:" + threadID},
+		Limit:  0,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store list thread: %w", err)
+	}
+
+	messages := make([]*Message, 0, len(sdkIssues))
+	for _, issue := range sdkIssues {
+		if message := sdkIssueToMessage(issue); message != nil {
+			messages = append(messages, message)
+		}
+	}
+	sortThreadMessages(messages)
+	return messages, nil
+}
+
 // storeGetFromDir retrieves a message using the in-process store.
 func (m *Mailbox) storeGetFromDir(id string) (*Message, error) {
 	ctx, cancel := mailStoreCtx()
