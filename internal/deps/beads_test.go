@@ -16,6 +16,9 @@ func TestParseBeadsVersion(t *testing.T) {
 		{"bd version 0.55.4", "0.55.4"},
 		{"bd version 1.2.3", "1.2.3"},
 		{"bd version 10.20.30 (release)", "10.20.30"},
+		{`{"branch":"v1.0.5","build":"Homebrew","schema_version":1,"version":"1.0.5"}`, "1.0.5"},
+		{`{"build":"bd version 9.9.9","version":"1.0.3"}`, "1.0.3"},
+		{`{"build":"bd version 9.9.9","version":"1.0.3"`, ""},
 		{"some other output", ""},
 		{"", ""},
 	}
@@ -74,13 +77,17 @@ func TestCheckBeadsEnforcesReasonFileVersionFloor(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	for _, tc := range []struct {
+		output  string
 		version string
 		status  BeadsStatus
 	}{
-		{version: "1.0.3", status: BeadsTooOld},
-		{version: "1.0.4", status: BeadsOK},
+		{output: "bd version 1.0.3", version: "1.0.3", status: BeadsTooOld},
+		{output: "bd version 1.0.4", version: "1.0.4", status: BeadsOK},
+		{output: `{"build":"test","version":"1.0.5"}`, version: "1.0.5", status: BeadsOK},
+		{output: `{"build":"bd version 9.9.9","version":"1.0.3"}`, version: "1.0.3", status: BeadsTooOld},
+		{output: `{"build":"bd version 9.9.9","version":"1.0.3"`, version: "", status: BeadsUnknown},
 	} {
-		if err := os.WriteFile(bdPath, []byte("#!/bin/sh\necho 'bd version "+tc.version+"'\n"), 0755); err != nil {
+		if err := os.WriteFile(bdPath, []byte("#!/bin/sh\necho '"+tc.output+"'\n"), 0755); err != nil {
 			t.Fatal(err)
 		}
 		status, version := CheckBeads()

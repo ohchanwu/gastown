@@ -3,6 +3,7 @@ package deps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -139,8 +140,23 @@ func appendGOBIN(env []string) []string {
 	return append(env, "GOBIN="+gobin)
 }
 
-// parseBeadsVersion extracts version from "bd version X.Y.Z ..." output.
+// parseBeadsVersion extracts the version from bd's text or JSON output.
 func parseBeadsVersion(output string) string {
+	trimmed := strings.TrimSpace(output)
+	data := []byte(trimmed)
+	if json.Valid(data) {
+		var parsed struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(data, &parsed) == nil && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(parsed.Version) {
+			return parsed.Version
+		}
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return ""
+	}
+
 	// Match patterns like "bd version 0.52.0" or "bd version 0.52.0 (dev: ...)"
 	re := regexp.MustCompile(`bd version (\d+\.\d+\.\d+)`)
 	matches := re.FindStringSubmatch(output)

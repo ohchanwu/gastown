@@ -553,8 +553,9 @@ post-SQL `DOLT_COMMIT` error directs operators to commit the pending working set
 without replaying auto-close. Full-cycle CLI runs join these per-database errors
 and report an incomplete cycle. Daemon failures stream the complete joined
 recovery record to `bd close --reason-file -` over stdin, keeping process argv
-bounded regardless of the affected-ID count. Daemon startup enforces `bd` 1.0.4
-or newer before molecule tracking begins. Retries resend the complete stdin
+bounded regardless of the affected-ID count. Daemon startup accepts `bd`'s text
+or JSON version output and enforces 1.0.4 or newer before molecule tracking
+begins. Retries resend the complete stdin
 record. A zero exit with blank stdout and non-empty stderr is still a command
 failure. If that durable write fails, no later child cleanup runs and the root
 molecule remains open. If a failed step cannot be mapped after rediscovery, all
