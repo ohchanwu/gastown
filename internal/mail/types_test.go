@@ -267,6 +267,16 @@ func TestBeadsMessageToMessage(t *testing.T) {
 	}
 }
 
+func TestBeadsMessageUnmarshalEphemeral(t *testing.T) {
+	var message BeadsMessage
+	if err := json.Unmarshal([]byte(`{"id":"mt-wisp-test","ephemeral":true}`), &message); err != nil {
+		t.Fatal(err)
+	}
+	if !message.Wisp {
+		t.Fatal("Beads ephemeral field did not map to Wisp")
+	}
+}
+
 func TestBeadsMessageToMessageWithReplyTo(t *testing.T) {
 	bm := BeadsMessage{
 		ID:          "hq-reply",

@@ -118,7 +118,7 @@ func (m *Mailbox) List() ([]*Message, error) {
 
 func (m *Mailbox) listBeads() ([]*Message, error) {
 	// Single query to beads - returns both persistent and wisp messages
-	// Wisps are stored in same DB with wisp=true flag, not synced to git
+	// Wisps are stored in the same DB with ephemeral=true, not synced to git.
 	messages, err := m.listFromDir(m.beadsDir)
 	if err != nil {
 		return nil, err
@@ -549,7 +549,7 @@ func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
 		return nil, ErrMessageNotFound
 	}
 
-	// Wisp status comes from beads issue.wisp field via ToMessage()
+	// Wisp status comes from the Beads issue.ephemeral field via ToMessage().
 	msg := bms[0].ToMessage()
 	if !mailboxCanReadMessage(m.identity, bms[0].Labels, msg) {
 		return nil, ErrMessageNotFound
@@ -1400,7 +1400,7 @@ func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 		return nil, fmt.Errorf("decode thread list: expected JSON array")
 	}
 
-	var messages []*Message
+	messages := make([]*Message, 0, len(beadsMsgs))
 	for _, bm := range beadsMsgs {
 		messages = append(messages, bm.ToMessage())
 	}

@@ -425,6 +425,9 @@ func TestMailboxBeadsListByThreadEmptyArray(t *testing.T) {
 	if len(messages) != 0 {
 		t.Fatalf("ListByThread returned %d messages, want 0", len(messages))
 	}
+	if messages == nil {
+		t.Fatal("ListByThread returned a nil slice, want JSON []")
+	}
 }
 
 func TestMailboxBeadsListByThreadRejectsInvalidOutput(t *testing.T) {
