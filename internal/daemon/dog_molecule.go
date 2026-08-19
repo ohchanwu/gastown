@@ -157,8 +157,6 @@ func (dm *dogMol) close() {
 		return
 	}
 
-	// Close any step wisps that were never explicitly closed/failed.
-	dm.closeRemainingSteps()
 	if dm.unmappedFailure {
 		dm.logger.Printf("dog_molecule: leaving root %s open: a failed step could not be mapped", dm.rootID)
 		return
@@ -167,6 +165,8 @@ func (dm *dogMol) close() {
 		dm.logger.Printf("dog_molecule: leaving root %s open: %d child failure reason(s) were not persisted", dm.rootID, len(dm.unpersistedFailures))
 		return
 	}
+	// Close any step wisps that were never explicitly closed/failed.
+	dm.closeRemainingSteps()
 
 	if err := dm.closeWisp(dm.rootID); err != nil {
 		dm.logger.Printf("dog_molecule: close root %s failed after %d attempts (non-fatal): %v", dm.rootID, dogCloseMaxAttempts, err)

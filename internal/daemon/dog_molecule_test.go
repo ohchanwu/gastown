@@ -273,7 +273,7 @@ cat > "${0%/*}/reason"
 	}
 }
 
-func TestDogMolClosePreservesStepWhenFailureReasonCannotPersist(t *testing.T) {
+func TestDogMolCloseSkipsCleanupWhenFailureReasonCannotPersist(t *testing.T) {
 	tmpDir := t.TempDir()
 	bdPath := filepath.Join(tmpDir, "bd")
 	script := `#!/bin/sh
@@ -283,7 +283,7 @@ if [ "$1" = "close" ] && [ "$2" = "step-auto-close" ] && [ "$#" -gt 2 ]; then
 	exit 23
 fi
 if [ "$1" = "show" ]; then
-	printf '%s\n' '{"root":[{"id":"step-auto-close","title":"Auto-close stale issues","status":"open"}]}'
+	printf '%s\n' '{"root":[{"id":"step-auto-close","title":"Auto-close stale issues","status":"closed"},{"id":"step-report","title":"Report results","status":"open"}]}'
 fi
 `
 	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
@@ -305,8 +305,8 @@ fi
 		t.Fatal(err)
 	}
 	for _, call := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
-		if call == "close step-auto-close" {
-			t.Fatal("close backstop silently closed step after failure reason was not persisted")
+		if call == "close step-report" {
+			t.Fatal("close backstop mutated another child after failure reason was not persisted")
 		}
 		if call == "close root" {
 			t.Fatal("root was closed while a child failure reason remained unpersisted")
@@ -397,8 +397,16 @@ func TestDogMolUnknownFailedStepPreventsCleanup(t *testing.T) {
 set -eu
 printf '%s\n' "$*" >> "${0%/*}/calls"
 if [ "$1" = "show" ]; then
-	printf '%s\n' 'temporary step discovery failure' >&2
-	exit 23
+	shows="${0%/*}/shows"
+	attempt=0
+	if [ -f "$shows" ]; then read -r attempt < "$shows"; fi
+	attempt=$((attempt + 1))
+	printf '%s\n' "$attempt" > "$shows"
+	if [ "$attempt" -eq 1 ]; then
+		printf '%s\n' 'temporary step discovery failure' >&2
+		exit 23
+	fi
+	printf '%s\n' '{"root":[{"id":"step-report","title":"Report results","status":"open"}]}'
 fi
 `
 	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {

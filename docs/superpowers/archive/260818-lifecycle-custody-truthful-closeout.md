@@ -269,8 +269,8 @@ missing-reason evidence. The active dependency floor is `bd` 1.0.4, the first
 version supporting `--reason-file`, and daemon startup rejects an older or
 unverifiable version. Retries resend the full stdin record, and an exit-zero
 command with only whitespace on stdout and an error on stderr is treated as
-failure. If step discovery cannot map the failed step, cleanup preserves every
-child and the root.
+failure. An unpersisted reason or an unmapped failed step stops all subsequent
+child cleanup and preserves the root.
 
 - [x] **Step 3: Update maintained architecture and archive the plan**
 

@@ -556,11 +556,11 @@ recovery record to `bd close --reason-file -` over stdin, keeping process argv
 bounded regardless of the affected-ID count. Daemon startup enforces `bd` 1.0.4
 or newer before molecule tracking begins. Retries resend the complete stdin
 record. A zero exit with blank stdout and non-empty stderr is still a command
-failure. If that durable write fails, the failed child is excluded from
-orphan-step cleanup and the root molecule remains open. If a failed step cannot
-be mapped after rediscovery, all children and the root remain open rather than
-erasing unknown recovery evidence. If rollback or session reset fails, the
-connection is marked bad and discarded rather than returned to the pool.
+failure. If that durable write fails, no later child cleanup runs and the root
+molecule remains open. If a failed step cannot be mapped after rediscovery, all
+children and the root likewise remain open rather than erasing unknown recovery
+evidence. If rollback or session reset fails, the connection is marked bad and
+discarded rather than returned to the pool.
 
 See [dolt-storage.md](dolt-storage.md) for full details.
 
