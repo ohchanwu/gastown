@@ -17,7 +17,7 @@ Native source installs require these host tools. Homebrew and Docker installs pr
 | **sqlite3** | any | `sqlite3 --version` | Usually pre-installed on macOS; Linux packages are commonly named `sqlite3` |
 | **ICU4C dev headers** | varies | `pkg-config --modversion icu-uc`, `dpkg -l libicu-dev`, `rpm -q libicu-devel`, or `brew --prefix icu4c` | Source builds need Debian/Ubuntu `libicu-dev`, Fedora/RHEL `libicu-devel` with `pkgconf-pkg-config`, macOS `icu4c`, or native Windows MSYS2 ICU/toolchain/pkg-config packages |
 | **Dolt** | >= 2.0.7 | `dolt version` | macOS: `brew install dolt`; other platforms: see [dolthub/dolt](https://github.com/dolthub/dolt?tab=readme-ov-file#installation) |
-| **Beads** | >= 0.57.0 | `bd version` | Installed by `brew install gastown`, or from source with `go install github.com/steveyegge/beads/cmd/bd@latest` |
+| **Beads** | >= 1.0.4 | `bd version` | Installed by `brew install gastown`, or from source with `go install github.com/steveyegge/beads/cmd/bd@latest` |
 | **Docker Compose** | v2+ | `docker compose version` | Docker setup only. Install Docker Desktop or Docker Engine with the Compose plugin. |
 
 ### Optional (for Full Stack Mode)

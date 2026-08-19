@@ -16,7 +16,7 @@ import (
 
 // MinBeadsVersion is the minimum compatible beads version for this Gas Town release.
 // Update this when Gas Town requires new beads features.
-const MinBeadsVersion = "0.57.0"
+const MinBeadsVersion = "1.0.4"
 
 // BeadsInstallPath is the go install path for beads.
 const BeadsInstallPath = "github.com/steveyegge/beads/cmd/bd@latest"
@@ -87,8 +87,7 @@ func EnsureBeads(autoInstall bool) error {
 			version, MinBeadsVersion, BeadsInstallPath)
 
 	case BeadsUnknown:
-		// Found bd but couldn't determine version - proceed with warning
-		return nil
+		return fmt.Errorf("beads (bd) version could not be determined\n\nTry reinstalling: go install %s", BeadsInstallPath)
 	}
 
 	return nil

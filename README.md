@@ -130,7 +130,7 @@ Native installs require the host tools below. Docker installs only require Docke
 |---|---|---|
 | Git | 2.20+ | Worktree support |
 | Go | 1.26.2+ (see `go.mod`) | Required for the Linux and Windows paths and for macOS source builds. Not needed for `brew install gastown` or Docker setup. |
-| Beads (`bd`) | 0.57.0+ | Required for native installs. Homebrew and Docker supply it; source/native Go paths install it with `go install`. |
+| Beads (`bd`) | 1.0.4+ | Required for native installs. Homebrew and Docker supply it; source/native Go paths install it with `go install`. |
 | sqlite3 | any | Used by convoy database queries. Usually pre-installed on macOS and Linux. |
 | ICU4C dev headers | varies | Required for source builds that compile the ICU-backed query layer. Use `libicu-dev` on Debian/Ubuntu, `libicu-devel` on Fedora/RHEL, `icu4c` on macOS, and MSYS2 ICU packages for native Windows. |
 | tmux | 3.0+ | Required for `gt up` and the tmux-backed roles (Mayor, Witnesses, Refineries, polecats). Optional only for minimal-mode workflows where you run runtime instances manually. |

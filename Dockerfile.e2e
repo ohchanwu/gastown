@@ -12,7 +12,7 @@
 FROM golang:1.26-alpine
 
 ARG DOLT_VERSION=2.0.7
-ARG BD_VERSION=v0.57.0
+ARG BD_VERSION=v1.0.4
 
 # Install dependencies including CGO build requirements for beads daemon
 # procps and lsof are required by gt dolt start for process verification

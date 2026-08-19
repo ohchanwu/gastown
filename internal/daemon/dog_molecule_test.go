@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -309,6 +310,160 @@ fi
 		}
 		if call == "close root" {
 			t.Fatal("root was closed while a child failure reason remained unpersisted")
+		}
+	}
+}
+
+func TestDogMolClosePreservesStepWhenBdReportsStderrFailureWithExitZero(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{name: "empty stdout"},
+		{name: "whitespace stdout", stdout: "printf '\\n'\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			bdPath := filepath.Join(tmpDir, "bd")
+			script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${0%/*}/calls"
+if [ "$1" = "close" ] && [ "$2" = "step-auto-close" ] && [ "$#" -gt 2 ]; then
+	cat >/dev/null
+` + tc.stdout + `	printf '%s\n' 'issue not found' >&2
+	exit 0
+fi
+if [ "$1" = "show" ]; then
+	printf '%s\n' '{"root":[{"id":"step-auto-close","title":"Auto-close stale issues","status":"open"}]}'
+fi
+`
+			if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			dm := &dogMol{
+				rootID:   "root",
+				stepIDs:  map[string]string{"auto-close": "step-auto-close"},
+				bdPath:   bdPath,
+				townRoot: tmpDir,
+				logger:   log.New(io.Discard, "", 0),
+			}
+			dm.failStep("auto-close", "complete recovery record")
+			dm.close()
+
+			calls, err := os.ReadFile(filepath.Join(tmpDir, "calls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+				if call == "close step-auto-close" {
+					t.Fatal("close backstop silently closed step after bd reported failure on stderr")
+				}
+				if call == "close root" {
+					t.Fatal("root was closed after bd reported failure on stderr")
+				}
+			}
+		})
+	}
+}
+
+func TestNewRejectsUnsupportedBeadsVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX bd shim")
+	}
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte("#!/bin/sh\necho 'bd version 1.0.3'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := New(DefaultConfig(t.TempDir()))
+	if err == nil {
+		t.Fatal("New accepted bd 1.0.3 despite the 1.0.4 runtime requirement")
+	}
+	for _, want := range []string{"1.0.3", "1.0.4"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("New error %q does not name version %s", err, want)
+		}
+	}
+}
+
+func TestDogMolUnknownFailedStepPreventsCleanup(t *testing.T) {
+	tmpDir := t.TempDir()
+	bdPath := filepath.Join(tmpDir, "bd")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${0%/*}/calls"
+if [ "$1" = "show" ]; then
+	printf '%s\n' 'temporary step discovery failure' >&2
+	exit 23
+fi
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dm := &dogMol{
+		rootID:   "root",
+		stepIDs:  make(map[string]string),
+		bdPath:   bdPath,
+		townRoot: tmpDir,
+		logger:   log.New(io.Discard, "", 0),
+	}
+	dm.failStep("auto-close", "complete recovery record")
+	dm.close()
+
+	calls, err := os.ReadFile(filepath.Join(tmpDir, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+		if strings.HasPrefix(call, "close ") {
+			t.Fatalf("cleanup ran after failed step could not be mapped: %q", call)
+		}
+	}
+}
+
+func TestDogMolFailStepResendsCompleteReasonOnRetry(t *testing.T) {
+	tmpDir := t.TempDir()
+	bdPath := filepath.Join(tmpDir, "bd")
+	script := `#!/bin/sh
+set -eu
+attempts="${0%/*}/attempts"
+attempt=0
+if [ -f "$attempts" ]; then attempt=$(sed -n '1p' "$attempts"); fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$attempts"
+cat > "${0%/*}/reason-$attempt"
+if [ "$attempt" -eq 1 ]; then
+	printf '%s\n' 'transient close failure' >&2
+	exit 23
+fi
+printf '%s\n' 'closed'
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	reason := strings.Repeat("complete-recovery-record\n", 8_000)
+	dm := &dogMol{
+		rootID:   "root",
+		stepIDs:  map[string]string{"auto-close": "step-auto-close"},
+		bdPath:   bdPath,
+		townRoot: tmpDir,
+		logger:   log.New(io.Discard, "", 0),
+	}
+	dm.failStep("auto-close", reason)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		got, err := os.ReadFile(filepath.Join(tmpDir, fmt.Sprintf("reason-%d", attempt)))
+		if err != nil {
+			t.Fatalf("read retry %d reason: %v", attempt, err)
+		}
+		if string(got) != reason {
+			t.Fatalf("retry %d transported %d bytes, want exact %d-byte reason", attempt, len(got), len(reason))
 		}
 	}
 }

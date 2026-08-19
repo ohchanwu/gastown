@@ -265,7 +265,12 @@ closeout now sends that record through `bd close --reason-file -` on stdin. A
 multi-database regression transports more than 1 MiB of affected IDs while argv
 stays constant-sized. If the durable close fails, the cleanup backstop preserves
 the failed child and leaves the root molecule open instead of erasing the
-missing-reason evidence.
+missing-reason evidence. The active dependency floor is `bd` 1.0.4, the first
+version supporting `--reason-file`, and daemon startup rejects an older or
+unverifiable version. Retries resend the full stdin record, and an exit-zero
+command with only whitespace on stdout and an error on stderr is treated as
+failure. If step discovery cannot map the failed step, cleanup preserves every
+child and the root.
 
 - [x] **Step 3: Update maintained architecture and archive the plan**
 

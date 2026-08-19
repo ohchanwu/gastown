@@ -61,6 +61,7 @@ type dogMol struct {
 	rootID              string              // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
 	stepIDs             map[string]string   // step slug -> wisp issue ID
 	unpersistedFailures map[string]struct{} // step IDs whose failure reason could not be stored.
+	unmappedFailure     bool                // A failed step could not be mapped to a child ID.
 	bdPath              string
 	townRoot            string
 	logger              interface{ Printf(string, ...interface{}) }
@@ -130,8 +131,13 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 
 	stepID, ok := dm.stepIDs[stepSlug]
 	if !ok {
-		dm.logger.Printf("dog_molecule: failStep %q: unknown step", stepSlug)
-		return
+		dm.discoverSteps()
+		stepID, ok = dm.stepIDs[stepSlug]
+		if !ok {
+			dm.unmappedFailure = true
+			dm.logger.Printf("dog_molecule: failStep %q: unknown step; preserving molecule", stepSlug)
+			return
+		}
 	}
 
 	if err := dm.closeWispWithReason(stepID, reason); err != nil {
@@ -143,9 +149,9 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 	}
 }
 
-// close closes all remaining open child step wisps, then closes the root molecule
-// wisp. A child whose failure reason could not be persisted and its root remain
-// open so cleanup cannot erase the recovery gap.
+// close closes remaining open child step wisps, then closes the root molecule
+// wisp. If failure custody could not be persisted or mapped, protected children
+// and the root remain open so cleanup cannot erase the recovery gap.
 func (dm *dogMol) close() {
 	if dm.rootID == "" {
 		return
@@ -153,6 +159,10 @@ func (dm *dogMol) close() {
 
 	// Close any step wisps that were never explicitly closed/failed.
 	dm.closeRemainingSteps()
+	if dm.unmappedFailure {
+		dm.logger.Printf("dog_molecule: leaving root %s open: a failed step could not be mapped", dm.rootID)
+		return
+	}
 	if len(dm.unpersistedFailures) > 0 {
 		dm.logger.Printf("dog_molecule: leaving root %s open: %d child failure reason(s) were not persisted", dm.rootID, len(dm.unpersistedFailures))
 		return
@@ -164,10 +174,10 @@ func (dm *dogMol) close() {
 }
 
 // closeRemainingSteps queries all children of the root wisp and closes any that
-// are still open, except children with an unpersisted failure reason. This is the
-// backstop for callers that forgot to close ordinary steps.
+// are still open, except children with an unpersisted failure reason. An unmapped
+// failure disables the backstop because the protected child is unknown.
 func (dm *dogMol) closeRemainingSteps() {
-	if dm.rootID == "" {
+	if dm.rootID == "" || dm.unmappedFailure {
 		return
 	}
 
@@ -387,8 +397,13 @@ func (dm *dogMol) runBdInput(input string, args ...string) (string, error) {
 		}
 		return "", err
 	}
+	out := strings.TrimSpace(stdout.String())
+	errMsg := strings.TrimSpace(stderr.String())
+	if out == "" && errMsg != "" {
+		return "", fmt.Errorf("command produced no output: %s", errMsg)
+	}
 
-	return strings.TrimSpace(stdout.String()), nil
+	return out, nil
 }
 
 // parseWispID extracts a wisp ID from bd mol wisp output.

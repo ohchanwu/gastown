@@ -236,13 +236,17 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	logger := log.New(logWriter, "", log.LstdFlags)
-	ctx, cancel := context.WithCancel(context.Background())
 
 	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
 	// directories before any subprocess lookup. The daemon is often launched
 	// from systemd / login shells / launchd without user-installed tool dirs
 	// such as ~/.local/bin or /opt/homebrew/bin.
 	augmentDaemonPath(logger)
+	if err := deps.EnsureBeads(false); err != nil {
+		_ = logWriter.Close()
+		return nil, fmt.Errorf("checking beads dependency: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Initialize session prefix and agent registries from town root.
 	if err := session.InitRegistry(config.TownRoot); err != nil {

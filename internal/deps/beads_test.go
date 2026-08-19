@@ -1,6 +1,11 @@
 package deps
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+)
 
 func TestParseBeadsVersion(t *testing.T) {
 	tests := []struct {
@@ -58,4 +63,29 @@ func TestCheckBeads(t *testing.T) {
 	}
 
 	t.Logf("CheckBeads: status=%d, version=%s", status, version)
+}
+
+func TestCheckBeadsEnforcesReasonFileVersionFloor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX bd shim")
+	}
+	tmpDir := t.TempDir()
+	bdPath := filepath.Join(tmpDir, "bd")
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, tc := range []struct {
+		version string
+		status  BeadsStatus
+	}{
+		{version: "1.0.3", status: BeadsTooOld},
+		{version: "1.0.4", status: BeadsOK},
+	} {
+		if err := os.WriteFile(bdPath, []byte("#!/bin/sh\necho 'bd version "+tc.version+"'\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		status, version := CheckBeads()
+		if status != tc.status || version != tc.version {
+			t.Fatalf("bd %s: CheckBeads() = (%v, %q), want (%v, %q)", tc.version, status, version, tc.status, tc.version)
+		}
+	}
 }
