@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -13,12 +14,30 @@ func isStoredPaneNudgeReceiverInvocation(mode, nonce string, args []string) bool
 	if mode != "1" || nonce == "" {
 		return false
 	}
-	for _, arg := range args {
-		if arg == storedPaneReceiverRunArg {
-			return true
+	effectiveRun := ""
+	runCount := 0
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch {
+		case strings.HasPrefix(arg, "-test.run="):
+			runCount++
+			effectiveRun = "-test.run=" + strings.TrimPrefix(arg, "-test.run=")
+		case strings.HasPrefix(arg, "--test.run="):
+			runCount++
+			effectiveRun = "-test.run=" + strings.TrimPrefix(arg, "--test.run=")
+		case arg == "-test.run" || arg == "--test.run":
+			runCount++
+			effectiveRun = ""
+			if index+1 < len(args) {
+				index++
+				effectiveRun = "-test.run=" + args[index]
+			}
+		}
+		if runCount > 1 {
+			return false
 		}
 	}
-	return false
+	return runCount == 1 && effectiveRun == storedPaneReceiverRunArg
 }
 
 // TestMain sets up a dedicated tmux server for the package's integration tests.

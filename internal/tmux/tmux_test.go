@@ -4307,9 +4307,34 @@ func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
 		want  bool
 	}{
 		{name: "exact helper", mode: "1", nonce: "nonce", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}, want: true},
+		{name: "exact helper split flag", mode: "1", nonce: "nonce", args: []string{"-test.run", "^TestNudgeStoredPaneReceiverHelper$"}, want: true},
+		{
+			name:  "conflicting helper after earlier run",
+			mode:  "1",
+			nonce: "nonce",
+			args:  []string{"-test.run=^TestSessionLifecycle$", "--test.run=^TestNudgeStoredPaneReceiverHelper$"},
+		},
 		{name: "disabled value", mode: "0", nonce: "nonce", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}},
 		{name: "missing nonce", mode: "1", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}},
 		{name: "wrong invocation", mode: "1", nonce: "nonce", args: []string{"-test.run=TestNudgeSession"}},
+		{
+			name:  "helper shadowed by later run",
+			mode:  "1",
+			nonce: "nonce",
+			args:  []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$", "-test.run=^TestSessionLifecycle$"},
+		},
+		{
+			name:  "helper shadowed by split double-dash run",
+			mode:  "1",
+			nonce: "nonce",
+			args:  []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$", "--test.run", "^TestSessionLifecycle$"},
+		},
+		{
+			name:  "duplicate helper selectors",
+			mode:  "1",
+			nonce: "nonce",
+			args:  []string{storedPaneReceiverRunArg, storedPaneReceiverRunArg},
+		},
 	}
 
 	for _, test := range tests {
@@ -4321,11 +4346,30 @@ func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
 	}
 }
 
+func TestStoredPaneNudgeReceiverBroadRunDoesNotActivate(t *testing.T) {
+	nonce := fmt.Sprintf("broad-%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
+	ctx, cancel := context.WithTimeout(context.Background(), constants.NudgeReadyTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], strings.TrimSuffix(storedPaneReceiverRunArg, "$"))
+	cmd.Env = append(os.Environ(),
+		storedPaneReceiverEnv+"=1",
+		storedPaneNonceEnv+"="+nonce,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("broad invocation: %v\n%s", err, output)
+	}
+	if strings.Contains(string(output), "READY "+nonce) {
+		t.Fatal("broad invocation activated receiver protocol")
+	}
+}
+
 func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
 	nonce := fmt.Sprintf("protocol-%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
 	ctx, cancel := context.WithTimeout(context.Background(), constants.NudgeReadyTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNudgeStoredPaneReceiverHelper$")
+	cmd := exec.CommandContext(ctx, os.Args[0], storedPaneReceiverRunArg)
 	cmd.Env = append(os.Environ(),
 		storedPaneReceiverEnv+"=1",
 		storedPaneNonceEnv+"="+nonce,
@@ -4405,12 +4449,13 @@ func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
 }
 
 func TestNudgeStoredPaneReceiverHelper(t *testing.T) {
-	if os.Getenv(storedPaneReceiverEnv) != "1" {
-		return
-	}
 	nonce := os.Getenv(storedPaneNonceEnv)
-	if nonce == "" {
-		t.Fatal("helper: nonce is empty")
+	if !isStoredPaneNudgeReceiverInvocation(
+		os.Getenv(storedPaneReceiverEnv),
+		nonce,
+		os.Args[1:],
+	) {
+		return
 	}
 
 	output := bufio.NewWriter(os.Stdout)
@@ -4582,13 +4627,13 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	receiverNonce := "receiver-" + nonce
 	decoyNonce := "decoy-" + nonce
 	message := "message-" + nonce
-	helperCommand := config.ShellQuote(os.Args[0]) + " -test.run=^TestNudgeStoredPaneReceiverHelper$"
+	helperCommand := config.ShellQuote(os.Args[0]) + " " + config.ShellQuote(storedPaneReceiverRunArg)
 
 	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), helperCommand, map[string]string{
 		storedPaneReceiverEnv: "1",
-		storedPaneNonceEnv:    receiverNonce,
+		storedPaneNonceEnv:    decoyNonce,
 	}); err != nil {
-		t.Fatalf("setup: READY %s not observed: create receiver: %v", receiverNonce, err)
+		t.Fatalf("setup: READY %s not observed: create decoy: %v", decoyNonce, err)
 	}
 	t.Cleanup(func() {
 		killErr := tm.KillSession(sessionName)
@@ -4602,39 +4647,12 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 		}
 	})
 
-	receiverPane, err := tm.GetPaneID(sessionName)
+	decoyPane, err := tm.GetPaneID(sessionName)
 	if err != nil {
-		t.Fatalf("setup: READY %s not observed: get receiver pane: %v", receiverNonce, err)
+		t.Fatalf("setup: READY %s not observed: get decoy pane: %v", decoyNonce, err)
 	}
-	receiverReady := "READY " + receiverNonce
-	_, ready, err := waitForExactPaneLine(
-		tm,
-		receiverPane,
-		receiverReady,
-		time.Now().Add(constants.NudgeReadyTimeout),
-	)
-	if err != nil {
-		t.Fatalf("setup: READY %s not observed: %v", receiverNonce, err)
-	}
-	if !ready {
-		t.Fatalf("setup: READY %s not observed", receiverNonce)
-	}
-
-	decoyPane, err := tm.run(
-		"split-window",
-		"-P",
-		"-F", "#{pane_id}",
-		"-t", receiverPane,
-		"-e", storedPaneReceiverEnv+"=1",
-		"-e", storedPaneNonceEnv+"="+decoyNonce,
-		helperCommand,
-	)
-	if err != nil {
-		t.Fatalf("setup: READY %s not observed: create decoy: %v", decoyNonce, err)
-	}
-	decoyPane = strings.TrimSpace(decoyPane)
 	decoyReady := "READY " + decoyNonce
-	_, ready, err = waitForExactPaneLine(
+	_, ready, err := waitForExactPaneLine(
 		tm,
 		decoyPane,
 		decoyReady,
@@ -4647,6 +4665,33 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 		t.Fatalf("setup: READY %s not observed", decoyNonce)
 	}
 
+	receiverPane, err := tm.run(
+		"split-window",
+		"-P",
+		"-F", "#{pane_id}",
+		"-t", decoyPane,
+		"-e", storedPaneReceiverEnv+"=1",
+		"-e", storedPaneNonceEnv+"="+receiverNonce,
+		helperCommand,
+	)
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: create receiver: %v", receiverNonce, err)
+	}
+	receiverPane = strings.TrimSpace(receiverPane)
+	receiverReady := "READY " + receiverNonce
+	_, ready, err = waitForExactPaneLine(
+		tm,
+		receiverPane,
+		receiverReady,
+		time.Now().Add(constants.NudgeReadyTimeout),
+	)
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: %v", receiverNonce, err)
+	}
+	if !ready {
+		t.Fatalf("setup: READY %s not observed", receiverNonce)
+	}
+
 	if _, err := tm.run("select-pane", "-t", decoyPane); err != nil {
 		t.Fatalf("setup: READY %s not observed: select decoy: %v", decoyNonce, err)
 	}
@@ -4656,6 +4701,16 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	}
 	if strings.TrimSpace(activePane) != decoyPane {
 		t.Fatalf("setup: READY %s not observed: decoy pane is not active", decoyNonce)
+	}
+	fallbackPane, err := tm.GetPaneID(sessionName)
+	if err != nil {
+		t.Fatalf("setup: read fallback pane: %v", err)
+	}
+	if receiverPane == fallbackPane {
+		t.Fatal("setup: stored receiver pane is also the fallback pane")
+	}
+	if receiverPane == strings.TrimSpace(activePane) {
+		t.Fatal("setup: stored receiver pane is also the active pane")
 	}
 
 	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", receiverPane); err != nil {
