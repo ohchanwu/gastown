@@ -110,10 +110,15 @@ func (m *Mailbox) storeListByThread(threadID string) ([]*Message, error) {
 	}
 
 	messages := make([]*Message, 0, len(sdkIssues))
-	for _, issue := range sdkIssues {
-		if message := sdkIssueToMessage(issue); message != nil {
-			messages = append(messages, message)
+	for i, issue := range sdkIssues {
+		message := sdkIssueToMessage(issue)
+		if message == nil {
+			return nil, fmt.Errorf("store thread message %d is null", i)
 		}
+		if err := validateThreadMessage(message, issue.Labels, threadID); err != nil {
+			return nil, fmt.Errorf("store thread message %d: %w", i, err)
+		}
+		messages = append(messages, message)
 	}
 	sortThreadMessages(messages)
 	return messages, nil

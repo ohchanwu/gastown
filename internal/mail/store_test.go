@@ -29,10 +29,10 @@ func (s *threadSearchStore) SearchIssues(_ context.Context, query string, filter
 func TestMailboxStoreListByThread(t *testing.T) {
 	base := time.Date(2026, time.August, 20, 0, 0, 0, 0, time.UTC)
 	store := &threadSearchStore{issues: []*beadsdk.Issue{
-		{ID: "msg-z", Status: beadsdk.StatusClosed, CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
-		{ID: "msg-hooked", Status: beadsdk.Status("hooked"), CreatedAt: base.Add(time.Minute), Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "read"}},
-		{ID: "msg-wisp", Status: beadsdk.StatusOpen, CreatedAt: base.Add(2 * time.Minute), Ephemeral: true, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
-		{ID: "msg-a", Status: beadsdk.StatusOpen, CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		{ID: "msg-z", Title: "message z", Assignee: "gastown/Toast", Status: beadsdk.StatusClosed, CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		{ID: "msg-hooked", Title: "hooked message", Assignee: "gastown/Toast", Status: beadsdk.Status("hooked"), CreatedAt: base.Add(time.Minute), Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "read"}},
+		{ID: "msg-wisp", Title: "ephemeral message", Assignee: "gastown/Toast", Status: beadsdk.StatusOpen, CreatedAt: base.Add(2 * time.Minute), Ephemeral: true, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		{ID: "msg-a", Title: "message a", Assignee: "gastown/Toast", Status: beadsdk.StatusOpen, CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
 	}}
 	t.Setenv("PATH", t.TempDir())
 	m := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store)
@@ -65,6 +65,18 @@ func TestMailboxStoreListByThread(t *testing.T) {
 	}
 	if !messages[3].Wisp {
 		t.Fatal("ephemeral message was not preserved")
+	}
+}
+
+func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
+	store := &threadSearchStore{issues: []*beadsdk.Issue{{
+		ID: "msg-1", Title: "message", Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"},
+	}}}
+	t.Setenv("PATH", t.TempDir())
+	m := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store)
+
+	if _, err := m.ListByThread("thread-target"); err == nil {
+		t.Fatal("ListByThread succeeded, want invalid stored message error")
 	}
 }
 

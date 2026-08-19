@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1392,22 +1393,127 @@ func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 		return nil, err
 	}
 
-	var beadsMsgs []BeadsMessage
-	if err := json.Unmarshal(stdout, &beadsMsgs); err != nil {
+	messages, err := decodeThreadList(stdout, threadID)
+	if err != nil {
 		return nil, fmt.Errorf("decode thread list: %w", err)
-	}
-	if beadsMsgs == nil {
-		return nil, fmt.Errorf("decode thread list: expected JSON array")
-	}
-
-	messages := make([]*Message, 0, len(beadsMsgs))
-	for _, bm := range beadsMsgs {
-		messages = append(messages, bm.ToMessage())
 	}
 
 	sortThreadMessages(messages)
 
 	return messages, nil
+}
+
+func decodeThreadList(stdout []byte, threadID string) ([]*Message, error) {
+	data, err := threadListData(stdout)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []json.RawMessage
+	if err := json.Unmarshal(data, &records); err != nil || records == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("expected JSON array")
+	}
+
+	messages := make([]*Message, 0, len(records))
+	for i, record := range records {
+		if bytes.Equal(bytes.TrimSpace(record), []byte("null")) {
+			return nil, fmt.Errorf("message %d is null", i)
+		}
+		var bm BeadsMessage
+		if err := json.Unmarshal(record, &bm); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		message := bm.ToMessage()
+		if err := validateThreadMessage(message, bm.Labels, threadID); err != nil {
+			return nil, fmt.Errorf("message %d: %w", i, err)
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
+func threadListData(stdout []byte) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(stdout)
+	if len(trimmed) == 0 {
+		return nil, errors.New("empty output")
+	}
+	if trimmed[0] == '[' {
+		return json.RawMessage(trimmed), nil
+	}
+	if trimmed[0] != '{' {
+		return nil, errors.New("expected JSON array or schema-v1 envelope")
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage, 2)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, errors.New("invalid envelope field")
+		}
+		if name != "schema_version" && name != "data" {
+			return nil, fmt.Errorf("unknown envelope field %q", name)
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate envelope field %q", name)
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, err
+	}
+
+	var version int
+	versionJSON, ok := fields["schema_version"]
+	if !ok {
+		return nil, errors.New("missing envelope field \"schema_version\"")
+	}
+	if err := json.Unmarshal(versionJSON, &version); err != nil || version != 1 {
+		return nil, errors.New("unsupported envelope schema_version")
+	}
+	data, ok := fields["data"]
+	if !ok {
+		return nil, errors.New("missing envelope field \"data\"")
+	}
+	return data, nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func validateThreadMessage(message *Message, labels []string, threadID string) error {
+	if !hasExactString(labels, "gt:message") {
+		return errors.New("missing gt:message label")
+	}
+	if !hasExactString(labels, "thread:"+threadID) || message.ThreadID != threadID {
+		return errors.New("wrong or missing thread label")
+	}
+	return message.Validate()
 }
 
 func sortThreadMessages(messages []*Message) {

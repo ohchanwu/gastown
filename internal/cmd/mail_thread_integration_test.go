@@ -78,6 +78,20 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	if strings.TrimSpace(missing) != "[]" {
 		t.Fatalf("missing thread output = %q, want []", missing)
 	}
+
+	envelopeEnv := append(append([]string(nil), env...), "BD_JSON_ENVELOPE=1")
+	enveloped := runMailThreadFixtureCommand(t, townRoot, envelopeEnv, gtBinary, "mail", "thread", threadID, "--json")
+	var envelopedMessages []*mail.Message
+	if err := json.Unmarshal([]byte(enveloped), &envelopedMessages); err != nil {
+		t.Fatalf("decode enveloped gt mail thread output: %v\nstdout: %s", err, enveloped)
+	}
+	if len(envelopedMessages) != len(wantIDs) {
+		t.Fatalf("enveloped gt mail thread returned %d messages, want %d: %s", len(envelopedMessages), len(wantIDs), enveloped)
+	}
+	envelopedMissing := runMailThreadFixtureCommand(t, townRoot, envelopeEnv, gtBinary, "mail", "thread", "thread-missing", "--json")
+	if strings.TrimSpace(envelopedMissing) != "[]" {
+		t.Fatalf("enveloped missing thread output = %q, want []", envelopedMissing)
+	}
 }
 
 func createMailThreadFixture(t *testing.T, townRoot string, env []string, title string, ephemeral bool, labels ...string) string {

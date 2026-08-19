@@ -466,6 +466,7 @@ func writeMailBDStub(t *testing.T, binDir string) {
 	printf 'BD_DOLT_AUTO_COMMIT=%s\n' "${BD_DOLT_AUTO_COMMIT-}"
 	printf 'BEADS_NO_AUTO_IMPORT=%s\n' "${BEADS_NO_AUTO_IMPORT-}"
 	printf 'BD_IDENTITY=%s\n' "${BD_IDENTITY-}"
+	printf 'BD_JSON_ENVELOPE=%s\n' "${BD_JSON_ENVELOPE-}"
 	printf 'BEADS_DIR=%s\n' "${BEADS_DIR-}"
 	printf 'BEADS_DOLT_SERVER_DATABASE=%s\n' "${BEADS_DOLT_SERVER_DATABASE-}"
 	printf 'PWD=%s\n' "$(pwd)"

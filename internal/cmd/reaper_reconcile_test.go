@@ -8,8 +8,72 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reaper"
 )
+
+func TestSendReaperAnomalyMailChecksCustodyPerTarget(t *testing.T) {
+	issue := &beads.Issue{ID: "hq-escalation"}
+	anomaly := testReaperAnomaly("hq-child")
+	targetA := "gastown/witness"
+	targetB := "overseer"
+	storedToA := &mail.Message{
+		ID:       "hq-message-a",
+		From:     "reaper",
+		To:       targetA,
+		Subject:  "[MEDIUM] Reaper anomaly",
+		Type:     mail.TypeEscalation,
+		ThreadID: issue.ID,
+	}
+	var sent []*mail.Message
+
+	err := sendReaperAnomalyMail(issue, anomaly, []string{targetA, targetB},
+		func(_, _ string) ([]*mail.Message, error) {
+			return []*mail.Message{storedToA}, nil
+		},
+		func(msg *mail.Message) error {
+			sent = append(sent, msg)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 1 || sent[0].To != targetB {
+		t.Fatalf("sent = %#v, want one notice to %q", sent, targetB)
+	}
+}
+
+func TestIsStoredReaperNoticeRequiresMatchingValidNotice(t *testing.T) {
+	valid := mail.Message{
+		ID:       "hq-message",
+		From:     "reaper",
+		To:       "gastown/witness",
+		Subject:  "[MEDIUM] Reaper anomaly",
+		Type:     mail.TypeEscalation,
+		ThreadID: "hq-escalation",
+	}
+	tests := []struct {
+		name    string
+		message *mail.Message
+		want    bool
+	}{
+		{name: "matching", message: &valid, want: true},
+		{name: "nil"},
+		{name: "missing ID", message: func() *mail.Message { msg := valid; msg.ID = ""; return &msg }()},
+		{name: "wrong sender", message: func() *mail.Message { msg := valid; msg.From = "mayor"; return &msg }()},
+		{name: "wrong recipient", message: func() *mail.Message { msg := valid; msg.To = "overseer"; return &msg }()},
+		{name: "wrong type", message: func() *mail.Message { msg := valid; msg.Type = mail.TypeReply; return &msg }()},
+		{name: "wrong thread", message: func() *mail.Message { msg := valid; msg.ThreadID = "other"; return &msg }()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isStoredReaperNotice(tt.message, "gastown/witness", "hq-escalation"); got != tt.want {
+				t.Fatalf("isStoredReaperNotice() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestReconcileAnomalyScansFiveIdenticalPatrolsPersistOneEscalationAndMail(t *testing.T) {
 	lifecycle := newIsolatedAnomalyLifecycle()

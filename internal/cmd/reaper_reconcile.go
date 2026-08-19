@@ -227,28 +227,12 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 		create: bd.CreateEscalationBead,
 		close:  bd.CloseEscalation,
 		send: func(issue *beads.Issue, anomaly reaper.Anomaly) error {
-			for _, target := range targets {
-				stored, err := mail.NewMailboxFromAddress(target, townRoot).ListByThread(issue.ID)
-				if err != nil {
-					return err
-				}
-				if len(stored) > 0 {
-					continue
-				}
-				msg := &mail.Message{
-					From:     "reaper",
-					To:       target,
-					Subject:  fmt.Sprintf("[MEDIUM] Reaper anomaly: %s (%s)", anomaly.Type, anomaly.Scope),
-					Body:     formatEscalationMailBody(issue.ID, config.SeverityMedium, anomaly.Message, "reaper", ""),
-					Type:     mail.TypeEscalation,
-					Priority: mail.PriorityNormal,
-					ThreadID: issue.ID,
-				}
-				if err := router.Send(msg); err != nil {
-					return err
-				}
-			}
-			return nil
+			return sendReaperAnomalyMail(issue, anomaly, targets,
+				func(target, threadID string) ([]*mail.Message, error) {
+					return mail.NewMailboxFromAddress(target, townRoot).ListByThread(threadID)
+				},
+				router.Send,
+			)
 		},
 		mark: func(issue *beads.Issue) error {
 			fields := beads.ParseEscalationFields(issue.Description)
@@ -274,4 +258,51 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("incomplete anomaly scopes preserved: %s", strings.Join(incomplete, "; "))
 	}
 	return nil
+}
+
+func sendReaperAnomalyMail(
+	issue *beads.Issue,
+	anomaly reaper.Anomaly,
+	targets []string,
+	list func(target, threadID string) ([]*mail.Message, error),
+	send func(*mail.Message) error,
+) error {
+	for _, target := range targets {
+		stored, err := list(target, issue.ID)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, message := range stored {
+			if isStoredReaperNotice(message, target, issue.ID) {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		if err := send(&mail.Message{
+			From:     "reaper",
+			To:       target,
+			Subject:  fmt.Sprintf("[MEDIUM] Reaper anomaly: %s (%s)", anomaly.Type, anomaly.Scope),
+			Body:     formatEscalationMailBody(issue.ID, config.SeverityMedium, anomaly.Message, "reaper", ""),
+			Type:     mail.TypeEscalation,
+			Priority: mail.PriorityNormal,
+			ThreadID: issue.ID,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isStoredReaperNotice(message *mail.Message, target, threadID string) bool {
+	if message == nil || message.Validate() != nil {
+		return false
+	}
+	return mail.AddressToIdentity(message.From) == "reaper" &&
+		mail.AddressToIdentity(message.To) == mail.AddressToIdentity(target) &&
+		message.Type == mail.TypeEscalation &&
+		message.ThreadID == threadID
 }

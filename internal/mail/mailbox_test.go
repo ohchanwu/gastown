@@ -377,8 +377,8 @@ func TestMailboxBeadsListByThread(t *testing.T) {
 		})
 	}
 	beadsMessages = append(beadsMessages,
-		BeadsMessage{ID: "msg-z", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
-		BeadsMessage{ID: "msg-a", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		BeadsMessage{ID: "msg-z", Title: "message z", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		BeadsMessage{ID: "msg-a", Title: "message a", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
 	)
 
 	m, logPath := newBeadsThreadTestMailbox(t, beadsMessages)
@@ -409,6 +409,58 @@ func TestMailboxBeadsListByThread(t *testing.T) {
 	}
 	if strings.Contains(log, "args:[message][thread]") {
 		t.Fatalf("bd log used unsupported message thread command:\n%s", log)
+	}
+}
+
+func TestMailboxBeadsListByThreadSchemaV1Envelope(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	tests := []struct {
+		name    string
+		data    []BeadsMessage
+		wantIDs []string
+	}{
+		{
+			name: "populated",
+			data: []BeadsMessage{{
+				ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+				Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"},
+			}},
+			wantIDs: []string{"msg-1"},
+		},
+		{name: "empty", data: []BeadsMessage{}, wantIDs: []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, err := json.Marshal(struct {
+				SchemaVersion int            `json:"schema_version"`
+				Data          []BeadsMessage `json:"data"`
+			}{SchemaVersion: 1, Data: tt.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, logPath := newBeadsThreadTestMailboxOutput(t, string(stdout))
+			t.Setenv("BD_JSON_ENVELOPE", "1")
+
+			messages, err := m.ListByThread("thread-target")
+			if err != nil {
+				t.Fatalf("ListByThread: %v", err)
+			}
+			if len(messages) != len(tt.wantIDs) {
+				t.Fatalf("ListByThread returned %d messages, want %d", len(messages), len(tt.wantIDs))
+			}
+			for i, want := range tt.wantIDs {
+				if messages[i].ID != want {
+					t.Fatalf("message[%d].ID = %q, want %q", i, messages[i].ID, want)
+				}
+			}
+			if !strings.Contains(readStubLog(t, logPath), "BD_JSON_ENVELOPE=1") {
+				t.Fatal("bd subprocess did not inherit BD_JSON_ENVELOPE=1")
+			}
+		})
 	}
 }
 
@@ -445,6 +497,19 @@ func TestMailboxBeadsListByThreadRejectsInvalidOutput(t *testing.T) {
 		{name: "scalar", stdout: `"value"`},
 		{name: "malformed JSON", stdout: "[{\n"},
 		{name: "non-JSON", stdout: "not json\n"},
+		{name: "null record", stdout: "[null]"},
+		{name: "empty record", stdout: "[{}]"},
+		{name: "missing message label", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["thread:thread-target","from:reaper"]}]`},
+		{name: "wrong thread", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["gt:message","thread:thread-other","from:reaper"]}]`},
+		{name: "missing route", stdout: `[{"id":"msg-1","title":"message","labels":["gt:message","thread:thread-target","from:reaper"]}]`},
+		{name: "unknown schema", stdout: `{"schema_version":2,"data":[]}`},
+		{name: "missing schema", stdout: `{"data":[]}`},
+		{name: "missing data", stdout: `{"schema_version":1}`},
+		{name: "extra envelope field", stdout: `{"schema_version":1,"data":[],"extra":true}`},
+		{name: "duplicate schema", stdout: `{"schema_version":1,"schema_version":1,"data":[]}`},
+		{name: "duplicate data", stdout: `{"schema_version":1,"data":[],"data":[]}`},
+		{name: "null envelope data", stdout: `{"schema_version":1,"data":null}`},
+		{name: "object envelope data", stdout: `{"schema_version":1,"data":{}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
