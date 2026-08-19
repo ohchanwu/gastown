@@ -545,9 +545,15 @@ Reaper auto-close keeps every live closure provisional on one pinned SQL
 connection. It publishes closed entries and counts only after SQL `COMMIT` and a
 successful (or benign empty) `DOLT_COMMIT`. Either commit failure returns a
 non-nil `ErrAutoCloseCommitOutcomeUnknown`, so daemon and CLI callers can fail
-the lifecycle step instead of counting success. If rollback or session reset
-fails, the connection is marked bad and discarded rather than returned to the
-pool.
+the lifecycle step instead of counting success. That error carries the
+structured anomaly and affected IDs even if a caller ignores the result. An SQL
+commit error directs operators to inspect those IDs and either retry auto-close
+when they remain open or commit the pending working set when they are closed. A
+post-SQL `DOLT_COMMIT` error directs operators to commit the pending working set
+without replaying auto-close. Full-cycle CLI runs join these per-database errors
+and report an incomplete cycle; daemon failures store the same recovery detail
+in the failed molecule step. If rollback or session reset fails, the connection
+is marked bad and discarded rather than returned to the pool.
 
 See [dolt-storage.md](dolt-storage.md) for full details.
 

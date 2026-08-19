@@ -251,6 +251,14 @@ idle dogs cannot be dispatched, cleared, removed, or daemon-reaped from ambient
 absence. The post-fix clean serialized repository suite, vet, build, and both
 cross-compilation gates passed.
 
+The exact-SHA rereview then found two closeout-reporting gaps. Full `reaper run`
+now joins auto-close commit errors and reports an incomplete cycle instead of
+returning success. Commit-outcome errors also carry their structured anomaly and
+affected IDs across every caller boundary. SQL commit uncertainty records the
+inspect-then-retry-or-commit decision, while a post-SQL `DOLT_COMMIT` failure
+records a direct pending-working-set commit action and forbids replaying
+auto-close.
+
 - [x] **Step 3: Update maintained architecture and archive the plan**
 
 Record generation-bound legacy behavior, commit-proof result publication, and

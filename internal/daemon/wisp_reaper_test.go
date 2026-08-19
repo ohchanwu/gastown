@@ -66,8 +66,26 @@ func TestAutoCloseCommitErrorIsNotCounted(t *testing.T) {
 		closed, failures := autoCloseTotals([]string{"testdb"}, func(string) (*reaper.AutoCloseResult, error) {
 			return &reaper.AutoCloseResult{Database: "testdb", Closed: 1}, commitErr
 		})
-		if closed != 0 || failures != 1 {
-			t.Fatalf("commit error totals = closed %d failures %d, want 0/1", closed, failures)
+		if closed != 0 || len(failures) != 1 {
+			t.Fatalf("commit error totals = closed %d failures %d, want 0/1", closed, len(failures))
+		}
+	}
+}
+
+func TestAutoCloseFailureReasonPreservesRecoveryDetails(t *testing.T) {
+	commitErr := &reaper.AutoCloseCommitOutcomeError{
+		Cause: fmt.Errorf("%w: injected Dolt commit failure", reaper.ErrAutoCloseCommitOutcomeUnknown),
+		Anomalies: []reaper.Anomaly{{
+			Type:        "dolt_commit_failed",
+			Scope:       "testdb",
+			AffectedIDs: []string{"stale-task"},
+			Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
+		}},
+	}
+	reason := autoCloseFailureReason([]error{fmt.Errorf("testdb: %w", commitErr)})
+	for _, want := range []string{"dolt_commit_failed", "stale-task", "CALL DOLT_COMMIT"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("failure reason = %q, want recovery detail %q", reason, want)
 		}
 	}
 }

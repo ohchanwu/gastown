@@ -703,6 +703,11 @@ func TestAutoCloseSQLCommitFailureReturnsNoSuccess(t *testing.T) {
 	if result == nil || result.Closed != 0 || len(result.ClosedEntries) != 0 {
 		t.Fatalf("SQL commit failure result = %#v, want zero ordinary success", result)
 	}
+	for _, want := range []string{`"type":"sql_commit_failed"`, `"affected_ids":["stale-task"]`, "if open, rerun auto-close", "if closed, run CALL DOLT_COMMIT"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("SQL commit error = %q, want preserved recovery detail %q", err, want)
+		}
+	}
 }
 
 func TestAutoCloseDoltCommitFailureReturnsNoSuccess(t *testing.T) {
@@ -717,6 +722,21 @@ func TestAutoCloseDoltCommitFailureReturnsNoSuccess(t *testing.T) {
 	}
 	if result == nil || result.Closed != 0 || len(result.ClosedEntries) != 0 {
 		t.Fatalf("Dolt commit failure result = %#v, want zero ordinary success", result)
+	}
+	if len(result.Anomalies) != 1 {
+		t.Fatalf("Dolt commit failure anomalies = %#v, want one recovery anomaly", result.Anomalies)
+	}
+	var outcomeErr *AutoCloseCommitOutcomeError
+	if !errors.As(err, &outcomeErr) || !reflect.DeepEqual(outcomeErr.Anomalies, result.Anomalies) {
+		t.Fatalf("Dolt commit error = %#v, want structured result anomalies", err)
+	}
+	for _, want := range []string{`"type":"dolt_commit_failed"`, `"affected_ids":["stale-task"]`, "CALL DOLT_COMMIT", "do not rerun auto-close"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Dolt commit error = %q, want preserved recovery detail %q", err, want)
+		}
+	}
+	if !strings.Contains(result.Anomalies[0].Remediation, "CALL DOLT_COMMIT") {
+		t.Fatalf("Dolt commit remediation = %q, want executable commit action", result.Anomalies[0].Remediation)
 	}
 }
 

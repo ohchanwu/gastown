@@ -489,116 +489,134 @@ var reaperRunCmd = &cobra.Command{
 
 This is the inline fallback for when Dog dispatch is unavailable.
 Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		databases := reaperDatabaseNames()
+	RunE: runReaperCycleCommand,
+}
 
-		maxAge, err := time.ParseDuration(reaperMaxAge)
+type reaperRunResult struct {
+	reaped, moleculeSteps, purged, mailPurged, closed, open int
+}
+
+type reaperRunDatabaseFunc func(string, time.Duration, time.Duration, time.Duration, time.Duration) (reaperRunResult, error)
+
+func runReaperCycleCommand(_ *cobra.Command, _ []string) error {
+	maxAge, err := time.ParseDuration(reaperMaxAge)
+	if err != nil {
+		return fmt.Errorf("invalid --max-age: %w", err)
+	}
+	purgeAge, err := time.ParseDuration(reaperPurgeAge)
+	if err != nil {
+		return fmt.Errorf("invalid --purge-age: %w", err)
+	}
+	mailAge, err := time.ParseDuration(reaperMailAge)
+	if err != nil {
+		return fmt.Errorf("invalid --mail-age: %w", err)
+	}
+	staleAge, err := time.ParseDuration(reaperStaleAge)
+	if err != nil {
+		return fmt.Errorf("invalid --stale-age: %w", err)
+	}
+	return runReaperCycle(reaperDatabaseNames(), maxAge, purgeAge, mailAge, staleAge, runReaperDatabase)
+}
+
+func runReaperCycle(databases []string, maxAge, purgeAge, mailAge, staleAge time.Duration, runDB reaperRunDatabaseFunc) error {
+	var totals reaperRunResult
+	var runErrors []error
+	for i, dbName := range databases {
+		if err := waitBeforeReaperDatabase(i); err != nil {
+			return err
+		}
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			fmt.Printf("skip invalid db: %s\n", dbName)
+			continue
+		}
+		result, err := runDB(dbName, maxAge, purgeAge, mailAge, staleAge)
+		totals.reaped += result.reaped
+		totals.moleculeSteps += result.moleculeSteps
+		totals.purged += result.purged
+		totals.mailPurged += result.mailPurged
+		totals.open += result.open
 		if err != nil {
-			return fmt.Errorf("invalid --max-age: %w", err)
+			fmt.Printf("%s: %v\n", dbName, err)
+			runErrors = append(runErrors, fmt.Errorf("%s: %w", dbName, err))
+		} else {
+			totals.closed += result.closed
 		}
-		purgeAge, err := time.ParseDuration(reaperPurgeAge)
-		if err != nil {
-			return fmt.Errorf("invalid --purge-age: %w", err)
-		}
-		mailAge, err := time.ParseDuration(reaperMailAge)
-		if err != nil {
-			return fmt.Errorf("invalid --mail-age: %w", err)
-		}
-		staleAge, err := time.ParseDuration(reaperStaleAge)
-		if err != nil {
-			return fmt.Errorf("invalid --stale-age: %w", err)
-		}
+	}
 
-		var totalReaped, totalMoleculeSteps, totalPurged, totalMailPurged, totalClosed, totalOpen int
+	prefix := ""
+	if reaperDryRun {
+		prefix = "[DRY RUN] "
+	}
+	status := "complete"
+	if len(runErrors) > 0 {
+		status = "incomplete"
+	}
+	fmt.Printf("\n%sReaper cycle %s:\n", prefix, status)
+	fmt.Printf("  Databases: %d\n", len(databases))
+	fmt.Printf("  Reaped:    %d", totals.reaped)
+	if totals.moleculeSteps > 0 {
+		fmt.Printf(" (+%d closed-molecule steps)", totals.moleculeSteps)
+	}
+	fmt.Println()
+	fmt.Printf("  Purged:    %d wisps, %d mail\n", totals.purged, totals.mailPurged)
+	fmt.Printf("  Closed:    %d stale issues\n", totals.closed)
+	fmt.Printf("  Open:      %d wisps remain\n", totals.open)
+	return errors.Join(runErrors...)
+}
 
-		for i, dbName := range databases {
-			if err := waitBeforeReaperDatabase(i); err != nil {
-				return err
-			}
-			if err := reaper.ValidateDBName(dbName); err != nil {
-				fmt.Printf("skip invalid db: %s\n", dbName)
-				continue
-			}
+func runReaperDatabase(dbName string, maxAge, purgeAge, mailAge, staleAge time.Duration) (reaperRunResult, error) {
+	var result reaperRunResult
+	db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
+	if err != nil {
+		fmt.Printf("%s: connect error: %v\n", dbName, err)
+		return result, nil
+	}
+	defer db.Close()
 
-			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 30*time.Second, 30*time.Second)
-			if err != nil {
-				fmt.Printf("%s: connect error: %v\n", dbName, err)
-				continue
-			}
+	if ok, err := reaper.HasReaperSchema(db); err != nil {
+		fmt.Printf("%s: schema check error: %v\n", dbName, err)
+		return result, nil
+	} else if !ok {
+		fmt.Printf("%s: skipped (no reaper schema)\n", dbName)
+		return result, nil
+	}
 
-			if ok, err := reaper.HasReaperSchema(db); err != nil {
-				fmt.Printf("%s: schema check error: %v\n", dbName, err)
-				db.Close()
-				continue
-			} else if !ok {
-				fmt.Printf("%s: skipped (no reaper schema)\n", dbName)
-				db.Close()
-				continue
-			}
+	scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
+	if err != nil {
+		fmt.Printf("%s: scan error: %v\n", dbName, err)
+		return result, nil
+	}
+	for _, anomaly := range scanResult.Anomalies {
+		fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), anomaly.Message)
+	}
 
-			// Scan
-			scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
-			if err != nil {
-				fmt.Printf("%s: scan error: %v\n", dbName, err)
-				db.Close()
-				continue
-			}
-			for _, a := range scanResult.Anomalies {
-				fmt.Printf("%s: %s %s\n", dbName, style.Warning.Render("ANOMALY:"), a.Message)
-			}
+	reapResult, err := reaper.Reap(db, dbName, maxAge, reaperDryRun)
+	if err != nil {
+		fmt.Printf("%s: reap error: %v\n", dbName, err)
+	} else {
+		result.reaped = reapResult.Reaped
+		result.moleculeSteps = reapResult.MoleculeStepsClosed
+		result.open = reapResult.OpenRemain
+	}
 
-			// Reap
-			reapResult, err := reaper.Reap(db, dbName, maxAge, reaperDryRun)
-			if err != nil {
-				fmt.Printf("%s: reap error: %v\n", dbName, err)
-			} else {
-				totalReaped += reapResult.Reaped
-				totalMoleculeSteps += reapResult.MoleculeStepsClosed
-				totalOpen += reapResult.OpenRemain
-			}
+	purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
+	if err != nil {
+		fmt.Printf("%s: purge error: %v\n", dbName, err)
+	} else {
+		result.purged = purgeResult.WispsPurged
+		result.mailPurged = purgeResult.MailPurged
+	}
 
-			// Purge
-			purgeResult, err := reaper.Purge(db, dbName, purgeAge, mailAge, reaperDryRun)
-			if err != nil {
-				fmt.Printf("%s: purge error: %v\n", dbName, err)
-			} else {
-				totalPurged += purgeResult.WispsPurged
-				totalMailPurged += purgeResult.MailPurged
-			}
-
-			// Auto-close
-			closeResult, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
-			if err != nil {
-				fmt.Printf("%s: auto-close error: %v\n", dbName, err)
-			} else {
-				for _, entry := range closeResult.ClosedEntries {
-					fmt.Printf("  %s %s (%dd stale, db:%s)\n",
-						entry.ID, entry.Title, entry.AgeDays, entry.Database)
-				}
-				totalClosed += closeResult.Closed
-			}
-
-			db.Close()
-		}
-
-		// Report
-		prefix := ""
-		if reaperDryRun {
-			prefix = "[DRY RUN] "
-		}
-		fmt.Printf("\n%sReaper cycle complete:\n", prefix)
-		fmt.Printf("  Databases: %d\n", len(databases))
-		fmt.Printf("  Reaped:    %d", totalReaped)
-		if totalMoleculeSteps > 0 {
-			fmt.Printf(" (+%d closed-molecule steps)", totalMoleculeSteps)
-		}
-		fmt.Println()
-		fmt.Printf("  Purged:    %d wisps, %d mail\n", totalPurged, totalMailPurged)
-		fmt.Printf("  Closed:    %d stale issues\n", totalClosed)
-		fmt.Printf("  Open:      %d wisps remain\n", totalOpen)
-
-		return nil
-	},
+	closeResult, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
+	if err != nil {
+		return result, fmt.Errorf("auto-close error: %w", err)
+	}
+	for _, entry := range closeResult.ClosedEntries {
+		fmt.Printf("  %s %s (%dd stale, db:%s)\n",
+			entry.ID, entry.Title, entry.AgeDays, entry.Database)
+	}
+	result.closed = closeResult.Closed
+	return result, nil
 }
 
 func init() {

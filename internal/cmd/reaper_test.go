@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +51,15 @@ func TestReaperAutoCloseCommandReturnsCommitError(t *testing.T) {
 		reaperDryRun, reaperJSON, runReaperAutoClose = oldDryRun, oldJSON, oldRun
 	})
 
-	commitErr := errors.New("auto-close commit outcome unknown")
+	commitErr := &reaper.AutoCloseCommitOutcomeError{
+		Cause: fmt.Errorf("%w: injected Dolt commit failure", reaper.ErrAutoCloseCommitOutcomeUnknown),
+		Anomalies: []reaper.Anomaly{{
+			Type:        "dolt_commit_failed",
+			Scope:       "testdb",
+			AffectedIDs: []string{"stale-task"},
+			Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
+		}},
+	}
 	reaperDB = "testdb"
 	reaperDBDelay = "0s"
 	reaperStaleAge = "24h"
@@ -62,6 +72,46 @@ func TestReaperAutoCloseCommandReturnsCommitError(t *testing.T) {
 	err := reaperAutoCloseCmd.RunE(reaperAutoCloseCmd, nil)
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("auto-close command error = %v, want commit error", err)
+	}
+	if !strings.Contains(err.Error(), "stale-task") {
+		t.Fatalf("auto-close command error = %q, want preserved affected ID", err)
+	}
+}
+
+func TestReaperRunReturnsAutoCloseCommitError(t *testing.T) {
+	oldDelay, oldDryRun := reaperDBDelay, reaperDryRun
+	t.Cleanup(func() {
+		reaperDBDelay, reaperDryRun = oldDelay, oldDryRun
+	})
+	reaperDBDelay = "0s"
+	reaperDryRun = false
+
+	commitErr := &reaper.AutoCloseCommitOutcomeError{
+		Cause: fmt.Errorf("%w: injected Dolt commit failure", reaper.ErrAutoCloseCommitOutcomeUnknown),
+		Anomalies: []reaper.Anomaly{{
+			Type:        "dolt_commit_failed",
+			Scope:       "testdb",
+			AffectedIDs: []string{"stale-task"},
+			Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
+		}},
+	}
+	var err error
+	output := captureStdout(t, func() {
+		err = runReaperCycle(
+			[]string{"testdb"}, time.Hour, time.Hour, time.Hour, time.Hour,
+			func(string, time.Duration, time.Duration, time.Duration, time.Duration) (reaperRunResult, error) {
+				return reaperRunResult{closed: 1}, commitErr
+			},
+		)
+	})
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("reaper run error = %v, want commit error", err)
+	}
+	if !strings.Contains(err.Error(), "stale-task") {
+		t.Fatalf("reaper run error = %q, want preserved affected ID", err)
+	}
+	if !strings.Contains(output, "Reaper cycle incomplete:") || !strings.Contains(output, "Closed:    0 stale issues") {
+		t.Fatalf("reaper run output = %q, want incomplete cycle with zero unproven closes", output)
 	}
 }
 

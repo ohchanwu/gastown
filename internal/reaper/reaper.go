@@ -28,6 +28,30 @@ var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // could not be proven. Callers must not report ordinary success for this run.
 var ErrAutoCloseCommitOutcomeUnknown = errors.New("auto-close commit outcome unknown")
 
+// AutoCloseCommitOutcomeError preserves structured recovery data even when a
+// caller ignores the accompanying AutoCloseResult.
+type AutoCloseCommitOutcomeError struct {
+	Cause     error
+	Anomalies []Anomaly
+}
+
+func (e *AutoCloseCommitOutcomeError) Error() string {
+	encoded, err := json.Marshal(e.Anomalies)
+	if err != nil {
+		return e.Cause.Error()
+	}
+	return fmt.Sprintf("%v; anomalies=%s", e.Cause, encoded)
+}
+
+func (e *AutoCloseCommitOutcomeError) Unwrap() error { return e.Cause }
+
+func autoCloseCommitOutcomeError(phase string, err error, anomalies []Anomaly) error {
+	return &AutoCloseCommitOutcomeError{
+		Cause:     fmt.Errorf("%w: %s commit: %w", ErrAutoCloseCommitOutcomeUnknown, phase, err),
+		Anomalies: append([]Anomaly(nil), anomalies...),
+	}
+}
+
 // DefaultDatabases is the static fallback list of known production databases.
 // Used only when SHOW DATABASES fails (server unreachable).
 // GH#2385: Removed legacy "gt" and "bd" names — modern towns use "hq" (town
@@ -948,18 +972,26 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	if len(ids) > 0 {
 		// Flush SQL transaction to working set before DOLT_COMMIT.
 		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			remediation := fmt.Sprintf(
+				"inspect affected IDs in %s; if open, rerun auto-close; if closed, run CALL DOLT_COMMIT('-Am', 'reaper: reconcile pending auto-close in %s')",
+				dbName, dbName,
+			)
 			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
-				"sql_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("sql commit after auto-close failed: %v", err)))
-			return result, fmt.Errorf("%w: SQL commit: %w", ErrAutoCloseCommitOutcomeUnknown, err)
+				"sql_commit_failed", dbName, ids, remediation, fmt.Sprintf("sql commit after auto-close failed: %v; recovery: %s", err, remediation)))
+			return result, autoCloseCommitOutcomeError("SQL", err, result.Anomalies)
 		}
 		transactionOpen = false
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// "nothing to commit" is expected when the updated tables are dolt_ignored.
 			if !isNothingToCommit(err) {
+				remediation := fmt.Sprintf(
+					"run CALL DOLT_COMMIT('-Am', 'reaper: reconcile pending auto-close in %s'); do not rerun auto-close",
+					dbName,
+				)
 				result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
-					"dolt_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("dolt commit after auto-close failed: %v", err)))
-				return result, fmt.Errorf("%w: Dolt commit: %w", ErrAutoCloseCommitOutcomeUnknown, err)
+					"dolt_commit_failed", dbName, ids, remediation, fmt.Sprintf("dolt commit after auto-close failed: %v; recovery: %s", err, remediation)))
+				return result, autoCloseCommitOutcomeError("Dolt", err, result.Anomalies)
 			}
 		}
 	}

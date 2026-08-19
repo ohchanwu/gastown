@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -79,11 +80,11 @@ func wispDeleteAge(config *DaemonPatrolConfig) time.Duration {
 func autoCloseTotals(
 	databases []string,
 	run func(string) (*reaper.AutoCloseResult, error),
-) (closed, failures int) {
+) (closed int, failures []error) {
 	for _, dbName := range databases {
 		result, err := run(dbName)
 		if err != nil {
-			failures++
+			failures = append(failures, fmt.Errorf("%s: %w", dbName, err))
 			continue
 		}
 		if result != nil {
@@ -91,6 +92,10 @@ func autoCloseTotals(
 		}
 	}
 	return closed, failures
+}
+
+func autoCloseFailureReason(failures []error) string {
+	return errors.Join(failures...).Error()
 }
 
 // reapWisps is the thin orchestrator for the wisp_reaper patrol.
@@ -308,7 +313,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 	}
 
 	// Step 4: Auto-close
-	autoCloseErrors := 0
+	var autoCloseErrors []error
 	totalAutoClosed, autoCloseErrors = autoCloseTotals(databases, func(dbName string) (*reaper.AutoCloseResult, error) {
 		if err := reaper.ValidateDBName(dbName); err != nil {
 			return nil, nil
@@ -329,8 +334,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 		return result, err
 	})
-	if autoCloseErrors > 0 {
-		mol.failStep("auto-close", fmt.Sprintf("%d databases had auto-close errors", autoCloseErrors))
+	if len(autoCloseErrors) > 0 {
+		mol.failStep("auto-close", autoCloseFailureReason(autoCloseErrors))
 	} else {
 		mol.closeStep("auto-close")
 	}
