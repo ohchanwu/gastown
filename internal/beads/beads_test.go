@@ -733,7 +733,7 @@ func TestArgsAreReadOnlyClassifiesKnownReadCommands(t *testing.T) {
 		{"formula", "show", "mol-polecat-work"},
 		{"kv", "get", "key"},
 		{"kv", "list"},
-		{"message", "thread", "hq-msg", "--json"},
+		{"list", "--include-infra", "--all", "--label", "gt:message", "--label", "thread:hq-msg", "--limit", "0", "--json"},
 		{"mol", "current", "--json"},
 		{"mol", "wisp", "list", "--json"},
 		{"sql", "SELECT 1"},

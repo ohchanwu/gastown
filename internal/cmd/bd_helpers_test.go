@@ -869,7 +869,7 @@ func TestBdCmd_UsesCentralReadMutationModes(t *testing.T) {
 		{
 			name: "read routing",
 			setup: func() *bdCmd {
-				return (&bdCmd{args: []string{"message", "thread", "hq-msg"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).Dir(rigDir).WithRouting()
+				return (&bdCmd{args: []string{"list", "--include-infra", "--all", "--label", "gt:message", "--label", "thread:hq-msg", "--limit", "0", "--json"}, env: append([]string{}, baseEnv...), stderr: os.Stderr}).Dir(rigDir).WithRouting()
 			},
 			wantReadOnly:   true,
 			wantAutoCommit: "off",

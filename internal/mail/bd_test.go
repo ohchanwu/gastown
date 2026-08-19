@@ -365,7 +365,7 @@ func TestArgsAreReadOnlyForMailCommands(t *testing.T) {
 		{[]string{"show", "hq-abc"}, true},
 		{[]string{"sql", "--json", "SELECT * FROM wisps"}, true},
 		{[]string{"mol", "wisp", "list", "--json"}, true},
-		{[]string{"message", "thread", "hq-abc", "--json"}, true},
+		{[]string{"list", "--include-infra", "--all", "--label", "gt:message", "--label", "thread:hq-abc", "--limit", "0", "--json"}, true},
 		{[]string{"sql", "UPDATE issues SET status='closed'"}, false},
 		{[]string{"sql", "--json", "WITH x AS (SELECT 1) SELECT * FROM x"}, false},
 		{[]string{"mol", "wisp", "create", "mol-test"}, false},
