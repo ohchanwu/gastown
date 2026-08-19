@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -689,6 +690,104 @@ func TestCommitFailureAnomalyCarriesStableLifecycleFields(t *testing.T) {
 	}
 }
 
+func TestAutoCloseSQLCommitFailureReturnsNoSuccess(t *testing.T) {
+	state := autoCloseFailureState()
+	state.execFailures["COMMIT"] = fmt.Errorf("injected SQL commit failure")
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if !errors.Is(err, ErrAutoCloseCommitOutcomeUnknown) {
+		t.Fatalf("SQL commit error = %v, want ErrAutoCloseCommitOutcomeUnknown", err)
+	}
+	if result == nil || result.Closed != 0 || len(result.ClosedEntries) != 0 {
+		t.Fatalf("SQL commit failure result = %#v, want zero ordinary success", result)
+	}
+}
+
+func TestAutoCloseDoltCommitFailureReturnsNoSuccess(t *testing.T) {
+	state := autoCloseFailureState()
+	state.execFailures["CALL DOLT_COMMIT"] = fmt.Errorf("injected Dolt commit failure")
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if !errors.Is(err, ErrAutoCloseCommitOutcomeUnknown) {
+		t.Fatalf("Dolt commit error = %v, want ErrAutoCloseCommitOutcomeUnknown", err)
+	}
+	if result == nil || result.Closed != 0 || len(result.ClosedEntries) != 0 {
+		t.Fatalf("Dolt commit failure result = %#v, want zero ordinary success", result)
+	}
+}
+
+func TestAutoCloseDiscardsConnectionWhenTransactionResetFails(t *testing.T) {
+	state := autoCloseFailureState()
+	state.execFailures["COMMIT"] = fmt.Errorf("injected SQL commit failure")
+	state.execFailures["ROLLBACK"] = fmt.Errorf("injected rollback failure")
+	db := openFakeReaperDB(t, state)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if err == nil {
+		t.Errorf("AutoClose error = nil, want commit/reset failure")
+	}
+	if result != nil && (result.Closed != 0 || len(result.ClosedEntries) != 0) {
+		t.Errorf("failed reset result = %#v, want zero ordinary success", result)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping after discarded connection: %v", err)
+	}
+	state.mu.Lock()
+	opened := state.nextConn
+	state.mu.Unlock()
+	if opened != 2 {
+		t.Fatalf("connections opened after failed reset = %d, want 2 (dirty connection discarded)", opened)
+	}
+}
+
+func TestAutoCloseRowsAffectedAndAutocommitResetFailureDiscardsConnection(t *testing.T) {
+	state := autoCloseFailureState()
+	state.rowsAffectedFailure = fmt.Errorf("injected RowsAffected failure")
+	state.execFailures["SET @@autocommit = 1"] = fmt.Errorf("injected autocommit reset failure")
+	db := openFakeReaperDB(t, state)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := AutoClose(db, "testdb", 7*24*time.Hour, false)
+	if err == nil || !strings.Contains(err.Error(), "RowsAffected failure") ||
+		!strings.Contains(err.Error(), "autocommit reset failure") {
+		t.Fatalf("AutoClose error = %v, want mutation and reset failures", err)
+	}
+	if result != nil && (result.Closed != 0 || len(result.ClosedEntries) != 0) {
+		t.Fatalf("failed mutation result = %#v, want zero ordinary success", result)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping after discarded connection: %v", err)
+	}
+	state.mu.Lock()
+	opened := state.nextConn
+	state.mu.Unlock()
+	if opened != 2 {
+		t.Fatalf("connections opened after failed reset = %d, want 2 (dirty connection discarded)", opened)
+	}
+}
+
+func autoCloseFailureState() *fakeReaperState {
+	now := time.Now().UTC()
+	return &fakeReaperState{
+		issues: map[string]*fakeIssue{
+			"stale-task": {
+				id: "stale-task", title: "Stale task", status: "open",
+				issueType: "task", updatedAt: now.Add(-8 * 24 * time.Hour),
+			},
+		},
+		wisps:        map[string]*fakeWisp{},
+		ops:          map[int][]string{},
+		execFailures: map[string]error{},
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
@@ -732,6 +831,8 @@ type fakeReaperState struct {
 	deps                  []fakeDep
 	nextConn              int
 	ops                   map[int][]string
+	execFailures          map[string]error
+	rowsAffectedFailure   error
 	beforeAutoCloseUpdate func(*fakeReaperState)
 }
 
@@ -981,6 +1082,12 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
 	c.state.record(c.id, "EXEC "+normalized)
+	for prefix, err := range c.state.execFailures {
+		if normalized == prefix || strings.HasPrefix(normalized, prefix) {
+			delete(c.state.execFailures, prefix)
+			return nil, err
+		}
+	}
 
 	switch {
 	case strings.HasPrefix(normalized, "UPDATE `testdb`.issues") && strings.Contains(normalized, "SET i.status = 'closed'"):
@@ -999,6 +1106,10 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 				issue.status = "closed"
 				affected++
 			}
+		}
+		if err := c.state.rowsAffectedFailure; err != nil {
+			c.state.rowsAffectedFailure = nil
+			return fakeReaperResultFailure{affected: affected, err: err}, nil
 		}
 		return fakeReaperResult(affected), nil
 	case strings.HasPrefix(normalized, "UPDATE wisps SET status='closed'"):
@@ -1027,6 +1138,14 @@ type fakeReaperResult int64
 
 func (r fakeReaperResult) LastInsertId() (int64, error) { return 0, nil }
 func (r fakeReaperResult) RowsAffected() (int64, error) { return int64(r), nil }
+
+type fakeReaperResultFailure struct {
+	affected int64
+	err      error
+}
+
+func (r fakeReaperResultFailure) LastInsertId() (int64, error) { return 0, nil }
+func (r fakeReaperResultFailure) RowsAffected() (int64, error) { return r.affected, r.err }
 
 type fakeReaperRows struct {
 	cols []string

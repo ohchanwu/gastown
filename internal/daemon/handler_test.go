@@ -45,12 +45,13 @@ func testSetupDogState(t *testing.T, townRoot, name string, state dog.State, las
 	}
 
 	ds := &dog.DogState{
-		Name:       name,
-		State:      state,
-		LastActive: lastActive,
-		Worktrees:  map[string]string{},
-		CreatedAt:  lastActive,
-		UpdatedAt:  lastActive,
+		Name:                 name,
+		State:                state,
+		SessionAbsenceProven: true,
+		LastActive:           lastActive,
+		Worktrees:            map[string]string{},
+		CreatedAt:            lastActive,
+		UpdatedAt:            lastActive,
 	}
 
 	data, err := json.MarshalIndent(ds, "", "  ")
@@ -59,6 +60,27 @@ func testSetupDogState(t *testing.T, townRoot, name string, state dog.State, las
 	}
 	if err := os.WriteFile(filepath.Join(kennelDir, ".dog.json"), data, 0644); err != nil {
 		t.Fatalf("Failed to write dog state: %v", err)
+	}
+}
+
+func testSetDogSessionAbsenceProven(t *testing.T, townRoot, name string, proven bool) {
+	t.Helper()
+	path := filepath.Join(townRoot, "deacon", "dogs", name, ".dog.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state dog.DogState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	state.SessionAbsenceProven = proven
+	data, err = json.MarshalIndent(&state, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -78,13 +100,14 @@ func testSetupWorkingDogState(t *testing.T, townRoot, name, work string, lastAct
 	}
 
 	ds := &dog.DogState{
-		Name:       name,
-		State:      dog.StateWorking,
-		Work:       work,
-		LastActive: lastActive,
-		Worktrees:  map[string]string{},
-		CreatedAt:  lastActive,
-		UpdatedAt:  lastActive,
+		Name:                 name,
+		State:                dog.StateWorking,
+		Work:                 work,
+		SessionAbsenceProven: true,
+		LastActive:           lastActive,
+		Worktrees:            map[string]string{},
+		CreatedAt:            lastActive,
+		UpdatedAt:            lastActive,
 	}
 
 	data, err := json.MarshalIndent(ds, "", "  ")
@@ -146,11 +169,20 @@ func TestDetectStaleWorkingDogs_ClearsStaleWorkers(t *testing.T) {
 
 	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
 	mgr := dog.NewManager(townRoot, rigsConfig)
-	tm := tmux.NewTmux()
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-test-dog-stale-dead-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
 	sm := dog.NewSessionManager(tm, townRoot, mgr)
 
-	// Dog working for 3 hours with no activity — should be cleared.
+	// Dog working for 3 hours with an exact session generation proven dead.
 	testSetupWorkingDogState(t, townRoot, "stale", constants.MolConvoyFeed, time.Now().Add(-3*time.Hour))
+	sessionName := sm.SessionName("stale")
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand(%q): %v", sessionName, err)
+	}
+	generation := testPersistDogSessionGeneration(t, townRoot, mgr, tm, "stale")
+	if err := tm.KillSessionGeneration(generation); err != nil {
+		t.Fatalf("KillSessionGeneration(%q): %v", sessionName, err)
+	}
 
 	d.detectStaleWorkingDogs(mgr, sm, &config.DaemonThresholds{})
 
@@ -415,6 +447,7 @@ func TestReapIdleDogs_PreservesLiveLegacySessionAndKennel(t *testing.T) {
 		testSetupDogState(t, townRoot, fmt.Sprintf("recent-%d", i), dog.StateIdle, time.Now())
 	}
 	testSetupDogState(t, townRoot, "legacy", dog.StateIdle, time.Now().Add(-6*time.Hour))
+	testSetDogSessionAbsenceProven(t, townRoot, "legacy", false)
 	sessionName := sm.SessionName("legacy")
 	if err := tm.NewSession(sessionName, ""); err != nil {
 		t.Fatalf("NewSession(%q): %v", sessionName, err)
@@ -428,6 +461,52 @@ func TestReapIdleDogs_PreservesLiveLegacySessionAndKennel(t *testing.T) {
 	}
 	if running, err := tm.HasSession(sessionName); err != nil || !running {
 		t.Fatalf("live legacy idle session was not preserved: running=%v err=%v", running, err)
+	}
+}
+
+func TestReapIdleDogs_PreservesLegacySessionAfterAmbientRootDrift(t *testing.T) {
+	requireTmux(t)
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-reap-drift-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-reap-drift-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socket := fmt.Sprintf("gt-test-dog-reap-drift-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	ambient := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + secondRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	t.Cleanup(func() { _ = ambient.KillServer() })
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	sm := dog.NewSessionManager(ambient, townRoot, mgr)
+	for i := 0; i < maxDogPoolSize; i++ {
+		testSetupDogState(t, townRoot, fmt.Sprintf("recent-%d", i), dog.StateIdle, time.Now())
+	}
+	testSetupDogState(t, townRoot, "legacy", dog.StateIdle, time.Now().Add(-6*time.Hour))
+	testSetDogSessionAbsenceProven(t, townRoot, "legacy", false)
+	sessionName := sm.SessionName("legacy")
+	if err := target.NewSessionWithCommand(sessionName, t.TempDir(), "sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+
+	d.reapIdleDogs(mgr, sm, &config.DaemonThresholds{})
+
+	if !testDogExists(townRoot, "legacy") {
+		t.Fatal("legacy kennel was removed from false ambient absence")
+	}
+	if running, err := target.HasSession(sessionName); err != nil || !running {
+		t.Fatalf("legacy session was not preserved: running=%v err=%v", running, err)
 	}
 }
 
@@ -621,13 +700,14 @@ func TestRollbackDogDispatchAssignmentPreservesPluginCustodyWhenArchiveFails(t *
 	testSetupDogState(t, townRoot, "alpha", dog.StateWorking, started)
 	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
 	state := &dog.DogState{
-		Name:          "alpha",
-		State:         dog.StateWorking,
-		Work:          "plugin:reaper",
-		WorkStartedAt: started,
-		LastActive:    started,
-		CreatedAt:     started,
-		UpdatedAt:     started,
+		Name:                 "alpha",
+		State:                dog.StateWorking,
+		Work:                 "plugin:reaper",
+		WorkStartedAt:        started,
+		SessionAbsenceProven: true,
+		LastActive:           started,
+		CreatedAt:            started,
+		UpdatedAt:            started,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -680,9 +760,19 @@ func TestCleanupStuckDogs_ClearsDeadSessionWorker(t *testing.T) {
 
 	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
 	mgr := dog.NewManager(townRoot, rigsConfig)
-	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
+	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-test-dog-cleanup-dead-%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = tm.KillServer() })
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
 
 	testSetupWorkingDogState(t, townRoot, "alpha", constants.MolDogReaper, time.Now())
+	sessionName := sm.SessionName("alpha")
+	if err := tm.NewSessionWithCommand(sessionName, "", "sleep 60"); err != nil {
+		t.Fatalf("NewSessionWithCommand(%q): %v", sessionName, err)
+	}
+	generation := testPersistDogSessionGeneration(t, townRoot, mgr, tm, "alpha")
+	if err := tm.KillSessionGeneration(generation); err != nil {
+		t.Fatalf("KillSessionGeneration(%q): %v", sessionName, err)
+	}
 
 	d.cleanupStuckDogs(mgr, sm)
 
@@ -774,6 +864,66 @@ func TestCleanupStuckDogs_PreservesAgentDeadLegacySession(t *testing.T) {
 	}
 	if running, err := tm.HasSession(sessionName); err != nil || !running {
 		t.Fatalf("agent-dead legacy session was not preserved: running=%v err=%v", running, err)
+	}
+}
+
+func TestCleanupStuckDogsUsesPersistedEndpointBeforeExactTeardown(t *testing.T) {
+	requireTmux(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-cleanup-bound-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-cleanup-bound-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socketName := fmt.Sprintf("gt-test-dog-cleanup-bound-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socketName, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	mgr := dog.NewManager(townRoot, &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}})
+	testSetupWorkingDogState(t, townRoot, "alpha", constants.MolDogReaper, time.Now())
+	generation, err := target.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha", t.TempDir(), "sleep 30", map[string]string{"GT_PROCESS_NAMES": "sleep"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", current.Work, current.WorkStartedAt, nil, generation,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist generation = %v, %v", set, err)
+	}
+	ambient := tmux.NewTmuxWithSocketAndEnv(socketName, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + secondRoot,
+	})
+	sm := dog.NewSessionManager(ambient, townRoot, mgr)
+
+	d.cleanupStuckDogs(mgr, sm)
+
+	stored, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != dog.StateWorking || stored.Work != constants.MolDogReaper || stored.SessionGeneration == nil {
+		t.Fatalf("ambient absence released exact custody: %+v", stored)
+	}
+	if live, err := target.HasSession(generation.Name); err != nil || !live {
+		t.Fatalf("exact healthy generation was torn down: live=%v err=%v", live, err)
 	}
 }
 

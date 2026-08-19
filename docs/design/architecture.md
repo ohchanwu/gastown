@@ -67,7 +67,7 @@ Each agent bead references its role bead via the `role_bead` field.
 |-------|------|-------------|
 | **Mayor** | Global coordinator, handles cross-rig communication and escalations | Persistent |
 | **Deacon** | Daemon beacon — receives heartbeats, runs plugins and monitoring | Persistent |
-| **Boot** | Deacon watchdog — spawned by daemon for triage decisions when Deacon is down | Ephemeral |
+| **Boot** | Deacon watchdog for triage when Deacon is down | Ephemeral |
 | **Dogs** | Long-running workers for cross-rig batch work | Variable |
 
 ### Rig-Level Agents (Per-Project)
@@ -76,7 +76,7 @@ Each agent bead references its role bead via the `role_bead` field.
 |-------|------|-------------|
 | **Witness** | Monitors polecat health, handles nudging and cleanup | Persistent |
 | **Refinery** | Processes merge queue, runs verification | Persistent |
-| **Polecats** | Workers with persistent identity, assigned to specific issues | Persistent identity, ephemeral sessions |
+| **Polecats** | Workers assigned to specific issues | Persistent identity; ephemeral session |
 | **Crew** | Human workspaces — full git clones, user-managed lifecycle | Persistent |
 
 ## Directory Structure
@@ -308,8 +308,18 @@ name and the canonical absolute socket path used by tmux. The path is the
 authority because the same `-L` name under two `TMUX_TMPDIR` roots addresses two
 different servers; reconstructed controllers use `-S` and do not consult the
 later environment. Missing paths, including older name-only records, are legacy
-unbound receipts. Starting a dog captures all three in the session creation
-transaction and records them before claiming successful runtime custody.
+unbound receipts. A persisted generation is checked and, after authoritative
+absence, replaced on that same transport rather than the ambient tmux server.
+
+Generation-free state carries a separate durable session-absence proof. New
+dogs and exact terminal teardown publish that proof; startup consumes it before
+creating a session. Fresh startup also requires the non-serialized capability
+returned by the atomic assignment transaction. Work text and timestamps remain
+comparison fields, not replayable startup authority. Legacy JSON has no absence
+proof, so nil-generation legacy dogs remain recovery-blocked: dispatch, daemon
+reaping, removal, and ambient absence cannot release or replace them. Starting
+a dog captures all generation receipt fields in the session creation transaction
+and records them before claiming successful runtime custody.
 Completion and removal hold the stable per-name lifecycle lock, compare the full
 durable snapshot, perform process-aware teardown of only that exact pane and
 session, finalize the exact assignment mail, and only then publish idle or remove
@@ -531,6 +541,14 @@ CREATE → LIVE → CLOSE → DECAY → COMPACT → FLATTEN
 Stages 1-3 are automated today. Stages 4-6 are being shipped via Dog automation
 (gt-at0i Reaper DELETE, gt-l8dc Compactor REBASE, gt-emm4 Doctor gc).
 
+Reaper auto-close keeps every live closure provisional on one pinned SQL
+connection. It publishes closed entries and counts only after SQL `COMMIT` and a
+successful (or benign empty) `DOLT_COMMIT`. Either commit failure returns a
+non-nil `ErrAutoCloseCommitOutcomeUnknown`, so daemon and CLI callers can fail
+the lifecycle step instead of counting success. If rollback or session reset
+fails, the connection is marked bad and discarded rather than returned to the
+pool.
+
 See [dolt-storage.md](dolt-storage.md) for full details.
 
 ## Deployment Artifacts
@@ -542,9 +560,9 @@ trigger GitHub Actions release workflows that build and publish everything.
 
 | Channel | Artifact | Trigger |
 |---------|----------|---------|
-| **GitHub Releases** | Platform binaries (darwin/linux/windows, amd64/arm64) + checksums | GoReleaser on tag push |
-| **Homebrew** | `brew install steveyegge/gastown/gt` — formula auto-updated on release | `update-homebrew` job pushes to `steveyegge/homebrew-gastown` |
-| **npm** | `npx @gastown/gt` — wrapper that downloads the correct binary | OIDC trusted publishing (no token) |
+| **GitHub Releases** | Platform binaries + checksums | GoReleaser on tag push |
+| **Homebrew** | `brew install steveyegge/gastown/gt` | Release workflow updates formula |
+| **npm** | `npx @gastown/gt` binary wrapper | OIDC trusted publishing |
 | **Local build** | `go build -o $(go env GOPATH)/bin/gt ./cmd/gt` | Manual |
 
 ### Beads (`bd`)
@@ -553,8 +571,8 @@ trigger GitHub Actions release workflows that build and publish everything.
 |---------|----------|---------|
 | **GitHub Releases** | Platform binaries + checksums | GoReleaser on tag push |
 | **Homebrew** | `brew install steveyegge/beads/bd` | `update-homebrew` job |
-| **npm** | `npx @beads/bd` — wrapper that downloads the correct binary | OIDC trusted publishing (no token) |
-| **PyPI** | `beads-mcp` — MCP server integration | `publish-pypi` job with `PYPI_API_TOKEN` secret |
+| **npm** | `npx @beads/bd` binary wrapper | OIDC trusted publishing |
+| **PyPI** | `beads-mcp` integration | Release job with `PYPI_API_TOKEN` |
 | **Local build** | `go build -o $(go env GOPATH)/bin/bd ./cmd/bd` | Manual |
 
 ### npm Authentication

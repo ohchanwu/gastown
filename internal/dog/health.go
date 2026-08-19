@@ -150,7 +150,7 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 
 func (hc *HealthChecker) checkerForDog(d *Dog) (sessionChecker, error) {
 	if d == nil || d.SessionGeneration == nil {
-		return hc.checker, nil
+		return nil, ErrSessionGenerationUnavailable
 	}
 	return hc.checkerForGeneration(d.SessionGeneration.Tmux())
 }
@@ -168,20 +168,7 @@ func (hc *HealthChecker) clearExactDogRuntimeWithChecker(d *Dog, sessionLive boo
 		return errors.New("dog lifecycle evidence unavailable")
 	}
 	if d.SessionGeneration == nil {
-		if sessionLive {
-			return errors.New("live legacy session has no persisted generation")
-		}
-		if d.State == StateIdle && d.Work == "" {
-			return nil
-		}
-		cleared, err := hc.mgr.ClearWorkIfMatches(d.Name, d.Work, d.WorkStartedAt)
-		if err != nil {
-			return err
-		}
-		if !cleared {
-			return errors.New("dog assignment changed during absent-session cleanup")
-		}
-		return nil
+		return ErrSessionGenerationUnavailable
 	}
 
 	expected := d.SessionGeneration.Tmux()

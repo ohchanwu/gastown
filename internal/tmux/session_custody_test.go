@@ -1,10 +1,22 @@
 package tmux
 
 import (
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestParseSessionGenerationClassifiesEmptyTargetFieldsAsAbsent(t *testing.T) {
+	for _, output := range []string{"123", "123\t\t\t\t", "123\t\tserver-global-value\t\t"} {
+		if _, err := parseSessionGeneration("gt-missing", output); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("parseSessionGeneration(%q) error = %v, want ErrSessionNotFound", output, err)
+		}
+	}
+	if _, err := parseSessionGeneration("gt-missing", "123\tinvalid session\tgeneration\t\t"); errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("malformed non-empty session ID classified as absence: %v", err)
+	}
+}
 
 func TestParseSessionGenerationBindsCustodyToken(t *testing.T) {
 	const custody = "11111111-2222-4333-8444-555555555555"

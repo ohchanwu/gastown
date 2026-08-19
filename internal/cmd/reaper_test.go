@@ -1,10 +1,14 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/reaper"
 )
 
 func TestReaperDatabaseNamesTrimsConfiguredList(t *testing.T) {
@@ -34,6 +38,30 @@ func TestWaitBeforeReaperDatabase(t *testing.T) {
 	reaperDBDelay = "not-a-duration"
 	if err := waitBeforeReaperDatabase(1); err == nil {
 		t.Fatal("invalid delay should return an error")
+	}
+}
+
+func TestReaperAutoCloseCommandReturnsCommitError(t *testing.T) {
+	oldDB, oldDelay, oldStaleAge := reaperDB, reaperDBDelay, reaperStaleAge
+	oldDryRun, oldJSON, oldRun := reaperDryRun, reaperJSON, runReaperAutoClose
+	t.Cleanup(func() {
+		reaperDB, reaperDBDelay, reaperStaleAge = oldDB, oldDelay, oldStaleAge
+		reaperDryRun, reaperJSON, runReaperAutoClose = oldDryRun, oldJSON, oldRun
+	})
+
+	commitErr := errors.New("auto-close commit outcome unknown")
+	reaperDB = "testdb"
+	reaperDBDelay = "0s"
+	reaperStaleAge = "24h"
+	reaperDryRun = false
+	reaperJSON = false
+	runReaperAutoClose = func(string, time.Duration, bool) (*reaper.AutoCloseResult, error) {
+		return &reaper.AutoCloseResult{Database: "testdb", Closed: 1}, commitErr
+	}
+
+	err := reaperAutoCloseCmd.RunE(reaperAutoCloseCmd, nil)
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("auto-close command error = %v, want commit error", err)
 	}
 }
 

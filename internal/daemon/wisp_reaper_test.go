@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/reaper"
 )
 
 func TestWispReaperInterval(t *testing.T) {
@@ -53,6 +55,20 @@ func TestWispReaperMaxAge(t *testing.T) {
 	}
 	if got := wispReaperMaxAge(config); got != 48*time.Hour {
 		t.Errorf("expected 48h, got %v", got)
+	}
+}
+
+func TestAutoCloseCommitErrorIsNotCounted(t *testing.T) {
+	for _, commitErr := range []error{
+		errors.New("SQL commit outcome unknown"),
+		errors.New("Dolt commit outcome unknown"),
+	} {
+		closed, failures := autoCloseTotals([]string{"testdb"}, func(string) (*reaper.AutoCloseResult, error) {
+			return &reaper.AutoCloseResult{Database: "testdb", Closed: 1}, commitErr
+		})
+		if closed != 0 || failures != 1 {
+			t.Fatalf("commit error totals = closed %d failures %d, want 0/1", closed, failures)
+		}
 	}
 }
 

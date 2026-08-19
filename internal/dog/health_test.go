@@ -76,10 +76,10 @@ func healthTestGeneration() tmux.SessionGeneration {
 // Healthy dogs
 // =============================================================================
 
-func TestHealth_IdleDog_NoSession(t *testing.T) {
+func TestHealth_IdleLegacyDogRequiresRecovery(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
+	setupLegacyDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateIdle, LastActive: now,
 		CreatedAt: now, UpdatedAt: now,
 	})
@@ -90,11 +90,11 @@ func TestHealth_IdleDog_NoSession(t *testing.T) {
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, false)
 
-	if r.NeedsAttention {
-		t.Error("idle dog with no session should not need attention")
+	if !r.NeedsAttention {
+		t.Error("idle legacy dog without durable generation should need recovery")
 	}
-	if r.SessionStatus != "none" {
-		t.Errorf("session_status = %q, want 'none'", r.SessionStatus)
+	if r.SessionStatus != "unknown" {
+		t.Errorf("session_status = %q, want 'unknown'", r.SessionStatus)
 	}
 	if r.WorkDuration != 0 {
 		t.Errorf("work_duration = %v, want 0", r.WorkDuration)
@@ -105,15 +105,16 @@ func TestHealth_WorkingDog_Healthy(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
 	workStart := now.Add(-10 * time.Minute)
-	setupDogWithState(t, m, "alpha", &DogState{
+	generation := healthTestGeneration()
+	setupLegacyDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: workStart, LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.SessionHealthy
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, false)
@@ -136,7 +137,7 @@ func TestHealth_WorkingDog_Healthy(t *testing.T) {
 func TestHealth_Zombie_SessionDead(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
-	setupDogWithState(t, m, "alpha", &DogState{
+	setupLegacyDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-1 * time.Hour), LastActive: now,
 		CreatedAt: now, UpdatedAt: now,
@@ -188,15 +189,16 @@ func TestHealth_Zombie_AgentDead(t *testing.T) {
 func TestHealth_Hung_ReportOnly(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, false) // autoClear=false: report only
@@ -305,6 +307,33 @@ func TestHealthUsesPersistedEndpointAfterAmbientRootDrift(t *testing.T) {
 	}
 }
 
+func TestHealthPreservesLegacyAssignmentWhenAmbientEndpointIsAbsent(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now().UTC().Round(0)
+	setupLegacyDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-legacy", WorkStartedAt: now,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	mc := newMockChecker()
+	hc := NewHealthChecker(m, mc)
+	d, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := hc.Check(d, time.Hour, true)
+	if result.SessionStatus != "unknown" || !result.NeedsAttention || result.AutoCleared {
+		t.Fatalf("legacy health result = %+v, want recovery-required unknown state", result)
+	}
+	stored, err := m.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StateWorking || stored.Work != "task-legacy" || stored.SessionGeneration != nil {
+		t.Fatalf("ambient health absence released legacy custody: %+v", stored)
+	}
+}
+
 func TestHealthClearExactDogRuntimeRejectsNameOnlyTransport(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now().UTC()
@@ -341,10 +370,11 @@ func TestHealthClearExactDogRuntimeRejectsNameOnlyTransport(t *testing.T) {
 func TestHealthAutoClearPluginFinalizerFailurePreservesAssignment(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	state := &DogState{
 		Name: "alpha", State: StateWorking, Work: "plugin:reaper",
 		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	}
 	setupDogWithState(t, m, "alpha", state)
 	wantErr := errors.New("mail archive unavailable")
@@ -352,7 +382,7 @@ func TestHealthAutoClearPluginFinalizerFailurePreservesAssignment(t *testing.T) 
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 	d, _ := m.Get("alpha")
 	result := hc.Check(d, 30*time.Minute, true)
 
@@ -381,15 +411,16 @@ func TestHealthAutoClearPluginFinalizerFailurePreservesAssignment(t *testing.T) 
 func TestHealth_AutoClear_SessionDead(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-1 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, true)
@@ -449,14 +480,15 @@ func TestHealth_AutoClear_AgentDead(t *testing.T) {
 func TestHealth_Orphan_IdleWithSession(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	generation := healthTestGeneration()
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateIdle, LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(generation),
 	})
 
 	mc := newMockChecker()
 	mc.sessionsAlive["hq-dog-alpha"] = true
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	d, _ := m.Get("alpha")
 	r := hc.Check(d, 30*time.Minute, false)
@@ -505,7 +537,7 @@ func TestHealth_WorkDuration_ZeroStartedAt(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
 	// Working dog with zero WorkStartedAt (legacy state file)
-	setupDogWithState(t, m, "alpha", &DogState{
+	setupLegacyDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateWorking, Work: "task-1",
 		LastActive: now, CreatedAt: now, UpdatedAt: now,
 	})
@@ -529,20 +561,25 @@ func TestHealth_WorkDuration_ZeroStartedAt(t *testing.T) {
 func TestHealth_CheckAll_MultipleDogs(t *testing.T) {
 	m, _ := testManager(t)
 	now := time.Now()
+	alphaGeneration := healthTestGeneration()
+	betaGeneration := healthTestGeneration()
+	betaGeneration.Name = "hq-dog-beta"
+	betaGeneration.SessionID = "$2"
+	betaGeneration.Nonce = "health-generation-beta"
 
 	setupDogWithState(t, m, "alpha", &DogState{
 		Name: "alpha", State: StateIdle, LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(alphaGeneration),
 	})
 	setupDogWithState(t, m, "beta", &DogState{
 		Name: "beta", State: StateWorking, Work: "task-1",
 		WorkStartedAt: now.Add(-1 * time.Hour), LastActive: now,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, SessionGeneration: SessionGenerationFromTmux(betaGeneration),
 	})
 
 	mc := newMockChecker()
 	mc.healthResults["hq-dog-beta"] = tmux.SessionDead // zombie
-	hc := NewHealthChecker(m, mc)
+	hc := newMockHealthChecker(m, mc)
 
 	results, err := hc.CheckAll(30*time.Minute, false)
 	if err != nil {

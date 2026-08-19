@@ -52,6 +52,17 @@ func testManagerNoRigs(t *testing.T) (*Manager, string) {
 // This bypasses Add() to test functions that don't require git worktrees.
 func setupDogWithState(t *testing.T, m *Manager, name string, state *DogState) {
 	t.Helper()
+	state.SessionAbsenceProven = state.SessionGeneration == nil
+	writeDogState(t, m, name, state)
+}
+
+func setupLegacyDogWithState(t *testing.T, m *Manager, name string, state *DogState) {
+	t.Helper()
+	writeDogState(t, m, name, state)
+}
+
+func writeDogState(t *testing.T, m *Manager, name string, state *DogState) {
+	t.Helper()
 
 	dogPath := m.dogDir(name)
 	if err := os.MkdirAll(dogPath, 0755); err != nil {

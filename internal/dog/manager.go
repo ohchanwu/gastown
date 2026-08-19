@@ -151,12 +151,13 @@ func (m *Manager) Add(name string) (*Dog, error) {
 	// Create initial state file
 	now := time.Now()
 	state := &DogState{
-		Name:       name,
-		State:      StateIdle,
-		LastActive: now,
-		Worktrees:  worktrees,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 name,
+		State:                StateIdle,
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		Worktrees:            worktrees,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 
 	if err := m.saveState(name, state); err != nil {
@@ -165,12 +166,13 @@ func (m *Manager) Add(name string) (*Dog, error) {
 
 	success = true
 	return &Dog{
-		Name:       name,
-		State:      StateIdle,
-		Path:       dogPath,
-		Worktrees:  worktrees,
-		LastActive: now,
-		CreatedAt:  now,
+		Name:                 name,
+		State:                StateIdle,
+		Path:                 dogPath,
+		Worktrees:            worktrees,
+		LastActive:           now,
+		SessionAbsenceProven: true,
+		CreatedAt:            now,
 	}, nil
 }
 
@@ -324,7 +326,8 @@ func (m *Manager) RemoveWithTeardownIfMatches(
 }
 
 func dogStateMatchesRemovalSnapshot(state *DogState, snapshot *Dog) bool {
-	if state == nil || snapshot == nil || snapshot.State != StateIdle || snapshot.Work != "" || snapshot.SessionGeneration != nil {
+	if state == nil || snapshot == nil || snapshot.State != StateIdle || snapshot.Work != "" ||
+		snapshot.SessionGeneration != nil || !snapshot.SessionAbsenceProven {
 		return false
 	}
 	return dogStateExactlyMatchesRemovalSnapshot(state, snapshot)
@@ -341,6 +344,7 @@ func dogStateExactlyMatchesRemovalSnapshot(state *DogState, snapshot *Dog) bool 
 	return generationMatches &&
 		state.Name == snapshot.Name &&
 		state.State == snapshot.State &&
+		state.SessionAbsenceProven == snapshot.SessionAbsenceProven &&
 		state.Work == snapshot.Work &&
 		state.WorkStartedAt.Equal(snapshot.WorkStartedAt) &&
 		state.LastActive.Equal(snapshot.LastActive) &&
@@ -431,15 +435,16 @@ func (m *Manager) Get(name string) (*Dog, error) {
 	}
 
 	return &Dog{
-		Name:              name,
-		State:             state.State,
-		Path:              m.dogDir(name),
-		Worktrees:         state.Worktrees,
-		LastActive:        state.LastActive,
-		Work:              state.Work,
-		WorkStartedAt:     state.WorkStartedAt,
-		CreatedAt:         state.CreatedAt,
-		SessionGeneration: state.SessionGeneration,
+		Name:                 name,
+		State:                state.State,
+		Path:                 m.dogDir(name),
+		Worktrees:            state.Worktrees,
+		LastActive:           state.LastActive,
+		Work:                 state.Work,
+		WorkStartedAt:        state.WorkStartedAt,
+		SessionAbsenceProven: state.SessionAbsenceProven,
+		CreatedAt:            state.CreatedAt,
+		SessionGeneration:    state.SessionGeneration,
 	}, nil
 }
 
@@ -504,12 +509,16 @@ func (m *Manager) AssignWorkIfIdle(name, work string) (*DogState, error) {
 	if state.State != StateIdle || state.SessionGeneration != nil {
 		return nil, ErrDogWorking
 	}
+	if !state.SessionAbsenceProven {
+		return nil, ErrSessionGenerationUnavailable
+	}
 
 	state.State = StateWorking
 	state.Work = work
 	state.WorkStartedAt = time.Now()
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
+	state.StartReceipt = newAssignmentStartReceipt(name, work, state.WorkStartedAt)
 
 	if err := m.saveState(name, state); err != nil {
 		return nil, err
@@ -539,6 +548,9 @@ func (m *Manager) ClearWork(name string) error {
 	}
 	if state.SessionGeneration != nil {
 		return errors.New("dog still owns an exact session generation")
+	}
+	if !state.SessionAbsenceProven {
+		return ErrSessionGenerationUnavailable
 	}
 	if err := m.finalizeAssignment(state); err != nil {
 		return err
@@ -589,7 +601,8 @@ func (m *Manager) ClearWorkWithFinalizeIfMatches(
 	if state.State != StateWorking ||
 		state.Work != expectedWork ||
 		!state.WorkStartedAt.Equal(expectedStartedAt) ||
-		state.SessionGeneration != nil {
+		state.SessionGeneration != nil ||
+		!state.SessionAbsenceProven {
 		return false, nil
 	}
 	if err := m.finalizeAssignment(state); err != nil {
@@ -672,6 +685,7 @@ func (m *Manager) setSessionGenerationIfAssignmentMatchesLocked(
 	}
 
 	state.SessionGeneration = SessionGenerationFromTmux(generation)
+	state.SessionAbsenceProven = false
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 	return true, m.saveState(name, state)
@@ -763,6 +777,7 @@ func (m *Manager) CompleteWorkWithTeardownAndFinalizeIfMatches(
 	state.Work = ""
 	state.WorkStartedAt = time.Time{}
 	state.SessionGeneration = nil
+	state.SessionAbsenceProven = true
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 	if err := m.saveState(name, state); err != nil {
@@ -829,6 +844,7 @@ func (m *Manager) RetireSessionWithTeardownIfMatches(
 	}
 
 	state.SessionGeneration = nil
+	state.SessionAbsenceProven = true
 	state.LastActive = time.Now()
 	state.UpdatedAt = time.Now()
 	return true, m.saveState(name, state)
@@ -1096,7 +1112,7 @@ func (m *Manager) GetIdleDog() (*Dog, error) {
 	}
 
 	for _, dog := range dogs {
-		if dog.State == StateIdle && dog.SessionGeneration == nil {
+		if dog.State == StateIdle && dog.SessionGeneration == nil && dog.SessionAbsenceProven {
 			return dog, nil
 		}
 	}
@@ -1113,7 +1129,7 @@ func (m *Manager) IdleCount() (int, error) {
 
 	count := 0
 	for _, dog := range dogs {
-		if dog.State == StateIdle && dog.SessionGeneration == nil {
+		if dog.State == StateIdle && dog.SessionGeneration == nil && dog.SessionAbsenceProven {
 			count++
 		}
 	}

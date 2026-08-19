@@ -76,6 +76,23 @@ func wispDeleteAge(config *DaemonPatrolConfig) time.Duration {
 	return defaultWispDeleteAge
 }
 
+func autoCloseTotals(
+	databases []string,
+	run func(string) (*reaper.AutoCloseResult, error),
+) (closed, failures int) {
+	for _, dbName := range databases {
+		result, err := run(dbName)
+		if err != nil {
+			failures++
+			continue
+		}
+		if result != nil {
+			closed += result.Closed
+		}
+	}
+	return closed, failures
+}
+
 // reapWisps is the thin orchestrator for the wisp_reaper patrol.
 // It pours a mol-dog-reaper molecule, then dispatches a Dog to execute it.
 // The Dog reads the formula steps and calls `gt reaper` CLI helpers.
@@ -292,30 +309,26 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 
 	// Step 4: Auto-close
 	autoCloseErrors := 0
-	for _, dbName := range databases {
+	totalAutoClosed, autoCloseErrors = autoCloseTotals(databases, func(dbName string) (*reaper.AutoCloseResult, error) {
 		if err := reaper.ValidateDBName(dbName); err != nil {
-			continue
+			return nil, nil
 		}
 		db, err := reaper.OpenDB(host, port, dbName, 10*time.Second, 10*time.Second)
 		if err != nil {
-			autoCloseErrors++
-			continue
+			return nil, err
 		}
+		defer db.Close()
 		// Auto-close operates on the issues table, not wisps, but if the database
 		// has no beads schema at all we should skip it too.
 		if ok, _ := reaper.HasReaperSchema(db); !ok {
-			db.Close()
-			continue
+			return nil, nil
 		}
 		result, err := reaper.AutoClose(db, dbName, defaultStaleIssueAge, dryRun)
-		db.Close()
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: auto-close error: %v", dbName, err)
-			autoCloseErrors++
-			continue
 		}
-		totalAutoClosed += result.Closed
-	}
+		return result, err
+	})
 	if autoCloseErrors > 0 {
 		mol.failStep("auto-close", fmt.Sprintf("%d databases had auto-close errors", autoCloseErrors))
 	} else {

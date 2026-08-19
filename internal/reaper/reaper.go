@@ -9,7 +9,9 @@ package reaper
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -21,6 +23,10 @@ import (
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// ErrAutoCloseCommitOutcomeUnknown marks an auto-close whose durable commit
+// could not be proven. Callers must not report ordinary success for this run.
+var ErrAutoCloseCommitOutcomeUnknown = errors.New("auto-close commit outcome unknown")
 
 // DefaultDatabases is the static fallback list of known production databases.
 // Used only when SHOW DATABASES fails (server unreachable).
@@ -751,7 +757,7 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 // AutoClose closes issues that have been open with no updates past staleAge.
 // Excludes P0/P1 priority, epics, convoys, control-plane identity records,
 // standing-order labels, and issues with active dependencies.
-func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
+func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (result *AutoCloseResult, retErr error) {
 	if err := ValidateDBName(dbName); err != nil {
 		return nil, err
 	}
@@ -759,7 +765,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	defer cancel()
 
 	staleCutoff := time.Now().UTC().Add(-staleAge)
-	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
+	result = &AutoCloseResult{Database: dbName, DryRun: dryRun}
 
 	// Convoys are excluded from staleness auto-close (hq-jnap): their lifecycle
 	// is driven by tracked-bead status (`gt convoy check` / refinery post-merge),
@@ -838,17 +844,42 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	if err != nil {
 		return nil, fmt.Errorf("pin auto-close connection: %w", err)
 	}
-	defer conn.Close()
+	resetSession := false
+	transactionOpen := false
+	clearOrdinarySuccess := func() {
+		if result == nil {
+			return
+		}
+		result.Closed = 0
+		result.ClosedEntries = nil
+	}
+	defer func() {
+		var cleanupErr error
+		if transactionOpen {
+			if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("rollback auto-close transaction: %w", err))
+			}
+		}
+		if resetSession {
+			if _, err := conn.ExecContext(context.Background(), "SET @@autocommit = 1"); err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reset auto-close autocommit: %w", err))
+			}
+		}
+		if cleanupErr != nil {
+			clearOrdinarySuccess()
+			retErr = errors.Join(retErr, cleanupErr)
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		if err := conn.Close(); err != nil {
+			clearOrdinarySuccess()
+			retErr = errors.Join(retErr, fmt.Errorf("close auto-close connection: %w", err))
+		}
+	}()
 	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
 		return nil, fmt.Errorf("disable autocommit: %w", err)
 	}
-	transactionOpen := true
-	defer func() {
-		if transactionOpen {
-			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		}
-		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
-	}()
+	resetSession = true
+	transactionOpen = true
 
 	// Recheck every eligibility predicate in the mutation itself. The JOIN form
 	// avoids MySQL Error 1093 from self-referencing subqueries while preventing
@@ -883,6 +914,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			AND reverse_dependency.depends_on_issue_id IS NULL`, quotedDBName)
 
 	ids := make([]string, 0, len(candidates))
+	closedEntries := make([]ClosedEntry, 0, len(candidates))
 	for _, candidate := range candidates {
 		updateResult, err := conn.ExecContext(ctx, updateQuery, candidate.id, staleCutoff)
 		if err != nil {
@@ -899,13 +931,11 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			return nil, fmt.Errorf("auto-close %s changed %d rows, want exactly one", candidate.id, affected)
 		}
 		ids = append(ids, candidate.id)
-		result.ClosedEntries = append(result.ClosedEntries, ClosedEntry{
+		closedEntries = append(closedEntries, ClosedEntry{
 			ID: candidate.id, Title: candidate.title,
 			AgeDays: int(now.Sub(candidate.updatedAt).Hours() / 24), Database: dbName,
 		})
 	}
-
-	result.Closed = len(ids)
 
 	if len(ids) == 0 {
 		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
@@ -920,7 +950,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 			result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
 				"sql_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("sql commit after auto-close failed: %v", err)))
-			return result, nil
+			return result, fmt.Errorf("%w: SQL commit: %w", ErrAutoCloseCommitOutcomeUnknown, err)
 		}
 		transactionOpen = false
 		commitMsg := fmt.Sprintf("reaper: auto-close %d stale issues in %s", len(ids), dbName)
@@ -929,9 +959,12 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			if !isNothingToCommit(err) {
 				result.Anomalies = append(result.Anomalies, commitFailureAnomaly(
 					"dolt_commit_failed", dbName, ids, "retry_auto_close_commit", fmt.Sprintf("dolt commit after auto-close failed: %v", err)))
+				return result, fmt.Errorf("%w: Dolt commit: %w", ErrAutoCloseCommitOutcomeUnknown, err)
 			}
 		}
 	}
+	result.ClosedEntries = closedEntries
+	result.Closed = len(ids)
 
 	return result, nil
 }

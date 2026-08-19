@@ -23,6 +23,10 @@ func (c testSessionGenerationController) CaptureSessionGeneration(name string) (
 	return c.capture(name)
 }
 
+func (testSessionGenerationController) GetPaneID(string) (string, error) {
+	return "", errors.New("test session generation controller has no pane")
+}
+
 func (testSessionGenerationController) SendKeysRawGeneration(tmux.SessionGeneration, string) error {
 	return nil
 }
@@ -40,8 +44,169 @@ func useInjectedSessionGenerationController(sm *SessionManager) {
 	}
 }
 
+func TestDogEnsureRunningUsesPersistedEndpointAfterAmbientRootDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-ensure-bound-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-ensure-bound-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socket := fmt.Sprintf("gt-dog-ensure-bound-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	generation, err := target.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha", t.TempDir(), "sleep 30", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, initial := newDogStateManager(t, "alpha", "work")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", initial.Work, initial.WorkStartedAt, nil, generation,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist generation = %v, %v", set, err)
+	}
+	ambient := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + secondRoot,
+	})
+	sm := NewSessionManager(ambient, mgr.townRoot, mgr)
+	started := 0
+	sm.startSession = func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error) {
+		started++
+		return nil, errors.New("ambient replacement started")
+	}
+
+	pane, err := sm.EnsureRunning("alpha", SessionStartOptions{WorkDesc: initial.Work})
+	if err != nil {
+		t.Fatalf("EnsureRunning through persisted endpoint: %v", err)
+	}
+	if pane == "" {
+		t.Fatal("EnsureRunning returned an empty pane for the persisted generation")
+	}
+	if started != 0 {
+		t.Fatalf("ambient replacement starts = %d, want 0", started)
+	}
+}
+
+func TestDogStartUsesPersistedEndpointAfterAuthoritativeAbsence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
+	}
+	firstRoot, err := os.MkdirTemp("/tmp", "gt-dog-replace-bound-a-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(firstRoot) })
+	secondRoot, err := os.MkdirTemp("/tmp", "gt-dog-replace-bound-b-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secondRoot) })
+	socket := fmt.Sprintf("gt-dog-replace-bound-%d", time.Now().UnixNano())
+	target := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + firstRoot,
+	})
+	ambient := tmux.NewTmuxWithSocketAndEnv(socket, []string{
+		"PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + secondRoot,
+	})
+	t.Cleanup(func() { _ = target.KillServer() })
+	t.Cleanup(func() { _ = ambient.KillServer() })
+	if err := target.NewSessionWithCommand("keep-target", t.TempDir(), "sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := target.NewSessionWithCommandAndEnvGeneration(
+		"hq-dog-alpha", t.TempDir(), "sleep 30", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ambient.NewSessionWithCommand("keep-ambient", t.TempDir(), "sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, initial := newDogStateManager(t, "alpha", "work")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", initial.Work, initial.WorkStartedAt, nil, prior,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist prior generation = %v, %v", set, err)
+	}
+	if err := target.KillSession("hq-dog-alpha"); err != nil {
+		t.Fatal(err)
+	}
+
+	sm := NewSessionManager(ambient, mgr.townRoot, mgr)
+	sm.startSession = func(controller *tmux.Tmux, cfg session.SessionConfig) (*session.StartResult, error) {
+		generation, err := controller.NewSessionWithCommandAndEnvGeneration(
+			cfg.SessionID, cfg.WorkDir, "sleep 30", nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return &session.StartResult{SessionGeneration: generation}, nil
+	}
+
+	if err := sm.Start("alpha", SessionStartOptions{WorkDesc: initial.Work}); err != nil {
+		t.Fatalf("Start replacement: %v", err)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SessionGeneration == nil || current.SessionGeneration.Transport != prior.Transport {
+		t.Fatalf("replacement transport = %+v, want persisted %+v", current.SessionGeneration, prior.Transport)
+	}
+	if running, err := target.HasSession("hq-dog-alpha"); err != nil || !running {
+		t.Fatalf("persisted endpoint replacement running=%v err=%v", running, err)
+	}
+	if running, err := ambient.HasSession("hq-dog-alpha"); err != nil || running {
+		t.Fatalf("ambient endpoint replacement running=%v err=%v", running, err)
+	}
+}
+
+func TestDogStartPreservesNilGenerationWithoutFreshAssignmentReceipt(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "legacy-work")
+	initial.SessionAbsenceProven = false
+	initial.StartReceipt = AssignmentStartReceipt{}
+	if err := mgr.saveState("alpha", initial); err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(tmux.NewTmuxWithSocket("wrong-ambient-socket"), mgr.townRoot, mgr)
+	started := 0
+	sm.startSession = func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error) {
+		started++
+		return nil, errors.New("unproven session started")
+	}
+
+	err := sm.Start("alpha", SessionStartOptions{WorkDesc: initial.Work})
+	if !errors.Is(err, ErrSessionGenerationUnavailable) {
+		t.Fatalf("Start error = %v, want missing durable generation", err)
+	}
+	if started != 0 {
+		t.Fatalf("unproven session starts = %d, want 0", started)
+	}
+	current, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if current.State != StateWorking || current.Work != initial.Work || current.SessionGeneration != nil {
+		t.Fatalf("legacy assignment changed: %+v", current)
+	}
+}
+
 func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
-	mgr, _ := newDogStateManager(t, "alpha", "work")
+	mgr, state := newDogStateManager(t, "alpha", "work")
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-%d", os.Getpid()))
 	t.Cleanup(func() { _ = tm.KillServer() })
 	sm := NewSessionManager(tm, mgr.townRoot, mgr)
@@ -57,7 +222,9 @@ func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
 		return nil
 	}
 
-	if err := sm.Start("alpha", SessionStartOptions{WorkDesc: "work"}); err != nil {
+	if err := sm.Start("alpha", SessionStartOptions{
+		WorkDesc: state.Work, AssignmentReceipt: state.StartReceipt,
+	}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if started != 1 || killed != 0 {
@@ -69,6 +236,9 @@ func TestDogStartCapturesAndPersistsSessionGeneration(t *testing.T) {
 	}
 	if dog.SessionGeneration == nil || !dog.SessionGeneration.EqualTmux(want) {
 		t.Fatalf("persisted generation = %+v, want %+v", dog.SessionGeneration, want)
+	}
+	if dog.SessionAbsenceProven {
+		t.Fatal("successful start retained a stale session-absence proof")
 	}
 }
 
@@ -87,7 +257,12 @@ func TestDogStartHoldsLifecycleLockThroughGenerationPersistence(t *testing.T) {
 	}
 
 	startDone := make(chan error, 1)
-	go func() { startDone <- sm.Start("alpha", SessionStartOptions{WorkDesc: state.Work}) }()
+	go func() {
+		startDone <- sm.Start("alpha", SessionStartOptions{
+			WorkDesc:          state.Work,
+			AssignmentReceipt: state.StartReceipt,
+		})
+	}()
 	<-startEntered
 
 	type clearResult struct {
@@ -123,7 +298,7 @@ func TestDogStartHoldsLifecycleLockThroughGenerationPersistence(t *testing.T) {
 }
 
 func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
-	mgr, _ := newDogStateManager(t, "alpha", "work")
+	mgr, state := newDogStateManager(t, "alpha", "work")
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-fail-%d", os.Getpid()))
 	t.Cleanup(func() { _ = tm.KillServer() })
 	sm := NewSessionManager(tm, mgr.townRoot, mgr)
@@ -140,18 +315,51 @@ func TestDogStartPersistenceFailureKillsOnlyCapturedGeneration(t *testing.T) {
 		killed = append(killed, generation)
 		return nil
 	}
+	useInjectedSessionGenerationController(sm)
 
-	err := sm.Start("alpha", SessionStartOptions{WorkDesc: "work"})
+	err := sm.Start("alpha", SessionStartOptions{
+		WorkDesc: state.Work, AssignmentReceipt: state.StartReceipt,
+	})
 	if !errors.Is(err, persistErr) {
 		t.Fatalf("Start error = %v, want persistence failure", err)
 	}
 	if len(killed) != 1 || !killed[0].Equal(want) {
 		t.Fatalf("killed generations = %+v, want exact captured generation", killed)
 	}
+	current, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if !current.SessionAbsenceProven || current.SessionGeneration != nil {
+		t.Fatalf("successful rollback did not restore absence proof: %+v", current)
+	}
+}
+
+func TestDogStartRestoresAbsenceProofAfterReconciledFailure(t *testing.T) {
+	mgr, state := newDogStateManager(t, "alpha", "work")
+	sm := NewSessionManager(tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-start-fail-%d", os.Getpid())), mgr.townRoot, mgr)
+	wantErr := errors.New("startup failed after cleanup")
+	sm.startSession = func(*tmux.Tmux, session.SessionConfig) (*session.StartResult, error) {
+		return nil, wantErr
+	}
+
+	err := sm.Start("alpha", SessionStartOptions{
+		WorkDesc: state.Work, AssignmentReceipt: state.StartReceipt,
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Start error = %v, want reconciled startup failure", err)
+	}
+	current, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if !current.SessionAbsenceProven || current.SessionGeneration != nil {
+		t.Fatalf("reconciled failure did not restore absence proof: %+v", current)
+	}
 }
 
 func TestDogStartMissingCreationReceiptFailsClosed(t *testing.T) {
-	mgr, _ := newDogStateManager(t, "alpha", "work")
+	mgr, state := newDogStateManager(t, "alpha", "work")
 	tm := tmux.NewTmuxWithSocket(fmt.Sprintf("gt-dog-generation-capture-%d", os.Getpid()))
 	t.Cleanup(func() { _ = tm.KillServer() })
 	sm := NewSessionManager(tm, mgr.townRoot, mgr)
@@ -164,12 +372,21 @@ func TestDogStartMissingCreationReceiptFailsClosed(t *testing.T) {
 		return nil
 	}
 
-	err := sm.Start("alpha", SessionStartOptions{})
+	err := sm.Start("alpha", SessionStartOptions{
+		WorkDesc: state.Work, AssignmentReceipt: state.StartReceipt,
+	})
 	if !errors.Is(err, ErrSessionStartCleanupIncomplete) || !strings.Contains(err.Error(), "creation receipt") {
 		t.Fatalf("Start error = %v, want missing-receipt cleanup blocker", err)
 	}
 	if killed != 0 {
 		t.Fatalf("unproven session received %d destructive kill(s)", killed)
+	}
+	current, getErr := mgr.Get("alpha")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if current.SessionAbsenceProven {
+		t.Fatal("missing creation receipt retained a stale absence proof")
 	}
 }
 
@@ -182,7 +399,9 @@ func TestDogStartPreservesAssignmentWhenLowerLifecycleCleanupIsUnreconciled(t *t
 		return nil, errors.Join(errors.New("startup failed"), tmux.ErrSessionCleanupUnreconciled)
 	}
 
-	err := sm.Start("alpha", SessionStartOptions{WorkDesc: "work"})
+	err := sm.Start("alpha", SessionStartOptions{
+		WorkDesc: initial.Work, AssignmentReceipt: initial.StartReceipt,
+	})
 	if !errors.Is(err, ErrSessionStartCleanupIncomplete) ||
 		!errors.Is(err, tmux.ErrSessionCleanupUnreconciled) {
 		t.Fatalf("Start error = %v, want cleanup-incomplete assignment hold", err)
@@ -194,6 +413,9 @@ func TestDogStartPreservesAssignmentWhenLowerLifecycleCleanupIsUnreconciled(t *t
 	if after.State != StateWorking || after.Work != initial.Work ||
 		!after.WorkStartedAt.Equal(initial.WorkStartedAt) {
 		t.Fatalf("unreconciled startup mutated assignment: %+v", after)
+	}
+	if after.SessionAbsenceProven {
+		t.Fatal("unreconciled startup retained a stale absence proof")
 	}
 }
 
@@ -393,8 +615,8 @@ func TestDogStopIfMatchesPreservesLiveLegacySession(t *testing.T) {
 	sm.killSessionGeneration = func(context.Context, tmux.SessionGeneration) error { killed++; return nil }
 
 	err = sm.StopIfMatches(snapshot, true)
-	if err == nil || !strings.Contains(err.Error(), "live legacy dog session") {
-		t.Fatalf("StopIfMatches error = %v, want live legacy preservation", err)
+	if !errors.Is(err, ErrSessionGenerationUnavailable) {
+		t.Fatalf("StopIfMatches error = %v, want missing durable generation", err)
 	}
 	if killed != 0 {
 		t.Fatalf("live legacy session received %d kill(s)", killed)
@@ -405,6 +627,30 @@ func TestDogStopIfMatchesPreservesLiveLegacySession(t *testing.T) {
 	}
 	if current.State != StateWorking || current.Work != initial.Work || current.SessionGeneration != nil {
 		t.Fatalf("legacy custody changed: %+v", current)
+	}
+}
+
+func TestDogStopIfMatchesPreservesLegacyAssignmentWhenAmbientEndpointIsAbsent(t *testing.T) {
+	mgr, initial := newDogStateManager(t, "alpha", "legacy-work")
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(tmux.NewTmuxWithSocket("wrong-ambient-socket"), mgr.townRoot, mgr)
+	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) {
+		return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
+	}
+
+	err = sm.StopIfMatches(snapshot, true)
+	if !errors.Is(err, ErrSessionGenerationUnavailable) {
+		t.Fatalf("StopIfMatches error = %v, want missing durable generation", err)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != StateWorking || current.Work != initial.Work || current.SessionGeneration != nil {
+		t.Fatalf("ambient absence released legacy custody: %+v", current)
 	}
 }
 
@@ -450,6 +696,13 @@ func TestDogStopIfMatchesPluginFinalizerFailurePreservesAssignment(t *testing.T)
 	mgr, state := newDogStateManager(t, "alpha", "plugin:reaper")
 	wantErr := errors.New("mail archive unavailable")
 	mgr.assignmentFinalizer = func(string, string, time.Time) error { return wantErr }
+	generation := testDogTmuxGeneration("$plugin", "nonce-plugin")
+	set, err := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", state.Work, state.WorkStartedAt, nil, generation,
+	)
+	if err != nil || !set {
+		t.Fatalf("persist generation = %v, %v", set, err)
+	}
 	snapshot, err := mgr.Get("alpha")
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +711,7 @@ func TestDogStopIfMatchesPluginFinalizerFailurePreservesAssignment(t *testing.T)
 	sm.captureSessionGeneration = func(string) (tmux.SessionGeneration, error) {
 		return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
 	}
+	useInjectedSessionGenerationController(sm)
 
 	if err := sm.StopIfMatches(snapshot, true); !errors.Is(err, wantErr) {
 		t.Fatalf("StopIfMatches() error = %v, want assignment finalizer failure", err)

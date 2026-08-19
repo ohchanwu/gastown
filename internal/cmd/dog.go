@@ -470,15 +470,10 @@ func removeDogExact(mgr *dog.Manager, sessions dogSessionController, snapshot *d
 	return mgr.RemoveWithTeardownIfMatches(snapshot, force, func(stored *dog.SessionGeneration) error {
 		sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
 		if stored == nil {
-			_, err := sessions.CaptureSessionGeneration(sessionName)
-			switch {
-			case errors.Is(err, tmux.ErrSessionNotFound), errors.Is(err, tmux.ErrNoServer):
+			if snapshot.SessionAbsenceProven {
 				return nil
-			case err != nil:
-				return fmt.Errorf("proving legacy dog session absence: %w", err)
-			default:
-				return errors.New("live legacy dog session has no persisted generation; preserve it for recovery")
 			}
+			return dog.ErrSessionGenerationUnavailable
 		}
 
 		expected := stored.Tmux()
@@ -590,7 +585,7 @@ func runDogCall(cmd *cobra.Command, args []string) error {
 
 		woken := 0
 		for _, d := range dogs {
-			if d.State == dog.StateIdle {
+			if d.State == dog.StateIdle && d.SessionGeneration == nil && d.SessionAbsenceProven {
 				if err := mgr.SetState(d.Name, dog.StateIdle); err != nil {
 					style.PrintWarning("failed to wake %s: %v", d.Name, err)
 					continue
@@ -619,6 +614,9 @@ func runDogCall(cmd *cobra.Command, args []string) error {
 		if d.State == dog.StateWorking {
 			fmt.Printf("Dog %s is already working (use 'gt dog done %s' when complete)\n", name, name)
 			return nil
+		}
+		if d.SessionGeneration != nil || !d.SessionAbsenceProven {
+			return fmt.Errorf("waking dog %s: %w", name, dog.ErrSessionGenerationUnavailable)
 		}
 
 		if err := mgr.SetState(name, dog.StateIdle); err != nil {
@@ -661,7 +659,8 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
-	alreadyIdle := d.State == dog.StateIdle && d.Work == "" && d.SessionGeneration == nil
+	alreadyIdle := d.State == dog.StateIdle && d.Work == "" &&
+		d.SessionGeneration == nil && d.SessionAbsenceProven
 
 	// Clear only after exact absence or generation-bound teardown. --force
 	// bypasses the liveness refusal; it never bypasses identity custody. Select
@@ -800,7 +799,10 @@ func clearDogSnapshot(mgr dogCloseoutManager, controller dogSessionController, s
 	if snapshot == nil {
 		return errors.New("dog closeout snapshot is unavailable")
 	}
-	if !force {
+	if snapshot.SessionGeneration == nil && !snapshot.SessionAbsenceProven {
+		return fmt.Errorf("%w: dog session absence is unproven", errDogCloseoutIncomplete)
+	}
+	if !force && snapshot.SessionGeneration != nil {
 		sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
 		has, err := controller.HasSession(sessionName)
 		if err != nil {
@@ -1048,22 +1050,27 @@ func completeDogCloseoutWithFinalize(
 	if mgr == nil || sessions == nil || snapshot == nil {
 		return fmt.Errorf("%w: lifecycle evidence unavailable", errDogCloseoutIncomplete)
 	}
+	if snapshot.SessionGeneration == nil {
+		if !snapshot.SessionAbsenceProven {
+			return fmt.Errorf("%w: dog session absence is unproven", errDogCloseoutIncomplete)
+		}
+		if snapshot.State == dog.StateIdle && snapshot.Work == "" {
+			return nil
+		}
+		completed, err := mgr.ClearWorkWithFinalizeIfMatches(
+			snapshot.Name, snapshot.Work, snapshot.WorkStartedAt, finalize,
+		)
+		if err != nil {
+			return fmt.Errorf("completing generation-free dog work: %w", err)
+		}
+		if !completed {
+			return fmt.Errorf("%w: work assignment or absence proof changed", errDogCloseoutIncomplete)
+		}
+		return nil
+	}
+
 	sessionName := fmt.Sprintf("hq-dog-%s", snapshot.Name)
 	current, captureErr := sessions.CaptureSessionGeneration(sessionName)
-
-	if snapshot.SessionGeneration == nil {
-		switch {
-		case errors.Is(captureErr, tmux.ErrSessionNotFound), errors.Is(captureErr, tmux.ErrNoServer):
-			if snapshot.State == dog.StateIdle && snapshot.Work == "" {
-				return nil
-			}
-			return fmt.Errorf("%w: legacy assignment has no transport-bound runtime generation", errDogCloseoutIncomplete)
-		case captureErr != nil:
-			return fmt.Errorf("%w: session identity could not be verified", errDogCloseoutIncomplete)
-		default:
-			return fmt.Errorf("%w: live legacy session has no persisted generation; preserve it for recovery", errDogCloseoutIncomplete)
-		}
-	}
 
 	expected := snapshot.SessionGeneration.Tmux()
 	if !expected.Transport.Bound {
@@ -1599,7 +1606,8 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
 	sessOpts := dog.SessionStartOptions{
-		WorkDesc: workDesc,
+		WorkDesc:          workDesc,
+		AssignmentReceipt: assignedState.StartReceipt,
 	}
 	result.SessionStarted = true
 	if _, sessErr := sessMgr.EnsureRunning(targetDog.Name, sessOpts); sessErr != nil {

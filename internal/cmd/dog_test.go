@@ -221,12 +221,13 @@ func TestDogDone_AlreadyIdle(t *testing.T) {
 
 	now := time.Now()
 	state := &dog.DogState{
-		Name:       "alpha",
-		State:      dog.StateIdle,
-		Work:       "",
-		LastActive: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 "alpha",
+		State:                dog.StateIdle,
+		Work:                 "",
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 	setupTestDog(t, m, tmpDir, "alpha", state)
 
@@ -262,12 +263,13 @@ func TestDogDone_WorkingToIdle(t *testing.T) {
 
 	now := time.Now()
 	state := &dog.DogState{
-		Name:       "alpha",
-		State:      dog.StateWorking,
-		Work:       "hq-convoy-xyz",
-		LastActive: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 "alpha",
+		State:                dog.StateWorking,
+		Work:                 "hq-convoy-xyz",
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 	setupTestDog(t, m, tmpDir, "alpha", state)
 
@@ -455,11 +457,54 @@ func TestRemoveDogExactRejectsLiveLegacySessionEvenWithForce(t *testing.T) {
 	controller := &fakeDogSessionController{captured: cmdTestDogGeneration("$legacy", "nonce-legacy")}
 
 	removed, err := removeDogExact(mgr, controller, snapshot, true)
-	if removed || err == nil || !strings.Contains(err.Error(), "legacy") {
+	if removed || !errors.Is(err, dog.ErrSessionGenerationUnavailable) {
 		t.Fatalf("forced legacy removal = %v, %v; want preserved recovery blocker", removed, err)
 	}
 	if _, err := mgr.Get("alpha"); err != nil {
 		t.Fatalf("live legacy dog was removed: %v", err)
+	}
+}
+
+func TestRemoveDogExactRejectsAmbientAbsenceForLegacySession(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captureErr: tmux.ErrSessionNotFound}
+
+	removed, err := removeDogExact(mgr, controller, snapshot, true)
+	if removed || !errors.Is(err, dog.ErrSessionGenerationUnavailable) {
+		t.Fatalf("legacy removal under ambient absence = %v, %v; want preserved recovery blocker", removed, err)
+	}
+	if _, err := mgr.Get("alpha"); err != nil {
+		t.Fatalf("ambient absence removed legacy dog: %v", err)
+	}
+}
+
+func TestRemoveDogExactUsesDurableAbsenceProofWithoutAmbientLookup(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	now := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateIdle, SessionAbsenceProven: true,
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeDogSessionController{captureErr: errors.New("ambient transport must not be consulted")}
+
+	removed, err := removeDogExact(mgr, controller, snapshot, true)
+	if err != nil || !removed {
+		t.Fatalf("proven-absent removal = %v, %v; want true, nil", removed, err)
+	}
+	if _, err := mgr.Get("alpha"); !errors.Is(err, dog.ErrDogNotFound) {
+		t.Fatalf("removed dog lookup = %v, want ErrDogNotFound", err)
 	}
 }
 
@@ -580,29 +625,27 @@ func TestDogDoneAbsentSessionCannotClearNewlyPersistedGeneration(t *testing.T) {
 	mgr, townRoot := testDogManager(t)
 	started := time.Now().UTC().Round(0)
 	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
-		Name:          "alpha",
-		State:         dog.StateWorking,
-		Work:          "plugin:reaper",
-		WorkStartedAt: started,
-		LastActive:    started,
-		CreatedAt:     started,
-		UpdatedAt:     started,
+		Name:                 "alpha",
+		State:                dog.StateWorking,
+		Work:                 "plugin:reaper",
+		WorkStartedAt:        started,
+		SessionAbsenceProven: true,
+		LastActive:           started,
+		CreatedAt:            started,
+		UpdatedAt:            started,
 	})
 	snapshot, err := mgr.Get("alpha")
 	if err != nil {
 		t.Fatal(err)
 	}
 	generation := cmdTestDogGeneration("$replacement", "nonce-replacement")
-	controller := &fakeDogSessionController{}
-	controller.captureFn = func(string) (tmux.SessionGeneration, error) {
-		persisted, persistErr := mgr.SetSessionGenerationIfAssignmentMatches(
-			"alpha", snapshot.Work, snapshot.WorkStartedAt, nil, generation,
-		)
-		if persistErr != nil || !persisted {
-			t.Fatalf("persist replacement generation = %v, %v", persisted, persistErr)
-		}
-		return tmux.SessionGeneration{}, tmux.ErrSessionNotFound
+	persisted, persistErr := mgr.SetSessionGenerationIfAssignmentMatches(
+		"alpha", snapshot.Work, snapshot.WorkStartedAt, nil, generation,
+	)
+	if persistErr != nil || !persisted {
+		t.Fatalf("persist replacement generation = %v, %v", persisted, persistErr)
 	}
+	controller := &fakeDogSessionController{captureErr: errors.New("ambient transport must not be consulted")}
 
 	err = completeDogCloseout(mgr, controller, snapshot)
 	if !errors.Is(err, errDogCloseoutIncomplete) {
@@ -731,6 +774,36 @@ func TestDogDoneGenerationLegacyLiveAndTmuxUnknownRefuseWithoutMutation(t *testi
 				t.Fatalf("refusal killed session: %+v", tc.controller.killed)
 			}
 		})
+	}
+}
+
+func TestClearDogSnapshotUsesFreshAbsenceProofWithoutAmbientLookup(t *testing.T) {
+	mgr, townRoot := testDogManager(t)
+	started := time.Now().UTC().Round(0)
+	setupTestDog(t, mgr, townRoot, "alpha", &dog.DogState{
+		Name: "alpha", State: dog.StateWorking, Work: "hq-work", WorkStartedAt: started,
+		SessionAbsenceProven: true,
+		LastActive:           started, CreatedAt: started, UpdatedAt: started,
+	})
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambientErr := errors.New("ambient transport must not be consulted")
+	controller := &fakeDogSessionController{
+		hasSessionErr: ambientErr,
+		captureErr:    ambientErr,
+	}
+
+	if err := clearDogSnapshot(mgr, controller, snapshot, false); err != nil {
+		t.Fatalf("clear generation-free fresh assignment: %v", err)
+	}
+	current, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != dog.StateIdle || current.Work != "" || !current.SessionAbsenceProven {
+		t.Fatalf("fresh absence closeout = %+v, want proven idle", current)
 	}
 }
 
@@ -1168,7 +1241,7 @@ func TestClearDogSnapshotFailsClosedOnBoundControllerLookupError(t *testing.T) {
 	}
 }
 
-func TestRunDogClearIdleLegacyDogRefusesLiveSession(t *testing.T) {
+func TestRunDogClearIdleLegacyDogPreservesLiveSessionWithoutAmbientLookup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("native Windows tmux workflows are unsupported; WSL runs the Linux path")
 	}
@@ -1200,8 +1273,11 @@ func TestRunDogClearIdleLegacyDogRefusesLiveSession(t *testing.T) {
 	t.Cleanup(func() { dogForce = oldForce })
 
 	err = runDogClear(nil, []string{"alpha"})
-	if err == nil || !strings.Contains(err.Error(), "has an active session") {
-		t.Fatalf("runDogClear() error = %v, want live legacy-session refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "session absence is unproven") {
+		t.Fatalf("runDogClear() error = %v, want durable absence-proof refusal", err)
+	}
+	if running, checkErr := target.HasSession("hq-dog-alpha"); checkErr != nil || !running {
+		t.Fatalf("legacy session changed: running=%v err=%v", running, checkErr)
 	}
 }
 
@@ -1228,8 +1304,8 @@ func TestRunDogClearIdleLegacyDogFailsClosedOnLookupError(t *testing.T) {
 	t.Cleanup(func() { dogForce = oldForce })
 
 	err := runDogClear(nil, []string{"alpha"})
-	if err == nil || !strings.Contains(err.Error(), "exact transport lookup failed") {
-		t.Fatalf("runDogClear() error = %v, want lookup failure", err)
+	if err == nil || !strings.Contains(err.Error(), "session absence is unproven") {
+		t.Fatalf("runDogClear() error = %v, want refusal before ambient lookup", err)
 	}
 }
 
@@ -1293,12 +1369,13 @@ func TestDogClear_WorkingToIdle(t *testing.T) {
 
 	now := time.Now()
 	state := &dog.DogState{
-		Name:       "alpha",
-		State:      dog.StateWorking,
-		Work:       constants.MolConvoyFeed,
-		LastActive: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 "alpha",
+		State:                dog.StateWorking,
+		Work:                 constants.MolConvoyFeed,
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 	setupTestDog(t, m, tmpDir, "alpha", state)
 
@@ -1337,12 +1414,13 @@ func TestDogClear_AlreadyIdle(t *testing.T) {
 
 	now := time.Now()
 	state := &dog.DogState{
-		Name:       "alpha",
-		State:      dog.StateIdle,
-		Work:       "",
-		LastActive: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 "alpha",
+		State:                dog.StateIdle,
+		Work:                 "",
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
 	setupTestDog(t, m, tmpDir, "alpha", state)
 

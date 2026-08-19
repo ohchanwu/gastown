@@ -14,6 +14,9 @@ import (
 
 func writeDogStateForDispatchTest(t *testing.T, townRoot, name string, state *dog.DogState) {
 	t.Helper()
+	if state.SessionGeneration == nil {
+		state.SessionAbsenceProven = true
+	}
 	dogPath := filepath.Join(townRoot, "deacon", "dogs", name)
 	if err := os.MkdirAll(dogPath, 0755); err != nil {
 		t.Fatalf("mkdir dog path: %v", err)

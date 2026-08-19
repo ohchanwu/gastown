@@ -74,6 +74,7 @@ type DogDispatchInfo struct {
 	townRoot       string
 	workDesc       string
 	workStartedAt  time.Time
+	startReceipt   dog.AssignmentStartReceipt
 	ownsWork       bool
 	agentOverride  string
 	rigsConfig     *config.RigsConfig
@@ -101,6 +102,7 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 	var targetDog *dog.Dog
 	var spawned bool
 	var workStartedAt time.Time
+	var startReceipt dog.AssignmentStartReceipt
 
 	if dogName != "" {
 		// Specific dog requested
@@ -200,6 +202,7 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 				return nil, fmt.Errorf("assigning idle dog work: %w", err)
 			}
 			workStartedAt = assignedState.WorkStartedAt
+			startReceipt = assignedState.StartReceipt
 			break
 		}
 	}
@@ -210,6 +213,7 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 			return nil, fmt.Errorf("assigning idle dog work: %w", err)
 		}
 		workStartedAt = assignedState.WorkStartedAt
+		startReceipt = assignedState.StartReceipt
 	}
 
 	// Build agent ID
@@ -227,6 +231,7 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 			townRoot:       townRoot,
 			workDesc:       opts.WorkDesc,
 			workStartedAt:  workStartedAt,
+			startReceipt:   startReceipt,
 			ownsWork:       true,
 			agentOverride:  opts.AgentOverride,
 			rigsConfig:     rigsConfig,
@@ -238,8 +243,9 @@ func DispatchToDog(dogName string, opts DogDispatchOptions) (*DogDispatchInfo, e
 	sessMgr := dog.NewSessionManager(t, townRoot, mgr)
 
 	sessOpts := dog.SessionStartOptions{
-		WorkDesc:      opts.WorkDesc,
-		AgentOverride: opts.AgentOverride,
+		WorkDesc:          opts.WorkDesc,
+		AssignmentReceipt: startReceipt,
+		AgentOverride:     opts.AgentOverride,
 	}
 	pane, err := sessMgr.EnsureRunning(targetDog.Name, sessOpts)
 	if err != nil {
@@ -301,8 +307,9 @@ func (d *DogDispatchInfo) StartDelayedSession() (string, error) {
 	sessMgr := dog.NewSessionManager(t, d.townRoot, mgr)
 
 	opts := dog.SessionStartOptions{
-		WorkDesc:      d.workDesc,
-		AgentOverride: d.agentOverride,
+		WorkDesc:          d.workDesc,
+		AssignmentReceipt: d.startReceipt,
+		AgentOverride:     d.agentOverride,
 	}
 	pane, err := sessMgr.EnsureRunning(d.DogName, opts)
 	if err != nil {

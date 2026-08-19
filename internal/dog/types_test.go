@@ -45,14 +45,16 @@ func TestDog_ZeroValues(t *testing.T) {
 func TestDogState_JSONMarshaling(t *testing.T) {
 	now := time.Now().Round(time.Second)
 	dogState := DogState{
-		Name:       "test-dog",
-		State:      StateWorking,
-		LastActive: now,
-		Work:       "hq-abc123",
-		Worktrees:  map[string]string{"gastown": "/path/to/worktree"},
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Name:                 "test-dog",
+		State:                StateWorking,
+		LastActive:           now,
+		Work:                 "hq-abc123",
+		SessionAbsenceProven: true,
+		Worktrees:            map[string]string{"gastown": "/path/to/worktree"},
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
+	dogState.StartReceipt = newAssignmentStartReceipt(dogState.Name, dogState.Work, now)
 
 	// Marshal to JSON
 	data, err := json.Marshal(dogState)
@@ -74,6 +76,12 @@ func TestDogState_JSONMarshaling(t *testing.T) {
 	}
 	if unmarshaled.Work != dogState.Work {
 		t.Errorf("After round-trip: Work = %q, want %q", unmarshaled.Work, dogState.Work)
+	}
+	if !unmarshaled.SessionAbsenceProven {
+		t.Error("durable session-absence proof was not preserved")
+	}
+	if unmarshaled.StartReceipt.claim != nil {
+		t.Error("in-memory assignment capability was serialized")
 	}
 }
 

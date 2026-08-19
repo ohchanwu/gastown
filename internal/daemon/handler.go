@@ -89,36 +89,17 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 		return
 	}
 
-	t := tmux.NewTmux()
+	hc := dog.NewHealthChecker(mgr, tmux.NewTmux())
 	for _, dg := range dogs {
 		if dg.State != dog.StateWorking {
 			continue
 		}
 
-		sessionID := sm.SessionName(dg.Name)
-		running, err := sm.IsRunning(dg.Name)
-		if err != nil {
-			d.logger.Printf("Handler: error checking session for dog %s: %v", dg.Name, err)
-			continue
-		}
-
-		if !running {
-			d.logger.Printf("Handler: dog %s is working but session is dead, clearing work", dg.Name)
-			if err := sm.StopIfMatches(dg, true); err != nil {
-				d.logger.Printf("Handler: failed exact dead-session cleanup for dog %s: %v", dg.Name, err)
-			}
-			continue
-		}
-
-		status := t.CheckSessionHealth(sessionID, 0)
-		if status != tmux.AgentDead {
-			continue
-		}
-
-		d.logger.Printf("Handler: dog %s (%s) is working but agent is dead, killing session and clearing work", dg.Name, sessionID)
-		if err := sm.StopIfMatches(dg, true); err != nil {
-			d.logger.Printf("Handler: failed exact agent-dead cleanup for dog %s (%s): %v", dg.Name, sessionID, err)
-			continue
+		result := hc.Check(dg, 0, true)
+		if result.AutoCleared {
+			d.logger.Printf("Handler: dog %s auto-cleared after exact health check (%s)", dg.Name, result.SessionStatus)
+		} else if result.NeedsAttention {
+			d.logger.Printf("Handler: dog %s exact health requires recovery: %s", dg.Name, result.Recommendation)
 		}
 	}
 }
@@ -176,6 +157,10 @@ func (d *Daemon) reapIdleDogs(mgr *dog.Manager, sm *dog.SessionManager, daemonCf
 
 	for _, dg := range dogs {
 		if dg.State != dog.StateIdle {
+			continue
+		}
+		if dg.SessionGeneration == nil && !dg.SessionAbsenceProven {
+			d.logger.Printf("Handler: preserving idle dog %s: session absence is unproven", dg.Name)
 			continue
 		}
 
@@ -318,7 +303,8 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		}
 
 		if err := sm.Start(idleDog.Name, dog.SessionStartOptions{
-			WorkDesc: workDesc,
+			WorkDesc:          workDesc,
+			AssignmentReceipt: assignedState.StartReceipt,
 		}); err != nil {
 			d.logger.Printf("Handler: failed to start session for dog %s: %v", idleDog.Name, err)
 			// A cleanup-incomplete start may still own an exact live generation.

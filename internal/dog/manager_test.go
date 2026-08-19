@@ -370,6 +370,33 @@ func TestIdleDogWithSessionGenerationIsNotAssignable(t *testing.T) {
 	}
 }
 
+func TestIdleDogWithoutSessionAbsenceProofIsNotReusable(t *testing.T) {
+	mgr, state := newDogStateManager(t, "alpha", "")
+	state.State = StateIdle
+	state.WorkStartedAt = time.Time{}
+	state.SessionAbsenceProven = false
+	if err := mgr.saveState("alpha", state); err != nil {
+		t.Fatal(err)
+	}
+
+	if assigned, err := mgr.AssignWorkIfIdle("alpha", "work-new"); assigned != nil || !errors.Is(err, ErrSessionGenerationUnavailable) {
+		t.Fatalf("AssignWorkIfIdle = %+v, %v; want nil and absence-proof error", assigned, err)
+	}
+	if idle, err := mgr.GetIdleDog(); err != nil || idle != nil {
+		t.Fatalf("GetIdleDog = %+v, %v; want nil, nil", idle, err)
+	}
+	if count, err := mgr.IdleCount(); err != nil || count != 0 {
+		t.Fatalf("IdleCount = %d, %v; want 0, nil", count, err)
+	}
+	snapshot, err := mgr.Get("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := mgr.RemoveIfMatches(snapshot); err != nil || removed {
+		t.Fatalf("RemoveIfMatches = %v, %v; want false, nil", removed, err)
+	}
+}
+
 func TestSetSessionGenerationIfAssignmentMatchesAcceptsPlatformWithoutCustodyMarker(t *testing.T) {
 	mgr, initial := newDogStateManager(t, "alpha", "work")
 	generation := testDogTmuxGeneration("$4", "nonce-no-custody")
@@ -520,14 +547,16 @@ func newDogStateManager(t *testing.T, name, work string) (*Manager, *DogState) {
 	}
 	now := time.Now().UTC().Round(0)
 	state := &DogState{
-		Name:          name,
-		State:         StateWorking,
-		Work:          work,
-		WorkStartedAt: now,
-		LastActive:    now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		Name:                 name,
+		State:                StateWorking,
+		Work:                 work,
+		WorkStartedAt:        now,
+		SessionAbsenceProven: true,
+		LastActive:           now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
 	}
+	state.StartReceipt = newAssignmentStartReceipt(name, work, now)
 	if err := mgr.saveState(name, state); err != nil {
 		t.Fatal(err)
 	}

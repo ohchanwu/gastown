@@ -1448,15 +1448,19 @@ func (g PaneProcessGeneration) Equal(other PaneProcessGeneration) bool {
 
 func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 	parts := strings.Split(output, "\t")
-	if len(parts) != 3 && len(parts) != 4 && len(parts) != 5 {
-		// tmux display-message exits successfully for a missing target when the
-		// server still has other sessions, returning only the server PID after
-		// output trimming. Classify that exact shape as terminal absence.
-		if len(parts) == 1 {
-			if serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && serverPID > 0 {
-				return SessionGeneration{}, ErrSessionNotFound
+	if serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && serverPID > 0 {
+		targetFieldsEmpty := true
+		for _, part := range parts[1:] {
+			if strings.TrimSpace(part) != "" {
+				targetFieldsEmpty = false
+				break
 			}
 		}
+		if targetFieldsEmpty {
+			return SessionGeneration{}, ErrSessionNotFound
+		}
+	}
+	if len(parts) != 3 && len(parts) != 4 && len(parts) != 5 {
 		return SessionGeneration{}, fmt.Errorf("reading tmux session generation: unexpected field count %d", len(parts))
 	}
 	serverPID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
@@ -1464,6 +1468,9 @@ func parseSessionGeneration(name, output string) (SessionGeneration, error) {
 		return SessionGeneration{}, fmt.Errorf("reading tmux session generation: invalid server PID %q", parts[0])
 	}
 	sessionID := strings.TrimSpace(parts[1])
+	if sessionID == "" {
+		return SessionGeneration{}, ErrSessionNotFound
+	}
 	if !validSessionIDRe.MatchString(sessionID) {
 		return SessionGeneration{}, fmt.Errorf("reading tmux session generation: invalid session ID %q", sessionID)
 	}

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,6 +26,20 @@ var (
 	reaperDryRun   bool
 	reaperJSON     bool
 )
+
+var runReaperAutoClose = func(dbName string, staleAge time.Duration, dryRun bool) (*reaper.AutoCloseResult, error) {
+	db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 10*time.Second, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer db.Close()
+	if ok, err := reaper.HasReaperSchema(db); err != nil {
+		return nil, fmt.Errorf("schema check: %w", err)
+	} else if !ok {
+		return nil, nil
+	}
+	return reaper.AutoClose(db, dbName, staleAge, dryRun)
+}
 
 func reaperDatabaseNames() []string {
 	if reaperDB == "" {
@@ -415,6 +430,7 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 		databases := reaperDatabaseNames()
 
 		var results []*reaper.AutoCloseResult
+		var autoCloseErrors []error
 		for i, dbName := range databases {
 			if err := waitBeforeReaperDatabase(i); err != nil {
 				return err
@@ -424,25 +440,13 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 				continue
 			}
 
-			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 10*time.Second, 10*time.Second)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
-				continue
-			}
-
-			if ok, err := reaper.HasReaperSchema(db); err != nil {
-				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
-				db.Close()
-				continue
-			} else if !ok {
-				db.Close()
-				continue
-			}
-
-			result, err := reaper.AutoClose(db, dbName, staleAge, reaperDryRun)
-			db.Close()
+			result, err := runReaperAutoClose(dbName, staleAge, reaperDryRun)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: auto-close error: %v\n", dbName, err)
+				autoCloseErrors = append(autoCloseErrors, fmt.Errorf("%s: %w", dbName, err))
+				continue
+			}
+			if result == nil {
 				continue
 			}
 			results = append(results, result)
@@ -474,7 +478,7 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 					prefix, len(results), totalClosed)
 			}
 		}
-		return nil
+		return errors.Join(autoCloseErrors...)
 	},
 }
 
