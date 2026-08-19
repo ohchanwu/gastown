@@ -153,7 +153,7 @@ func parseBeadsVersion(output string) string {
 	}
 
 	// Match canonical text like "bd version 0.52.0" or "bd version 0.52.0 (dev: ...)".
-	re := regexp.MustCompile(`^bd version (\d+\.\d+\.\d+)(?: \([^()\r\n]*\))?$`)
+	re := regexp.MustCompile(`^bd version (\d+\.\d+\.\d+)(?: \([^\r\n]*\))?$`)
 	matches := re.FindStringSubmatch(trimmed)
 	if len(matches) >= 2 {
 		return matches[1]
@@ -164,6 +164,10 @@ func parseBeadsVersion(output string) string {
 func parseBeadsVersionJSON(data []byte) string {
 	root, ok := decodeJSONObject(data)
 	if !ok {
+		return ""
+	}
+	var schemaVersion int
+	if raw, exists := root["schema_version"]; !exists || json.Unmarshal(raw, &schemaVersion) != nil || schemaVersion != 1 {
 		return ""
 	}
 
