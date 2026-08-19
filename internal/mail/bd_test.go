@@ -468,8 +468,17 @@ func writeMailBDStub(t *testing.T, binDir string) {
 	printf 'BD_IDENTITY=%s\n' "${BD_IDENTITY-}"
 	printf 'BEADS_DIR=%s\n' "${BEADS_DIR-}"
 	printf 'BEADS_DOLT_SERVER_DATABASE=%s\n' "${BEADS_DOLT_SERVER_DATABASE-}"
+	printf 'PWD=%s\n' "$(pwd)"
 } >> "$BD_STUB_LOG"
-printf '[]\n'
+if [ -n "${BD_STUB_STDOUT_FILE-}" ]; then
+	cat "$BD_STUB_STDOUT_FILE"
+else
+	printf '[]\n'
+fi
+if [ -n "${BD_STUB_STDERR-}" ]; then
+	printf '%s\n' "$BD_STUB_STDERR" >&2
+fi
+exit "${BD_STUB_EXIT:-0}"
 `
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
 		t.Fatal(err)

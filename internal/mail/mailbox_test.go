@@ -2,6 +2,7 @@ package mail
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -356,6 +357,152 @@ func TestMailboxLegacyListByThread(t *testing.T) {
 	if len(empty) != 0 {
 		t.Errorf("Non-existent thread has %d messages, want 0", len(empty))
 	}
+}
+
+func TestMailboxBeadsListByThread(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	base := time.Date(2026, time.August, 20, 0, 0, 0, 0, time.UTC)
+	beadsMessages := make([]BeadsMessage, 0, 55)
+	for i := 0; i < 53; i++ {
+		beadsMessages = append(beadsMessages, BeadsMessage{
+			ID:        fmt.Sprintf("msg-%03d", i),
+			Title:     fmt.Sprintf("message %d", i),
+			Assignee:  "gastown/Toast",
+			Status:    "open",
+			CreatedAt: base.Add(time.Duration(53-i) * time.Minute),
+			Labels:    []string{"gt:message", "thread:thread-target", "from:mayor/"},
+		})
+	}
+	beadsMessages = append(beadsMessages,
+		BeadsMessage{ID: "msg-z", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+		BeadsMessage{ID: "msg-a", Assignee: "gastown/Toast", Status: "closed", CreatedAt: base, Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"}},
+	)
+
+	m, logPath := newBeadsThreadTestMailbox(t, beadsMessages)
+	messages, err := m.ListByThread("thread-target")
+	if err != nil {
+		t.Fatalf("ListByThread: %v", err)
+	}
+	if len(messages) != 55 {
+		t.Fatalf("ListByThread returned %d messages, want 55", len(messages))
+	}
+	if messages[0].ID != "msg-a" || messages[1].ID != "msg-z" {
+		t.Fatalf("equal-timestamp order = [%s %s], want [msg-a msg-z]", messages[0].ID, messages[1].ID)
+	}
+
+	log := readStubLog(t, logPath)
+	wantArgs := "args:[list][--include-infra][--all][--label][gt:message][--label][thread:thread-target][--limit][0][--json][--flat]"
+	for _, want := range []string{
+		wantArgs,
+		"BD_READONLY=true",
+		"BD_IDENTITY=gastown/Toast",
+		"BEADS_DIR=" + m.beadsDir,
+		"BEADS_DOLT_SERVER_DATABASE=maildb",
+		"PWD=" + m.workDir,
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("bd log missing %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "args:[message][thread]") {
+		t.Fatalf("bd log used unsupported message thread command:\n%s", log)
+	}
+}
+
+func TestMailboxBeadsListByThreadEmptyArray(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	m, _ := newBeadsThreadTestMailbox(t, []BeadsMessage{})
+	messages, err := m.ListByThread("thread-missing")
+	if err != nil {
+		t.Fatalf("ListByThread: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("ListByThread returned %d messages, want 0", len(messages))
+	}
+}
+
+func TestMailboxBeadsListByThreadRejectsInvalidOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	tests := []struct {
+		name   string
+		stdout string
+	}{
+		{name: "empty stdout"},
+		{name: "null", stdout: "null\n"},
+		{name: "object", stdout: "{}\n"},
+		{name: "scalar", stdout: `"value"`},
+		{name: "malformed JSON", stdout: "[{\n"},
+		{name: "non-JSON", stdout: "not json\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, _ := newBeadsThreadTestMailboxOutput(t, tt.stdout)
+			if _, err := m.ListByThread("thread-target"); err == nil {
+				t.Fatal("ListByThread succeeded, want output validation error")
+			}
+		})
+	}
+}
+
+func TestMailboxBeadsListByThreadReturnsCommandFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd is POSIX-only")
+	}
+
+	m, _ := newBeadsThreadTestMailboxOutput(t, "[]\n")
+	t.Setenv("BD_STUB_EXIT", "7")
+	t.Setenv("BD_STUB_STDERR", "thread lookup failed")
+	_, err := m.ListByThread("thread-target")
+	if err == nil {
+		t.Fatal("ListByThread succeeded, want command error")
+	}
+	var commandErr *bdError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("ListByThread error type = %T, want *bdError", err)
+	}
+}
+
+func newBeadsThreadTestMailbox(t *testing.T, messages []BeadsMessage) (*Mailbox, string) {
+	t.Helper()
+	data, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newBeadsThreadTestMailboxOutput(t, string(data))
+}
+
+func newBeadsThreadTestMailboxOutput(t *testing.T, stdout string) (*Mailbox, string) {
+	t.Helper()
+	binDir := t.TempDir()
+	writeMailBDStub(t, binDir)
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	stdoutPath := filepath.Join(t.TempDir(), "stdout")
+	if err := os.WriteFile(stdoutPath, []byte(stdout), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"dolt_database":"maildb"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+	t.Setenv("BD_STUB_STDOUT_FILE", stdoutPath)
+	return NewMailboxWithBeadsDir("gastown/Toast", workDir, beadsDir), logPath
 }
 
 func TestMailboxLegacyEmptyInbox(t *testing.T) {

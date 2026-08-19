@@ -1375,7 +1375,12 @@ func (m *Mailbox) ListByThread(threadID string) ([]*Message, error) {
 }
 
 func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
-	args := []string{"message", "thread", threadID, "--json"}
+	args := []string{
+		"list", "--include-infra", "--all",
+		"--label", "gt:message",
+		"--label", "thread:" + threadID,
+		"--limit", "0", "--json",
+	}
 
 	ctx, cancel := bdReadCtx()
 	defer cancel()
@@ -1384,12 +1389,12 @@ func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 		return nil, err
 	}
 
-	if !isJSON(stdout) {
-		return nil, nil
-	}
 	var beadsMsgs []BeadsMessage
 	if err := json.Unmarshal(stdout, &beadsMsgs); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode thread list: %w", err)
+	}
+	if beadsMsgs == nil {
+		return nil, fmt.Errorf("decode thread list: expected JSON array")
 	}
 
 	var messages []*Message
@@ -1399,6 +1404,9 @@ func (m *Mailbox) listByThreadBeads(threadID string) ([]*Message, error) {
 
 	// Sort by timestamp (oldest first for thread view)
 	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].Timestamp.Equal(messages[j].Timestamp) {
+			return messages[i].ID < messages[j].ID
+		}
 		return messages[i].Timestamp.Before(messages[j].Timestamp)
 	})
 
