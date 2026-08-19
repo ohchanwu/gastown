@@ -551,9 +551,13 @@ commit error directs operators to inspect those IDs and either retry auto-close
 when they remain open or commit the pending working set when they are closed. A
 post-SQL `DOLT_COMMIT` error directs operators to commit the pending working set
 without replaying auto-close. Full-cycle CLI runs join these per-database errors
-and report an incomplete cycle; daemon failures store the same recovery detail
-in the failed molecule step. If rollback or session reset fails, the connection
-is marked bad and discarded rather than returned to the pool.
+and report an incomplete cycle. Daemon failures stream the complete joined
+recovery record to `bd close --reason-file -` over stdin, keeping process argv
+bounded regardless of the affected-ID count. If that durable write still fails,
+the failed child is excluded from orphan-step cleanup and the root molecule is
+left open rather than silently closing without its recovery record. If rollback
+or session reset fails, the connection is marked bad and discarded rather than
+returned to the pool.
 
 See [dolt-storage.md](dolt-storage.md) for full details.
 

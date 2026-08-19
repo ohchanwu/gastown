@@ -1,8 +1,17 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/reaper"
 )
 
 func TestParseWispID(t *testing.T) {
@@ -196,4 +205,110 @@ func TestDogMolGracefulDegradation(t *testing.T) {
 	dm.closeStep("scan")
 	dm.failStep("scan", "test failure")
 	dm.close()
+}
+
+func TestDogMolFailStepStreamsLargeMultiDatabaseRecoveryReason(t *testing.T) {
+	tmpDir := t.TempDir()
+	bdPath := filepath.Join(tmpDir, "bd")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" > "${0%/*}/args"
+if [ "$#" -ne 4 ] || [ "$1" != "close" ] || [ "$2" != "step-auto-close" ] || [ "$3" != "--reason-file" ] || [ "$4" != "-" ]; then
+	exit 64
+fi
+cat > "${0%/*}/reason"
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var failures []error
+	for _, dbName := range []string{"alpha", "bravo"} {
+		ids := make([]string, 40_000)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("%s-task-%06d", dbName, i)
+		}
+		commitErr := &reaper.AutoCloseCommitOutcomeError{
+			Cause: fmt.Errorf("%w: injected Dolt commit failure", reaper.ErrAutoCloseCommitOutcomeUnknown),
+			Anomalies: []reaper.Anomaly{{
+				Type:        "dolt_commit_failed",
+				Scope:       dbName,
+				AffectedIDs: ids,
+				Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
+			}},
+		}
+		failures = append(failures, fmt.Errorf("%s: %w", dbName, commitErr))
+	}
+	reason := autoCloseFailureReason(failures)
+	if len(reason) < 1<<20 {
+		t.Fatalf("test reason is %d bytes, want at least 1 MiB", len(reason))
+	}
+
+	dm := &dogMol{
+		rootID:   "root",
+		stepIDs:  map[string]string{"auto-close": "step-auto-close"},
+		bdPath:   bdPath,
+		townRoot: tmpDir,
+		logger:   log.New(io.Discard, "", 0),
+	}
+	dm.failStep("auto-close", reason)
+
+	got, err := os.ReadFile(filepath.Join(tmpDir, "reason"))
+	if err != nil {
+		t.Fatalf("read transported recovery reason: %v", err)
+	}
+	if string(got) != reason {
+		t.Fatalf("transported recovery reason is %d bytes, want exact %d-byte payload", len(got), len(reason))
+	}
+	args, err := os.ReadFile(filepath.Join(tmpDir, "args"))
+	if err != nil {
+		t.Fatalf("read subprocess argv: %v", err)
+	}
+	if got := strings.TrimSpace(string(args)); got != "close step-auto-close --reason-file -" {
+		t.Fatalf("subprocess argv = %q, want bounded reason-file transport", got)
+	}
+	if len(args) > 128 {
+		t.Fatalf("subprocess argv grew to %d bytes for %d-byte reason", len(args), len(reason))
+	}
+}
+
+func TestDogMolClosePreservesStepWhenFailureReasonCannotPersist(t *testing.T) {
+	tmpDir := t.TempDir()
+	bdPath := filepath.Join(tmpDir, "bd")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${0%/*}/calls"
+if [ "$1" = "close" ] && [ "$2" = "step-auto-close" ] && [ "$#" -gt 2 ]; then
+	exit 23
+fi
+if [ "$1" = "show" ]; then
+	printf '%s\n' '{"root":[{"id":"step-auto-close","title":"Auto-close stale issues","status":"open"}]}'
+fi
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dm := &dogMol{
+		rootID:   "root",
+		stepIDs:  map[string]string{"auto-close": "step-auto-close"},
+		bdPath:   bdPath,
+		townRoot: tmpDir,
+		logger:   log.New(io.Discard, "", 0),
+	}
+	dm.failStep("auto-close", errors.New("commit outcome unknown").Error())
+	dm.close()
+
+	calls, err := os.ReadFile(filepath.Join(tmpDir, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+		if call == "close step-auto-close" {
+			t.Fatal("close backstop silently closed step after failure reason was not persisted")
+		}
+		if call == "close root" {
+			t.Fatal("root was closed while a child failure reason remained unpersisted")
+		}
+	}
 }

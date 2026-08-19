@@ -69,12 +69,18 @@ func TestReaperAutoCloseCommandReturnsCommitError(t *testing.T) {
 		return &reaper.AutoCloseResult{Database: "testdb", Closed: 1}, commitErr
 	}
 
-	err := reaperAutoCloseCmd.RunE(reaperAutoCloseCmd, nil)
+	var err error
+	output := captureStdout(t, func() {
+		err = reaperAutoCloseCmd.RunE(reaperAutoCloseCmd, nil)
+	})
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("auto-close command error = %v, want commit error", err)
 	}
 	if !strings.Contains(err.Error(), "stale-task") {
 		t.Fatalf("auto-close command error = %q, want preserved affected ID", err)
+	}
+	if strings.Contains(output, "auto-closed") {
+		t.Fatalf("auto-close command output = %q, want no ordinary success for commit failure", output)
 	}
 }
 
@@ -95,23 +101,52 @@ func TestReaperRunReturnsAutoCloseCommitError(t *testing.T) {
 			Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
 		}},
 	}
+	secondCommitErr := &reaper.AutoCloseCommitOutcomeError{
+		Cause: fmt.Errorf("%w: second injected Dolt commit failure", reaper.ErrAutoCloseCommitOutcomeUnknown),
+		Anomalies: []reaper.Anomaly{{
+			Type:        "dolt_commit_failed",
+			Scope:       "otherdb",
+			AffectedIDs: []string{"other-stale-task"},
+			Remediation: "run CALL DOLT_COMMIT; do not rerun auto-close",
+		}},
+	}
+	var called []string
 	var err error
 	output := captureStdout(t, func() {
 		err = runReaperCycle(
-			[]string{"testdb"}, time.Hour, time.Hour, time.Hour, time.Hour,
-			func(string, time.Duration, time.Duration, time.Duration, time.Duration) (reaperRunResult, error) {
-				return reaperRunResult{closed: 1}, commitErr
+			[]string{"successdb", "testdb", "otherdb"}, time.Hour, time.Hour, time.Hour, time.Hour,
+			func(dbName string, _ time.Duration, _ time.Duration, _ time.Duration, _ time.Duration) (reaperRunResult, error) {
+				called = append(called, dbName)
+				switch dbName {
+				case "successdb":
+					return reaperRunResult{closed: 2}, nil
+				case "testdb":
+					return reaperRunResult{closed: 1}, commitErr
+				default:
+					return reaperRunResult{closed: 4}, secondCommitErr
+				}
 			},
 		)
 	})
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("reaper run error = %v, want commit error", err)
 	}
-	if !strings.Contains(err.Error(), "stale-task") {
-		t.Fatalf("reaper run error = %q, want preserved affected ID", err)
+	if !errors.Is(err, secondCommitErr) {
+		t.Fatalf("reaper run error = %v, want second commit error", err)
 	}
-	if !strings.Contains(output, "Reaper cycle incomplete:") || !strings.Contains(output, "Closed:    0 stale issues") {
-		t.Fatalf("reaper run output = %q, want incomplete cycle with zero unproven closes", output)
+	if !reflect.DeepEqual(called, []string{"successdb", "testdb", "otherdb"}) {
+		t.Fatalf("reaper run databases = %v, want all databases attempted", called)
+	}
+	for _, want := range []string{"stale-task", "other-stale-task"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("reaper run error = %q, want preserved affected ID %q", err, want)
+		}
+	}
+	if !strings.Contains(output, "Reaper cycle incomplete:") || !strings.Contains(output, "Databases: 3") || !strings.Contains(output, "Closed:    2 stale issues") {
+		t.Fatalf("reaper run output = %q, want incomplete cycle with only proven closes", output)
+	}
+	if strings.Contains(output, "Reaper cycle complete:") || strings.Contains(output, "Closed:    7 stale issues") {
+		t.Fatalf("reaper run output = %q, want no ordinary or unproven success", output)
 	}
 }
 

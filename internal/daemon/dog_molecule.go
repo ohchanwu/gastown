@@ -31,10 +31,20 @@ const (
 // transient Dolt error does not leave the wisp open. Returns the final error if
 // every attempt fails.
 func (dm *dogMol) closeWisp(id string, extra ...string) error {
+	return dm.closeWispInput("", id, extra...)
+}
+
+// closeWispWithReason streams the reason over stdin so recovery records never
+// consume an unbounded argv element.
+func (dm *dogMol) closeWispWithReason(id, reason string) error {
+	return dm.closeWispInput(reason, id, "--reason-file", "-")
+}
+
+func (dm *dogMol) closeWispInput(input, id string, extra ...string) error {
 	args := append([]string{"close", id}, extra...)
 	var err error
 	for attempt := 1; attempt <= dogCloseMaxAttempts; attempt++ {
-		if _, err = dm.runBd(args...); err == nil {
+		if _, err = dm.runBdInput(input, args...); err == nil {
 			return nil
 		}
 		if attempt < dogCloseMaxAttempts {
@@ -48,11 +58,12 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 // Graceful degradation: if bd fails, the dog still does its work — molecule
 // tracking is observability, not control flow.
 type dogMol struct {
-	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
-	stepIDs  map[string]string // step slug -> wisp issue ID
-	bdPath   string
-	townRoot string
-	logger   interface{ Printf(string, ...interface{}) }
+	rootID              string              // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
+	stepIDs             map[string]string   // step slug -> wisp issue ID
+	unpersistedFailures map[string]struct{} // step IDs whose failure reason could not be stored.
+	bdPath              string
+	townRoot            string
+	logger              interface{ Printf(string, ...interface{}) }
 }
 
 // pourDogMolecule creates an ephemeral wisp molecule from a formula.
@@ -123,14 +134,18 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 		return
 	}
 
-	if err := dm.closeWisp(stepID, "--reason", reason); err != nil {
+	if err := dm.closeWispWithReason(stepID, reason); err != nil {
+		if dm.unpersistedFailures == nil {
+			dm.unpersistedFailures = make(map[string]struct{})
+		}
+		dm.unpersistedFailures[stepID] = struct{}{}
 		dm.logger.Printf("dog_molecule: fail step %s (%s) failed after %d attempts (non-fatal): %v", stepSlug, stepID, dogCloseMaxAttempts, err)
 	}
 }
 
-// close closes all remaining open child step wisps, then closes the root molecule wisp.
-// This prevents orphan step wisps from accumulating when callers forget to
-// explicitly close individual steps (the root cause of gt-3o59).
+// close closes all remaining open child step wisps, then closes the root molecule
+// wisp. A child whose failure reason could not be persisted and its root remain
+// open so cleanup cannot erase the recovery gap.
 func (dm *dogMol) close() {
 	if dm.rootID == "" {
 		return
@@ -138,6 +153,10 @@ func (dm *dogMol) close() {
 
 	// Close any step wisps that were never explicitly closed/failed.
 	dm.closeRemainingSteps()
+	if len(dm.unpersistedFailures) > 0 {
+		dm.logger.Printf("dog_molecule: leaving root %s open: %d child failure reason(s) were not persisted", dm.rootID, len(dm.unpersistedFailures))
+		return
+	}
 
 	if err := dm.closeWisp(dm.rootID); err != nil {
 		dm.logger.Printf("dog_molecule: close root %s failed after %d attempts (non-fatal): %v", dm.rootID, dogCloseMaxAttempts, err)
@@ -145,8 +164,8 @@ func (dm *dogMol) close() {
 }
 
 // closeRemainingSteps queries all children of the root wisp and closes any that
-// are still open. This is the backstop that prevents step wisp leaks regardless
-// of whether individual callers remembered to close each step.
+// are still open, except children with an unpersisted failure reason. This is the
+// backstop for callers that forgot to close ordinary steps.
 func (dm *dogMol) closeRemainingSteps() {
 	if dm.rootID == "" {
 		return
@@ -167,6 +186,10 @@ func (dm *dogMol) closeRemainingSteps() {
 	closed := 0
 	for _, child := range children {
 		if child.ID == "" || child.Status == "" {
+			continue
+		}
+		if _, protected := dm.unpersistedFailures[child.ID]; protected {
+			dm.logger.Printf("dog_molecule: closeRemainingSteps: preserving %s with unpersisted failure reason", child.ID)
 			continue
 		}
 		// Close any child that is still open/hooked/in_progress.
@@ -336,6 +359,11 @@ func (dm *dogMol) knownSteps() []string {
 
 // runBd executes a bd command and returns stdout.
 func (dm *dogMol) runBd(args ...string) (string, error) {
+	return dm.runBdInput("", args...)
+}
+
+// runBdInput executes a bd command with input streamed on stdin.
+func (dm *dogMol) runBdInput(input string, args ...string) (string, error) {
 	bdPath := dm.bdPath
 	if bdPath == "" {
 		bdPath = "bd"
@@ -346,6 +374,7 @@ func (dm *dogMol) runBd(args ...string) (string, error) {
 
 	cmd := exec.CommandContext(ctx, bdPath, args...)
 	beads.ConfigureCommand(cmd, dm.townRoot, filepath.Join(dm.townRoot, ".beads"), beads.SubprocessModeForArgs(args))
+	cmd.Stdin = strings.NewReader(input)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

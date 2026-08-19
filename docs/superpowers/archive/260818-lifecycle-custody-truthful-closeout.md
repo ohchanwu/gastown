@@ -259,6 +259,14 @@ inspect-then-retry-or-commit decision, while a post-SQL `DOLT_COMMIT` failure
 records a direct pending-working-set commit action and forbids replaying
 auto-close.
 
+A successor rereview found that the complete recovery record still crossed the
+daemon-to-`bd` boundary as one unbounded `--reason` argument. Molecule failure
+closeout now sends that record through `bd close --reason-file -` on stdin. A
+multi-database regression transports more than 1 MiB of affected IDs while argv
+stays constant-sized. If the durable close fails, the cleanup backstop preserves
+the failed child and leaves the root molecule open instead of erasing the
+missing-reason evidence.
+
 - [x] **Step 3: Update maintained architecture and archive the plan**
 
 Record generation-bound legacy behavior, commit-proof result publication, and
