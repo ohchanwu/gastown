@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -4297,6 +4298,29 @@ const (
 
 var storedPaneNudgeSequence atomic.Uint64
 
+func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
+	tests := []struct {
+		name  string
+		mode  string
+		nonce string
+		args  []string
+		want  bool
+	}{
+		{name: "exact helper", mode: "1", nonce: "nonce", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}, want: true},
+		{name: "disabled value", mode: "0", nonce: "nonce", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}},
+		{name: "missing nonce", mode: "1", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}},
+		{name: "wrong invocation", mode: "1", nonce: "nonce", args: []string{"-test.run=TestNudgeSession"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isStoredPaneNudgeReceiverInvocation(test.mode, test.nonce, test.args); got != test.want {
+				t.Fatalf("isStoredPaneNudgeReceiverInvocation() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
 	nonce := fmt.Sprintf("protocol-%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
 	ctx, cancel := context.WithTimeout(context.Background(), constants.NudgeReadyTimeout)
@@ -4318,6 +4342,16 @@ func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("protocol: start helper: %v", err)
 	}
+	var waitOnce sync.Once
+	var waitErr error
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = wait()
+	})
 
 	scanner := bufio.NewScanner(stdout)
 	wantReady := "READY " + nonce
@@ -4335,28 +4369,37 @@ func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
 		t.Fatalf("protocol: READY %s not observed", nonce)
 	}
 
-	message := "message-" + nonce
-	if _, err := fmt.Fprintln(stdin, message); err != nil {
-		t.Fatalf("protocol: write message: %v", err)
+	messages := []string{
+		"message-" + nonce,
+		"control-" + nonce + "\x1b",
+	}
+	for _, message := range messages {
+		if _, err := fmt.Fprintln(stdin, message); err != nil {
+			t.Fatalf("protocol: write message: %v", err)
+		}
 	}
 	if err := stdin.Close(); err != nil {
 		t.Fatalf("protocol: close stdin: %v", err)
 	}
 
-	wantACK := fmt.Sprintf("ACK %s 1 %s", nonce, message)
-	ack := false
+	wantACKs := make(map[string]bool, len(messages))
+	for index, message := range messages {
+		wantACKs[fmt.Sprintf("ACK %s %d %x", nonce, index+1, message)] = false
+	}
 	for scanner.Scan() {
-		if scanner.Text() == wantACK {
-			ack = true
+		if _, ok := wantACKs[scanner.Text()]; ok {
+			wantACKs[scanner.Text()] = true
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatalf("protocol: read stdout: %v", err)
 	}
-	if !ack {
-		t.Fatalf("protocol: ACK %s not observed", nonce)
+	for wantACK, observed := range wantACKs {
+		if !observed {
+			t.Fatalf("protocol: %s not observed", wantACK)
+		}
 	}
-	if err := cmd.Wait(); err != nil {
+	if err := wait(); err != nil {
 		t.Fatalf("protocol: helper exit: %v", err)
 	}
 }
@@ -4382,7 +4425,7 @@ func TestNudgeStoredPaneReceiverHelper(t *testing.T) {
 	count := 0
 	for scanner.Scan() {
 		count++
-		if _, err := fmt.Fprintf(output, "ACK %s %d %s\n", nonce, count, scanner.Text()); err != nil {
+		if _, err := fmt.Fprintf(output, "ACK %s %d %x\n", nonce, count, scanner.Bytes()); err != nil {
 			t.Fatalf("helper: write ACK: %v", err)
 		}
 		if err := output.Flush(); err != nil {
@@ -4416,84 +4459,109 @@ func waitForExactPaneLine(tm *Tmux, pane, want string, deadline time.Time) (stri
 	}
 }
 
-func waitForStablePaneOutput(tm *Tmux, pane string, deadline time.Time) (string, bool, error) {
-	var previous string
-	havePrevious := false
-	for {
-		content, err := tm.CapturePaneAll(pane)
-		if err != nil {
-			return previous, false, err
+func storedPaneACKLines(output, nonce string) []string {
+	prefix := "ACK " + nonce + " "
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			lines = append(lines, line)
 		}
-		if havePrevious && content == previous {
-			return content, true, nil
-		}
-		previous = content
-		havePrevious = true
-		if !time.Now().Before(deadline) {
-			return previous, false, nil
-		}
-		time.Sleep(storedPanePollInterval)
 	}
+	return lines
 }
 
-func validateStoredPaneNudgeOutput(receiver, decoy, nonce, message string) error {
-	for _, line := range strings.Split(decoy, "\n") {
-		if strings.Contains(line, message) || strings.HasPrefix(line, "ACK ") {
-			return errors.New("routing: message observed in decoy pane")
-		}
-	}
-
-	ackPrefix := "ACK " + nonce + " "
-	var ackLines []string
-	for _, line := range strings.Split(receiver, "\n") {
-		if strings.HasPrefix(line, ackPrefix) {
-			ackLines = append(ackLines, line)
-		}
-	}
-	if len(ackLines) == 0 {
+func validateStoredPaneNudgeOutput(
+	receiver,
+	decoy,
+	receiverNonce,
+	decoyNonce,
+	message,
+	receiverBarrier,
+	decoyBarrier string,
+) error {
+	receiverACKs := storedPaneACKLines(receiver, receiverNonce)
+	wantMessageACK := fmt.Sprintf("ACK %s 1 %x", receiverNonce, message)
+	if len(receiverACKs) == 0 {
 		return errors.New("routing: receiver ACK missing")
 	}
-	if len(ackLines) != 1 {
-		return fmt.Errorf("delivery: ACK count = %d, want 1", len(ackLines))
+	wantReceiverBarrierACK := fmt.Sprintf("ACK %s 2 %x", receiverNonce, receiverBarrier)
+	if len(receiverACKs) != 2 || receiverACKs[0] != wantMessageACK || receiverACKs[1] != wantReceiverBarrierACK {
+		return errors.New("delivery: receiver transcript mismatch")
 	}
 
-	countText, gotMessage, ok := strings.Cut(strings.TrimPrefix(ackLines[0], ackPrefix), " ")
-	if !ok {
-		return errors.New("delivery: malformed ACK line")
+	decoyACKs := storedPaneACKLines(decoy, decoyNonce)
+	if len(decoyACKs) == 0 {
+		return errors.New("routing: decoy barrier missing")
 	}
-	count, err := strconv.Atoi(countText)
-	if err != nil {
-		return errors.New("delivery: malformed ACK line")
-	}
-	if count != 1 {
-		return fmt.Errorf("delivery: ACK count = %d, want 1", count)
-	}
-	if gotMessage != message {
-		return errors.New("delivery: malformed ACK line")
+	wantDecoyBarrierACK := fmt.Sprintf("ACK %s 1 %x", decoyNonce, decoyBarrier)
+	if len(decoyACKs) != 1 || decoyACKs[0] != wantDecoyBarrierACK {
+		return errors.New("routing: message observed in decoy pane")
 	}
 	return nil
 }
 
 func TestValidateStoredPaneNudgeOutput(t *testing.T) {
-	nonce := "123-1"
+	receiverNonce := "receiver-123-1"
+	decoyNonce := "decoy-123-1"
 	message := "message-123-1"
+	receiverBarrier := "barrier-receiver-123-1"
+	decoyBarrier := "barrier-decoy-123-1"
+	receiverACK := fmt.Sprintf("ACK %s 1 %x", receiverNonce, message)
+	receiverBarrierACK := fmt.Sprintf("ACK %s 2 %x", receiverNonce, receiverBarrier)
+	decoyBarrierACK := fmt.Sprintf("ACK %s 1 %x", decoyNonce, decoyBarrier)
 	tests := []struct {
 		name     string
 		receiver string
 		decoy    string
 		wantErr  string
 	}{
-		{name: "success", receiver: "READY 123-1\nACK 123-1 1 message-123-1"},
-		{name: "missing", receiver: "READY 123-1", wantErr: "routing: receiver ACK missing"},
-		{name: "decoy", receiver: "ACK 123-1 1 message-123-1", decoy: "message-123-1", wantErr: "routing: message observed in decoy pane"},
-		{name: "duplicate", receiver: "ACK 123-1 1 message-123-1\nACK 123-1 2 message-123-1", wantErr: "delivery: ACK count = 2, want 1"},
-		{name: "wrong count", receiver: "ACK 123-1 2 message-123-1", wantErr: "delivery: ACK count = 2, want 1"},
-		{name: "malformed", receiver: "ACK 123-1 nope message-123-1", wantErr: "delivery: malformed ACK line"},
+		{
+			name:     "success",
+			receiver: "READY " + receiverNonce + "\n" + receiverACK + "\n" + receiverBarrierACK,
+			decoy:    "READY " + decoyNonce + "\n" + decoyBarrierACK,
+		},
+		{name: "missing receiver", receiver: "READY " + receiverNonce, decoy: decoyBarrierACK, wantErr: "routing: receiver ACK missing"},
+		{
+			name:     "message routed to decoy",
+			receiver: receiverACK + "\n" + receiverBarrierACK,
+			decoy: fmt.Sprintf("ACK %s 1 %x\nACK %s 2 %x",
+				decoyNonce, message, decoyNonce, decoyBarrier),
+			wantErr: "routing: message observed in decoy pane",
+		},
+		{
+			name: "duplicate receiver delivery",
+			receiver: receiverACK + "\n" +
+				fmt.Sprintf("ACK %s 2 %x\nACK %s 3 %x", receiverNonce, message, receiverNonce, receiverBarrier),
+			decoy:   decoyBarrierACK,
+			wantErr: "delivery: receiver transcript mismatch",
+		},
+		{
+			name:     "raw control byte corruption",
+			receiver: fmt.Sprintf("ACK %s 1 %x\n%s", receiverNonce, message+"\x1b", receiverBarrierACK),
+			decoy:    decoyBarrierACK,
+			wantErr:  "delivery: receiver transcript mismatch",
+		},
+		{name: "receiver barrier missing", receiver: receiverACK, decoy: decoyBarrierACK, wantErr: "delivery: receiver transcript mismatch"},
+		{name: "decoy barrier missing", receiver: receiverACK + "\n" + receiverBarrierACK, wantErr: "routing: decoy barrier missing"},
+		{
+			name:     "receiver input after barrier",
+			receiver: receiverACK + "\n" + receiverBarrierACK + "\n" + fmt.Sprintf("ACK %s 3 %x", receiverNonce, message),
+			decoy:    decoyBarrierACK,
+			wantErr:  "delivery: receiver transcript mismatch",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateStoredPaneNudgeOutput(test.receiver, test.decoy, nonce, message)
+			err := validateStoredPaneNudgeOutput(
+				test.receiver,
+				test.decoy,
+				receiverNonce,
+				decoyNonce,
+				message,
+				receiverBarrier,
+				decoyBarrier,
+			)
 			if test.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validate output: %v", err)
@@ -4594,32 +4662,62 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 		t.Fatalf("routing: receiver ACK missing: set GT_PANE_ID: %v", err)
 	}
 
-	if err := tm.NudgeSession(sessionName, message); err != nil {
+	if err := tm.NudgeSessionWithOpts(sessionName, message, NudgeOpts{SkipEscape: true}); err != nil {
 		t.Fatalf("routing: receiver ACK missing: %v", err)
+	}
+
+	receiverBarrier := "barrier-receiver-" + nonce
+	decoyBarrier := "barrier-decoy-" + nonce
+	for _, barrier := range []struct {
+		pane string
+		line string
+	}{
+		{pane: receiverPane, line: receiverBarrier},
+		{pane: decoyPane, line: decoyBarrier},
+	} {
+		if err := tm.sendMessageToTarget(barrier.pane, barrier.line); err != nil {
+			t.Fatalf("delivery: send FIFO barrier: %v", err)
+		}
+		if _, err := tm.run("send-keys", "-t", barrier.pane, "Enter"); err != nil {
+			t.Fatalf("delivery: submit FIFO barrier: %v", err)
+		}
 	}
 
 	deliveryDeadline := time.Now().Add(constants.NudgeReadyTimeout)
-	wantACK := fmt.Sprintf("ACK %s 1 %s", receiverNonce, message)
-	_, acknowledged, err := waitForExactPaneLine(tm, receiverPane, wantACK, deliveryDeadline)
+	wantReceiverBarrierACK := fmt.Sprintf("ACK %s 2 %x", receiverNonce, receiverBarrier)
+	_, acknowledged, err := waitForExactPaneLine(tm, receiverPane, wantReceiverBarrierACK, deliveryDeadline)
 	if err != nil {
-		t.Fatalf("routing: receiver ACK missing: %v", err)
+		t.Fatalf("delivery: receiver FIFO barrier missing: %v", err)
 	}
 	if !acknowledged {
-		t.Fatal("routing: receiver ACK missing")
+		t.Fatal("delivery: receiver FIFO barrier missing")
+	}
+	wantDecoyBarrierACK := fmt.Sprintf("ACK %s 1 %x", decoyNonce, decoyBarrier)
+	_, acknowledged, err = waitForExactPaneLine(tm, decoyPane, wantDecoyBarrierACK, deliveryDeadline)
+	if err != nil {
+		t.Fatalf("delivery: decoy FIFO barrier missing: %v", err)
+	}
+	if !acknowledged {
+		t.Fatal("delivery: decoy FIFO barrier missing")
 	}
 
-	receiverOutput, stable, err := waitForStablePaneOutput(tm, receiverPane, deliveryDeadline)
+	receiverOutput, err := tm.CapturePaneAll(receiverPane)
 	if err != nil {
-		t.Fatalf("delivery: receiver output did not stabilize: %v", err)
-	}
-	if !stable {
-		t.Fatal("delivery: receiver output did not stabilize")
+		t.Fatalf("delivery: capture receiver transcript: %v", err)
 	}
 	decoyOutput, err := tm.CapturePaneAll(decoyPane)
 	if err != nil {
 		t.Fatalf("routing: message observed in decoy pane: capture: %v", err)
 	}
-	if err := validateStoredPaneNudgeOutput(receiverOutput, decoyOutput, receiverNonce, message); err != nil {
+	if err := validateStoredPaneNudgeOutput(
+		receiverOutput,
+		decoyOutput,
+		receiverNonce,
+		decoyNonce,
+		message,
+		receiverBarrier,
+		decoyBarrier,
+	); err != nil {
 		t.Fatal(err)
 	}
 }

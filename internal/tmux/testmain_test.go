@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+const storedPaneReceiverRunArg = "-test.run=^TestNudgeStoredPaneReceiverHelper$"
+
+func isStoredPaneNudgeReceiverInvocation(mode, nonce string, args []string) bool {
+	if mode != "1" || nonce == "" {
+		return false
+	}
+	for _, arg := range args {
+		if arg == storedPaneReceiverRunArg {
+			return true
+		}
+	}
+	return false
+}
+
 // TestMain sets up a dedicated tmux server for the package's integration tests.
 // All tests that call newTestTmux() share this isolated server, which is torn
 // down after all tests complete. This prevents test sessions from appearing on
@@ -19,7 +33,11 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	if os.Getenv("GT_TEST_NUDGE_RECEIVER") != "" ||
+	if isStoredPaneNudgeReceiverInvocation(
+		os.Getenv(storedPaneReceiverEnv),
+		os.Getenv(storedPaneNonceEnv),
+		os.Args[1:],
+	) ||
 		os.Getenv("GT_TEST_SESSION_CUSTODY_HELPER") != "" ||
 		os.Getenv("GT_TEST_SESSION_CUSTODY_WORKLOAD") != "" ||
 		os.Getenv("GT_TEST_SESSION_CGROUP_PROVISION_HELPER") != "" {
