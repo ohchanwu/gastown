@@ -2,6 +2,7 @@
 package deps
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -145,23 +146,83 @@ func parseBeadsVersion(output string) string {
 	trimmed := strings.TrimSpace(output)
 	data := []byte(trimmed)
 	if json.Valid(data) {
-		var parsed struct {
-			Version string `json:"version"`
-		}
-		if json.Unmarshal(data, &parsed) == nil && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(parsed.Version) {
-			return parsed.Version
-		}
-		return ""
+		return parseBeadsVersionJSON(data)
 	}
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		return ""
 	}
 
-	// Match patterns like "bd version 0.52.0" or "bd version 0.52.0 (dev: ...)"
-	re := regexp.MustCompile(`bd version (\d+\.\d+\.\d+)`)
-	matches := re.FindStringSubmatch(output)
+	// Match canonical text like "bd version 0.52.0" or "bd version 0.52.0 (dev: ...)".
+	re := regexp.MustCompile(`^bd version (\d+\.\d+\.\d+)(?: \([^()\r\n]*\))?$`)
+	matches := re.FindStringSubmatch(trimmed)
 	if len(matches) >= 2 {
 		return matches[1]
 	}
 	return ""
+}
+
+func parseBeadsVersionJSON(data []byte) string {
+	root, ok := decodeJSONObject(data)
+	if !ok {
+		return ""
+	}
+
+	var version string
+	hasVersion := false
+	if raw, exists := root["version"]; exists {
+		if json.Unmarshal(raw, &version) != nil {
+			return ""
+		}
+		hasVersion = true
+	}
+	if raw, exists := root["data"]; exists {
+		envelope, ok := decodeJSONObject(raw)
+		versionRaw, hasEnvelopeVersion := envelope["version"]
+		if !ok || !hasEnvelopeVersion {
+			return ""
+		}
+		var envelopeVersion string
+		if json.Unmarshal(versionRaw, &envelopeVersion) != nil || hasVersion && version != envelopeVersion {
+			return ""
+		}
+		version = envelopeVersion
+		hasVersion = true
+	}
+	if hasVersion && regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(version) {
+		return version
+	}
+	return ""
+}
+
+func decodeJSONObject(data []byte) (map[string]json.RawMessage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return nil, false
+	}
+
+	object := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, false
+		}
+		if _, duplicate := object[key]; duplicate {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		object[key] = value
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return nil, false
+	}
+	return object, true
 }
