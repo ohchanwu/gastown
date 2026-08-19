@@ -4306,8 +4306,8 @@ func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
 		args  []string
 		want  bool
 	}{
-		{name: "exact helper", mode: "1", nonce: "nonce", args: []string{"-test.run=^TestNudgeStoredPaneReceiverHelper$"}, want: true},
-		{name: "exact helper split flag", mode: "1", nonce: "nonce", args: []string{"-test.run", "^TestNudgeStoredPaneReceiverHelper$"}, want: true},
+		{name: "exact helper", mode: "1", nonce: "nonce", args: []string{storedPaneReceiverRunArg}, want: true},
+		{name: "split selector rejected", mode: "1", nonce: "nonce", args: []string{"-test.run", "^TestNudgeStoredPaneReceiverHelper$"}},
 		{
 			name:  "conflicting helper after earlier run",
 			mode:  "1",
@@ -4335,6 +4335,8 @@ func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
 			nonce: "nonce",
 			args:  []string{storedPaneReceiverRunArg, storedPaneReceiverRunArg},
 		},
+		{name: "selector after double dash", mode: "1", nonce: "nonce", args: []string{"--", storedPaneReceiverRunArg}},
+		{name: "selector after positional", mode: "1", nonce: "nonce", args: []string{"positional", storedPaneReceiverRunArg}},
 	}
 
 	for _, test := range tests {
@@ -4343,25 +4345,6 @@ func TestStoredPaneNudgeReceiverInvocation(t *testing.T) {
 				t.Fatalf("isStoredPaneNudgeReceiverInvocation() = %v, want %v", got, test.want)
 			}
 		})
-	}
-}
-
-func TestStoredPaneNudgeReceiverBroadRunDoesNotActivate(t *testing.T) {
-	nonce := fmt.Sprintf("broad-%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
-	ctx, cancel := context.WithTimeout(context.Background(), constants.NudgeReadyTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, os.Args[0], strings.TrimSuffix(storedPaneReceiverRunArg, "$"))
-	cmd.Env = append(os.Environ(),
-		storedPaneReceiverEnv+"=1",
-		storedPaneNonceEnv+"="+nonce,
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("broad invocation: %v\n%s", err, output)
-	}
-	if strings.Contains(string(output), "READY "+nonce) {
-		t.Fatal("broad invocation activated receiver protocol")
 	}
 }
 
