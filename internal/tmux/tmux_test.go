@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/delivery"
 )
 
@@ -4287,27 +4290,337 @@ func TestNudgeSessionReceipt_AcceptsMatchingReceiptAfterAmbiguousComposerError(t
 	}
 }
 
+const (
+	storedPaneReceiverEnv = "GT_TEST_NUDGE_RECEIVER"
+	storedPaneNonceEnv    = "GT_TEST_NUDGE_NONCE"
+)
+
+var storedPaneNudgeSequence atomic.Uint64
+
+func TestNudgeStoredPaneReceiverProtocol(t *testing.T) {
+	nonce := fmt.Sprintf("protocol-%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
+	ctx, cancel := context.WithTimeout(context.Background(), constants.NudgeReadyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNudgeStoredPaneReceiverHelper$")
+	cmd.Env = append(os.Environ(),
+		storedPaneReceiverEnv+"=1",
+		storedPaneNonceEnv+"="+nonce,
+	)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("protocol: stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("protocol: stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("protocol: start helper: %v", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	wantReady := "READY " + nonce
+	ready := false
+	for scanner.Scan() {
+		if scanner.Text() == wantReady {
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		if ctx.Err() != nil {
+			t.Fatalf("protocol: helper timeout: %v", ctx.Err())
+		}
+		t.Fatalf("protocol: READY %s not observed", nonce)
+	}
+
+	message := "message-" + nonce
+	if _, err := fmt.Fprintln(stdin, message); err != nil {
+		t.Fatalf("protocol: write message: %v", err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatalf("protocol: close stdin: %v", err)
+	}
+
+	wantACK := fmt.Sprintf("ACK %s 1 %s", nonce, message)
+	ack := false
+	for scanner.Scan() {
+		if scanner.Text() == wantACK {
+			ack = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("protocol: read stdout: %v", err)
+	}
+	if !ack {
+		t.Fatalf("protocol: ACK %s not observed", nonce)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("protocol: helper exit: %v", err)
+	}
+}
+
+func TestNudgeStoredPaneReceiverHelper(t *testing.T) {
+	if os.Getenv(storedPaneReceiverEnv) != "1" {
+		return
+	}
+	nonce := os.Getenv(storedPaneNonceEnv)
+	if nonce == "" {
+		t.Fatal("helper: nonce is empty")
+	}
+
+	output := bufio.NewWriter(os.Stdout)
+	if _, err := fmt.Fprintf(output, "READY %s\n", nonce); err != nil {
+		t.Fatalf("helper: write READY: %v", err)
+	}
+	if err := output.Flush(); err != nil {
+		t.Fatalf("helper: flush READY: %v", err)
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	count := 0
+	for scanner.Scan() {
+		count++
+		if _, err := fmt.Fprintf(output, "ACK %s %d %s\n", nonce, count, scanner.Text()); err != nil {
+			t.Fatalf("helper: write ACK: %v", err)
+		}
+		if err := output.Flush(); err != nil {
+			t.Fatalf("helper: flush ACK: %v", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("helper: read stdin: %v", err)
+	}
+}
+
+const storedPanePollInterval = 10 * time.Millisecond
+
+func waitForExactPaneLine(tm *Tmux, pane, want string, deadline time.Time) (string, bool, error) {
+	var last string
+	for {
+		content, err := tm.CapturePaneAll(pane)
+		if err != nil {
+			return last, false, err
+		}
+		last = content
+		for _, line := range strings.Split(content, "\n") {
+			if line == want {
+				return content, true, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return last, false, nil
+		}
+		time.Sleep(storedPanePollInterval)
+	}
+}
+
+func waitForStablePaneOutput(tm *Tmux, pane string, deadline time.Time) (string, bool, error) {
+	var previous string
+	havePrevious := false
+	for {
+		content, err := tm.CapturePaneAll(pane)
+		if err != nil {
+			return previous, false, err
+		}
+		if havePrevious && content == previous {
+			return content, true, nil
+		}
+		previous = content
+		havePrevious = true
+		if !time.Now().Before(deadline) {
+			return previous, false, nil
+		}
+		time.Sleep(storedPanePollInterval)
+	}
+}
+
+func validateStoredPaneNudgeOutput(receiver, decoy, nonce, message string) error {
+	for _, line := range strings.Split(decoy, "\n") {
+		if strings.Contains(line, message) || strings.HasPrefix(line, "ACK ") {
+			return errors.New("routing: message observed in decoy pane")
+		}
+	}
+
+	ackPrefix := "ACK " + nonce + " "
+	var ackLines []string
+	for _, line := range strings.Split(receiver, "\n") {
+		if strings.HasPrefix(line, ackPrefix) {
+			ackLines = append(ackLines, line)
+		}
+	}
+	if len(ackLines) == 0 {
+		return errors.New("routing: receiver ACK missing")
+	}
+	if len(ackLines) != 1 {
+		return fmt.Errorf("delivery: ACK count = %d, want 1", len(ackLines))
+	}
+
+	countText, gotMessage, ok := strings.Cut(strings.TrimPrefix(ackLines[0], ackPrefix), " ")
+	if !ok {
+		return errors.New("delivery: malformed ACK line")
+	}
+	count, err := strconv.Atoi(countText)
+	if err != nil {
+		return errors.New("delivery: malformed ACK line")
+	}
+	if count != 1 {
+		return fmt.Errorf("delivery: ACK count = %d, want 1", count)
+	}
+	if gotMessage != message {
+		return errors.New("delivery: malformed ACK line")
+	}
+	return nil
+}
+
+func TestValidateStoredPaneNudgeOutput(t *testing.T) {
+	nonce := "123-1"
+	message := "message-123-1"
+	tests := []struct {
+		name     string
+		receiver string
+		decoy    string
+		wantErr  string
+	}{
+		{name: "success", receiver: "READY 123-1\nACK 123-1 1 message-123-1"},
+		{name: "missing", receiver: "READY 123-1", wantErr: "routing: receiver ACK missing"},
+		{name: "decoy", receiver: "ACK 123-1 1 message-123-1", decoy: "message-123-1", wantErr: "routing: message observed in decoy pane"},
+		{name: "duplicate", receiver: "ACK 123-1 1 message-123-1\nACK 123-1 2 message-123-1", wantErr: "delivery: ACK count = 2, want 1"},
+		{name: "wrong count", receiver: "ACK 123-1 2 message-123-1", wantErr: "delivery: ACK count = 2, want 1"},
+		{name: "malformed", receiver: "ACK 123-1 nope message-123-1", wantErr: "delivery: malformed ACK line"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateStoredPaneNudgeOutput(test.receiver, test.decoy, nonce, message)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate output: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != test.wantErr {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	tm := newTestTmux(t)
-	sessionName := "gt-test-nudge-paneid-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	nonce := fmt.Sprintf("%d-%d", os.Getpid(), storedPaneNudgeSequence.Add(1))
+	sessionName := "gt-test-nudge-paneid-" + nonce
+	receiverNonce := "receiver-" + nonce
+	decoyNonce := "decoy-" + nonce
+	message := "message-" + nonce
+	helperCommand := config.ShellQuote(os.Args[0]) + " -test.run=^TestNudgeStoredPaneReceiverHelper$"
 
-	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
-		t.Fatalf("NewSession: %v", err)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), helperCommand, map[string]string{
+		storedPaneReceiverEnv: "1",
+		storedPaneNonceEnv:    receiverNonce,
+	}); err != nil {
+		t.Fatalf("setup: READY %s not observed: create receiver: %v", receiverNonce, err)
 	}
-	defer func() { _ = tm.KillSession(sessionName) }()
+	t.Cleanup(func() {
+		killErr := tm.KillSession(sessionName)
+		has, err := tm.HasSession(sessionName)
+		if err != nil {
+			t.Errorf("cleanup: session %s still present: verify absence: %v", sessionName, err)
+			return
+		}
+		if has {
+			t.Errorf("cleanup: session %s still present: kill: %v", sessionName, killErr)
+		}
+	})
 
-	time.Sleep(200 * time.Millisecond)
-
-	paneID, err := tm.GetPaneID(sessionName)
+	receiverPane, err := tm.GetPaneID(sessionName)
 	if err != nil {
-		t.Fatalf("GetPaneID: %v", err)
+		t.Fatalf("setup: READY %s not observed: get receiver pane: %v", receiverNonce, err)
 	}
-	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", paneID); err != nil {
-		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	receiverReady := "READY " + receiverNonce
+	_, ready, err := waitForExactPaneLine(
+		tm,
+		receiverPane,
+		receiverReady,
+		time.Now().Add(constants.NudgeReadyTimeout),
+	)
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: %v", receiverNonce, err)
+	}
+	if !ready {
+		t.Fatalf("setup: READY %s not observed", receiverNonce)
 	}
 
-	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
-		t.Fatalf("NudgeSession() with GT_PANE_ID = %v, want nil", err)
+	decoyPane, err := tm.run(
+		"split-window",
+		"-P",
+		"-F", "#{pane_id}",
+		"-t", receiverPane,
+		"-e", storedPaneReceiverEnv+"=1",
+		"-e", storedPaneNonceEnv+"="+decoyNonce,
+		helperCommand,
+	)
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: create decoy: %v", decoyNonce, err)
+	}
+	decoyPane = strings.TrimSpace(decoyPane)
+	decoyReady := "READY " + decoyNonce
+	_, ready, err = waitForExactPaneLine(
+		tm,
+		decoyPane,
+		decoyReady,
+		time.Now().Add(constants.NudgeReadyTimeout),
+	)
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: %v", decoyNonce, err)
+	}
+	if !ready {
+		t.Fatalf("setup: READY %s not observed", decoyNonce)
+	}
+
+	if _, err := tm.run("select-pane", "-t", decoyPane); err != nil {
+		t.Fatalf("setup: READY %s not observed: select decoy: %v", decoyNonce, err)
+	}
+	activePane, err := tm.run("display-message", "-p", "-t", sessionName, "#{pane_id}")
+	if err != nil {
+		t.Fatalf("setup: READY %s not observed: read active pane: %v", decoyNonce, err)
+	}
+	if strings.TrimSpace(activePane) != decoyPane {
+		t.Fatalf("setup: READY %s not observed: decoy pane is not active", decoyNonce)
+	}
+
+	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", receiverPane); err != nil {
+		t.Fatalf("routing: receiver ACK missing: set GT_PANE_ID: %v", err)
+	}
+
+	if err := tm.NudgeSession(sessionName, message); err != nil {
+		t.Fatalf("routing: receiver ACK missing: %v", err)
+	}
+
+	deliveryDeadline := time.Now().Add(constants.NudgeReadyTimeout)
+	wantACK := fmt.Sprintf("ACK %s 1 %s", receiverNonce, message)
+	_, acknowledged, err := waitForExactPaneLine(tm, receiverPane, wantACK, deliveryDeadline)
+	if err != nil {
+		t.Fatalf("routing: receiver ACK missing: %v", err)
+	}
+	if !acknowledged {
+		t.Fatal("routing: receiver ACK missing")
+	}
+
+	receiverOutput, stable, err := waitForStablePaneOutput(tm, receiverPane, deliveryDeadline)
+	if err != nil {
+		t.Fatalf("delivery: receiver output did not stabilize: %v", err)
+	}
+	if !stable {
+		t.Fatal("delivery: receiver output did not stabilize")
+	}
+	decoyOutput, err := tm.CapturePaneAll(decoyPane)
+	if err != nil {
+		t.Fatalf("routing: message observed in decoy pane: capture: %v", err)
+	}
+	if err := validateStoredPaneNudgeOutput(receiverOutput, decoyOutput, receiverNonce, message); err != nil {
+		t.Fatal(err)
 	}
 }
 

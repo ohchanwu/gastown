@@ -19,7 +19,8 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	if os.Getenv("GT_TEST_SESSION_CUSTODY_HELPER") != "" ||
+	if os.Getenv("GT_TEST_NUDGE_RECEIVER") != "" ||
+		os.Getenv("GT_TEST_SESSION_CUSTODY_HELPER") != "" ||
 		os.Getenv("GT_TEST_SESSION_CUSTODY_WORKLOAD") != "" ||
 		os.Getenv("GT_TEST_SESSION_CGROUP_PROVISION_HELPER") != "" {
 		os.Exit(m.Run())
