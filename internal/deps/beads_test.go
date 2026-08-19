@@ -13,7 +13,7 @@ func TestParseBeadsVersion(t *testing.T) {
 		expected string
 	}{
 		{"bd version 0.55.4 (dev: main@3e1378e122c6)", "0.55.4"},
-		{"bd version 1.0.5 (dev: fix(foo)@3e1378e122c6)", "1.0.5"},
+		{"bd version 1.0.4 (dev: fix(foo)@abc123)", "1.0.4"},
 		{"bd version 0.55.4", "0.55.4"},
 		{"bd version 1.2.3", "1.2.3"},
 		{"bd version 10.20.30 (release)", "10.20.30"},
@@ -102,7 +102,7 @@ func TestCheckBeadsEnforcesReasonFileVersionFloor(t *testing.T) {
 	}{
 		{output: "bd version 1.0.3", version: "1.0.3", status: BeadsTooOld},
 		{output: "bd version 1.0.4", version: "1.0.4", status: BeadsOK},
-		{output: "bd version 1.0.5 (dev: fix(foo)@3e1378e122c6)", version: "1.0.5", status: BeadsOK},
+		{output: "bd version 1.0.4 (dev: fix(foo)@abc123)", version: "1.0.4", status: BeadsOK},
 		{output: `{"build":"test","schema_version":1,"version":"1.0.5"}`, version: "1.0.5", status: BeadsOK},
 		{output: `{"build":"bd version 9.9.9","schema_version":1,"version":"1.0.3"}`, version: "1.0.3", status: BeadsTooOld},
 		{output: `{"build":"test","version":"1.0.5"}`, version: "", status: BeadsUnknown},
