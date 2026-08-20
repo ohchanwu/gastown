@@ -38,6 +38,8 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	firstID := createMailThreadFixture(t, townRoot, env, "first", false, "gt:message", "thread:"+threadID, "from:deacon/")
 	secondID := createMailThreadFixture(t, townRoot, env, "second", false, "gt:message", "thread:"+threadID, "from:mayor/")
 	wispID := createMailThreadFixture(t, townRoot, env, "ephemeral", true, "gt:message", "thread:"+threadID, "from:deacon/")
+	queueID := createMailThreadFixtureForAssignee(t, townRoot, env, "queue", "queue:triage", false, "gt:message", "gt:escalation", "msg-type:escalation", "thread:"+threadID, "from:reaper", "queue:triage")
+	channelID := createMailThreadFixtureForAssignee(t, townRoot, env, "channel", "channel:alerts", false, "gt:message", "gt:escalation", "msg-type:escalation", "thread:"+threadID, "from:reaper", "channel:alerts")
 	createMailThreadFixture(t, townRoot, env, "other thread", false, "gt:message", "thread:other", "from:deacon/")
 	createMailThreadFixture(t, townRoot, env, "missing message label", false, "thread:"+threadID, "from:deacon/")
 	createMailThreadFixture(t, townRoot, env, "missing thread label", false, "gt:message", "from:deacon/")
@@ -49,7 +51,7 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	if err := json.Unmarshal([]byte(output), &messages); err != nil {
 		t.Fatalf("decode gt mail thread output: %v\nstdout: %s", err, output)
 	}
-	wantIDs := map[string]bool{firstID: true, secondID: true, wispID: true}
+	wantIDs := map[string]bool{firstID: true, secondID: true, wispID: true, queueID: true, channelID: true}
 	if len(messages) != len(wantIDs) {
 		t.Fatalf("gt mail thread returned %d messages, want %d: %s", len(messages), len(wantIDs), output)
 	}
@@ -72,6 +74,12 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	}
 	if !byID[wispID].Wisp {
 		t.Fatalf("ephemeral message %q was not preserved as a wisp", wispID)
+	}
+	if byID[queueID].To != "queue:triage" || byID[queueID].Queue != "triage" || byID[queueID].Type != mail.TypeEscalation {
+		t.Fatalf("queue route was not preserved: %#v", byID[queueID])
+	}
+	if byID[channelID].To != "channel:alerts" || byID[channelID].Channel != "alerts" || byID[channelID].Type != mail.TypeEscalation {
+		t.Fatalf("channel route was not preserved: %#v", byID[channelID])
 	}
 
 	missing := runMailThreadFixtureCommand(t, townRoot, env, gtBinary, "mail", "thread", "thread-missing", "--json")
@@ -96,7 +104,12 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 
 func createMailThreadFixture(t *testing.T, townRoot string, env []string, title string, ephemeral bool, labels ...string) string {
 	t.Helper()
-	args := []string{"create", title, "--assignee", "mayor", "--labels", strings.Join(labels, ","), "--silent"}
+	return createMailThreadFixtureForAssignee(t, townRoot, env, title, "mayor", ephemeral, labels...)
+}
+
+func createMailThreadFixtureForAssignee(t *testing.T, townRoot string, env []string, title, assignee string, ephemeral bool, labels ...string) string {
+	t.Helper()
+	args := []string{"create", title, "--assignee", assignee, "--labels", strings.Join(labels, ","), "--silent"}
 	if ephemeral {
 		args = append(args, "--ephemeral")
 	}

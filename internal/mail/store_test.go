@@ -69,14 +69,53 @@ func TestMailboxStoreListByThread(t *testing.T) {
 }
 
 func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
-	store := &threadSearchStore{issues: []*beadsdk.Issue{{
-		ID: "msg-1", Title: "message", Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"},
-	}}}
-	t.Setenv("PATH", t.TempDir())
-	m := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store)
+	tests := []struct {
+		name  string
+		issue *beadsdk.Issue
+	}{
+		{name: "nil"},
+		{name: "missing route", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Labels: []string{"gt:message", "thread:thread-target", "from:mayor/"},
+		}},
+		{name: "wrong thread", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-other", "from:mayor/"},
+		}},
+		{name: "queue assignee mismatch", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "queue:other",
+			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "queue:triage"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &threadSearchStore{issues: []*beadsdk.Issue{tt.issue}}
+			t.Setenv("PATH", t.TempDir())
+			m := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store)
+			if _, err := m.ListByThread("thread-target"); err == nil {
+				t.Fatal("ListByThread succeeded, want invalid stored message error")
+			}
+		})
+	}
+}
 
-	if _, err := m.ListByThread("thread-target"); err == nil {
-		t.Fatal("ListByThread succeeded, want invalid stored message error")
+func TestMailboxStoreListByThreadAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
+	store := &threadSearchStore{issues: []*beadsdk.Issue{
+		{
+			ID: "msg-queue", Title: "queue message", Assignee: "queue:triage",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "queue:triage"},
+		},
+		{
+			ID: "msg-channel", Title: "channel message", Assignee: "channel:alerts",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "channel:alerts"},
+		},
+	}}
+	t.Setenv("PATH", t.TempDir())
+	messages, err := NewMailboxBeadsWithStore("gastown/Toast", t.TempDir(), store).ListByThread("thread-target")
+	if err != nil {
+		t.Fatalf("ListByThread: %v", err)
+	}
+	if len(messages) != 2 || messages[0].Channel != "alerts" || messages[1].Queue != "triage" {
+		t.Fatalf("messages = %#v, want channel and queue routes", messages)
 	}
 }
 

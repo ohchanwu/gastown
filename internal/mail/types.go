@@ -270,6 +270,30 @@ func (m *Message) Validate() error {
 	return nil
 }
 
+// ValidateStored validates a message reconstructed from Beads storage. Queue
+// and channel records use their routing address as the storage assignee, so To
+// is expected to duplicate the logical Queue or Channel route.
+func (m *Message) ValidateStored() error {
+	if m == nil {
+		return fmt.Errorf("message must not be nil")
+	}
+	logical := *m
+	if logical.Queue != "" {
+		if logical.Channel != "" || logical.To != "queue:"+logical.Queue {
+			return fmt.Errorf("stored queue message has inconsistent route")
+		}
+		logical.To = ""
+	} else if logical.Channel != "" {
+		if logical.To != "channel:"+logical.Channel {
+			return fmt.Errorf("stored channel message has inconsistent route")
+		}
+		logical.To = ""
+	} else if strings.HasPrefix(logical.To, "queue:") || strings.HasPrefix(logical.To, "channel:") {
+		return fmt.Errorf("stored message is missing its route label")
+	}
+	return logical.Validate()
+}
+
 // GenerateID creates a random message ID for in-memory tracking (notifications, logging).
 // Falls back to time-based ID if crypto/rand fails (extremely rare).
 // NOTE: This ID is NOT passed to bd create — bd auto-generates IDs with the correct

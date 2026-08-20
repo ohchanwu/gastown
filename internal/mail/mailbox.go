@@ -1423,7 +1423,7 @@ func decodeThreadList(stdout []byte, threadID string) ([]*Message, error) {
 			return nil, fmt.Errorf("message %d is null", i)
 		}
 		var bm BeadsMessage
-		if err := json.Unmarshal(record, &bm); err != nil {
+		if err := decodeThreadRecord(record, &bm); err != nil {
 			return nil, fmt.Errorf("message %d: %w", i, err)
 		}
 		message := bm.ToMessage()
@@ -1433,6 +1433,43 @@ func decodeThreadList(stdout []byte, threadID string) ([]*Message, error) {
 		messages = append(messages, message)
 	}
 	return messages, nil
+}
+
+func decodeThreadRecord(record json.RawMessage, message *BeadsMessage) error {
+	decoder := json.NewDecoder(bytes.NewReader(record))
+	start, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if start != json.Delim('{') {
+		return errors.New("expected message object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return errors.New("invalid message field")
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate message field %q", name)
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return err
+	}
+	return json.Unmarshal(record, message)
 }
 
 func threadListData(stdout []byte) (json.RawMessage, error) {
@@ -1513,7 +1550,13 @@ func validateThreadMessage(message *Message, labels []string, threadID string) e
 	if !hasExactString(labels, "thread:"+threadID) || message.ThreadID != threadID {
 		return errors.New("wrong or missing thread label")
 	}
-	return message.Validate()
+	if message.Queue != "" && !hasExactString(labels, "queue:"+message.Queue) {
+		return errors.New("missing queue route label")
+	}
+	if message.Channel != "" && !hasExactString(labels, "channel:"+message.Channel) {
+		return errors.New("missing channel route label")
+	}
+	return message.ValidateStored()
 }
 
 func sortThreadMessages(messages []*Message) {

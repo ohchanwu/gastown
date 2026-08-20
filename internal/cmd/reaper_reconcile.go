@@ -221,13 +221,23 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 	}
 	targets := extractMailTargetsFromActions(escalationConfig.GetRouteForSeverity(config.SeverityMedium))
 	router := mail.NewRouter(townRoot)
+	var concreteTargets []string
+	targetsResolved := false
 	result, err := reconcileAnomalyScans(scans, anomalyReconcileDeps{
 		now:    time.Now,
 		list:   bd.ListEscalationOccurrences,
 		create: bd.CreateEscalationBead,
 		close:  bd.CloseEscalation,
 		send: func(issue *beads.Issue, anomaly reaper.Anomaly) error {
-			return sendReaperAnomalyMail(issue, anomaly, targets,
+			if !targetsResolved {
+				resolved, resolveErr := expandReaperMailTargets(targets, router.ExpandListAddress, router.ResolveGroupAddress)
+				if resolveErr != nil {
+					return fmt.Errorf("resolving Reaper mail targets: %w", resolveErr)
+				}
+				concreteTargets = resolved
+				targetsResolved = true
+			}
+			return sendReaperAnomalyMail(issue, anomaly, concreteTargets,
 				func(target, threadID string) ([]*mail.Message, error) {
 					return mail.NewMailboxFromAddress(target, townRoot).ListByThread(threadID)
 				},
@@ -258,6 +268,69 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("incomplete anomaly scopes preserved: %s", strings.Join(incomplete, "; "))
 	}
 	return nil
+}
+
+func expandReaperMailTargets(
+	targets []string,
+	expandList func(string) ([]string, error),
+	resolveGroup func(string) ([]string, error),
+) ([]string, error) {
+	var recipients []string
+	seenRecipients := make(map[string]bool)
+	resolvedFanout := make(map[string]bool)
+	resolving := make(map[string]bool)
+	var add func(string) error
+	add = func(target string) error {
+		var expand func(string) ([]string, error)
+		switch {
+		case strings.HasPrefix(target, "list:"):
+			expand = expandList
+		case strings.HasPrefix(target, "@"):
+			expand = resolveGroup
+		default:
+			identity := mail.AddressToIdentity(target)
+			if identity == "" {
+				return errors.New("empty Reaper mail target")
+			}
+			if !seenRecipients[identity] {
+				seenRecipients[identity] = true
+				recipients = append(recipients, target)
+			}
+			return nil
+		}
+
+		if resolving[target] {
+			return fmt.Errorf("cyclic fan-out target %q", target)
+		}
+		if resolvedFanout[target] {
+			return nil
+		}
+		resolving[target] = true
+		expanded, err := expand(target)
+		if err != nil {
+			delete(resolving, target)
+			return fmt.Errorf("expanding %q: %w", target, err)
+		}
+		if len(expanded) == 0 {
+			delete(resolving, target)
+			return fmt.Errorf("fan-out target %q has no recipients", target)
+		}
+		for _, recipient := range expanded {
+			if err := add(recipient); err != nil {
+				delete(resolving, target)
+				return err
+			}
+		}
+		delete(resolving, target)
+		resolvedFanout[target] = true
+		return nil
+	}
+	for _, target := range targets {
+		if err := add(target); err != nil {
+			return nil, err
+		}
+	}
+	return recipients, nil
 }
 
 func sendReaperAnomalyMail(
@@ -298,7 +371,7 @@ func sendReaperAnomalyMail(
 }
 
 func isStoredReaperNotice(message *mail.Message, target, threadID string) bool {
-	if message == nil || message.Validate() != nil {
+	if message == nil || message.ValidateStored() != nil {
 		return false
 	}
 	return mail.AddressToIdentity(message.From) == "reaper" &&

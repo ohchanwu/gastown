@@ -303,6 +303,10 @@ func (r *Router) ensureCustomTypes(beadsDir string) error {
 }
 
 func (r *Router) buildLabels(msg *Message) []string {
+	return buildMessageLabels(msg, true)
+}
+
+func buildMessageLabels(msg *Message, includeDelivery bool) []string {
 	var labels []string
 	labels = append(labels, "gt:message")
 	if msg.Type == TypeEscalation {
@@ -310,7 +314,9 @@ func (r *Router) buildLabels(msg *Message) []string {
 	}
 	labels = append(labels, "from:"+msg.From)
 	labels = append(labels, "msg-type:"+string(msg.Type))
-	labels = append(labels, DeliverySendLabels()...)
+	if includeDelivery {
+		labels = append(labels, DeliverySendLabels()...)
+	}
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -1332,22 +1338,9 @@ func (r *Router) sendToQueue(msg *Message) error {
 		return err
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus queue metadata
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
+	// Build labels for type, from/thread/reply-to/cc plus queue metadata.
+	labels := r.buildLabels(msg)
 	labels = append(labels, "queue:"+queueName)
-	labels = append(labels, DeliverySendLabels()...)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
 
 	// Build command: bd create --assignee=queue:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.
@@ -1504,20 +1497,8 @@ func (r *Router) sendToChannel(msg *Message) error {
 	// Note: delivery:pending is intentionally omitted for the channel-origin
 	// copy — it has no single recipient to ack. Subscriber fan-out copies go
 	// through sendToSingle which adds delivery tracking.
-	var labels []string
-	labels = append(labels, "gt:message")
-	labels = append(labels, "from:"+msg.From)
+	labels := buildMessageLabels(msg, false)
 	labels = append(labels, "channel:"+channelName)
-	if msg.ThreadID != "" {
-		labels = append(labels, "thread:"+msg.ThreadID)
-	}
-	if msg.ReplyTo != "" {
-		labels = append(labels, "reply-to:"+msg.ReplyTo)
-	}
-	for _, cc := range msg.CC {
-		ccIdentity := AddressToIdentity(cc)
-		labels = append(labels, "cc:"+ccIdentity)
-	}
 
 	// Build command: bd create --assignee=channel:<name> -d <body> ... -- <subject>
 	// Flags go first, then -- to end flag parsing, then the positional subject.

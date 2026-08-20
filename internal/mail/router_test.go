@@ -2211,6 +2211,21 @@ func TestRouterSendEscalationAddsStructuredLabels(t *testing.T) {
 	}
 }
 
+func TestBuildMessageLabelsCanOmitDeliveryWithoutDroppingEscalationType(t *testing.T) {
+	msg := &Message{From: "reaper", Type: TypeEscalation, ThreadID: "hq-abc123"}
+	labels := buildMessageLabels(msg, false)
+	for _, want := range []string{"gt:message", "gt:escalation", "msg-type:escalation", "from:reaper", "thread:hq-abc123"} {
+		if !containsLabel(labels, want) {
+			t.Fatalf("labels %v missing %q", labels, want)
+		}
+	}
+	for _, label := range labels {
+		if strings.HasPrefix(label, "delivery:") {
+			t.Fatalf("labels %v contain delivery metadata", labels)
+		}
+	}
+}
+
 func containsLabel(labels []string, want string) bool {
 	for _, label := range labels {
 		if label == want {

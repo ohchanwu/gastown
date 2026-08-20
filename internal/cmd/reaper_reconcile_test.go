@@ -44,6 +44,129 @@ func TestSendReaperAnomalyMailChecksCustodyPerTarget(t *testing.T) {
 	}
 }
 
+func TestExpandReaperMailTargetsResolvesFanoutAndDeduplicates(t *testing.T) {
+	targets, err := expandReaperMailTargets(
+		[]string{"list:oncall", "@witnesses", "queue:triage", "gastown/witness"},
+		func(address string) ([]string, error) {
+			if address != "list:oncall" {
+				t.Fatalf("list address = %q", address)
+			}
+			return []string{"mayor/", "gastown/witness"}, nil
+		},
+		func(address string) ([]string, error) {
+			if address != "@witnesses" {
+				t.Fatalf("group address = %q", address)
+			}
+			return []string{"gastown/witness", "other/witness"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"mayor/", "gastown/witness", "other/witness", "queue:triage"}
+	if len(targets) != len(want) {
+		t.Fatalf("targets = %#v, want %#v", targets, want)
+	}
+	for i := range want {
+		if targets[i] != want[i] {
+			t.Fatalf("targets = %#v, want %#v", targets, want)
+		}
+	}
+}
+
+func TestSendReaperAnomalyMailRetriesOnlyMissingFanoutRecipients(t *testing.T) {
+	issue := &beads.Issue{ID: "hq-escalation"}
+	anomaly := testReaperAnomaly("hq-child")
+	targets, err := expandReaperMailTargets(
+		[]string{"list:oncall"},
+		func(string) ([]string, error) { return []string{"gastown/witness", "overseer"}, nil },
+		func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := make(map[string]*mail.Message)
+	attempts := make(map[string]int)
+	list := func(_, _ string) ([]*mail.Message, error) {
+		messages := make([]*mail.Message, 0, len(stored))
+		for _, message := range stored {
+			messages = append(messages, message)
+		}
+		return messages, nil
+	}
+	send := func(message *mail.Message) error {
+		attempts[message.To]++
+		if message.To == "overseer" && attempts[message.To] == 1 {
+			return errors.New("injected partial fanout failure")
+		}
+		copy := *message
+		copy.ID = "stored-" + message.To
+		stored[message.To] = &copy
+		return nil
+	}
+
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err == nil {
+		t.Fatal("first fanout succeeded, want injected partial failure")
+	}
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err != nil {
+		t.Fatalf("fanout retry: %v", err)
+	}
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err != nil {
+		t.Fatalf("post-store marker retry: %v", err)
+	}
+	if attempts["gastown/witness"] != 1 || attempts["overseer"] != 2 {
+		t.Fatalf("attempts = %#v, want witness=1 overseer=2", attempts)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("stored = %#v, want one notice per concrete recipient", stored)
+	}
+}
+
+func TestReconcileAnomalyScansFanoutMarkerRetryDoesNotDuplicateMail(t *testing.T) {
+	lifecycle := newIsolatedAnomalyLifecycle()
+	lifecycle.markerErr = errors.New("injected marker failure")
+	targets, err := expandReaperMailTargets(
+		[]string{"list:oncall"},
+		func(string) ([]string, error) { return []string{"gastown/witness", "overseer"}, nil },
+		func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := make(map[string]*mail.Message)
+	attempts := make(map[string]int)
+	deps := lifecycle.deps()
+	deps.send = func(issue *beads.Issue, anomaly reaper.Anomaly) error {
+		return sendReaperAnomalyMail(issue, anomaly, targets,
+			func(_, _ string) ([]*mail.Message, error) {
+				messages := make([]*mail.Message, 0, len(stored))
+				for _, message := range stored {
+					messages = append(messages, message)
+				}
+				return messages, nil
+			},
+			func(message *mail.Message) error {
+				attempts[message.To]++
+				copy := *message
+				copy.ID = "stored-" + message.To
+				stored[message.To] = &copy
+				return nil
+			},
+		)
+	}
+	scan := completeAnomalyScan(testReaperAnomaly("hq-child"))
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, deps); err == nil {
+		t.Fatal("first reconcile succeeded, want marker failure")
+	}
+	lifecycle.markerErr = nil
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, deps); err != nil {
+		t.Fatalf("marker retry: %v", err)
+	}
+	if attempts["gastown/witness"] != 1 || attempts["overseer"] != 1 {
+		t.Fatalf("attempts = %#v, want one send per concrete recipient", attempts)
+	}
+}
+
 func TestIsStoredReaperNoticeRequiresMatchingValidNotice(t *testing.T) {
 	valid := mail.Message{
 		ID:       "hq-message",
@@ -70,6 +193,29 @@ func TestIsStoredReaperNoticeRequiresMatchingValidNotice(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isStoredReaperNotice(tt.message, "gastown/witness", "hq-escalation"); got != tt.want {
 				t.Fatalf("isStoredReaperNotice() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsStoredReaperNoticeAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		set    func(*mail.Message)
+	}{
+		{name: "queue", target: "queue:triage", set: func(message *mail.Message) { message.Queue = "triage" }},
+		{name: "channel", target: "channel:alerts", set: func(message *mail.Message) { message.Channel = "alerts" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			message := &mail.Message{
+				ID: "hq-message", From: "reaper", To: tt.target,
+				Subject: "[MEDIUM] Reaper anomaly", Type: mail.TypeEscalation, ThreadID: "hq-escalation",
+			}
+			tt.set(message)
+			if !isStoredReaperNotice(message, tt.target, "hq-escalation") {
+				t.Fatalf("stored %s notice was not accepted: %#v", tt.name, message)
 			}
 		})
 	}
