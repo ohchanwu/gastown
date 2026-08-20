@@ -77,6 +77,14 @@ func TestExpandReaperMailTargetsResolvesFanoutAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestReaperChannelRecipientsExcludeNormalizedSelf(t *testing.T) {
+	got := reaperChannelRecipients([]string{"reaper", "reaper/", "gastown/witness", "overseer"})
+	want := []string{"gastown/witness", "overseer"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("recipients = %v, want %v", got, want)
+	}
+}
+
 func TestSendReaperAnomalyMailRetriesOnlyMissingFanoutRecipients(t *testing.T) {
 	issue := &beads.Issue{ID: "hq-escalation"}
 	anomaly := testReaperAnomaly("hq-child")

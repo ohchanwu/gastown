@@ -1549,6 +1549,19 @@ func validateThreadMessage(message *Message, labels []string, threadID string) e
 	if err := validateSingletonThreadLabels(labels); err != nil {
 		return err
 	}
+	escalationMarkers := 0
+	for _, label := range labels {
+		if label == "gt:escalation" {
+			escalationMarkers++
+		}
+	}
+	if message.Type == TypeEscalation {
+		if escalationMarkers != 1 {
+			return errors.New("escalation message must have exactly one gt:escalation label")
+		}
+	} else if escalationMarkers != 0 {
+		return errors.New("gt:escalation label on non-escalation message")
+	}
 	if !hasExactString(labels, "gt:message") {
 		return errors.New("missing gt:message label")
 	}

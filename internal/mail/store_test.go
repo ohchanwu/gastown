@@ -97,6 +97,18 @@ func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
 			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
 			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "msg-type:notification", "msg-type:escalation"},
 		}},
+		{name: "escalation marker missing", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "msg-type:escalation"},
+		}},
+		{name: "duplicate escalation markers", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "gt:escalation", "gt:escalation", "thread:thread-target", "from:reaper", "msg-type:escalation"},
+		}},
+		{name: "escalation marker on notification", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "gt:escalation", "thread:thread-target", "from:reaper", "msg-type:notification"},
+		}},
 		{name: "announce route label missing", issue: &beadsdk.Issue{
 			ID: "msg-1", Title: "message", Assignee: "announce:alerts",
 			Labels: []string{"gt:message", "thread:thread-target", "from:reaper"},
