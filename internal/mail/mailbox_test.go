@@ -464,7 +464,7 @@ func TestMailboxBeadsListByThreadSchemaV1Envelope(t *testing.T) {
 	}
 }
 
-func TestMailboxBeadsListByThreadAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
+func TestMailboxBeadsListByThreadAcceptsStoredQueueChannelAndAnnounceRoutes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fake bd is POSIX-only")
 	}
@@ -478,20 +478,30 @@ func TestMailboxBeadsListByThreadAcceptsStoredQueueAndChannelRoutes(t *testing.T
 			ID: "msg-channel", Title: "channel message", Assignee: "channel:alerts",
 			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "channel:alerts"},
 		},
+		{
+			ID: "msg-announce", Title: "announce message", Assignee: "announce:alerts",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "announce:alerts"},
+		},
 	})
 	messages, err := m.ListByThread("thread-target")
 	if err != nil {
 		t.Fatalf("ListByThread: %v", err)
 	}
-	if len(messages) != 2 {
-		t.Fatalf("ListByThread returned %d messages, want 2", len(messages))
+	if len(messages) != 3 {
+		t.Fatalf("ListByThread returned %d messages, want 3", len(messages))
 	}
-	byID := map[string]*Message{messages[0].ID: messages[0], messages[1].ID: messages[1]}
+	byID := make(map[string]*Message, len(messages))
+	for _, message := range messages {
+		byID[message.ID] = message
+	}
 	if got := byID["msg-queue"]; got == nil || got.To != "queue:triage" || got.Queue != "triage" {
 		t.Fatalf("queue message = %#v", got)
 	}
 	if got := byID["msg-channel"]; got == nil || got.To != "channel:alerts" || got.Channel != "alerts" {
 		t.Fatalf("channel message = %#v", got)
+	}
+	if got := byID["msg-announce"]; got == nil || got.To != "announce:alerts" {
+		t.Fatalf("announce message = %#v", got)
 	}
 }
 
@@ -545,6 +555,8 @@ func TestMailboxBeadsListByThreadRejectsInvalidOutput(t *testing.T) {
 		{name: "duplicate record assignee", stdout: `[{"id":"msg-1","title":"message","assignee":"overseer","assignee":"mayor/","labels":["gt:message","thread:thread-target","from:reaper"]}]`},
 		{name: "duplicate record labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":[],"labels":["gt:message","thread:thread-target","from:reaper"]}]`},
 		{name: "case folded duplicate record labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":[],"Labels":["gt:message","thread:thread-target","from:reaper"]}]`},
+		{name: "unicode folded duplicate record labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":[],"labelſ":["gt:message","thread:thread-target","from:reaper"]}]`},
+		{name: "unicode folded duplicate record assignee", stdout: `[{"id":"msg-1","title":"message","assignee":"overseer","aſſignee":"mayor/","labels":["gt:message","thread:thread-target","from:reaper"]}]`},
 		{name: "duplicate sender labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["gt:message","thread:thread-target","from:mayor/","from:reaper"]}]`},
 		{name: "duplicate thread labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["gt:message","thread:thread-other","thread:thread-target","from:reaper"]}]`},
 		{name: "duplicate message type labels", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["gt:message","thread:thread-target","from:reaper","msg-type:notification","msg-type:escalation"]}]`},
@@ -553,6 +565,10 @@ func TestMailboxBeadsListByThreadRejectsInvalidOutput(t *testing.T) {
 		{name: "queue assignee mismatch", stdout: `[{"id":"msg-1","title":"message","assignee":"queue:other","labels":["gt:message","thread:thread-target","from:reaper","queue:triage"]}]`},
 		{name: "queue route label missing", stdout: `[{"id":"msg-1","title":"message","assignee":"queue:triage","labels":["gt:message","thread:thread-target","from:reaper"]}]`},
 		{name: "channel assignee mismatch", stdout: `[{"id":"msg-1","title":"message","assignee":"channel:other","labels":["gt:message","thread:thread-target","from:reaper","channel:alerts"]}]`},
+		{name: "announce route label missing", stdout: `[{"id":"msg-1","title":"message","assignee":"announce:alerts","labels":["gt:message","thread:thread-target","from:reaper"]}]`},
+		{name: "announce assignee mismatch", stdout: `[{"id":"msg-1","title":"message","assignee":"announce:other","labels":["gt:message","thread:thread-target","from:reaper","announce:alerts"]}]`},
+		{name: "duplicate announce labels", stdout: `[{"id":"msg-1","title":"message","assignee":"announce:alerts","labels":["gt:message","thread:thread-target","from:reaper","announce:other","announce:alerts"]}]`},
+		{name: "announce label on direct message", stdout: `[{"id":"msg-1","title":"message","assignee":"mayor/","labels":["gt:message","thread:thread-target","from:reaper","announce:alerts"]}]`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

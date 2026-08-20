@@ -1444,7 +1444,7 @@ func decodeThreadRecord(record json.RawMessage, message *BeadsMessage) error {
 	if start != json.Delim('{') {
 		return errors.New("expected message object")
 	}
-	seen := make(map[string]bool)
+	var seen []string
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
@@ -1454,11 +1454,12 @@ func decodeThreadRecord(record json.RawMessage, message *BeadsMessage) error {
 		if !ok {
 			return errors.New("invalid message field")
 		}
-		canonicalName := strings.ToLower(name)
-		if seen[canonicalName] {
-			return fmt.Errorf("duplicate message field %q", name)
+		for _, previous := range seen {
+			if strings.EqualFold(previous, name) {
+				return fmt.Errorf("duplicate message field %q", name)
+			}
 		}
-		seen[canonicalName] = true
+		seen = append(seen, name)
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
 			return err
@@ -1560,6 +1561,21 @@ func validateThreadMessage(message *Message, labels []string, threadID string) e
 	if message.Channel != "" && !hasExactString(labels, "channel:"+message.Channel) {
 		return errors.New("missing channel route label")
 	}
+	announce := ""
+	hasAnnounce := false
+	for _, label := range labels {
+		if strings.HasPrefix(label, "announce:") {
+			hasAnnounce = true
+			announce = strings.TrimPrefix(label, "announce:")
+		}
+	}
+	if strings.HasPrefix(message.To, "announce:") {
+		if !hasAnnounce || announce == "" || message.To != "announce:"+announce {
+			return errors.New("missing or inconsistent announce route label")
+		}
+	} else if hasAnnounce {
+		return errors.New("announce route label on non-announce message")
+	}
 	return message.ValidateStored()
 }
 
@@ -1571,7 +1587,7 @@ func validateSingletonThreadLabels(labels []string) error {
 			continue
 		}
 		switch key {
-		case "from", "thread", "msg-type", "queue", "channel":
+		case "from", "thread", "msg-type", "queue", "channel", "announce":
 			if seen[key] {
 				return fmt.Errorf("duplicate %s label", key)
 			}

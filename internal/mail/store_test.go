@@ -97,6 +97,22 @@ func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
 			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
 			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "msg-type:notification", "msg-type:escalation"},
 		}},
+		{name: "announce route label missing", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "announce:alerts",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper"},
+		}},
+		{name: "announce assignee mismatch", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "announce:other",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "announce:alerts"},
+		}},
+		{name: "duplicate announce labels", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "announce:alerts",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "announce:other", "announce:alerts"},
+		}},
+		{name: "announce label on direct message", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "announce:alerts"},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -110,8 +126,12 @@ func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
 	}
 }
 
-func TestMailboxStoreListByThreadAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
+func TestMailboxStoreListByThreadAcceptsStoredQueueChannelAndAnnounceRoutes(t *testing.T) {
 	store := &threadSearchStore{issues: []*beadsdk.Issue{
+		{
+			ID: "msg-announce", Title: "announce message", Assignee: "announce:alerts",
+			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "announce:alerts"},
+		},
 		{
 			ID: "msg-queue", Title: "queue message", Assignee: "queue:triage",
 			Labels: []string{"gt:message", "thread:thread-target", "from:reaper", "queue:triage"},
@@ -126,8 +146,15 @@ func TestMailboxStoreListByThreadAcceptsStoredQueueAndChannelRoutes(t *testing.T
 	if err != nil {
 		t.Fatalf("ListByThread: %v", err)
 	}
-	if len(messages) != 2 || messages[0].Channel != "alerts" || messages[1].Queue != "triage" {
-		t.Fatalf("messages = %#v, want channel and queue routes", messages)
+	if len(messages) != 3 {
+		t.Fatalf("messages = %#v, want announce, channel, and queue routes", messages)
+	}
+	byID := make(map[string]*Message, len(messages))
+	for _, message := range messages {
+		byID[message.ID] = message
+	}
+	if byID["msg-announce"].To != "announce:alerts" || byID["msg-channel"].Channel != "alerts" || byID["msg-queue"].Queue != "triage" {
+		t.Fatalf("messages = %#v, want announce, channel, and queue routes", messages)
 	}
 }
 
