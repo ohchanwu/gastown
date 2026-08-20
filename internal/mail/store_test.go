@@ -85,6 +85,18 @@ func TestMailboxStoreListByThreadRejectsInvalidMessage(t *testing.T) {
 			ID: "msg-1", Title: "message", Assignee: "queue:other",
 			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "queue:triage"},
 		}},
+		{name: "duplicate sender labels", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "from:reaper"},
+		}},
+		{name: "duplicate thread labels", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-other", "thread:thread-target", "from:mayor/"},
+		}},
+		{name: "duplicate message type labels", issue: &beadsdk.Issue{
+			ID: "msg-1", Title: "message", Assignee: "gastown/Toast",
+			Labels: []string{"gt:message", "thread:thread-target", "from:mayor/", "msg-type:notification", "msg-type:escalation"},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

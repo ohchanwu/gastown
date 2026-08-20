@@ -59,6 +59,9 @@ func TestExpandReaperMailTargetsResolvesFanoutAndDeduplicates(t *testing.T) {
 			}
 			return []string{"gastown/witness", "other/witness"}, nil
 		},
+		func(address string) ([]string, error) {
+			return nil, fmt.Errorf("unexpected channel lookup %q", address)
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +84,7 @@ func TestSendReaperAnomalyMailRetriesOnlyMissingFanoutRecipients(t *testing.T) {
 		[]string{"list:oncall"},
 		func(string) ([]string, error) { return []string{"gastown/witness", "overseer"}, nil },
 		func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+		func(string) ([]string, error) { return nil, errors.New("unexpected channel lookup") },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +126,57 @@ func TestSendReaperAnomalyMailRetriesOnlyMissingFanoutRecipients(t *testing.T) {
 	}
 }
 
+func TestSendReaperAnomalyMailRetriesOnlyMissingChannelSubscribers(t *testing.T) {
+	issue := &beads.Issue{ID: "hq-escalation"}
+	anomaly := testReaperAnomaly("hq-child")
+	targets, err := expandReaperMailTargets(
+		[]string{"channel:alerts"},
+		func(string) ([]string, error) { return nil, errors.New("unexpected list lookup") },
+		func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+		func(address string) ([]string, error) {
+			if address != "channel:alerts" {
+				t.Fatalf("channel address = %q", address)
+			}
+			return []string{"gastown/witness", "overseer"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := make(map[string]*mail.Message)
+	attempts := make(map[string]int)
+	list := func(_, _ string) ([]*mail.Message, error) {
+		messages := make([]*mail.Message, 0, len(stored))
+		for _, message := range stored {
+			messages = append(messages, message)
+		}
+		return messages, nil
+	}
+	send := func(message *mail.Message) error {
+		attempts[message.To]++
+		if message.To == "overseer" && attempts[message.To] == 1 {
+			return errors.New("injected channel subscriber failure")
+		}
+		copy := *message
+		copy.ID = "stored-" + message.To
+		stored[message.To] = &copy
+		return nil
+	}
+
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err == nil {
+		t.Fatal("first channel fanout succeeded, want injected subscriber failure")
+	}
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err != nil {
+		t.Fatalf("channel fanout retry: %v", err)
+	}
+	if err := sendReaperAnomalyMail(issue, anomaly, targets, list, send); err != nil {
+		t.Fatalf("channel marker retry: %v", err)
+	}
+	if attempts["gastown/witness"] != 1 || attempts["overseer"] != 2 {
+		t.Fatalf("attempts = %#v, want witness=1 overseer=2", attempts)
+	}
+}
+
 func TestReconcileAnomalyScansFanoutMarkerRetryDoesNotDuplicateMail(t *testing.T) {
 	lifecycle := newIsolatedAnomalyLifecycle()
 	lifecycle.markerErr = errors.New("injected marker failure")
@@ -129,6 +184,7 @@ func TestReconcileAnomalyScansFanoutMarkerRetryDoesNotDuplicateMail(t *testing.T
 		[]string{"list:oncall"},
 		func(string) ([]string, error) { return []string{"gastown/witness", "overseer"}, nil },
 		func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+		func(string) ([]string, error) { return nil, errors.New("unexpected channel lookup") },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -167,6 +223,106 @@ func TestReconcileAnomalyScansFanoutMarkerRetryDoesNotDuplicateMail(t *testing.T
 	}
 }
 
+func TestReconcileAnomalyScansAnnounceMarkerRetryDoesNotDuplicateMail(t *testing.T) {
+	lifecycle := newIsolatedAnomalyLifecycle()
+	lifecycle.markerErr = errors.New("injected marker failure")
+	stored := make([]*mail.Message, 0, 1)
+	attempts := 0
+	deps := lifecycle.deps()
+	deps.send = func(issue *beads.Issue, anomaly reaper.Anomaly) error {
+		return sendReaperAnomalyMail(issue, anomaly, []string{"announce:alerts"},
+			func(_, _ string) ([]*mail.Message, error) { return stored, nil },
+			func(message *mail.Message) error {
+				attempts++
+				stored = append(stored, (&mail.BeadsMessage{
+					ID: "hq-announce", Title: message.Subject, Description: message.Body,
+					Assignee: message.To, Priority: 2, CreatedAt: time.Now(),
+					Labels: []string{
+						"gt:message", "gt:escalation", "from:reaper", "msg-type:escalation",
+						"thread:" + issue.ID, "announce:alerts",
+					},
+				}).ToMessage())
+				return nil
+			},
+		)
+	}
+	scan := completeAnomalyScan(testReaperAnomaly("hq-child"))
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, deps); err == nil {
+		t.Fatal("first reconcile succeeded, want marker failure")
+	}
+	lifecycle.markerErr = nil
+	if _, err := reconcileAnomalyScans([]reaper.AnomalyScan{scan}, deps); err != nil {
+		t.Fatalf("announce marker retry: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("announce attempts = %d, want 1", attempts)
+	}
+	if len(stored) != 1 || !isStoredReaperNotice(stored[0], "announce:alerts", lifecycle.issues[0].ID) {
+		t.Fatalf("stored announce notice = %#v, want valid retry custody", stored)
+	}
+}
+
+func TestExpandReaperMailTargetsResolvesNestedFanoutAndRejectsCyclesOrEmpty(t *testing.T) {
+	t.Run("nested fanout", func(t *testing.T) {
+		targets, err := expandReaperMailTargets(
+			[]string{"list:oncall", "mayor/"},
+			func(address string) ([]string, error) {
+				switch address {
+				case "list:oncall":
+					return []string{"@ops", "mayor/"}, nil
+				case "list:backup":
+					return []string{"other/witness"}, nil
+				default:
+					return nil, fmt.Errorf("unexpected list lookup %q", address)
+				}
+			},
+			func(address string) ([]string, error) {
+				if address != "@ops" {
+					return nil, fmt.Errorf("unexpected group lookup %q", address)
+				}
+				return []string{"channel:alerts", "list:backup"}, nil
+			},
+			func(address string) ([]string, error) {
+				if address != "channel:alerts" {
+					return nil, fmt.Errorf("unexpected channel lookup %q", address)
+				}
+				return []string{"gastown/witness", "mayor/"}, nil
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"gastown/witness", "mayor/", "other/witness"}
+		if fmt.Sprint(targets) != fmt.Sprint(want) {
+			t.Fatalf("targets = %v, want %v", targets, want)
+		}
+	})
+
+	t.Run("cycle", func(t *testing.T) {
+		_, err := expandReaperMailTargets(
+			[]string{"list:a"},
+			func(string) ([]string, error) { return []string{"@b"}, nil },
+			func(string) ([]string, error) { return []string{"list:a"}, nil },
+			func(string) ([]string, error) { return nil, errors.New("unexpected channel lookup") },
+		)
+		if err == nil || !strings.Contains(err.Error(), "cyclic fan-out") {
+			t.Fatalf("cycle error = %v, want cyclic fan-out", err)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		_, err := expandReaperMailTargets(
+			[]string{"channel:empty"},
+			func(string) ([]string, error) { return nil, errors.New("unexpected list lookup") },
+			func(string) ([]string, error) { return nil, errors.New("unexpected group lookup") },
+			func(string) ([]string, error) { return nil, nil },
+		)
+		if err == nil || !strings.Contains(err.Error(), "has no recipients") {
+			t.Fatalf("empty error = %v, want no recipients", err)
+		}
+	})
+}
+
 func TestIsStoredReaperNoticeRequiresMatchingValidNotice(t *testing.T) {
 	valid := mail.Message{
 		ID:       "hq-message",
@@ -198,14 +354,15 @@ func TestIsStoredReaperNoticeRequiresMatchingValidNotice(t *testing.T) {
 	}
 }
 
-func TestIsStoredReaperNoticeAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
+func TestIsStoredReaperNoticeAcceptsStoredQueueAndRejectsChannelOrigin(t *testing.T) {
 	tests := []struct {
 		name   string
 		target string
 		set    func(*mail.Message)
+		want   bool
 	}{
-		{name: "queue", target: "queue:triage", set: func(message *mail.Message) { message.Queue = "triage" }},
-		{name: "channel", target: "channel:alerts", set: func(message *mail.Message) { message.Channel = "alerts" }},
+		{name: "queue", target: "queue:triage", set: func(message *mail.Message) { message.Queue = "triage" }, want: true},
+		{name: "channel origin", target: "channel:alerts", set: func(message *mail.Message) { message.Channel = "alerts" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -214,8 +371,8 @@ func TestIsStoredReaperNoticeAcceptsStoredQueueAndChannelRoutes(t *testing.T) {
 				Subject: "[MEDIUM] Reaper anomaly", Type: mail.TypeEscalation, ThreadID: "hq-escalation",
 			}
 			tt.set(message)
-			if !isStoredReaperNotice(message, tt.target, "hq-escalation") {
-				t.Fatalf("stored %s notice was not accepted: %#v", tt.name, message)
+			if got := isStoredReaperNotice(message, tt.target, "hq-escalation"); got != tt.want {
+				t.Fatalf("stored %s notice accepted = %v, want %v: %#v", tt.name, got, tt.want, message)
 			}
 		})
 	}

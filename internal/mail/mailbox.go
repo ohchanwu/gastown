@@ -1454,10 +1454,11 @@ func decodeThreadRecord(record json.RawMessage, message *BeadsMessage) error {
 		if !ok {
 			return errors.New("invalid message field")
 		}
-		if seen[name] {
+		canonicalName := strings.ToLower(name)
+		if seen[canonicalName] {
 			return fmt.Errorf("duplicate message field %q", name)
 		}
-		seen[name] = true
+		seen[canonicalName] = true
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
 			return err
@@ -1544,6 +1545,9 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 func validateThreadMessage(message *Message, labels []string, threadID string) error {
+	if err := validateSingletonThreadLabels(labels); err != nil {
+		return err
+	}
 	if !hasExactString(labels, "gt:message") {
 		return errors.New("missing gt:message label")
 	}
@@ -1557,6 +1561,24 @@ func validateThreadMessage(message *Message, labels []string, threadID string) e
 		return errors.New("missing channel route label")
 	}
 	return message.ValidateStored()
+}
+
+func validateSingletonThreadLabels(labels []string) error {
+	seen := make(map[string]bool)
+	for _, label := range labels {
+		key, _, ok := strings.Cut(label, ":")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "from", "thread", "msg-type", "queue", "channel":
+			if seen[key] {
+				return fmt.Errorf("duplicate %s label", key)
+			}
+			seen[key] = true
+		}
+	}
+	return nil
 }
 
 func sortThreadMessages(messages []*Message) {

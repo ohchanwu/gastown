@@ -27,6 +27,17 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"mail-thread-test"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
+	configDir := filepath.Join(townRoot, "config")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "messaging.json"), []byte(`{
+  "type": "messaging",
+  "version": 1,
+  "announces": {"alerts": {"readers": ["@town"], "retain_count": 10}}
+}`), 0644); err != nil {
+		t.Fatal(err)
+	}
 	env := mailThreadCompatibilityEnv(homeDir, townRoot, port)
 
 	runMailThreadFixtureCommand(t, townRoot, env, "bd",
@@ -40,6 +51,22 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	wispID := createMailThreadFixture(t, townRoot, env, "ephemeral", true, "gt:message", "thread:"+threadID, "from:deacon/")
 	queueID := createMailThreadFixtureForAssignee(t, townRoot, env, "queue", "queue:triage", false, "gt:message", "gt:escalation", "msg-type:escalation", "thread:"+threadID, "from:reaper", "queue:triage")
 	channelID := createMailThreadFixtureForAssignee(t, townRoot, env, "channel", "channel:alerts", false, "gt:message", "gt:escalation", "msg-type:escalation", "thread:"+threadID, "from:reaper", "channel:alerts")
+	for key, value := range map[string]string{
+		"GT_TOWN_ROOT": townRoot, "GT_ROOT": townRoot, "GT_ROLE": "mayor",
+		"GT_DOLT_HOST": "127.0.0.1", "GT_DOLT_PORT": port,
+		"BEADS_DOLT_SERVER_HOST": "127.0.0.1", "BEADS_DOLT_SERVER_PORT": port,
+		"BEADS_DOLT_PORT": port, "BEADS_DOLT_AUTO_START": "0",
+	} {
+		t.Setenv(key, value)
+	}
+	announceSubject := "announce escalation"
+	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	if err := router.Send(&mail.Message{
+		From: "reaper", To: "announce:alerts", Subject: announceSubject, Body: "announce body",
+		Type: mail.TypeEscalation, Priority: mail.PriorityNormal, ThreadID: threadID, SuppressNotify: true,
+	}); err != nil {
+		t.Fatalf("send announce escalation: %v", err)
+	}
 	createMailThreadFixture(t, townRoot, env, "other thread", false, "gt:message", "thread:other", "from:deacon/")
 	createMailThreadFixture(t, townRoot, env, "missing message label", false, "thread:"+threadID, "from:deacon/")
 	createMailThreadFixture(t, townRoot, env, "missing thread label", false, "gt:message", "from:deacon/")
@@ -51,7 +78,16 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	if err := json.Unmarshal([]byte(output), &messages); err != nil {
 		t.Fatalf("decode gt mail thread output: %v\nstdout: %s", err, output)
 	}
-	wantIDs := map[string]bool{firstID: true, secondID: true, wispID: true, queueID: true, channelID: true}
+	announceID := ""
+	for _, message := range messages {
+		if message.To == "announce:alerts" && message.Subject == announceSubject {
+			announceID = message.ID
+		}
+	}
+	if announceID == "" {
+		t.Fatalf("announce escalation missing from thread: %s", output)
+	}
+	wantIDs := map[string]bool{firstID: true, secondID: true, wispID: true, queueID: true, channelID: true, announceID: true}
 	if len(messages) != len(wantIDs) {
 		t.Fatalf("gt mail thread returned %d messages, want %d: %s", len(messages), len(wantIDs), output)
 	}
@@ -80,6 +116,9 @@ func TestMailThreadBeadsCompatibility(t *testing.T) {
 	}
 	if byID[channelID].To != "channel:alerts" || byID[channelID].Channel != "alerts" || byID[channelID].Type != mail.TypeEscalation {
 		t.Fatalf("channel route was not preserved: %#v", byID[channelID])
+	}
+	if byID[announceID].To != "announce:alerts" || byID[announceID].Type != mail.TypeEscalation {
+		t.Fatalf("announce escalation metadata was not preserved: %#v", byID[announceID])
 	}
 
 	missing := runMailThreadFixtureCommand(t, townRoot, env, gtBinary, "mail", "thread", "thread-missing", "--json")

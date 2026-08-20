@@ -221,6 +221,7 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 	}
 	targets := extractMailTargetsFromActions(escalationConfig.GetRouteForSeverity(config.SeverityMedium))
 	router := mail.NewRouter(townRoot)
+	channelBeads := beads.New(townRoot)
 	var concreteTargets []string
 	targetsResolved := false
 	result, err := reconcileAnomalyScans(scans, anomalyReconcileDeps{
@@ -230,7 +231,25 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 		close:  bd.CloseEscalation,
 		send: func(issue *beads.Issue, anomaly reaper.Anomaly) error {
 			if !targetsResolved {
-				resolved, resolveErr := expandReaperMailTargets(targets, router.ExpandListAddress, router.ResolveGroupAddress)
+				resolved, resolveErr := expandReaperMailTargets(
+					targets,
+					router.ExpandListAddress,
+					router.ResolveGroupAddress,
+					func(address string) ([]string, error) {
+						name := strings.TrimPrefix(address, "channel:")
+						_, fields, err := channelBeads.GetChannelBead(name)
+						if err != nil {
+							return nil, fmt.Errorf("getting channel %q: %w", name, err)
+						}
+						if fields == nil {
+							return nil, fmt.Errorf("channel not found: %s", name)
+						}
+						if fields.Status == beads.ChannelStatusClosed {
+							return nil, fmt.Errorf("channel %s is closed", name)
+						}
+						return fields.Subscribers, nil
+					},
+				)
 				if resolveErr != nil {
 					return fmt.Errorf("resolving Reaper mail targets: %w", resolveErr)
 				}
@@ -274,6 +293,7 @@ func expandReaperMailTargets(
 	targets []string,
 	expandList func(string) ([]string, error),
 	resolveGroup func(string) ([]string, error),
+	resolveChannel func(string) ([]string, error),
 ) ([]string, error) {
 	var recipients []string
 	seenRecipients := make(map[string]bool)
@@ -287,6 +307,8 @@ func expandReaperMailTargets(
 			expand = expandList
 		case strings.HasPrefix(target, "@"):
 			expand = resolveGroup
+		case strings.HasPrefix(target, "channel:"):
+			expand = resolveChannel
 		default:
 			identity := mail.AddressToIdentity(target)
 			if identity == "" {
@@ -372,6 +394,9 @@ func sendReaperAnomalyMail(
 
 func isStoredReaperNotice(message *mail.Message, target, threadID string) bool {
 	if message == nil || message.ValidateStored() != nil {
+		return false
+	}
+	if message.Channel != "" || strings.HasPrefix(target, "channel:") {
 		return false
 	}
 	return mail.AddressToIdentity(message.From) == "reaper" &&
