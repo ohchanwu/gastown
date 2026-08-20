@@ -77,11 +77,62 @@ func TestExpandReaperMailTargetsResolvesFanoutAndDeduplicates(t *testing.T) {
 	}
 }
 
-func TestReaperChannelRecipientsExcludeNormalizedSelf(t *testing.T) {
-	got := reaperChannelRecipients([]string{"reaper", "reaper/", "gastown/witness", "overseer"})
-	want := []string{"gastown/witness", "overseer"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("recipients = %v, want %v", got, want)
+func TestExpandReaperMailTargetsExcludesSelfAfterRecursiveFanout(t *testing.T) {
+	tests := []struct {
+		name                string
+		channelRecipients   []string
+		groupRecipients     []string
+		listRecipients      []string
+		want                []string
+		wantNoRecipientsErr bool
+	}{
+		{
+			name:              "channel to group to self",
+			channelRecipients: []string{"@ops", "gastown/witness"},
+			groupRecipients:   []string{"reaper/"},
+			want:              []string{"gastown/witness"},
+		},
+		{
+			name:              "channel to list to self",
+			channelRecipients: []string{"list:oncall", "overseer"},
+			listRecipients:    []string{"reaper"},
+			want:              []string{"overseer"},
+		},
+		{
+			name:              "mixed direct self and valid recipients",
+			channelRecipients: []string{"reaper", "reaper/", "gastown/witness"},
+			want:              []string{"gastown/witness"},
+		},
+		{
+			name:                "indirect sole self has no recipients",
+			channelRecipients:   []string{"@ops"},
+			groupRecipients:     []string{"list:oncall"},
+			listRecipients:      []string{"reaper/"},
+			wantNoRecipientsErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := expandReaperMailTargets(
+				[]string{"channel:alerts"},
+				func(string) ([]string, error) { return tt.listRecipients, nil },
+				func(string) ([]string, error) { return tt.groupRecipients, nil },
+				func(string) ([]string, error) { return tt.channelRecipients, nil },
+			)
+			if tt.wantNoRecipientsErr {
+				if err == nil || !strings.Contains(err.Error(), "no recipients") {
+					t.Fatalf("error = %v, want no recipients error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("recipients = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

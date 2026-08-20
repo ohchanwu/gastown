@@ -247,7 +247,7 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 						if fields.Status == beads.ChannelStatusClosed {
 							return nil, fmt.Errorf("channel %s is closed", name)
 						}
-						return reaperChannelRecipients(fields.Subscribers), nil
+						return fields.Subscribers, nil
 					},
 				)
 				if resolveErr != nil {
@@ -289,16 +289,6 @@ func runReaperReconcileAnomalies(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func reaperChannelRecipients(subscribers []string) []string {
-	recipients := make([]string, 0, len(subscribers))
-	for _, subscriber := range subscribers {
-		if mail.AddressToIdentity(subscriber) != "reaper" {
-			recipients = append(recipients, subscriber)
-		}
-	}
-	return recipients
-}
-
 func expandReaperMailTargets(
 	targets []string,
 	expandList func(string) ([]string, error),
@@ -323,6 +313,9 @@ func expandReaperMailTargets(
 			identity := mail.AddressToIdentity(target)
 			if identity == "" {
 				return errors.New("empty Reaper mail target")
+			}
+			if identity == "reaper" {
+				return nil
 			}
 			if !seenRecipients[identity] {
 				seenRecipients[identity] = true
@@ -361,6 +354,9 @@ func expandReaperMailTargets(
 		if err := add(target); err != nil {
 			return nil, err
 		}
+	}
+	if len(recipients) == 0 {
+		return nil, errors.New("Reaper mail targets have no recipients")
 	}
 	return recipients, nil
 }
